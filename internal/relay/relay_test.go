@@ -366,14 +366,14 @@ func TestParkedDeadPeerFreesRoom(t *testing.T) {
 // TestParkedEarlyDataSurvivesPairing verifies that bytes a parked client sent
 // before its partner arrived are forwarded once the splice starts. Clients
 // may begin the PAKE handshake immediately after dialling, so the relay must
-// treat pre-pairing data as legitimate traffic buffered by TCP.
+// treat pre-pairing data as legitimate traffic and replay it.
 func TestParkedEarlyDataSurvivesPairing(t *testing.T) {
 	base, stop := startTestRelay(t)
 	defer stop()
 
 	a := dial(t, base, "early", "A")
 	defer a.Close()
-	// A speaks before B even exists; the bytes must sit in the socket buffer.
+	// A speaks before B even exists; the bytes must be buffered and replayed.
 	if err := a.Send([]byte("early bird")); err != nil {
 		t.Fatal(err)
 	}
@@ -388,5 +388,85 @@ func TestParkedEarlyDataSurvivesPairing(t *testing.T) {
 	}
 	if string(got) != "early bird" {
 		t.Errorf("B got %q, want %q", got, "early bird")
+	}
+}
+
+// TestNoLiveLockBetweenReconnectingPeers is the regression test for a bug
+// found against a real deployment: with "last writer wins" replacement, two
+// healthy peers that both re-park on a timer kept evicting each other forever
+// and never met. A parked peer that is still alive must keep its slot, so
+// pairing succeeds on the next attempt.
+func TestNoLiveLockBetweenReconnectingPeers(t *testing.T) {
+	base, stop := startTestRelay(t)
+	defer stop()
+
+	// A parks and stays connected. Repeatedly re-parking A (as a client does
+	// after a pair-window expiry) must not prevent the eventual pair.
+	a := dial(t, base, "livelock", "A")
+	defer a.Close()
+
+	for i := 0; i < 3; i++ {
+		// A is healthy: sending nothing keeps it parked; the relay must not
+		// consider it stale merely because time passed.
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	b := dial(t, base, "livelock", "B")
+	defer b.Close()
+
+	if err := a.Send([]byte("hello after waiting")); err != nil {
+		t.Fatalf("A send: %v", err)
+	}
+	_ = b.SetReadDeadline(time.Now().Add(3 * time.Second))
+	got, err := b.Recv()
+	if err != nil {
+		t.Fatalf("B recv: %v", err)
+	}
+	if string(got) != "hello after waiting" {
+		t.Errorf("B got %q", got)
+	}
+
+	// And the reverse direction must work on the same splice.
+	if err := b.Send([]byte("reply")); err != nil {
+		t.Fatalf("B send: %v", err)
+	}
+	_ = a.SetReadDeadline(time.Now().Add(3 * time.Second))
+	got, err = a.Recv()
+	if err != nil {
+		t.Fatalf("A recv: %v", err)
+	}
+	if string(got) != "reply" {
+		t.Errorf("A got %q", got)
+	}
+}
+
+// TestParkedPeerDeathIsNoticed checks that a peer that dies while parked is
+// detected by the parked reader rather than holding the room for PairTimeout.
+func TestParkedPeerDeathIsNoticed(t *testing.T) {
+	base, stop := startTestRelay(t)
+	defer stop()
+
+	a := dial(t, base, "death", "A")
+	_ = a.Close() // die while parked
+
+	// Give the parked reader a moment to notice, then confirm a fresh peer
+	// can take the slot and pair.
+	time.Sleep(300 * time.Millisecond)
+
+	a2 := dial(t, base, "death", "A")
+	defer a2.Close()
+	b := dial(t, base, "death", "B")
+	defer b.Close()
+
+	if err := a2.Send([]byte("recovered")); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	_ = b.SetReadDeadline(time.Now().Add(3 * time.Second))
+	got, err := b.Recv()
+	if err != nil {
+		t.Fatalf("B recv: %v", err)
+	}
+	if string(got) != "recovered" {
+		t.Errorf("B got %q", got)
 	}
 }

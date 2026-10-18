@@ -195,9 +195,12 @@ func TestProbeRespectsShortTimeout(t *testing.T) {
 	opts := DefaultOptions()
 	opts.SkipNetwork = false
 	opts.NetworkTimeout = 150 * time.Millisecond
-	// Point at a blackhole address so the check cannot succeed; we only care
-	// that the probe returns promptly rather than hanging.
-	opts.TCPAddr = "192.0.2.1:9" // TEST-NET-1, guaranteed unroutable
+	// Point at a documentation address so the check normally cannot succeed.
+	// The property under test is that the probe *returns promptly*; asserting
+	// that the target is unreachable is not portable — some networks (and
+	// transparent proxies) complete TCP handshakes to any address, which says
+	// nothing about this code.
+	opts.TCPAddr = "192.0.2.1:9" // TEST-NET-1
 	opts.UDPServer = "192.0.2.1:9"
 	opts.TUNDevice = filepath.Join(t.TempDir(), "nope")
 
@@ -208,7 +211,12 @@ func TestProbeRespectsShortTimeout(t *testing.T) {
 	if elapsed > 5*time.Second {
 		t.Fatalf("probe took %s, expected it to honour the timeout", elapsed)
 	}
-	if rep.Network.TCPOutbound.OK {
-		t.Error("blackhole TCP target should not report success")
+	// Each individual check must have finished within its own deadline plus
+	// scheduling slack, whether it succeeded or failed.
+	if rep.Network.TCPOutbound.Latency != "" {
+		d, err := time.ParseDuration(rep.Network.TCPOutbound.Latency)
+		if err == nil && d > 2*time.Second {
+			t.Errorf("TCP check took %s, want <= 2s", d)
+		}
 	}
 }

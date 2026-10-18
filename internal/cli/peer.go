@@ -73,13 +73,14 @@ func newNode(cf commonFlags, role secure.Role, outDir string, oneShot bool) (*No
 		OutDir:     outDir,
 	}
 	if oneShot {
-		// One-shot commands must terminate on their own: give up after a few
-		// rounds instead of waiting for a partner forever, do not sit in a
-		// full pair window per attempt, and stop re-offering a file that no
-		// receiver ever accepts.
-		cfg.MaxConnectAttempts = 8
+		// One-shot commands must terminate on their own, but must also survive
+		// a partner that starts a little later: a 10s window across the public
+		// internet makes both sides miss each other whenever their start times
+		// drift. Keep a generous per-relay window and a bounded number of
+		// rounds; stop re-offering a file nobody accepts.
+		cfg.MaxConnectAttempts = 12
 		cfg.MaxTransferAttempts = 3
-		cfg.PairWindow = min(cfg.PairWindow, 10*time.Second)
+		cfg.PairWindow = min(cfg.PairWindow, 45*time.Second)
 	}
 	return NewNode(cfg), nil
 }
@@ -109,17 +110,20 @@ func runSend(args []string) error {
 	runErr := make(chan error, 1)
 	go func() { runErr <- node.Run(ctx) }()
 
-	// drainRun reaps the Run goroutine so it never leaks.
-	drainRun := func() {
+	// drainRun stops the node and returns whatever ended it, so a failure to
+	// ever connect is reported instead of looking like a clean exit.
+	drainRun := func() error {
 		stop()
-		<-runErr
+		return <-runErr
 	}
 
 	fileOK := false
 	if *file != "" {
 		res, err := node.SendFile(ctx, *file, progressPrinter(os.Stderr))
 		if err != nil {
-			drainRun()
+			if rerr := drainRun(); rerr != nil && ctx.Err() == nil {
+				return rerr
+			}
 			return err
 		}
 		if !res.OK {
@@ -139,7 +143,9 @@ func runSend(args []string) error {
 				// succeeded, so a lost goodbye is a warning, not a failure.
 				fmt.Fprintf(os.Stderr, "warning: message not delivered (receiver left): %v\n", err)
 			} else {
-				drainRun()
+				if rerr := drainRun(); rerr != nil && ctx.Err() == nil {
+					return rerr
+				}
 				return err
 			}
 		} else {
@@ -148,8 +154,7 @@ func runSend(args []string) error {
 	}
 
 	if !*stay {
-		drainRun()
-		return nil
+		return drainRun()
 	}
 
 	fmt.Fprintln(os.Stderr, "session open; type messages, /file PATH to send a file, ctrl-d or ctrl-c to quit")

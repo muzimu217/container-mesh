@@ -78,19 +78,31 @@ type Server struct {
 }
 
 // waiter is one peer parked in a room waiting for its partner.
+//
+// Nothing reads the socket while parked. That is deliberate: gorilla latches
+// the first read error and panics after a bounded number of retries, so any
+// "probe by reading with a deadline" scheme eventually crashes the relay (both
+// variants were observed doing exactly that in a real deployment). Liveness is
+// handled by the transport instead — the WebSocket ping ticker closes a
+// connection whose pongs stop arriving, and the splice's first read then sees
+// the failure immediately. Bytes a client sends before pairing are not lost:
+// they sit in the TCP/socket buffer and the splice reads them as soon as it
+// starts.
 type waiter struct {
 	conn *wsconn.Conn
 	// paired receives the partner's waiter exactly once.
 	paired chan *waiter
-	// done is closed when the splicer has finished with this connection.
+	// done is closed when the splice for this connection has finished.
 	done chan struct{}
-	// kick is closed when a newer connection claims this slot; the parked
-	// goroutine then gives up and closes the socket.
-	kick chan struct{}
-	once sync.Once
+	// evicted is closed when a newer connection with the same role takes the
+	// slot; the older waiter gives up instead of being spliced.
+	evicted   chan struct{}
+	evictOnce sync.Once
+	// closed is closed once the transport reports the socket is gone.
+	closed chan struct{}
 }
 
-func (w *waiter) evict() { w.once.Do(func() { close(w.kick) }) }
+func (w *waiter) markEvicted() { w.evictOnce.Do(func() { close(w.evicted) }) }
 
 type room struct {
 	id    string
@@ -194,23 +206,26 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	s.log.Info("paired", "room", roomID, "role", role, "remote", c.RemoteAddr())
 
 	// Exactly one side runs the splice: the peer that completed the room.
-	s.splice(roomID, c, partner)
+	s.splice(roomID, c, partner.conn)
 	close(self.done)
 }
 
-// join parks the peer until its partner arrives, evicting any stale waiter
-// that already holds the slot (a client that reconnects is fresher than a
-// zombie).
+// join parks the peer until its partner arrives.
+//
+// A newer connection with the same room+role replaces the parked one
+// (last-writer-wins). That is what makes client reconnects recover: a fresh
+// dial is by definition more useful than whatever is stuck in the slot, and a
+// parked waiter that is actually dead costs nothing to replace.
 //
 // It returns (partner, self, nil) when the room is now complete, or
-// (nil, self, nil) if this peer is the first one and is still waiting. The
-// caller must block on self.done in the waiting case.
-func (s *Server) join(ctx context.Context, roomID, role string, c *wsconn.Conn) (*wsconn.Conn, *waiter, error) {
+// (nil, self, nil) if this peer is the first one and is still waiting.
+func (s *Server) join(ctx context.Context, roomID, role string, c *wsconn.Conn) (*waiter, *waiter, error) {
 	w := &waiter{
-		conn:   c,
-		paired: make(chan *waiter, 1),
-		done:   make(chan struct{}),
-		kick:   make(chan struct{}),
+		conn:    c,
+		paired:  make(chan *waiter, 1),
+		done:    make(chan struct{}),
+		evicted: make(chan struct{}),
+		closed:  make(chan struct{}),
 	}
 	other := "B"
 	if role == "B" {
@@ -230,14 +245,14 @@ func (s *Server) join(ctx context.Context, roomID, role string, c *wsconn.Conn) 
 			s.rooms[roomID] = rm
 		}
 		if old, taken := rm.roles[role]; taken {
-			// A stale waiter holds our slot. Evict it and retry the placement.
 			delete(rm.roles, role)
 			if len(rm.roles) == 0 {
 				delete(s.rooms, roomID)
 			}
 			s.mu.Unlock()
-			s.log.Info("evicting stale parked peer", "room", roomID, "role", role)
-			old.evict()
+			s.log.Info("replacing parked peer", "room", roomID, "role", role)
+			old.markEvicted()
+			_ = old.conn.Close()
 			continue
 		}
 		rm.roles[role] = w
@@ -250,14 +265,19 @@ func (s *Server) join(ctx context.Context, roomID, role string, c *wsconn.Conn) 
 	}
 
 	if partner != nil {
-		// Hand our waiter to the peer that is already parked, then take over
-		// splicing on this goroutine.
 		partner.paired <- w
-		return partner.conn, w, nil
+		return partner, w, nil
 	}
 
-	// First peer: wait for the partner, honouring the kick channel, the
-	// request context (client disconnect) and the pairing timeout.
+	// Watch the socket without consuming its data: when the transport gives up
+	// on the connection (pongs stopped arriving), free the room slot instead
+	// of holding it until PairTimeout. The wait itself does not read, so the
+	// peer's pre-pairing bytes stay in the buffer for the splice.
+	go func() {
+		<-c.Closed()
+		close(w.closed)
+	}()
+
 	timer := time.NewTimer(s.cfg.PairTimeout)
 	defer timer.Stop()
 
@@ -268,8 +288,11 @@ func (s *Server) join(ctx context.Context, roomID, role string, c *wsconn.Conn) 
 		// our own would deadlock because only the splice owner closes it.
 		<-arriving.done
 		return nil, w, nil
-	case <-w.kick:
-		return nil, nil, errors.New("displaced by a newer connection with the same role")
+	case <-w.evicted:
+		return nil, nil, errors.New("replaced by a newer connection with the same role")
+	case <-w.closed:
+		s.removeWaiter(roomID, role, w)
+		return nil, nil, errors.New("connection closed while waiting for partner")
 	case <-timer.C:
 		s.removeWaiter(roomID, role, w)
 		return nil, nil, fmt.Errorf("timed out after %s waiting for the other peer", s.cfg.PairTimeout)

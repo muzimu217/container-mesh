@@ -25,10 +25,6 @@ func probeNet(opts Options) NetReport {
 	n.UDPOutbound = checkUDP(opts.UDPServer, to)
 	n.LocalhostListen = checkListen()
 
-	// UDP egress alone is enough for a userspace transport, but TCP is the
-	// transport this project actually uses, so require TCP or UDP.
-	n.OutboundUsable = n.TCPOutbound.OK || n.UDPOutbound.OK
-
 	// STUN bindings tell us whether we are behind NAT and what the public
 	// address looks like. Several servers are queried in parallel — including
 	// Chinese and international ones — because reachability differs per
@@ -42,10 +38,30 @@ func probeNet(opts Options) NetReport {
 			break
 		}
 	}
+
+	// Outbound usability must not depend on a single hard-coded target. A
+	// server inside China routinely cannot reach 1.1.1.1:53/443 while its
+	// egress works fine — an earlier version called such hosts "unusable",
+	// which is actively misleading. Any of these is proof of egress:
+	//   - a completed TCP handshake,
+	//   - a UDP datagram that got a reply,
+	//   - a STUN binding (proves UDP egress to a public host),
+	//   - successful DNS resolution (proves a working resolver path).
+	anySTUN := false
+	for _, r := range n.STUN {
+		if r.OK {
+			anySTUN = true
+			break
+		}
+	}
+	n.OutboundUsable = n.TCPOutbound.OK || n.UDPOutbound.OK || anySTUN || n.DNSResolution.OK
+
 	if n.PublicIPViaSTUN == "" {
 		n.STUNError = "no STUN server answered"
 		if n.UDPOutbound.OK {
 			n.EffectiveNATNote = "UDP works but STUN did not answer; NAT type unknown"
+		} else if n.OutboundUsable {
+			n.EffectiveNATNote = "outbound works (TCP/DNS) but no STUN reply; UDP may be filtered"
 		} else {
 			n.EffectiveNATNote = "no UDP egress"
 		}

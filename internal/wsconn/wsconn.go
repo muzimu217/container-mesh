@@ -67,7 +67,12 @@ type Conn struct {
 	// stopLive shuts the ping ticker down; liveDone reports its exit.
 	stopLive chan struct{}
 	liveDone chan struct{}
+	// gone is closed once the connection is unusable.
+	gone     chan struct{}
+	goneOnce sync.Once
 }
+
+func (c *Conn) markGone() { c.goneOnce.Do(func() { close(c.gone) }) }
 
 // DialOptions controls outbound connection behaviour.
 type DialOptions struct {
@@ -136,7 +141,7 @@ func newConn(ws *websocket.Conn) *Conn {
 	// No read deadline by default: transfers may legitimately stall while the
 	// sender hashes a large file. Keepalive is opt-in via EnableLiveness.
 	ws.SetReadLimit(16 << 20) // 16 MiB per message, well above our 1 MiB frames
-	return &Conn{ws: ws}
+	return &Conn{ws: ws, gone: make(chan struct{})}
 }
 
 // EnableLiveness starts the ping ticker and read-deadline enforcement. Call
@@ -180,6 +185,7 @@ func (c *Conn) EnableLiveness(l Liveness) {
 				// after its own deadline; a failure means the TCP path is
 				// gone, so force the read side to notice too.
 				if err := c.ws.WriteControl(websocket.PingMessage, nil, time.Now().Add(10*time.Second)); err != nil {
+					c.markGone()
 					_ = c.ws.Close()
 					return
 				}
@@ -212,6 +218,7 @@ func (c *Conn) Recv() ([]byte, error) {
 		}
 		mt, data, err := c.ws.ReadMessage()
 		if err != nil {
+			c.markGone()
 			return nil, err
 		}
 		if mt == websocket.BinaryMessage {
@@ -222,9 +229,32 @@ func (c *Conn) Recv() ([]byte, error) {
 	}
 }
 
-// SetReadDeadline bounds the next Recv call. Zero clears it. It must not be
-// used on connections with liveness enabled — the liveness ticker owns the
-// deadline there.
+// RecvWithDeadline reads one binary message after setting an explicit read
+// deadline. It is meant for callers that own the socket's read side and need
+// their own timeout semantics (the relay's parked-peer probe); it must not be
+// mixed with Recv on the same connection. A timeout returns a net.Error whose
+// Timeout() is true and leaves the connection usable for the next call.
+func (c *Conn) RecvWithDeadline(deadline time.Time) ([]byte, error) {
+	c.readMu.Lock()
+	defer c.readMu.Unlock()
+	if err := c.ws.SetReadDeadline(deadline); err != nil {
+		return nil, err
+	}
+	for {
+		mt, data, err := c.ws.ReadMessage()
+		if err != nil {
+			return nil, err
+		}
+		if mt == websocket.BinaryMessage {
+			return data, nil
+		}
+	}
+}
+
+// Closed reports a channel that is closed once the connection is gone, either
+// because Close was called or because the read side failed. It lets a caller
+// observe liveness without consuming data from the socket.
+func (c *Conn) Closed() <-chan struct{} { return c.gone }
 func (c *Conn) SetReadDeadline(t time.Time) error {
 	return c.ws.SetReadDeadline(t)
 }
@@ -239,6 +269,7 @@ func (c *Conn) Close() error {
 		return nil
 	}
 	c.closed = true
+	c.markGone()
 	if c.stopLive != nil {
 		close(c.stopLive)
 	}
