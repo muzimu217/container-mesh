@@ -1,0 +1,22 @@
+# 构建产物
+/cmesh
+/dist/
+/build/
+*.exe
+
+# 运行产物
+*.part
+*.log
+probe.json
+
+# 测试临时目录
+/tmp-test/
+
+# 编辑器/系统
+.DS_Store
+.idea/
+.vscode/
+
+# 工具插件残留
+.v2c/
+.video_agent/

@@ -1,0 +1,106 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Lint & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: true
+
+      - name: 依赖下载
+        run: go mod download
+
+      - name: 格式检查
+        run: |
+          set -e
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "以下文件未格式化:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: 单元测试
+        run: go test ./... -race -count=1
+
+      - name: 构建
+        run: go build -o cmesh ./cmd/cm
+
+      - name: 端到端测试
+        run: bash tests/run-tests.sh --verbose --large
+
+      - name: 交叉编译 (linux/amd64)
+        run: GOOS=linux GOARCH=amd64 go build -o /tmp/cmesh-linux-amd64 ./cmd/cm
+
+      - name: 交叉编译 (linux/arm64)
+        run: GOOS=linux GOARCH=arm64 go build -o /tmp/cmesh-linux-arm64 ./cmd/cm
+
+  linux-tun-probe:
+    name: Linux 上的 TUN 探测
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: true
+
+      - name: 构建
+        run: go build -o cmesh ./cmd/cm
+
+      - name: 探测（GitHub runner 无 CAP_NET_ADMIN，应报 userspace_only 或 unusable）
+        run: |
+          set +e
+          ./cmesh probe --json > probe.json
+          code=$?
+          echo "exit=$code"
+          cat probe.json
+          # 只要不是 0（TUN 可用）都算符合预期；关键是输出是合法 JSON
+          python3 -c "import json;json.load(open('probe.json'))"
+          case "$code" in
+            10|20) echo "✅ 符合预期: 无 TUN 权限" ;;
+            0)     echo "⚠️ runner 竟然有 CAP_NET_ADMIN，未覆盖到目标场景" ;;
+            *)     echo "❌ 意外退出码 $code"; exit 1 ;;
+          esac
+
+      - name: Linux 端到端
+        run: |
+          set -e
+          PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')
+          ./cmesh relay --addr "127.0.0.1:$PORT" &
+          RELAY=$!
+          trap 'kill $RELAY 2>/dev/null' EXIT
+          for i in $(seq 1 50); do
+            curl -sf "http://127.0.0.1:$PORT/healthz" >/dev/null && break
+            sleep 0.1
+          done
+
+          mkdir -p /tmp/src /tmp/dst
+          head -c 2097152 /dev/urandom > /tmp/src/f.bin
+
+          ./cmesh recv --relay "ws://127.0.0.1:$PORT/ws" --code "ci-code-1" \
+            --out /tmp/dst --stay=false &
+          RECV=$!
+          sleep 0.5
+          ./cmesh send --relay "ws://127.0.0.1:$PORT/ws" --code "ci-code-1" \
+            --file /tmp/src/f.bin --stay=false
+          wait $RECV
+
+          cmp /tmp/src/f.bin /tmp/dst/f.bin
+          echo "✅ Linux 端到端通过"

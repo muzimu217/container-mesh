@@ -1,0 +1,5 @@
+# WebSocket 反向代理, 自动 HTTPS。
+# 把 relay.example.com 换成你的域名。
+relay.example.com {
+	reverse_proxy /ws relay:8080
+}

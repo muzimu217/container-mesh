@@ -1,0 +1,10 @@
+.git
+.github
+dist
+out
+tests
+*.md
+Dockerfile
+docker-compose.yml
+.v2c
+.video_agent

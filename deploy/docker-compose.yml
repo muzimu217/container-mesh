@@ -1,0 +1,41 @@
+# 自建 relay 的最小生产部署: cmesh relay + Caddy 自动 HTTPS。
+#
+# Caddy 把 wss://relay.example.com/ws 反代到容器内的 :8080,
+# 证书自动申请和续期 (ACME)。客户端这样连:
+#
+#   cmesh send --relay wss://relay.example.com/ws --code ...
+#
+# 用法:
+#   1. 把 relay.example.com 的 DNS A 记录指向这台机器 (80/443 可达)
+#   2. 替换下面两处 relay.example.com
+#   3. docker compose up -d
+#
+# 国内服务器提示: 若域名未备案, 可用非常用端口 (如 8443) 或改用
+# 自签证书 + --relay 里显式 wss + 客户端跳过校验的方案 (见 deploy/README.md)。
+
+services:
+  relay:
+    build: ..
+    image: cmesh:latest
+    command: ["relay", "--addr", ":8080"]
+    restart: unless-stopped
+    networks: [internal]
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"     # ACME HTTP-01 挑战
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks: [internal]
+
+networks:
+  internal:
+
+volumes:
+  caddy_data:
+  caddy_config:
