@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 muzimu217
+
 // Package relay implements the rendezvous server.
 //
 // The relay's only job is to introduce two peers that know the same room code

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 muzimu217
+
 // Package probe inspects what a container is actually allowed to do, with
 // emphasis on whether a TUN device can be created.
 //

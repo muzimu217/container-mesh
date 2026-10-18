@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 muzimu217
+
 // Package wire defines the binary framing used between two container-mesh peers.
 //
 // Every frame travels inside an encrypted envelope (see package secure) and is

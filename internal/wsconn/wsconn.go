@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 muzimu217
+
 // Package wsconn wraps a WebSocket connection so it looks like a reliable
 // message pipe. It is the only transport in this project: outbound TCP/TLS to
 // the relay, which works from a container with no inbound connectivity and no

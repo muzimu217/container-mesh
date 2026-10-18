@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 muzimu217
+
 // Package secure provides the authenticated, encrypted channel that sits on
 // top of a raw message transport.
 //
