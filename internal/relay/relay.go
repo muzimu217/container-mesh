@@ -33,7 +33,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/blackevil/container-mesh/internal/wsconn"
+	"github.com/muzimu217/container-mesh/internal/wsconn"
 )
 
 // Config controls relay behaviour.
@@ -53,6 +53,12 @@ type Config struct {
 	// IdleTimeout closes a client connection with no inbound traffic —
 	// including keepalive pongs — for this long (0 = default).
 	IdleTimeout time.Duration
+	// MaxConnsPerIP caps concurrent connections from one source IP. It bounds
+	// room-squatting and connection floods from a single host (0 = default).
+	MaxConnsPerIP int
+	// ConnectRatePerMin limits new connections per source IP per minute
+	// (0 = default).
+	ConnectRatePerMin int
 	// Logger receives structured events.
 	Logger *slog.Logger
 }
@@ -61,13 +67,15 @@ type Config struct {
 func DefaultConfig() Config {
 	l := wsconn.DefaultLiveness()
 	return Config{
-		Addr:            ":8080",
-		Path:            "/ws",
-		PairTimeout:     10 * time.Minute,
-		MaxRooms:        1024,
-		MaxMessageBytes: 16 << 20,
-		PingPeriod:      l.PingEvery,
-		IdleTimeout:     l.IdleTimeout,
+		Addr:              ":8080",
+		Path:              "/ws",
+		PairTimeout:       10 * time.Minute,
+		MaxRooms:          1024,
+		MaxMessageBytes:   16 << 20,
+		PingPeriod:        l.PingEvery,
+		IdleTimeout:       l.IdleTimeout,
+		MaxConnsPerIP:     16,
+		ConnectRatePerMin: 120,
 	}
 }
 
@@ -78,6 +86,18 @@ type Server struct {
 
 	mu    sync.Mutex
 	rooms map[string]*room
+	// contested tracks rooms where peers are evicting each other in lockstep.
+	// It lives on the Server because a room entry is deleted as soon as two
+	// peers pair, which is exactly when the race repeats.
+	contested map[string]contestState
+
+	limiter *ipLimiter
+}
+
+// contestState records recent take-overs for one room label.
+type contestState struct {
+	evictions int
+	until     time.Time
 }
 
 // waiter is one peer parked in a room waiting for its partner.
@@ -112,6 +132,15 @@ type room struct {
 	roles map[string]*waiter
 }
 
+// maxEvictionsPerRoom is how many take-overs a room tolerates before it starts
+// refusing new connections for a moment. Two well-behaved peers need at most a
+// couple (one per real reconnect); a higher count means the sides are racing.
+const maxEvictionsPerRoom = 4
+
+// contestedWindow is how long a room refuses take-overs after the budget is
+// exhausted. Long enough for the clients' backoff to spread out.
+const contestedWindow = 5 * time.Second
+
 // New creates a relay server.
 func New(cfg Config) *Server {
 	def := DefaultConfig()
@@ -136,10 +165,22 @@ func New(cfg Config) *Server {
 	if cfg.IdleTimeout == 0 {
 		cfg.IdleTimeout = def.IdleTimeout
 	}
+	if cfg.MaxConnsPerIP == 0 {
+		cfg.MaxConnsPerIP = def.MaxConnsPerIP
+	}
+	if cfg.ConnectRatePerMin == 0 {
+		cfg.ConnectRatePerMin = def.ConnectRatePerMin
+	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
-	return &Server{cfg: cfg, log: cfg.Logger, rooms: make(map[string]*room)}
+	return &Server{
+		cfg:       cfg,
+		log:       cfg.Logger,
+		rooms:     make(map[string]*room),
+		contested: make(map[string]contestState),
+		limiter:   newIPLimiter(cfg.ConnectRatePerMin, cfg.MaxConnsPerIP),
+	}
 }
 
 // Handler returns the HTTP mux for the relay.
@@ -172,6 +213,19 @@ func (s *Server) ListenAndServe() error {
 	return s.HTTPServer().ListenAndServe()
 }
 
+// sweepContested drops expired contest records so the map cannot grow without
+// bound on a long-running relay. Called opportunistically from handleWS.
+func (s *Server) sweepContested() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	for room, st := range s.contested {
+		if st.evictions == 0 && now.After(st.until) {
+			delete(s.contested, room)
+		}
+	}
+}
+
 func (s *Server) liveness() wsconn.Liveness {
 	return wsconn.Liveness{PingEvery: s.cfg.PingPeriod, IdleTimeout: s.cfg.IdleTimeout}
 }
@@ -188,6 +242,19 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.sweepContested()
+
+	ip := clientIP(r)
+	if !s.limiter.acquire(ip) {
+		// The relay is unauthenticated by design (the room label is not a
+		// credential), so per-IP budgets are the only thing standing between a
+		// single host and a room-exhaustion or squatting flood.
+		s.log.Warn("rate limited", "ip", ip, "room", redactRoom(roomID))
+		http.Error(w, "too many connections", http.StatusTooManyRequests)
+		return
+	}
+	defer s.limiter.release(ip)
+
 	c, err := wsconn.Upgrade(w, r)
 	if err != nil {
 		s.log.Warn("upgrade failed", "err", err)
@@ -198,7 +265,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	partner, self, err := s.join(r.Context(), roomID, role, c)
 	if err != nil {
 		_ = c.Close()
-		s.log.Warn("join failed", "room", roomID, "role", role, "err", err)
+		s.log.Warn("join failed", "room", redactRoom(roomID), "role", role, "err", err)
 		return
 	}
 	if partner == nil {
@@ -206,7 +273,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		// splice finished, so there is nothing left to do.
 		return
 	}
-	s.log.Info("paired", "room", roomID, "role", role, "remote", c.RemoteAddr())
+	s.log.Info("paired", "room", redactRoom(roomID), "role", role, "remote", c.RemoteAddr())
 
 	// Exactly one side runs the splice: the peer that completed the room.
 	s.splice(roomID, c, partner.conn)
@@ -248,12 +315,33 @@ func (s *Server) join(ctx context.Context, roomID, role string, c *wsconn.Conn) 
 			s.rooms[roomID] = rm
 		}
 		if old, taken := rm.roles[role]; taken {
+			// Mutual eviction guard. Two peers that redial on similar timers
+			// can displace each other indefinitely: A arrives, kicks B; B
+			// redials, kicks A; repeat. Once a room has seen too many
+			// take-overs, refuse new arrivals for a short window so both
+			// clients back off and their retries decorrelate. Without this the
+			// room never converges (observed as two sides retrying forever
+			// against a healthy relay).
+			st := s.contested[roomID]
+			if time.Now().Before(st.until) {
+				s.mu.Unlock()
+				s.log.Warn("room contested; refusing take-over",
+					"room", redactRoom(roomID), "role", role, "evictions", st.evictions)
+				return nil, nil, errors.New("room is contested; retry after backoff")
+			}
+			st.evictions++
+			if st.evictions >= maxEvictionsPerRoom {
+				st.until = time.Now().Add(contestedWindow)
+				st.evictions = 0
+			}
+			s.contested[roomID] = st
+
 			delete(rm.roles, role)
 			if len(rm.roles) == 0 {
 				delete(s.rooms, roomID)
 			}
 			s.mu.Unlock()
-			s.log.Info("replacing parked peer", "room", roomID, "role", role)
+			s.log.Info("replacing parked peer", "room", redactRoom(roomID), "role", role)
 			old.markEvicted()
 			_ = old.conn.Close()
 			continue
@@ -303,6 +391,18 @@ func (s *Server) join(ctx context.Context, roomID, role string, c *wsconn.Conn) 
 		s.removeWaiter(roomID, role, w)
 		return nil, nil, ctx.Err()
 	}
+}
+
+// redactRoom shortens a room label for logs. Room labels are derived from the
+// shared code (see secure.RoomID); they are not the code itself, but a short
+// prefix is enough to correlate log lines and keeps the full label out of
+// access logs and log aggregators.
+func redactRoom(room string) string {
+	const keep = 8
+	if len(room) <= keep {
+		return room
+	}
+	return room[:keep] + "…"
 }
 
 // removeWaiter drops a parked peer from its room, deleting the room when it

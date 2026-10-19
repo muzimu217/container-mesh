@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/blackevil/container-mesh/internal/probe"
+	"github.com/muzimu217/container-mesh/internal/probe"
 )
 
 func runProbe(args []string) error {

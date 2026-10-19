@@ -14,10 +14,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/blackevil/container-mesh/internal/peer"
-	"github.com/blackevil/container-mesh/internal/secure"
-	"github.com/blackevil/container-mesh/internal/wire"
-	"github.com/blackevil/container-mesh/internal/wsconn"
+	"github.com/muzimu217/container-mesh/internal/peer"
+	"github.com/muzimu217/container-mesh/internal/secure"
+	"github.com/muzimu217/container-mesh/internal/wire"
+	"github.com/muzimu217/container-mesh/internal/wsconn"
 )
 
 // NodeConfig configures a Node.
@@ -39,6 +39,9 @@ type NodeConfig struct {
 	PairWindow time.Duration
 	// OutDir receives inbound files.
 	OutDir string
+	// MaxFileSize rejects inbound offers above this many bytes (0 = peer
+	// default, negative = unlimited).
+	MaxFileSize int64
 	// Liveness configures WebSocket keepalive. Default 20s ping / 60s idle.
 	Liveness wsconn.Liveness
 	// OnMessage receives inbound chat messages.
@@ -155,7 +158,12 @@ func (n *Node) Run(ctx context.Context) error {
 		// counter bounds total attempts for one-shot commands; stay mode runs
 		// with the cap disabled.
 		backoff = time.Second
-		n.status("connected", relayURL)
+		// Print the short authentication string so the two operators can
+		// compare it out of band. A malicious relay can route the connection
+		// (it knows the room label) but cannot make both sides derive the same
+		// SAS without the code, so a mismatch is the signal to abort.
+		n.status("connected", fmt.Sprintf("%s  peer=%s  SAS=%s  fingerprint=%s",
+			relayURL, sess.PeerName, sess.ShortAuth(), sess.Fingerprint()))
 		n.setSession(sess)
 
 		// The session's read pump dispatches messages, offers and pings via
@@ -192,7 +200,10 @@ func (n *Node) dialOne(ctx context.Context, relayURL string) (*peer.Session, err
 		return nil, fmt.Errorf("bad relay URL %q: %w", relayURL, err)
 	}
 	q := u.Query()
-	q.Set("room", secure.NormalizeCode(n.cfg.Code))
+	// The relay gets a one-way label, never the code itself: the code is the
+	// only shared secret, and a relay that knows it can complete the PAKE with
+	// each side separately (an active MITM). See secure.RoomID.
+	q.Set("room", secure.RoomID(n.cfg.Code))
 	q.Set("role", n.cfg.Role.String())
 	u.RawQuery = q.Encode()
 
@@ -215,10 +226,11 @@ func (n *Node) dialOne(ctx context.Context, relayURL string) (*peer.Session, err
 	ch := make(chan result, 1)
 	go func() {
 		s, err := peer.Handshake(conn, peer.Config{
-			Name:   n.cfg.Name,
-			Code:   n.cfg.Code,
-			Role:   n.cfg.Role,
-			Logger: n.log,
+			Name:        n.cfg.Name,
+			Code:        n.cfg.Code,
+			Role:        n.cfg.Role,
+			Logger:      n.log,
+			MaxFileSize: n.cfg.MaxFileSize,
 		})
 		if err == nil {
 			err = s.Start(n.handler())

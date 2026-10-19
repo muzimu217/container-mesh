@@ -7,7 +7,7 @@ import (
 	"bytes"
 	"testing"
 
-	"github.com/blackevil/container-mesh/internal/wire"
+	"github.com/muzimu217/container-mesh/internal/wire"
 )
 
 // runHandshake performs a full in-memory PAKE exchange between two roles.

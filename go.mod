@@ -1,4 +1,4 @@
-module github.com/blackevil/container-mesh
+module github.com/muzimu217/container-mesh
 
 go 1.24.0
 

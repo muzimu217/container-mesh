@@ -16,7 +16,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/blackevil/container-mesh/internal/cli"
+	"github.com/muzimu217/container-mesh/internal/cli"
 )
 
 func main() {

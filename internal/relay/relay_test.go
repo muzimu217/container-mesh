@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/blackevil/container-mesh/internal/wsconn"
+	"github.com/muzimu217/container-mesh/internal/wsconn"
 )
 
 // startTestRelay brings up a relay on a random localhost port and returns its

@@ -13,8 +13,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/blackevil/container-mesh/internal/secure"
-	"github.com/blackevil/container-mesh/internal/wire"
+	"github.com/muzimu217/container-mesh/internal/secure"
+	"github.com/muzimu217/container-mesh/internal/wire"
 )
 
 // hooks captures Handler events for tests.

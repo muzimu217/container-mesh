@@ -8,7 +8,7 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 all: check test build
 
 build:
-	$(GO) build -trimpath -ldflags "-s -w -X github.com/blackevil/container-mesh/internal/cli.Version=$(VERSION)" -o $(BIN) ./cmd/cm
+	$(GO) build -trimpath -ldflags "-s -w -X github.com/muzimu217/container-mesh/internal/cli.Version=$(VERSION)" -o $(BIN) ./cmd/cm
 
 test:
 	$(GO) test ./...

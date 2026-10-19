@@ -29,7 +29,9 @@ package secure
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -39,7 +41,7 @@ import (
 	"github.com/schollz/pake/v3"
 	"golang.org/x/crypto/hkdf"
 
-	"github.com/blackevil/container-mesh/internal/wire"
+	"github.com/muzimu217/container-mesh/internal/wire"
 )
 
 // Role identifies the two PAKE parties. RoleA opens the exchange.
@@ -188,6 +190,55 @@ func hkdfKey(secret []byte, info string) ([]byte, error) {
 	return out, nil
 }
 
+// roomDomain separates the room derivation from every other use of the code.
+const roomDomain = "container-mesh/room/v1"
+
+// RoomID derives the rendezvous identifier sent to the relay from the shared
+// code.
+//
+// The relay must not learn the code: the code is the only shared secret, and a
+// relay that knows it can complete the PAKE with each side separately and sit
+// in the middle. RoomID is a one-way HMAC, so the relay sees only an opaque
+// label it can route on.
+//
+// Note this is *not* by itself a defence against a malicious relay: an attacker
+// holding RoomID can still guess a weak code offline (the label is a verifier).
+// The defence against an active relay is the SAS check (see Session.ShortAuth);
+// RoomID only removes the code from logs and URLs.
+func RoomID(code string) string {
+	mac := hmac.New(sha256.New, []byte(roomDomain))
+	mac.Write([]byte(NormalizeCode(code)))
+	return hex.EncodeToString(mac.Sum(nil)[:16])
+}
+
+// ShortAuth returns a short authentication string derived from the established
+// session key. Both peers compute the same value; comparing it out of band
+// (reading 6 digits aloud) proves no relay sat in the middle.
+//
+// The derivation is symmetric — it deliberately does not mix in the role — so
+// A and B produce identical digits.
+func (s *Session) ShortAuth() string {
+	s.sasOnce.Do(func() {
+		mac := hmac.New(sha256.New, s.sasKey)
+		mac.Write([]byte("container-mesh/sas/v1"))
+		sum := mac.Sum(nil)
+		// 6 decimal digits from the first 4 bytes: easy to read aloud, ~20 bits,
+		// which is the usual size for a one-shot SAS (compare once per session).
+		n := uint32(sum[0])<<24 | uint32(sum[1])<<16 | uint32(sum[2])<<8 | uint32(sum[3])
+		s.sas = fmt.Sprintf("%06d", n%1000000)
+	})
+	return s.sas
+}
+
+// Fingerprint is a longer, human-comparable digest of the session key, for
+// situations where a 6-digit SAS is not enough (e.g. logging an audit trail).
+func (s *Session) Fingerprint() string {
+	mac := hmac.New(sha256.New, s.sasKey)
+	mac.Write([]byte("container-mesh/fingerprint/v1"))
+	sum := mac.Sum(nil)
+	return hex.EncodeToString(sum[:8])
+}
+
 // maxCounter bounds the number of frames per direction. 2^64 is unreachable in
 // practice; the check exists so a bug cannot silently reuse a nonce.
 const maxCounter = ^uint64(0)
@@ -202,6 +253,14 @@ type Session struct {
 
 	recvMu  sync.Mutex
 	recvCtr uint64
+
+	// sasKey is a dedicated *symmetric* derivation of the session key. It must
+	// not be the send or recv key: those differ per direction, so peers would
+	// compute different SAS values.
+	sasKey []byte
+
+	sasOnce sync.Once
+	sas     string
 }
 
 // NewSession builds a session from a completed handshake.
@@ -222,7 +281,11 @@ func NewSession(h *Handshake) (*Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Session{sendAEAD: sendAEAD, recvAEAD: recvAEAD}, nil
+	sasKey, err := hkdfKey(key, "container-mesh/v1 SAS")
+	if err != nil {
+		return nil, err
+	}
+	return &Session{sendAEAD: sendAEAD, recvAEAD: recvAEAD, sasKey: sasKey}, nil
 }
 
 func newAEAD(key []byte) (cipher.AEAD, error) {

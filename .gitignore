@@ -20,3 +20,6 @@ probe.json
 # 工具插件残留
 .v2c/
 .video_agent/
+
+# 外部评审报告（不纳入版本控制）
+/reports/

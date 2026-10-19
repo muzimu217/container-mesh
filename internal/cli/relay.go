@@ -9,7 +9,7 @@ import (
 	"log/slog"
 	"os"
 
-	"github.com/blackevil/container-mesh/internal/relay"
+	"github.com/muzimu217/container-mesh/internal/relay"
 )
 
 func runRelay(args []string) error {

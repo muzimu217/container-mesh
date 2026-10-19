@@ -15,8 +15,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/blackevil/container-mesh/internal/secure"
-	"github.com/blackevil/container-mesh/internal/wire"
+	"github.com/muzimu217/container-mesh/internal/secure"
+	"github.com/muzimu217/container-mesh/internal/wire"
 )
 
 // pairWindowDefault bounds a single relay attempt (dial + handshake + wait
@@ -121,6 +121,7 @@ func runSend(args []string) error {
 	}
 
 	fileOK := false
+	msgOK := false
 	if *file != "" {
 		res, err := node.SendFile(ctx, *file, progressPrinter(os.Stderr))
 		if err != nil {
@@ -138,7 +139,13 @@ func runSend(args []string) error {
 	}
 
 	if *message != "" {
-		if err := node.SendMessage(ctx, *message); err != nil {
+		// In one-shot mode with a completed transfer the receiver may already
+		// be gone. SendMessage would then block inside waitSession waiting for
+		// a reconnect that cannot happen, so skip the goodbye instead of
+		// hanging until the pair window expires.
+		if !*stay && fileOK {
+			fmt.Fprintln(os.Stderr, "note: trailing message skipped (receiver already finished)")
+		} else if err := node.SendMessage(ctx, *message); err != nil {
 			if fileOK && ctx.Err() == nil {
 				// The receiver already verified the file and (in one-shot
 				// mode) may have exited before our trailing message hit the
@@ -152,12 +159,28 @@ func runSend(args []string) error {
 				return err
 			}
 		} else {
+			msgOK = true
 			fmt.Fprintf(os.Stderr, "message sent (%d bytes)\n", len(*message))
 		}
 	}
 
 	if !*stay {
-		return drainRun()
+		// One-shot mode is done once the work is done. Do NOT wait for Run to
+		// return: after the peer leaves, Run starts a reconnect attempt whose
+		// pair window can be tens of seconds, and blocking on it would make a
+		// successful transfer appear to hang (observed as a timeout in stress
+		// runs). Cancelling is enough — Run is a daemon goroutine and the
+		// process exits as soon as main returns.
+		stop()
+		if fileOK || msgOK {
+			return nil
+		}
+		select {
+		case rerr := <-runErr:
+			return rerr
+		case <-time.After(2 * time.Second):
+			return errors.New("nothing was transferred before the session ended")
+		}
 	}
 
 	fmt.Fprintln(os.Stderr, "session open; type messages, /file PATH to send a file, ctrl-d or ctrl-c to quit")
@@ -177,6 +200,8 @@ func runRecv(args []string) error {
 	out := fs.String("out", ".", "directory for received files")
 	stay := fs.Bool("stay", true, "keep the session open after the transfer")
 	message := fs.String("message", "", "message to send after connecting (optional)")
+	maxSize := fs.Int64("max-file-size", 0,
+		"reject inbound files larger than this many bytes (0 = default 16 GiB, negative = unlimited)")
 	if err := fs.Parse(args); err != nil {
 		return ExitError{Code: 2, Err: err}
 	}
@@ -188,6 +213,7 @@ func runRecv(args []string) error {
 	if err != nil {
 		return ExitError{Code: 2, Err: err}
 	}
+	node.cfg.MaxFileSize = *maxSize
 
 	var runErr error
 	done := make(chan struct{})
@@ -207,8 +233,9 @@ func runRecv(args []string) error {
 
 		select {
 		case res := <-fileCh:
+			// The file is on disk and verified; do not wait for Run to unwind
+			// (it may be inside a reconnect attempt with a long pair window).
 			stop()
-			<-done
 			if !res.OK {
 				return fmt.Errorf("verification failed: %s", res.Message)
 			}
@@ -217,7 +244,6 @@ func runRecv(args []string) error {
 		case <-done:
 			return runErr
 		case <-ctx.Done():
-			<-done
 			return nil
 		}
 	}

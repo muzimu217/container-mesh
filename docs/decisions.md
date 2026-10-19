@@ -300,3 +300,98 @@ miwifi 138ms 成功、qq 超时、Cloudflare/Google 可达但返回**不同的�
 自动 HTTPS + 免费资源矩阵：Oracle Always Free / Cloudflare Tunnel / Workers
 DO / 国内轻量新用户）。免费选项的真实约束是**流量配额**（relay 转发量 ≈
 文件大小 ×2），不是 CPU/内存。公网部署未实测，诚实标注在 deploy/README.md。
+
+---
+
+# 2026-10-19 第三轮：外部评审报告驱动的安全加固
+
+依据外部评审（`container-mesh-review-2026-10-18.md`）逐条验证并修复。以下记录
+每条决定的技术取舍，特别是**没有完全照搬报告建议**的地方。
+
+## D17. room 改为 HMAC 派生 —— 但纯 HMAC 不足以防 MITM
+
+**报告建议**：`room = HMAC(code, salt)`，让 relay 看不到 code。
+
+**采纳，但补充了关键一点**：单纯改 room 只解决「relay 直接拿到 code」，
+**并不阻止主动 MITM**——因为 relay 拿到 `RoomID(code)` 后仍可对弱 code 做
+**离线字典攻击**（room 是 code 的确定性函数，等于一个 verifier）。一旦猜出
+code，MITM 依然成立。
+
+**因此同时引入 SAS**：
+- `secure.RoomID(code)`：`HMAC-SHA256(normalize(code), "container-mesh/room/v1")`
+  前 16 字节 hex。relay 只看到不可逆标签。
+- `secure.Session.ShortAuth()`：6 位十进制，由 session key 经**独立 HKDF 标签
+  `v1 SAS`** 派生。两端必须算出相同值。
+- 连接建立时打印 `SAS=xxxxxx fingerprint=...`，由双方带外比对。
+
+**踩到的坑**：最初用 `sendAEAD` 的密钥派生 SAS，导致两端数值不同——因为
+A→B 与 B→A 是**不同方向**的密钥。必须从 session key 单独派生一个**对称**
+的 SAS key。
+
+**未做的**：没有实现自动 SAS 校验。自动校验需要预共享身份（证书/公钥），
+那会把问题转移成另一套密钥分发。当前设计明确要求人工比对一次。
+
+## D18. relay 限流：按 IP 而非按 room
+
+**报告建议**：按源 IP/房间做令牌桶。
+
+**采纳按 IP，拒绝按 room**：按 room 限流会误伤——同一 code 的两个合法端
+本来就会各开一个连接，且重连会再开；按 room 限流需要区分「合法重连」与
+「恶意 squatting」，而这两者在 relay 视角完全一样（都是同 room+role 的新连接）。
+按 IP 限流则没有这个歧义，且能同时挡住「大量建房耗尽 MaxRooms」。
+
+- 并发连接上限：默认 16/IP
+- 新建速率：默认 120/分钟/IP（令牌桶，按秒补充）
+- `X-Forwarded-For` / `X-Real-IP` 参与判定：生产部署几乎一定在 nginx/Caddy 后面，
+  否则所有客户端共享代理的预算
+- 空闲状态定期 sweep，避免 map 无限增长
+
+**保留「后来者踢占位」**：它是断线重连能工作的前提（见 D10）。限流降低了
+被滥用的成本，但没有消除——知道 code 的人仍可踢掉等待者。这是可用性问题，
+不是机密性问题，且 SAS 会让真正的 MITM 暴露。
+
+## D19. 接收端：上限 + 空间预检 + 不覆盖
+
+**报告建议**：加 `--max-file-size` + `statfs` 检查 + 名字白名单。
+
+**全部采纳**，几处实现细节：
+
+- **默认 16 GiB，而非报告建议的 4 GiB**：本项目的目标场景包含大文件传输
+  （README 里 1 GiB 是常规用例），4 GiB 会误伤。上限的意义是「防写满磁盘」，
+  不是「限制合法用途」；真正的护栏是空间预检。
+- **用 `Bavail` 而非 `Bfree`**：`Bfree` 包含 root 保留块，非 root 接收端会
+  在预检通过后仍然写失败——而目标场景恰恰是非 root 容器。
+- **名字白名单放宽到包含 `()[]@#`**：第一版只允许 `[A-Za-z0-9._+- ]`，测试
+  立刻打脸——`My File (1).zip` 是极常见的下载文件名。这些都是安全的
+  （不是路径分隔符、不是 shell 元字符）。
+- **不覆盖用 link-then-remove**：`os.Rename` 会静默覆盖，等于让对端能销毁
+  无关文件。`os.Link` 在目标存在时返回 EEXIST，天然是「不存在才创建」；
+  不支持硬链接的文件系统（FAT/部分网络盘）回退为显式存在性检查。
+
+**顺带修掉的真实 bug**：`publishNoClobber` 失败时原本直接 `return nil, err`，
+**没有给发送方回 FileResult**，发送方会一直等到 10 分钟超时。测试
+（`TestRefusesToOverwriteExistingFile`）以 40 秒超时暴露了它。现在发布失败
+也会回一个 `OK:false` 的结果。
+
+## D20. 删除 insecure TLS 选项（而非保留）
+
+**报告建议**：删除或显式审计。
+
+**选择删除**：`wsconn.DialOptions.InsecureSkipVerify` 没有任何 CLI 调用点，
+属于「将来可能被误接上」的死代码。保留一个能静默关闭证书校验的开关，在
+一个以「relay 不可信」为前提的项目里是自相矛盾的——TLS 校验保护的是
+「relay 是不是真的 relay」，关掉它等于放弃唯一的路由层身份检查。
+需要自签证书的场景应该用私有 CA，而不是跳过校验。
+
+## D21. module 路径对齐仓库
+
+`github.com/blackevil/container-mesh` → `github.com/muzimu217/container-mesh`。
+之前不一致导致 `go install ...@latest` 不可用、外部按仓库地址 import 也对不上。
+Makefile 里的 `-ldflags -X` 路径同步修改。
+
+## D22. 错误不再静默吞掉
+
+评审指出多处 `_ = SendFrame(...)` / `_ = os.Remove(...)`。影响不是崩溃，而是
+**排障困难**：对端只会看到超时或「哈希不一致」，看不到「I/O 错误」。
+现在这些路径至少 `log.Warn` 一行；关键路径（发布失败、哈希不符）确保
+**一定给对端一个明确的 FileResult**，不让它空等。

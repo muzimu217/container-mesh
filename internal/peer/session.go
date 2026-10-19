@@ -33,8 +33,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/blackevil/container-mesh/internal/secure"
-	"github.com/blackevil/container-mesh/internal/wire"
+	"github.com/muzimu217/container-mesh/internal/secure"
+	"github.com/muzimu217/container-mesh/internal/wire"
 )
 
 // ChunkSize is the file payload per frame. 512 KiB keeps a frame inside the
@@ -64,7 +64,15 @@ type Config struct {
 	Role secure.Role
 	// Logger receives structured events.
 	Logger *slog.Logger
+	// MaxFileSize rejects inbound offers larger than this many bytes. Zero
+	// means DefaultMaxFileSize; a negative value disables the check.
+	MaxFileSize int64
 }
+
+// DefaultMaxFileSize caps inbound transfers at 16 GiB. The peer that offered a
+// file is authenticated by the PAKE, but authentication is not a disk quota:
+// without a ceiling one session can fill the receiver's volume.
+const DefaultMaxFileSize int64 = 16 << 30
 
 // Handler receives events from the session's read pump. Callbacks run on the
 // pump goroutine; they must be cheap unless documented otherwise.
@@ -174,6 +182,9 @@ func Handshake(conn MessageConn, cfg Config) (*Session, error) {
 	sec, err := secure.NewSession(h)
 	if err != nil {
 		return nil, err
+	}
+	if cfg.MaxFileSize == 0 {
+		cfg.MaxFileSize = DefaultMaxFileSize
 	}
 	return &Session{
 		cfg:        cfg,
@@ -293,14 +304,18 @@ func (s *Session) readPump() {
 func (s *Session) handleOffer(f *wire.Frame) {
 	var offer wire.FileOffer
 	if err := json.Unmarshal(f.Payload, &offer); err != nil {
-		_ = s.SendFrame(&wire.Frame{Type: wire.FrameFileReject, Payload: []byte("bad offer payload")})
+		if sendErr := s.SendFrame(&wire.Frame{Type: wire.FrameFileReject, Payload: []byte("bad offer payload")}); sendErr != nil {
+			s.log.Warn("could not send offer rejection", "err", sendErr)
+		}
 		return
 	}
 
 	s.inMu.Lock()
 	if s.inbound != nil {
 		s.inMu.Unlock()
-		_ = s.SendFrame(&wire.Frame{Type: wire.FrameFileReject, Payload: []byte("busy: another inbound transfer is active")})
+		if sendErr := s.SendFrame(&wire.Frame{Type: wire.FrameFileReject, Payload: []byte("busy: another inbound transfer is active")}); sendErr != nil {
+			s.log.Warn("could not send busy rejection", "err", sendErr)
+		}
 		return
 	}
 	tr := &InboundTransfer{
@@ -384,6 +399,15 @@ func (s *Session) recvFrame() (*wire.Frame, error) {
 func (s *Session) SendMessage(text string) error {
 	return s.SendFrame(&wire.Frame{Type: wire.FrameMsg, Payload: []byte(text)})
 }
+
+// ShortAuth returns the 6-digit short authentication string both peers derive
+// from the session key. Users compare it out of band; a mismatch means a third
+// party sat in the middle (the relay knows the room label, so it can route but
+// must not be trusted to have paired the intended peers).
+func (s *Session) ShortAuth() string { return s.sec.ShortAuth() }
+
+// Fingerprint is a longer digest of the same key, for logs and audit trails.
+func (s *Session) Fingerprint() string { return s.sec.Fingerprint() }
 
 // SendFile offers and streams one file, waiting for the receiver to verify it.
 //
@@ -591,6 +615,14 @@ func (tr *InboundTransfer) accept(dir string, progress func(got, total int64)) (
 		tr.Reject("negative size")
 		return &wire.FileResult{OK: false, Message: "negative size"}, nil
 	}
+	// A peer that completed the PAKE is authenticated, but that says nothing
+	// about how much disk it may consume: without a ceiling one session can
+	// fill the volume. The limit is configurable, not a protocol constant.
+	if s.cfg.MaxFileSize > 0 && offer.Size > s.cfg.MaxFileSize {
+		msg := fmt.Sprintf("file too large: %d bytes exceeds limit %d", offer.Size, s.cfg.MaxFileSize)
+		tr.Reject(msg)
+		return &wire.FileResult{OK: false, Message: msg}, nil
+	}
 
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("peer: mkdir %s: %w", dir, err)
@@ -609,12 +641,25 @@ func (tr *InboundTransfer) accept(dir string, progress func(got, total int64)) (
 		if have > offer.Size {
 			// Longer than the target: definitely stale.
 			have = 0
-			_ = os.Remove(partPath)
+			if rmErr := os.Remove(partPath); rmErr != nil && !os.IsNotExist(rmErr) {
+				s.log.Warn("could not remove stale part file", "path", partPath, "err", rmErr)
+			}
 		}
 	} else if fi, err := os.Stat(finalPath); err == nil && fi.Size() == offer.Size {
 		// The complete file is already here. Ask the sender for nothing and
 		// verify immediately.
 		have = offer.Size
+	}
+
+	// Refuse before writing when the volume cannot hold what is still missing.
+	// Without this the transfer fails at some arbitrary point, possibly after
+	// filling the disk for every other process on the host.
+	if need := offer.Size - have; need > 0 {
+		if free, err := freeDiskBytes(dir); err == nil && free < need {
+			msg := fmt.Sprintf("insufficient disk space: need %d bytes, %d available", need, free)
+			tr.Reject(msg)
+			return &wire.FileResult{OK: false, Message: msg}, nil
+		}
 	}
 
 	acc, _ := json.Marshal(wire.FileAccept{ResumeFrom: have})
@@ -696,10 +741,14 @@ func (tr *InboundTransfer) accept(dir string, progress func(got, total int64)) (
 	if sentHash != offer.SHA256 {
 		// The sender hashed a different file than the one it offered. Do not
 		// keep anything.
-		_ = os.Remove(partPath)
+		if rmErr := os.Remove(partPath); rmErr != nil && !os.IsNotExist(rmErr) {
+			s.log.Warn("could not remove part file after hash mismatch", "path", partPath, "err", rmErr)
+		}
 		res := wire.FileResult{OK: false, Message: "sender hash differs from offer"}
 		rb, _ := json.Marshal(res)
-		_ = s.SendFrame(&wire.Frame{Type: wire.FrameFileResult, Payload: rb})
+		if sendErr := s.SendFrame(&wire.Frame{Type: wire.FrameFileResult, Payload: rb}); sendErr != nil {
+			s.log.Warn("could not report hash mismatch to sender", "err", sendErr)
+		}
 		return &res, nil
 	}
 
@@ -724,8 +773,15 @@ func (tr *InboundTransfer) accept(dir string, progress func(got, total int64)) (
 	if res.OK {
 		res.Message = "hash verified: " + sum
 		if have != offer.Size {
-			if err := os.Rename(partPath, finalPath); err != nil {
-				return nil, fmt.Errorf("peer: rename: %w", err)
+			// Rename must not clobber an unrelated file that happens to share
+			// the name. Link-then-remove gives atomic "create if absent"
+			// semantics; on filesystems without hard links, fall back to an
+			// explicit existence check.
+			if pubErr := publishNoClobber(partPath, finalPath); pubErr != nil {
+				// The sender is waiting for a verdict: reporting this as a
+				// local error would leave it blocked until its timeout. Turn
+				// it into a rejection it can act on.
+				res = wire.FileResult{OK: false, Message: pubErr.Error()}
 			}
 		}
 	} else {
@@ -733,7 +789,9 @@ func (tr *InboundTransfer) accept(dir string, progress func(got, total int64)) (
 		// A mismatching partial file is useless; drop it so the next attempt
 		// is clean.
 		if have != offer.Size {
-			_ = os.Remove(partPath)
+			if rmErr := os.Remove(partPath); rmErr != nil && !os.IsNotExist(rmErr) {
+				s.log.Warn("could not remove failed part file", "path", partPath, "err", rmErr)
+			}
 		}
 	}
 
@@ -764,7 +822,26 @@ func (s *Session) Close() error {
 	return s.closeErr
 }
 
+// maxNameLen bounds the received file name. 255 bytes is the limit most
+// filesystems impose on a single path component.
+const maxNameLen = 255
+
+// reservedNames are rejected regardless of case: they are device names on
+// Windows, and a receiver on a shared volume should not create them.
+var reservedNames = map[string]bool{
+	"con": true, "prn": true, "aux": true, "nul": true,
+	"com1": true, "com2": true, "com3": true, "com4": true,
+	"com5": true, "com6": true, "com7": true, "com8": true, "com9": true,
+	"lpt1": true, "lpt2": true, "lpt3": true, "lpt4": true,
+	"lpt5": true, "lpt6": true, "lpt7": true, "lpt8": true, "lpt9": true,
+}
+
 // validateName rejects path traversal and other nonsense file names.
+//
+// The allow-list is deliberately narrow: letters, digits, dot, dash and
+// underscore. Anything else (control characters, colons, quotes, shell
+// metacharacters, unicode look-alikes) is refused rather than escaped, because
+// the receiver writes the name straight to disk.
 func validateName(name string) error {
 	if name == "" {
 		return errors.New("empty file name")
@@ -777,6 +854,37 @@ func validateName(name string) error {
 	}
 	if strings.HasPrefix(name, ".") {
 		return errors.New("refusing to receive hidden file")
+	}
+	if len(name) > maxNameLen {
+		return fmt.Errorf("file name too long (%d bytes, max %d)", len(name), maxNameLen)
+	}
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '.', r == '-', r == '_', r == '+', r == ' ',
+			r == '(', r == ')', r == '[', r == ']', r == '@', r == '#':
+			// Common in real file names (downloads, screenshots, exports).
+			// None of these are shell metacharacters when the name is passed
+			// as a single argv element, and none are path separators.
+		default:
+			return fmt.Errorf("file name contains unsupported character %q", r)
+		}
+	}
+	if strings.HasPrefix(name, " ") || strings.HasSuffix(name, " ") {
+		return errors.New("file name must not start or end with a space")
+	}
+	// ".part" is the receiver's own in-progress suffix; accepting it would let
+	// a peer collide with another transfer's temporary file.
+	if strings.HasSuffix(strings.ToLower(name), ".part") {
+		return errors.New("refusing reserved suffix .part")
+	}
+	// Windows device names, with or without an extension ("CON", "con.txt").
+	base := name
+	if i := strings.IndexByte(base, '.'); i >= 0 {
+		base = base[:i]
+	}
+	if reservedNames[strings.ToLower(base)] {
+		return fmt.Errorf("refusing reserved device name %q", name)
 	}
 	return nil
 }

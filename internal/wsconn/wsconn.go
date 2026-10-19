@@ -85,9 +85,6 @@ type DialOptions struct {
 	DialTimeout time.Duration
 	// HandshakeHeader carries any extra HTTP headers (e.g. auth).
 	HandshakeHeader http.Header
-	// InsecureSkipVerify disables TLS certificate verification. Only for
-	// self-signed relays in a lab; never in production.
-	InsecureSkipVerify bool
 	// Liveness enables keepalive on this connection. Recommended for anything
 	// long-lived; leave nil only in tests that manage deadlines by hand.
 	Liveness *Liveness
@@ -105,9 +102,6 @@ func Dial(ctx context.Context, opts DialOptions) (*Conn, error) {
 			Timeout:   opts.DialTimeout,
 			KeepAlive: 30 * time.Second,
 		}).Dial,
-	}
-	if opts.InsecureSkipVerify {
-		d.TLSClientConfig = insecureTLSConfig()
 	}
 	ws, resp, err := d.DialContext(ctx, opts.URL, opts.HandshakeHeader)
 	if err != nil {

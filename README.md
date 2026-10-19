@@ -97,6 +97,23 @@ go build -o cmesh ./cmd/cm
 
 `--stay=false` 表示传完就退出；默认 `true` 会保持会话，可以继续收发消息。
 
+**连上后两端都会打印一行 SAS**，请核对两边是否一致：
+
+```
+[cmesh] connected: wss://relay.example.com/ws  peer=beta  SAS=418302  fingerprint=9f3c1d8a77e0b245
+```
+
+`SAS` 相同时，说明中间没有第三方——即使 relay 被入侵或被要求配合，它也
+无法让两端派生出相同的 SAS（它不知道 code）。这是唯一需要人工确认的一步，
+每次会话一次。详细威胁模型见 [§3.3](#33-安全模型)。
+
+接收端默认限制单文件 16 GiB 并在写入前检查可用空间：
+
+```bash
+./cmesh recv --code "..." --out ./in --max-file-size 34359738368  # 32 GiB
+./cmesh recv --code "..." --out ./in --max-file-size -1           # 不限制
+```
+
 ### 聊天 / 双向消息 / 会话中随时传文件
 
 ```bash
@@ -182,17 +199,27 @@ A                              relay                              B
 
 ### 3.3 安全模型
 
-- **威胁模型**：relay 不可信（可丢包、延迟、注入、记录流量）；攻击者可能知道协议但不知道 code。
+- **威胁模型**：relay 不可信（可丢包、延迟、注入、记录流量，**也可以主动做中间人**）；攻击者可能知道协议但不知道 code。
 - **握手**：SPAKE2（`github.com/schollz/pake/v3`，P-256）。这是显式认证的 PAKE，被动录制者无法离线爆破短码。
-- **密钥分离**：`HKDF-SHA256(sessionKey, info="container-mesh/v1 A->B" / "B->A")`，两个方向独立。
+- **relay 拿不到 code**：客户端发给 relay 的 `room` 是 `HMAC-SHA256(code, "container-mesh/room/v1")` 的前 16 字节 hex（`secure.RoomID`），不是 code 本身。relay 只看到一个不可逆标签，无法直接参与握手。
+- **SAS 带外核对（防主动 MITM）**：连接建立后两端各打印同一个 **6 位短认证串**（`secure.Session.ShortAuth`，由 session key 经独立 HKDF 派生），并附带 16 位十六进制指纹。**双方口头/截图比对一次**即可确认中间没有第三方。恶意 relay 虽然能路由（它知道 room 标签），但不知道 code，无法让两端派生出相同的 SAS。
+- **密钥分离**：`HKDF-SHA256(sessionKey, info="container-mesh/v1 A->B" / "B->A")`，两个方向独立；SAS 用独立的 `v1 SAS` 标签派生，保证两端一致。
 - **加密**：AES-256-GCM，12 字节 nonce = 8 字节大端计数器 + 4 字节零。
 - **防重放**：接收方要求严格单调递增的计数器，任何乱序/重放/篡改都直接失败并断开。
-- **文件完整性**：全文件 SHA-256，发送方在 offer 里声明、在 done 里再确认一次，接收方校验后才 rename `.part`。
+- **文件完整性**：全文件 SHA-256，发送方在 offer 里声明、在 done 里再确认一次，接收方校验后才发布最终文件。
+- **接收端保护**：
+  - 文件名走白名单（字母/数字/`.`/`-`/`_`/`+`/空格/`()`/`[]`/`@`/`#`），拒绝路径分隔符、隐藏文件、Windows 设备名、`.part` 后缀、超长名；
+  - 默认拒绝覆盖已存在的同名文件（link-then-remove 原子发布，不支持硬链接时回退为存在性检查）；
+  - `--max-file-size` 限制单文件大小（默认 16 GiB，负数表示不限制）；
+  - 写入前用 `statfs(Bavail)` 预检可用空间，不足直接拒绝，避免写满磁盘。
+- **relay 侧防护**：按源 IP 的并发连接数（默认 16）与新建速率（默认 120/分钟）限流；`X-Forwarded-For` / `X-Real-IP` 参与判定，适配 nginx/Caddy 反代；日志只记录 room 前 8 字符。
 
 **未做的**（诚实标注）：
 - 没有前向保密轮换（单次会话内密钥固定）。
-- 没有证书固定 / relay 身份认证。relay 可以被替换，但替换者读不到内容（只能做 DoS）。
+- **SAS 需要人工比对**：不比对时，主动 relay 仍可 MITM。这是刻意的取舍——自动比对需要预共享身份（证书/公钥），那会引入另一套密钥分发问题。
+- `RoomID` 是 code 的确定性函数，所以拿到它的攻击者可以对**弱 code** 做离线字典攻击。请使用高熵 code（建议 4 个以上随机单词）。
 - code 强度依赖用户。代码强制规范化后至少 6 字符，但没有熵检查。
+- 没有内建限流之外的反滥用手段（如 captcha、账户体系）。
 
 ### 3.4 帧格式
 
