@@ -91,8 +91,11 @@ type Handler struct {
 
 // Session is one peer's view of the conversation.
 type Session struct {
-	cfg  Config
-	conn MessageConn
+	cfg Config
+	// conn is the switchable transport wrapper: it starts on the relay
+	// WebSocket and may be replaced by a direct UDP path once hole punching
+	// succeeds. All reads/writes go through it.
+	conn *switchable
 	sec  *secure.Session
 	log  *slog.Logger
 
@@ -188,7 +191,7 @@ func Handshake(conn MessageConn, cfg Config) (*Session, error) {
 	}
 	return &Session{
 		cfg:        cfg,
-		conn:       conn,
+		conn:       newSwitchable(conn),
 		sec:        sec,
 		log:        cfg.Logger,
 		done:       make(chan struct{}),
@@ -241,10 +244,34 @@ func (s *Session) exchangeHello() error {
 // Start runs the hello exchange and then starts the read pump. Call it once,
 // immediately after Handshake. All events are delivered via h.
 func (s *Session) Start(h Handler) error {
+	return s.StartWithNegotiation(h, nil)
+}
+
+// Negotiator runs after the hello exchange and before the read pump starts.
+// It may replace the transport (via UpgradeToDirect) so that all subsequent
+// traffic uses a direct path. Returning an error aborts the session; returning
+// nil means "continue on whatever transport is current", which lets a failed
+// hole-punch fall back to the relay transparently.
+//
+// It must not start goroutines that read the session: the read pump owns the
+// channel from the moment this returns.
+type Negotiator func(*Session) error
+
+// StartWithNegotiation is Start with a direct-path negotiation step.
+func (s *Session) StartWithNegotiation(h Handler, neg Negotiator) error {
 	if err := s.exchangeHello(); err != nil {
 		return err
 	}
 	s.handler = h
+	if neg != nil {
+		// The negotiator needs to read signalling frames itself, so the pump
+		// is not running yet. Any frames it consumes beyond signalling are
+		// buffered by the caller if needed; in practice the peers exchange
+		// only p2p frames here.
+		if err := neg(s); err != nil {
+			return err
+		}
+	}
 	s.log.Info("session established", "peer", s.PeerName, "role", s.cfg.Role.String())
 	go s.readPump()
 	return nil
@@ -266,6 +293,13 @@ func (s *Session) readPump() {
 	for {
 		f, err := s.recvFrame()
 		if err != nil {
+			if errors.Is(err, ErrTransportSwitched) {
+				// A direct path replaced the relay transport. The session key
+				// is unchanged (the switch happens inside the encrypted
+				// channel), so simply continue reading on the new transport.
+				s.log.Info("transport switched to direct path")
+				continue
+			}
 			pumpErr = err
 			return
 		}
@@ -385,8 +419,15 @@ func (s *Session) SendFrame(f *wire.Frame) error {
 	return s.conn.Send(b)
 }
 
-// recvFrame reads and opens one frame. Only the read pump (and the hello
-// exchange, which runs before the pump starts) may call this.
+// RecvFrame reads and opens one frame.
+//
+// It is exported for the direct-path negotiation, which runs between the hello
+// exchange and the read pump. Calling it while the pump is running would
+// compete for the same channel, so it must not be used afterwards.
+func (s *Session) RecvFrame() (*wire.Frame, error) { return s.recvFrame() }
+
+// recvFrame reads and opens one frame. Only the read pump (and the phases
+// before it starts: hello and p2p negotiation) may call this.
 func (s *Session) recvFrame() (*wire.Frame, error) {
 	b, err := s.conn.Recv()
 	if err != nil {
@@ -399,6 +440,24 @@ func (s *Session) recvFrame() (*wire.Frame, error) {
 func (s *Session) SendMessage(text string) error {
 	return s.SendFrame(&wire.Frame{Type: wire.FrameMsg, Payload: []byte(text)})
 }
+
+// UpgradeToDirect replaces the relay transport with a direct one.
+//
+// It is safe to call while the read pump is blocked in Recv: the old socket is
+// closed after the new transport is installed, and the pump recognises the
+// resulting error as a switch rather than a failure.
+//
+// The caller must have completed the p2p handshake on the *encrypted* channel,
+// so the session key and frame counters continue unchanged.
+func (s *Session) UpgradeToDirect(next MessageConn) error {
+	if next == nil {
+		return errors.New("peer: nil transport")
+	}
+	return s.conn.Switch(next)
+}
+
+// OnDirect reports whether the session is currently on a direct path.
+func (s *Session) OnDirect() bool { return s.conn.Switched() }
 
 // ShortAuth returns the 6-digit short authentication string both peers derive
 // from the session key. Users compare it out of band; a mismatch means a third
@@ -635,12 +694,22 @@ func (tr *InboundTransfer) accept(dir string, progress func(got, total int64)) (
 	// file hash is checked at the end. If that fails, the .part is deleted
 	// and the next attempt starts from zero, so a bad prefix cannot survive
 	// more than one retry.
-	var have int64
+	// have is how many bytes we already hold; havePath is where they live.
+	// They must be tracked separately: for a zero-byte file have == 0 ==
+	// offer.Size from the start, and treating that as "already complete" sent
+	// the code down a path that opened an empty file name (ENOENT), so empty
+	// files could never be received.
+	var (
+		have     int64
+		havePath string
+	)
 	if fi, err := os.Stat(partPath); err == nil {
 		have = fi.Size()
+		havePath = partPath
 		if have > offer.Size {
 			// Longer than the target: definitely stale.
 			have = 0
+			havePath = ""
 			if rmErr := os.Remove(partPath); rmErr != nil && !os.IsNotExist(rmErr) {
 				s.log.Warn("could not remove stale part file", "path", partPath, "err", rmErr)
 			}
@@ -649,6 +718,7 @@ func (tr *InboundTransfer) accept(dir string, progress func(got, total int64)) (
 		// The complete file is already here. Ask the sender for nothing and
 		// verify immediately.
 		have = offer.Size
+		havePath = finalPath
 	}
 
 	// Refuse before writing when the volume cannot hold what is still missing.
@@ -667,8 +737,14 @@ func (tr *InboundTransfer) accept(dir string, progress func(got, total int64)) (
 		return nil, err
 	}
 
+	// "Already complete" means the bytes are in the FINAL file. A zero-byte
+	// .part also has have == offer.Size == 0, but it still has to go through
+	// the normal publish path (sync/close/hash/rename) to become the final
+	// file.
+	alreadyFinal := havePath == finalPath && have == offer.Size
+
 	var out *os.File
-	if have == offer.Size {
+	if alreadyFinal {
 		// Already complete: open read-only and just verify.
 		fh, openErr := os.Open(finalPath)
 		if openErr != nil {
@@ -686,6 +762,10 @@ func (tr *InboundTransfer) accept(dir string, progress func(got, total int64)) (
 		if _, seekErr := out.Seek(have, io.SeekStart); seekErr != nil {
 			return nil, seekErr
 		}
+		// Record where the bytes will live. Without this a zero-byte transfer
+		// (where the loop below never runs) would look for its data in the
+		// final path, which does not exist yet.
+		havePath = partPath
 	}
 
 	written := have
@@ -752,9 +832,12 @@ func (tr *InboundTransfer) accept(dir string, progress func(got, total int64)) (
 		return &res, nil
 	}
 
-	// Verify.
+	// Verify. The source is chosen by where the bytes live, not by the byte
+	// count: a zero-byte transfer also has have == offer.Size, but its data is
+	// in the .part file that still needs sync/close/rename.
+	fromPart := !alreadyFinal
 	var sum string
-	if have == offer.Size {
+	if !fromPart {
 		sum, err = HashFile(finalPath)
 	} else {
 		if err := out.Sync(); err != nil {
@@ -772,7 +855,7 @@ func (tr *InboundTransfer) accept(dir string, progress func(got, total int64)) (
 	res := wire.FileResult{OK: sum == offer.SHA256}
 	if res.OK {
 		res.Message = "hash verified: " + sum
-		if have != offer.Size {
+		if fromPart {
 			// Rename must not clobber an unrelated file that happens to share
 			// the name. Link-then-remove gives atomic "create if absent"
 			// semantics; on filesystems without hard links, fall back to an
@@ -788,7 +871,7 @@ func (tr *InboundTransfer) accept(dir string, progress func(got, total int64)) (
 		res.Message = fmt.Sprintf("hash mismatch: got %s, want %s", sum, offer.SHA256)
 		// A mismatching partial file is useless; drop it so the next attempt
 		// is clean.
-		if have != offer.Size {
+		if fromPart {
 			if rmErr := os.Remove(partPath); rmErr != nil && !os.IsNotExist(rmErr) {
 				s.log.Warn("could not remove failed part file", "path", partPath, "err", rmErr)
 			}

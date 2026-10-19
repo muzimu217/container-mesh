@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/muzimu217/container-mesh/internal/p2p"
 	"github.com/muzimu217/container-mesh/internal/peer"
 	"github.com/muzimu217/container-mesh/internal/secure"
 	"github.com/muzimu217/container-mesh/internal/wire"
@@ -42,6 +43,9 @@ type NodeConfig struct {
 	// MaxFileSize rejects inbound offers above this many bytes (0 = peer
 	// default, negative = unlimited).
 	MaxFileSize int64
+	// P2P controls direct-path negotiation. When enabled, peers try to punch
+	// through their NATs and, on success, move the data plane off the relay.
+	P2P p2p.Options
 	// Liveness configures WebSocket keepalive. Default 20s ping / 60s idle.
 	Liveness wsconn.Liveness
 	// OnMessage receives inbound chat messages.
@@ -233,7 +237,7 @@ func (n *Node) dialOne(ctx context.Context, relayURL string) (*peer.Session, err
 			MaxFileSize: n.cfg.MaxFileSize,
 		})
 		if err == nil {
-			err = s.Start(n.handler())
+			err = s.StartWithNegotiation(n.handler(), n.negotiator())
 		}
 		if err != nil {
 			_ = conn.Close()
@@ -260,6 +264,37 @@ func (n *Node) dialOne(ctx context.Context, relayURL string) (*peer.Session, err
 			_ = r.sess.Close()
 		}
 		return nil, ctx.Err()
+	}
+}
+
+// negotiator attempts a direct UDP path after the encrypted channel is up.
+//
+// A failure is never fatal: the session simply stays on the relay, which is
+// the pre-existing behaviour. The result is reported through OnStatus so
+// operators can see which path is in use.
+func (n *Node) negotiator() peer.Negotiator {
+	return func(s *peer.Session) error {
+		if !n.cfg.P2P.Enabled {
+			return nil
+		}
+		// The signalling exchange reads frames directly, which is only safe
+		// before the read pump exists.
+		res, err := p2p.Negotiate(context.Background(), s, n.cfg.P2P)
+		if err != nil {
+			n.status("p2p-failed", err.Error())
+			return nil
+		}
+		if res == nil || res.Conn == nil {
+			n.status("p2p-relay", res.Describe())
+			return nil
+		}
+		if err := s.UpgradeToDirect(res.Conn); err != nil {
+			n.status("p2p-upgrade-failed", err.Error())
+			_ = res.Conn.Close()
+			return nil
+		}
+		n.status("p2p-direct", res.Describe())
+		return nil
 	}
 }
 

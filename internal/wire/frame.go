@@ -55,6 +55,13 @@ const (
 	FramePing
 	// FramePong answers FramePing.
 	FramePong
+	// FrameP2POffer advertises this peer's UDP candidates and session id.
+	// It travels inside the encrypted channel, so the relay cannot forge or
+	// rewrite candidates to force traffic through itself.
+	FrameP2POffer
+	// FrameP2PAnswer reports the peer's candidates (and, after punching, the
+	// address that worked).
+	FrameP2PAnswer
 )
 
 // String makes logs readable.
@@ -84,6 +91,10 @@ func (t FrameType) String() string {
 		return "ping"
 	case FramePong:
 		return "pong"
+	case FrameP2POffer:
+		return "p2p-offer"
+	case FrameP2PAnswer:
+		return "p2p-answer"
 	default:
 		return fmt.Sprintf("frame(%d)", uint8(t))
 	}
@@ -222,4 +233,31 @@ type FileAccept struct {
 type FileResult struct {
 	OK      bool   `json:"ok"`
 	Message string `json:"message"`
+}
+
+// P2PCandidate is one address a peer might be reachable at.
+type P2PCandidate struct {
+	Addr string `json:"addr"`
+	Kind string `json:"kind"` // local | stun
+}
+
+// P2POffer is the decoded FrameP2POffer payload.
+type P2POffer struct {
+	// SessionID isolates this attempt from other sessions on the same port.
+	SessionID uint64 `json:"sid"`
+	// Candidates are addresses to punch toward, highest priority first.
+	Candidates []P2PCandidate `json:"candidates"`
+	// Nonce lets each side derive the same conn id without another round trip.
+	Nonce string `json:"nonce,omitempty"`
+}
+
+// P2PAnswer is the decoded FrameP2PAnswer payload.
+type P2PAnswer struct {
+	SessionID  uint64         `json:"sid"`
+	Candidates []P2PCandidate `json:"candidates"`
+	// Chosen is set by the side that completed punching: the address that
+	// answered, so the peer knows where to send data.
+	Chosen string `json:"chosen,omitempty"`
+	// OK reports whether the sender believes a direct path is established.
+	OK bool `json:"ok"`
 }

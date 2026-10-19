@@ -176,6 +176,39 @@ else
 fi
 
 # ---------------------------------------------------------------
+section "4b. 端到端: 零字节文件"
+# 回归: 空文件曾因 have==offer.Size 被误判为"已完整"而无法传输
+CODE0="zero-byte-$$"
+mkdir -p "$TMP/dst0"
+: > "$TMP/src/empty.bin"
+"$BIN" recv --relay "$WS" --code "$CODE0" --name beta --out "$TMP/dst0" --stay=false \
+    > "$TMP/recv0.log" 2>&1 &
+RECV0_PID=$!
+sleep 0.4
+"$BIN" send --relay "$WS" --code "$CODE0" --name alpha \
+    --file "$TMP/src/empty.bin" --stay=false > "$TMP/send0.log" 2>&1
+SEND0_RC=$?
+wait "$RECV0_PID" 2>/dev/null
+RECV0_RC=$?
+assert_eq "零字节 send 退出码" "0" "$SEND0_RC"
+assert_eq "零字节 recv 退出码" "0" "$RECV0_RC"
+if [ -f "$TMP/dst0/empty.bin" ] && [ ! -s "$TMP/dst0/empty.bin" ]; then
+    ok "零字节文件已落盘且大小为 0"
+else
+    bad "零字节文件已落盘且大小为 0" "文件缺失或非空"
+fi
+if grep -q "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" "$TMP/send0.log"; then
+    ok "零字节 SHA-256 正确"
+else
+    bad "零字节 SHA-256 正确" "未看到空串哈希"
+fi
+if [ -f "$TMP/dst0/empty.bin.part" ]; then
+    bad "零字节无残留 .part" "发现 empty.bin.part"
+else
+    ok "零字节无残留 .part"
+fi
+
+# ---------------------------------------------------------------
 section "5. 端到端: 断点续传"
 CODE2="resume-code-$$"
 mkdir -p "$TMP/dst2"

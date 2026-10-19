@@ -106,6 +106,8 @@ type commonFlags struct {
 	code       string
 	name       string
 	pairWindow time.Duration
+	p2p        bool
+	stun       string
 }
 
 func addCommon(fs *flag.FlagSet, cf *commonFlags) {
@@ -117,6 +119,10 @@ func addCommon(fs *flag.FlagSet, cf *commonFlags) {
 		"name advertised to the peer")
 	fs.DurationVar(&cf.pairWindow, "pair-window", pairWindowDefault,
 		"how long one relay attempt may wait for the partner before rotating to the next relay")
+	fs.BoolVar(&cf.p2p, "p2p", true,
+		"try to establish a direct UDP path (falls back to the relay automatically)")
+	fs.StringVar(&cf.stun, "stun", "",
+		"comma-separated STUN servers for candidate discovery (default: built-in list)")
 }
 
 func envOr(key, def string) string {

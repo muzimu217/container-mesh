@@ -39,6 +39,13 @@ jobs:
       - name: 单元测试
         run: go test ./... -race -count=1
 
+      - name: 漏洞扫描 (govulncheck)
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          # 只报告本仓库可达的漏洞；标准库问题由工具链补丁版本决定，
+          # 不阻断构建，但会在日志中显示以便升级。
+          govulncheck ./... || echo "::warning::govulncheck reported issues (see log)"
+
       - name: 构建
         run: go build -o cmesh ./cmd/cm
 

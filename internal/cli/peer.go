@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/muzimu217/container-mesh/internal/p2p"
 	"github.com/muzimu217/container-mesh/internal/secure"
 	"github.com/muzimu217/container-mesh/internal/wire"
 )
@@ -58,6 +59,24 @@ func humanBytes(n int64) string {
 	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
 }
 
+// p2pOptions builds direct-path settings from the common flags.
+func p2pOptions(cf commonFlags) p2p.Options {
+	o := p2p.DefaultOptions()
+	o.Enabled = cf.p2p
+	if strings.TrimSpace(cf.stun) != "" {
+		var servers []string
+		for _, s := range strings.Split(cf.stun, ",") {
+			if s = strings.TrimSpace(s); s != "" {
+				servers = append(servers, s)
+			}
+		}
+		if len(servers) > 0 {
+			o.STUNServers = servers
+		}
+	}
+	return o
+}
+
 // newNode assembles a Node from parsed common flags.
 func newNode(cf commonFlags, role secure.Role, outDir string, oneShot bool) (*Node, error) {
 	if cf.code == "" {
@@ -74,6 +93,7 @@ func newNode(cf commonFlags, role secure.Role, outDir string, oneShot bool) (*No
 		Role:       role,
 		PairWindow: cf.pairWindow,
 		OutDir:     outDir,
+		P2P:        p2pOptions(cf),
 	}
 	if oneShot {
 		// One-shot commands must terminate on their own, but must also survive
