@@ -14,7 +14,15 @@ import (
 // the receiver destroy an unrelated file that happens to share the name.
 // Linking first is atomic on POSIX (link fails with EEXIST if the target
 // exists); the fallback covers filesystems that do not support hard links.
-func publishNoClobber(part, final string) error {
+func publishNoClobber(part, final string, force bool) error {
+	if force {
+		// The operator asked for replacement; rename is atomic and clobbers.
+		if err := os.Rename(part, final); err != nil {
+			return fmt.Errorf("peer: rename: %w", err)
+		}
+		return nil
+	}
+
 	if err := os.Link(part, final); err == nil {
 		// The data is now reachable under both names; drop the temporary one.
 		if rmErr := os.Remove(part); rmErr != nil && !os.IsNotExist(rmErr) {
@@ -27,7 +35,8 @@ func publishNoClobber(part, final string) error {
 
 	// Either the destination exists (refuse) or linking is unsupported here.
 	if _, statErr := os.Stat(final); statErr == nil {
-		return fmt.Errorf("peer: refusing to overwrite existing file %s", final)
+		return fmt.Errorf("peer: refusing to overwrite existing file %s "+
+			"(rerun with --force to replace it)", final)
 	}
 	if err := os.Rename(part, final); err != nil {
 		return fmt.Errorf("peer: rename: %w", err)

@@ -30,6 +30,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -356,4 +357,34 @@ func (s *Session) RecvCounter() uint64 {
 	s.recvMu.Lock()
 	defer s.recvMu.Unlock()
 	return s.recvCtr
+}
+
+// codeAlphabet omits characters that are easy to confuse when read aloud or
+// copied by hand (0/O, 1/l/I). The code is meant to be transcribed once.
+const codeAlphabet = "abcdefghjkmnpqrstuvwxyz23456789"
+
+// GenerateCode returns a fresh transfer code with enough entropy that the
+// room label derived from it is not worth attacking offline.
+//
+// 26 characters from a 31-symbol alphabet is ~128 bits, which is far beyond
+// what a relay could enumerate even if it records every room label it sees.
+func GenerateCode() (string, error) {
+	const n = 26
+	buf := make([]byte, n)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	out := make([]byte, n)
+	for i, b := range buf {
+		out[i] = codeAlphabet[int(b)%len(codeAlphabet)]
+	}
+	// Group for readability: abcde-fghij-...
+	var sb strings.Builder
+	for i := 0; i < n; i++ {
+		if i > 0 && i%5 == 0 {
+			sb.WriteByte('-')
+		}
+		sb.WriteByte(out[i])
+	}
+	return sb.String(), nil
 }

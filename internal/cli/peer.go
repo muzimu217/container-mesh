@@ -80,7 +80,20 @@ func p2pOptions(cf commonFlags) p2p.Options {
 // newNode assembles a Node from parsed common flags.
 func newNode(cf commonFlags, role secure.Role, outDir string, oneShot bool) (*Node, error) {
 	if cf.code == "" {
-		return nil, errors.New("--code is required (or set CMESH_CODE)")
+		// The code is the only shared secret, and the room label derived from
+		// it is a verifier a relay can attack offline — so a weak code is a
+		// real weakness, not just a bad habit. Generating a strong one and
+		// printing it once is safer than making the user invent one, and it
+		// removes the temptation to reuse "test123".
+		generated, err := secure.GenerateCode()
+		if err != nil {
+			return nil, fmt.Errorf("cannot generate a code: %w", err)
+		}
+		fmt.Fprintf(os.Stderr,
+			"no --code given; generated one for this session:\n\n  %s\n\n"+
+				"Give the same code to the other side (or set --code / CMESH_CODE).\n",
+			generated)
+		cf.code = generated
 	}
 	relays, err := splitRelays(cf.relay)
 	if err != nil {
@@ -227,6 +240,10 @@ func runRecv(args []string) error {
 	message := fs.String("message", "", "message to send after connecting (optional)")
 	maxSize := fs.Int64("max-file-size", 0,
 		"reject inbound files larger than this many bytes (0 = default 16 GiB, negative = unlimited)")
+	allowHidden := fs.Bool("allow-hidden", false,
+		"accept dotfiles (default: refuse, since the receiver writes into a working directory)")
+	force := fs.Bool("force", false,
+		"overwrite an existing file with the same name (default: refuse)")
 	if err := fs.Parse(args); err != nil {
 		return ExitError{Code: 2, Err: err}
 	}
@@ -239,6 +256,8 @@ func runRecv(args []string) error {
 		return ExitError{Code: 2, Err: err}
 	}
 	node.cfg.MaxFileSize = *maxSize
+	node.cfg.AllowHidden = *allowHidden
+	node.cfg.ForceOverwrite = *force
 
 	var runErr error
 	done := make(chan struct{})

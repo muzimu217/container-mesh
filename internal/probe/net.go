@@ -6,9 +6,9 @@ package probe
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/binary"
 	"fmt"
-	"math/rand"
 	"net"
 	"sync"
 	"time"
@@ -267,9 +267,13 @@ func stunExchange(server string, timeout time.Duration) (string, error) {
 	binary.BigEndian.PutUint16(req[0:], 0x0001)
 	binary.BigEndian.PutUint16(req[2:], 0)
 	binary.BigEndian.PutUint32(req[4:], 0x2112A442)
+	// A predictable transaction id lets an off-path attacker forge the
+	// binding reply and feed us a bogus public address, so it must come from
+	// the cryptographic source. (RFC 5389 requires 96 bits of randomness.)
 	txid := make([]byte, 12)
-	rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
-	rnd.Read(txid)
+	if _, err := rand.Read(txid); err != nil {
+		return "", err
+	}
 	copy(req[8:], txid)
 
 	if _, err := c.Write(req); err != nil {

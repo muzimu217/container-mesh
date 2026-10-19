@@ -67,6 +67,13 @@ type Config struct {
 	// MaxFileSize rejects inbound offers larger than this many bytes. Zero
 	// means DefaultMaxFileSize; a negative value disables the check.
 	MaxFileSize int64
+	// AllowHidden permits receiving dotfiles. Off by default: the receiver
+	// writes into a working directory, where a dropped .bashrc or .ssh entry
+	// is a code-execution risk.
+	AllowHidden bool
+	// ForceOverwrite replaces an existing file with the same name instead of
+	// refusing. Off by default so a peer cannot silently destroy local data.
+	ForceOverwrite bool
 }
 
 // DefaultMaxFileSize caps inbound transfers at 16 GiB. The peer that offered a
@@ -666,7 +673,7 @@ func (tr *InboundTransfer) next() (*wire.Frame, error) {
 func (tr *InboundTransfer) accept(dir string, progress func(got, total int64)) (*wire.FileResult, error) {
 	s := tr.session
 	offer := tr.Offer
-	if err := validateName(offer.Name); err != nil {
+	if err := validateNamePolicy(offer.Name, s.cfg.AllowHidden); err != nil {
 		tr.Reject(err.Error())
 		return &wire.FileResult{OK: false, Message: err.Error()}, nil
 	}
@@ -860,7 +867,7 @@ func (tr *InboundTransfer) accept(dir string, progress func(got, total int64)) (
 			// the name. Link-then-remove gives atomic "create if absent"
 			// semantics; on filesystems without hard links, fall back to an
 			// explicit existence check.
-			if pubErr := publishNoClobber(partPath, finalPath); pubErr != nil {
+			if pubErr := publishNoClobber(partPath, finalPath, s.cfg.ForceOverwrite); pubErr != nil {
 				// The sender is waiting for a verdict: reporting this as a
 				// local error would leave it blocked until its timeout. Turn
 				// it into a rejection it can act on.
@@ -925,7 +932,11 @@ var reservedNames = map[string]bool{
 // underscore. Anything else (control characters, colons, quotes, shell
 // metacharacters, unicode look-alikes) is refused rather than escaped, because
 // the receiver writes the name straight to disk.
-func validateName(name string) error {
+func validateName(name string) error { return validateNamePolicy(name, false) }
+
+// validateNamePolicy is validateName with the hidden-file policy as a
+// parameter, so the default stays strict and the opt-in is explicit.
+func validateNamePolicy(name string, allowHidden bool) error {
 	if name == "" {
 		return errors.New("empty file name")
 	}
@@ -935,8 +946,8 @@ func validateName(name string) error {
 	if strings.ContainsAny(name, `/\`) {
 		return errors.New("file name must not contain path separators")
 	}
-	if strings.HasPrefix(name, ".") {
-		return errors.New("refusing to receive hidden file")
+	if strings.HasPrefix(name, ".") && !allowHidden {
+		return errors.New("refusing to receive hidden file (use --allow-hidden to accept)")
 	}
 	if len(name) > maxNameLen {
 		return fmt.Errorf("file name too long (%d bytes, max %d)", len(name), maxNameLen)

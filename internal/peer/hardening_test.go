@@ -224,7 +224,7 @@ func TestPublishedFileIsNotClobberedByConcurrentOffer(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := publishNoClobber(part, final); err == nil {
+	if err := publishNoClobber(part, final, false); err == nil {
 		t.Fatal("publishNoClobber should refuse to overwrite")
 	}
 	got, err := os.ReadFile(final)
@@ -248,7 +248,7 @@ func TestPublishSucceedsWhenAbsent(t *testing.T) {
 	if err := os.WriteFile(part, []byte("data"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := publishNoClobber(part, final); err != nil {
+	if err := publishNoClobber(part, final, false); err != nil {
 		t.Fatalf("publish: %v", err)
 	}
 	got, err := os.ReadFile(final)
@@ -265,3 +265,46 @@ func TestPublishSucceedsWhenAbsent(t *testing.T) {
 
 // ensure wire stays imported for the result type used above
 var _ = wire.FileResult{}
+
+// TestForceOverwriteReplacesExisting: --force is the explicit opt-in for
+// replacing a same-named file; without it the publish refuses (see
+// TestPublishedFileIsNotClobberedByConcurrentOffer).
+func TestForceOverwriteReplacesExisting(t *testing.T) {
+	dir := t.TempDir()
+	part := filepath.Join(dir, "z.part")
+	final := filepath.Join(dir, "z")
+	if err := os.WriteFile(part, []byte("new"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(final, []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := publishNoClobber(part, final, true); err != nil {
+		t.Fatalf("forced publish: %v", err)
+	}
+	got, err := os.ReadFile(final)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "new" {
+		t.Errorf("content = %q, want %q", got, "new")
+	}
+}
+
+// TestAllowHiddenPolicy: dotfiles are refused by default and accepted when the
+// operator opts in.
+func TestAllowHiddenPolicy(t *testing.T) {
+	if err := validateNamePolicy(".env", false); err == nil {
+		t.Error("dotfile should be refused by default")
+	}
+	if err := validateNamePolicy(".env", true); err != nil {
+		t.Errorf("dotfile should be accepted with AllowHidden: %v", err)
+	}
+	// Opting in must not weaken the traversal defences.
+	for _, bad := range []string{"..", "../x", "a/b", ".part", "CON"} {
+		if err := validateNamePolicy(bad, true); err == nil {
+			t.Errorf("%q must still be refused even with AllowHidden", bad)
+		}
+	}
+}

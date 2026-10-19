@@ -209,6 +209,61 @@ else
 fi
 
 # ---------------------------------------------------------------
+section "4c. 端到端: 覆盖保护与显式放开"
+CODE_F="force-$$"
+mkdir -p "$TMP/dstF"
+head -c 4096 /dev/urandom > "$TMP/src/dup.bin"
+printf 'OLD CONTENT' > "$TMP/dstF/dup.bin"
+
+# 默认必须拒绝覆盖
+"$BIN" recv --relay "$WS" --code "$CODE_F" --name beta --out "$TMP/dstF" --stay=false \
+    --pair-window 5s > "$TMP/recvF.log" 2>&1 &
+RECVF_PID=$!
+sleep 0.4
+"$BIN" send --relay "$WS" --code "$CODE_F" --name alpha \
+    --file "$TMP/src/dup.bin" --stay=false --pair-window 5s > "$TMP/sendF.log" 2>&1
+SENDF_RC=$?
+wait "$RECVF_PID" 2>/dev/null
+if [ "$SENDF_RC" -ne 0 ]; then ok "默认拒绝覆盖同名文件"; else bad "默认拒绝覆盖同名文件" "竟然成功了"; fi
+if [ "$(cat "$TMP/dstF/dup.bin")" = "OLD CONTENT" ]; then
+    ok "被保护文件内容未变"
+else
+    bad "被保护文件内容未变" "原文件被改写"
+fi
+
+# --force 必须允许覆盖
+CODE_F2="force2-$$"
+"$BIN" recv --relay "$WS" --code "$CODE_F2" --name beta --out "$TMP/dstF" --stay=false \
+    --force --pair-window 5s > "$TMP/recvF2.log" 2>&1 &
+RECVF2_PID=$!
+sleep 0.4
+"$BIN" send --relay "$WS" --code "$CODE_F2" --name alpha \
+    --file "$TMP/src/dup.bin" --stay=false --pair-window 5s > "$TMP/sendF2.log" 2>&1
+SENDF2_RC=$?
+wait "$RECVF2_PID" 2>/dev/null
+assert_eq "--force 覆盖退出码" "0" "$SENDF2_RC"
+assert_file_eq "--force 后内容为新文件" "$TMP/src/dup.bin" "$TMP/dstF/dup.bin"
+
+# ---------------------------------------------------------------
+section "4d. 端到端: 自动生成 code"
+CODE_GEN_LOG="$TMP/gencode.log"
+"$BIN" recv --relay "$WS" --out "$TMP/dstF" --stay=false --pair-window 5s \
+    > "$CODE_GEN_LOG" 2>&1 &
+GEN_PID=$!
+sleep 1.2
+GEN_CODE=$(grep -oE '[a-z2-9]{5}-[a-z2-9]{5}-[a-z2-9]{5}-[a-z2-9]{5}-[a-z2-9]{5}-[a-z2-9]' "$CODE_GEN_LOG" | head -1)
+if [ -n "$GEN_CODE" ]; then
+    ok "未指定 --code 时自动生成 (${GEN_CODE:0:11}…)"
+    "$BIN" send --relay "$WS" --code "$GEN_CODE" --name alpha \
+        --file "$TMP/src/dup.bin" --stay=false --pair-window 5s > "$TMP/sendG.log" 2>&1
+    assert_eq "用生成的 code 传输退出码" "0" "$?"
+else
+    bad "未指定 --code 时自动生成" "日志中未找到 code"
+    kill "$GEN_PID" 2>/dev/null
+fi
+wait "$GEN_PID" 2>/dev/null
+
+# ---------------------------------------------------------------
 section "5. 端到端: 断点续传"
 CODE2="resume-code-$$"
 mkdir -p "$TMP/dst2"

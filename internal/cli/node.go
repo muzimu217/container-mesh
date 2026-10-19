@@ -43,6 +43,10 @@ type NodeConfig struct {
 	// MaxFileSize rejects inbound offers above this many bytes (0 = peer
 	// default, negative = unlimited).
 	MaxFileSize int64
+	// AllowHidden permits receiving dotfiles (default false).
+	AllowHidden bool
+	// ForceOverwrite replaces existing files instead of refusing (default false).
+	ForceOverwrite bool
 	// P2P controls direct-path negotiation. When enabled, peers try to punch
 	// through their NATs and, on success, move the data plane off the relay.
 	P2P p2p.Options
@@ -235,11 +239,13 @@ func (n *Node) dialOne(ctx context.Context, relayURL string) (*peer.Session, err
 	ch := make(chan result, 1)
 	go func() {
 		s, err := peer.Handshake(conn, peer.Config{
-			Name:        n.cfg.Name,
-			Code:        n.cfg.Code,
-			Role:        n.cfg.Role,
-			Logger:      n.log,
-			MaxFileSize: n.cfg.MaxFileSize,
+			Name:           n.cfg.Name,
+			Code:           n.cfg.Code,
+			Role:           n.cfg.Role,
+			Logger:         n.log,
+			MaxFileSize:    n.cfg.MaxFileSize,
+			AllowHidden:    n.cfg.AllowHidden,
+			ForceOverwrite: n.cfg.ForceOverwrite,
 		})
 		if err == nil {
 			err = s.StartWithNegotiation(n.handler(), n.negotiator())
