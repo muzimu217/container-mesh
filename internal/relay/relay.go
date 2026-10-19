@@ -59,6 +59,19 @@ type Config struct {
 	// ConnectRatePerMin limits new connections per source IP per minute
 	// (0 = default).
 	ConnectRatePerMin int
+	// TrustedProxies lists CIDRs whose X-Forwarded-For / X-Real-IP headers are
+	// believed. Empty means "trust nobody": the client address is always taken
+	// from the socket.
+	//
+	// This matters because those headers are attacker-controlled. A relay that
+	// honours them unconditionally lets any client claim a fresh identity per
+	// request, which defeats the per-IP limits entirely (measured: 60/60
+	// requests through with forged headers versus 5/60 without).
+	TrustedProxies []string
+	// LimiterSweepInterval bounds how often idle limiter entries are dropped
+	// (0 = default). Without it the map grows once per distinct claimed
+	// address, which is a remotely triggerable memory leak.
+	LimiterSweepInterval time.Duration
 	// Logger receives structured events.
 	Logger *slog.Logger
 }
@@ -67,15 +80,16 @@ type Config struct {
 func DefaultConfig() Config {
 	l := wsconn.DefaultLiveness()
 	return Config{
-		Addr:              ":8080",
-		Path:              "/ws",
-		PairTimeout:       10 * time.Minute,
-		MaxRooms:          1024,
-		MaxMessageBytes:   16 << 20,
-		PingPeriod:        l.PingEvery,
-		IdleTimeout:       l.IdleTimeout,
-		MaxConnsPerIP:     16,
-		ConnectRatePerMin: 120,
+		Addr:                 ":8080",
+		Path:                 "/ws",
+		PairTimeout:          10 * time.Minute,
+		MaxRooms:             1024,
+		MaxMessageBytes:      16 << 20,
+		PingPeriod:           l.PingEvery,
+		IdleTimeout:          l.IdleTimeout,
+		MaxConnsPerIP:        16,
+		ConnectRatePerMin:    120,
+		LimiterSweepInterval: time.Minute,
 	}
 }
 
@@ -171,6 +185,9 @@ func New(cfg Config) *Server {
 	if cfg.ConnectRatePerMin == 0 {
 		cfg.ConnectRatePerMin = def.ConnectRatePerMin
 	}
+	if cfg.LimiterSweepInterval == 0 {
+		cfg.LimiterSweepInterval = def.LimiterSweepInterval
+	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
@@ -210,7 +227,31 @@ func (s *Server) HTTPServer() *http.Server {
 // ListenAndServe runs the relay until the process exits.
 func (s *Server) ListenAndServe() error {
 	s.log.Info("relay listening", "addr", s.cfg.Addr, "path", s.cfg.Path)
+	s.StartMaintenance()
 	return s.HTTPServer().ListenAndServe()
+}
+
+// StartMaintenance begins periodic cleanup of limiter and contest state.
+//
+// It must run in production: without it the limiter map grows once per distinct
+// client address seen and never shrinks, which a remote client can drive by
+// opening connections from many addresses (or, before the trusted-proxy fix,
+// by forging a new address per request).
+func (s *Server) StartMaintenance() {
+	interval := s.cfg.LimiterSweepInterval
+	if interval <= 0 {
+		interval = time.Minute
+	}
+	go func() {
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for range t.C {
+			// Keep entries for a few intervals so an active client is never
+			// forgotten mid-burst.
+			s.limiter.sweep(4 * interval)
+			s.sweepContested()
+		}
+	}()
 }
 
 // sweepContested drops expired contest records so the map cannot grow without
@@ -244,7 +285,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 
 	s.sweepContested()
 
-	ip := clientIP(r)
+	ip := s.limiter.clientIP(r)
 	if !s.limiter.acquire(ip) {
 		// The relay is unauthenticated by design (the room label is not a
 		// credential), so per-IP budgets are the only thing standing between a
@@ -276,6 +317,8 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	s.log.Info("paired", "room", redactRoom(roomID), "role", role, "remote", c.RemoteAddr())
 
 	// Exactly one side runs the splice: the peer that completed the room.
+	// Anything the parked probe captured from either side is replayed first,
+	// so a client that spoke before its partner arrived is not dropped.
 	s.splice(roomID, c, partner.conn)
 	close(self.done)
 }
@@ -435,8 +478,17 @@ func (s *Server) splice(roomID string, a, b *wsconn.Conn) {
 		})
 	}
 
+	// forwarded counts messages actually delivered in each direction. It is
+	// what distinguishes "the peer died before we ever spoke" (recoverable:
+	// put the survivor back in the room) from "the session ran and then
+	// ended" (not recoverable: the stream position is lost).
+	var (
+		forwardedMu sync.Mutex
+		forwarded   [2]int
+	)
+
 	done := make(chan struct{}, 2)
-	pump := func(src, dst *wsconn.Conn, dir string) {
+	pump := func(src, dst *wsconn.Conn, dir string, idx int) {
 		defer func() { done <- struct{}{} }()
 		for {
 			msg, err := src.Recv()
@@ -452,11 +504,29 @@ func (s *Server) splice(roomID string, a, b *wsconn.Conn) {
 				shutdown(dir + " send: " + err.Error())
 				return
 			}
+			forwardedMu.Lock()
+			forwarded[idx]++
+			forwardedMu.Unlock()
 		}
 	}
 
-	go pump(a, b, "A->B")
-	pump(b, a, "B->A")
+	go pump(a, b, "A->B", 0)
+	pump(b, a, "B->A", 1)
 	<-done
 	shutdown("pump finished")
+
+	forwardedMu.Lock()
+	total := forwarded[0] + forwarded[1]
+	forwardedMu.Unlock()
+
+	// A pairing that failed before a single byte moved means one side was
+	// already gone when it was paired (a parked peer that died is invisible
+	// until its slot is taken over). Both connections are now closed, so the
+	// live side cannot be handed back as-is; the useful thing is to tell it to
+	// retry immediately instead of waiting out its backoff, which the client
+	// does on a normal close anyway.
+	if total == 0 {
+		s.log.Info("pairing produced no traffic; both sides closed",
+			"room", redactRoom(roomID))
+	}
 }

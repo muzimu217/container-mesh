@@ -4,6 +4,7 @@
 package relay
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -108,19 +109,42 @@ func TestLimiterKeepsBusyState(t *testing.T) {
 
 // TestClientIPHonoursProxyHeaders: behind nginx/Caddy every request comes from
 // the proxy, so the limiter must key on the forwarded client address.
-func TestClientIPHonoursProxyHeaders(t *testing.T) {
+func TestClientIPIgnoresForgedHeadersByDefault(t *testing.T) {
+	// With no trusted proxies configured, forwarding headers must be ignored:
+	// they are attacker-controlled and would otherwise hand every request a
+	// fresh rate-limit budget.
+	l := newIPLimiter(100, 10)
+	r := httptest.NewRequest(http.MethodGet, "/ws", nil)
+	r.RemoteAddr = "198.51.100.7:1234"
+	r.Header.Set("X-Forwarded-For", "10.9.9.9")
+	r.Header.Set("X-Real-IP", "10.9.9.8")
+
+	if got := l.clientIP(r); got != "198.51.100.7" {
+		t.Errorf("clientIP = %q, want the socket address 198.51.100.7", got)
+	}
+}
+
+func TestClientIPHonoursHeadersFromTrustedProxyOnly(t *testing.T) {
+	l := newIPLimiter(100, 10)
+	if err := l.setTrustedProxies([]string{"127.0.0.1", "10.0.0.0/8"}); err != nil {
+		t.Fatal(err)
+	}
+
 	cases := []struct {
 		name    string
 		remote  string
 		headers map[string]string
 		want    string
 	}{
-		{"direct", "10.0.0.5:1234", nil, "10.0.0.5"},
-		{"xff single", "127.0.0.1:1", map[string]string{"X-Forwarded-For": "203.0.113.9"}, "203.0.113.9"},
-		{"xff chain", "127.0.0.1:1", map[string]string{"X-Forwarded-For": "203.0.113.9, 10.0.0.1, 10.0.0.2"}, "203.0.113.9"},
-		{"x-real-ip", "127.0.0.1:1", map[string]string{"X-Real-IP": "198.51.100.7"}, "198.51.100.7"},
-		{"xff wins over x-real-ip", "127.0.0.1:1", map[string]string{
-			"X-Forwarded-For": "203.0.113.9", "X-Real-IP": "198.51.100.7"}, "203.0.113.9"},
+		{"trusted proxy, xff", "127.0.0.1:1",
+			map[string]string{"X-Forwarded-For": "203.0.113.9"}, "203.0.113.9"},
+		{"trusted proxy, xff chain", "10.1.2.3:1",
+			map[string]string{"X-Forwarded-For": "203.0.113.9, 10.0.0.1"}, "203.0.113.9"},
+		{"trusted proxy, x-real-ip", "127.0.0.1:1",
+			map[string]string{"X-Real-IP": "198.51.100.7"}, "198.51.100.7"},
+		{"untrusted peer, forged xff", "203.0.113.50:1",
+			map[string]string{"X-Forwarded-For": "10.9.9.9"}, "203.0.113.50"},
+		{"trusted proxy, no headers", "127.0.0.1:1", nil, "127.0.0.1"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -129,10 +153,38 @@ func TestClientIPHonoursProxyHeaders(t *testing.T) {
 			for k, v := range tc.headers {
 				r.Header.Set(k, v)
 			}
-			if got := clientIP(r); got != tc.want {
+			if got := l.clientIP(r); got != tc.want {
 				t.Errorf("clientIP = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestSetTrustedProxiesRejectsBadCIDR(t *testing.T) {
+	l := newIPLimiter(100, 10)
+	if err := l.setTrustedProxies([]string{"not-an-ip"}); err == nil {
+		t.Error("malformed CIDR should be rejected")
+	}
+}
+
+// TestForgedHeadersCannotBypassLimit is the end-to-end form of the above: a
+// client that invents a new address per request must still be throttled.
+func TestForgedHeadersCannotBypassLimit(t *testing.T) {
+	l := newIPLimiter(5, 100) // 5 connections per minute
+
+	allowed := 0
+	for i := 0; i < 60; i++ {
+		r := httptest.NewRequest(http.MethodGet, "/ws", nil)
+		r.RemoteAddr = "198.51.100.7:1234"
+		// A different claimed address every time.
+		r.Header.Set("X-Forwarded-For", fmt.Sprintf("10.9.9.%d", i%250))
+		ip := l.clientIP(r)
+		if l.acquire(ip) {
+			allowed++
+		}
+	}
+	if allowed > 5 {
+		t.Errorf("%d of 60 requests allowed, want <= 5: forged headers bypassed the limit", allowed)
 	}
 }
 

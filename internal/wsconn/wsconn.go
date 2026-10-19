@@ -248,6 +248,17 @@ func (c *Conn) RecvWithDeadline(deadline time.Time) ([]byte, error) {
 	}
 }
 
+// Ping sends a WebSocket ping and reports whether the write succeeded.
+//
+// It is used by the relay to check on a parked peer without reading: a write
+// to a connection whose TCP path is gone fails promptly, and unlike a read it
+// does not latch an error on the connection.
+func (c *Conn) Ping() error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	return c.ws.WriteControl(websocket.PingMessage, nil, time.Now().Add(5*time.Second))
+}
+
 // Closed reports a channel that is closed once the connection is gone, either
 // because Close was called or because the read side failed. It lets a caller
 // observe liveness without consuming data from the socket.

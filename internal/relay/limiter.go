@@ -4,8 +4,10 @@
 package relay
 
 import (
+	"fmt"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -21,6 +23,9 @@ type ipLimiter struct {
 
 	mu    sync.Mutex
 	state map[string]*ipState
+	// trusted holds the CIDRs whose forwarding headers are believed. Empty
+	// means the socket address is always used.
+	trusted []*net.IPNet
 	// now is injectable so tests need not sleep.
 	now func() time.Time
 }
@@ -100,10 +105,70 @@ func (l *ipLimiter) sweep(maxIdle time.Duration) {
 	}
 }
 
-// clientIP extracts the address to rate-limit on. X-Forwarded-For is honoured
-// because the normal deployment puts the relay behind nginx/Caddy; without it
-// every client would appear to come from the proxy and share one budget.
-func clientIP(r *http.Request) string {
+// setTrustedProxies parses the CIDR list.
+func (l *ipLimiter) setTrustedProxies(cidrs []string) error {
+	var nets []*net.IPNet
+	for _, c := range cidrs {
+		c = trimSpace(c)
+		if c == "" {
+			continue
+		}
+		// Accept both "10.0.0.0/8" and a bare address ("127.0.0.1").
+		if !strings.Contains(c, "/") {
+			ip := net.ParseIP(c)
+			if ip == nil {
+				return fmt.Errorf("relay: bad trusted proxy %q", c)
+			}
+			bits := 32
+			if ip.To4() == nil {
+				bits = 128
+			}
+			c = fmt.Sprintf("%s/%d", ip.String(), bits)
+		}
+		_, n, err := net.ParseCIDR(c)
+		if err != nil {
+			return fmt.Errorf("relay: bad trusted proxy %q: %w", c, err)
+		}
+		nets = append(nets, n)
+	}
+	l.mu.Lock()
+	l.trusted = nets
+	l.mu.Unlock()
+	return nil
+}
+
+// isTrustedPeer reports whether the request came from a configured proxy.
+func (l *ipLimiter) isTrustedPeer(remoteIP string) bool {
+	ip := net.ParseIP(remoteIP)
+	if ip == nil {
+		return false
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, n := range l.trusted {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// clientIP extracts the address to rate-limit on.
+//
+// Forwarding headers are attacker-controlled: any client can send
+// "X-Forwarded-For: 1.2.3.4" and claim a fresh identity, which would give it a
+// new budget on every request and grow the limiter map without bound. They are
+// therefore only consulted when the request actually arrives from a configured
+// trusted proxy; otherwise the socket address is authoritative.
+func (l *ipLimiter) clientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	if !l.isTrustedPeer(host) {
+		return host
+	}
+
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 		// Left-most entry is the original client; the rest are proxies.
 		for i := 0; i < len(xff); i++ {
@@ -115,10 +180,6 @@ func clientIP(r *http.Request) string {
 	}
 	if xr := r.Header.Get("X-Real-IP"); xr != "" {
 		return trimSpace(xr)
-	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
 	}
 	return host
 }

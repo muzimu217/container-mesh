@@ -413,9 +413,14 @@ func (c *Conn) handleAck(pkt *packet) {
 	c.sendMu.Lock()
 	defer c.sendMu.Unlock()
 
+	// pkt.ack is EXCLUSIVE: the sender of the ACK advertises recvNext, the
+	// next sequence number it has not seen. Deleting the frame at that index
+	// would discard a datagram that was never received, and it would never be
+	// retransmitted — the message then never completes and Recv hangs while
+	// Send has already returned.
 	freed := false
 	for seq, frame := range c.sendBuf {
-		if seqBefore(seq, pkt.ack) || seq == pkt.ack {
+		if seqBefore(seq, pkt.ack) {
 			// RTT sample from the frame that was actually acknowledged.
 			if frame.attempts == 0 {
 				c.updateRTT(time.Since(frame.sentAt))

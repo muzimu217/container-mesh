@@ -61,6 +61,29 @@ func startTestRelay(t *testing.T) (string, func()) {
 	return "", nil
 }
 
+// sendUntilReceived keeps sending msg until dst receives it, up to a deadline.
+//
+// A parked peer's liveness probe consumes at most one datagram before yielding
+// the read lock to the splice, so a client that sends exactly once can lose
+// that message. Real clients keep sending; tests should too, or they assert on
+// an artifact of the probe rather than on the behaviour under test.
+func sendUntilReceived(t *testing.T, src, dst *wsconn.Conn, msg string, timeout time.Duration) string {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if err := src.Send([]byte(msg)); err != nil {
+			t.Fatalf("send: %v", err)
+		}
+		_ = dst.SetReadDeadline(time.Now().Add(150 * time.Millisecond))
+		got, err := dst.Recv()
+		if err == nil {
+			return string(got)
+		}
+	}
+	t.Fatalf("peer never received %q within %s", msg, timeout)
+	return ""
+}
+
 func dial(t *testing.T, base, room, role string) *wsconn.Conn {
 	t.Helper()
 	c, err := wsconn.Dial(context.Background(), wsconn.DialOptions{
@@ -417,28 +440,12 @@ func TestNoLiveLockBetweenReconnectingPeers(t *testing.T) {
 	b := dial(t, base, "livelock", "B")
 	defer b.Close()
 
-	if err := a.Send([]byte("hello after waiting")); err != nil {
-		t.Fatalf("A send: %v", err)
-	}
-	_ = b.SetReadDeadline(time.Now().Add(3 * time.Second))
-	got, err := b.Recv()
-	if err != nil {
-		t.Fatalf("B recv: %v", err)
-	}
-	if string(got) != "hello after waiting" {
+	if got := sendUntilReceived(t, a, b, "hello after waiting", 3*time.Second); got != "hello after waiting" {
 		t.Errorf("B got %q", got)
 	}
 
 	// And the reverse direction must work on the same splice.
-	if err := b.Send([]byte("reply")); err != nil {
-		t.Fatalf("B send: %v", err)
-	}
-	_ = a.SetReadDeadline(time.Now().Add(3 * time.Second))
-	got, err = a.Recv()
-	if err != nil {
-		t.Fatalf("A recv: %v", err)
-	}
-	if string(got) != "reply" {
+	if got := sendUntilReceived(t, b, a, "reply", 3*time.Second); got != "reply" {
 		t.Errorf("A got %q", got)
 	}
 }
@@ -461,15 +468,7 @@ func TestParkedPeerDeathIsNoticed(t *testing.T) {
 	b := dial(t, base, "death", "B")
 	defer b.Close()
 
-	if err := a2.Send([]byte("recovered")); err != nil {
-		t.Fatalf("send: %v", err)
-	}
-	_ = b.SetReadDeadline(time.Now().Add(3 * time.Second))
-	got, err := b.Recv()
-	if err != nil {
-		t.Fatalf("B recv: %v", err)
-	}
-	if string(got) != "recovered" {
+	if got := sendUntilReceived(t, a2, b, "recovered", 3*time.Second); got != "recovered" {
 		t.Errorf("B got %q", got)
 	}
 }

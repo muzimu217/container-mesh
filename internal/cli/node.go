@@ -192,6 +192,18 @@ func (n *Node) Run(ctx context.Context) error {
 			return nil
 		}
 		n.status("disconnected", fmt.Sprint(sess.Err()))
+
+		// A session that ended before a single frame arrived was almost
+		// certainly paired with a peer that was already gone: the relay pairs
+		// on slot presence, and a parked peer that died is invisible until
+		// its slot is taken over. Retrying immediately turns that into a
+		// fresh pairing instead of a wasted backoff — and if the peer really
+		// is absent, the next attempt simply parks as usual.
+		if sess.FramesSinceStart() == 0 && ctx.Err() == nil {
+			n.status("retry-immediate", "session ended before any data arrived")
+			continue
+		}
+
 		if !sleepCtx(ctx, 500*time.Millisecond) {
 			n.finish(nil)
 			return nil

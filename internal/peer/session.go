@@ -108,6 +108,10 @@ type Session struct {
 
 	// PeerName is filled by the hello exchange.
 	PeerName string
+	// recvAtStart is the receive counter right after the hello exchange. The
+	// hello itself is one frame, so the raw counter is never zero; what
+	// matters for detecting a pairing that carried no data is the delta.
+	recvAtStart uint64
 
 	sendMu sync.Mutex
 
@@ -279,6 +283,7 @@ func (s *Session) StartWithNegotiation(h Handler, neg Negotiator) error {
 			return err
 		}
 	}
+	s.recvAtStart = s.sec.RecvCounter()
 	s.log.Info("session established", "peer", s.PeerName, "role", s.cfg.Role.String())
 	go s.readPump()
 	return nil
@@ -474,6 +479,21 @@ func (s *Session) ShortAuth() string { return s.sec.ShortAuth() }
 
 // Fingerprint is a longer digest of the same key, for logs and audit trails.
 func (s *Session) Fingerprint() string { return s.sec.Fingerprint() }
+
+// FramesSinceStart reports how many frames arrived after the session was
+// established (the hello exchange itself is excluded).
+//
+// A session that ends with zero such frames never really carried anything: the
+// relay pairs on slot presence, so a peer that died while parked can be paired
+// with a live one, and the splice then fails on its first read. Callers use
+// this to retry immediately instead of treating it as a normal disconnect.
+func (s *Session) FramesSinceStart() uint64 {
+	now := s.sec.RecvCounter()
+	if now <= s.recvAtStart {
+		return 0
+	}
+	return now - s.recvAtStart
+}
 
 // SendFile offers and streams one file, waiting for the receiver to verify it.
 //
