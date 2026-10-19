@@ -118,7 +118,12 @@ func (n *Node) Run(ctx context.Context) error {
 			return nil
 		}
 		if n.cfg.MaxConnectAttempts > 0 && attempts >= n.cfg.MaxConnectAttempts {
-			err := fmt.Errorf("could not connect after %d attempts across %d relay(s)", attempts, len(n.cfg.Relays))
+			// The most common cause by far is a code mismatch: the room
+			// label is derived from the code, so two different codes put the
+			// peers in different rooms and they wait for each other forever.
+			// Say so, rather than leaving the operator to guess.
+			err := fmt.Errorf("no partner after %d attempts across %d relay(s); "+
+				"check that both sides use the same --code", attempts, len(n.cfg.Relays))
 			n.finish(err)
 			return err
 		}

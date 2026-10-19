@@ -119,8 +119,14 @@ func addCommon(fs *flag.FlagSet, cf *commonFlags) {
 		"name advertised to the peer")
 	fs.DurationVar(&cf.pairWindow, "pair-window", pairWindowDefault,
 		"how long one relay attempt may wait for the partner before rotating to the next relay")
-	fs.BoolVar(&cf.p2p, "p2p", true,
-		"try to establish a direct UDP path (falls back to the relay automatically)")
+	// Off by default: measured on loopback the user-space UDP path is ~16x
+	// slower than the relay path (13 MiB/s vs 256 MiB/s on a 1 GiB transfer),
+	// because it pays a syscall + AEAD operation per 1177-byte datagram while
+	// the relay handles 512 KiB frames. The direct path is worth enabling when
+	// relay bandwidth or the extra RTT is the binding constraint, which needs
+	// a real wide-area link to evaluate.
+	fs.BoolVar(&cf.p2p, "p2p", false,
+		"try a direct UDP path before using the relay (experimental: slower on fast links)")
 	fs.StringVar(&cf.stun, "stun", "",
 		"comma-separated STUN servers for candidate discovery (default: built-in list)")
 }

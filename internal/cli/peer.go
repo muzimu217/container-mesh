@@ -97,13 +97,18 @@ func newNode(cf commonFlags, role secure.Role, outDir string, oneShot bool) (*No
 	}
 	if oneShot {
 		// One-shot commands must terminate on their own, but must also survive
-		// a partner that starts a little later: a 10s window across the public
-		// internet makes both sides miss each other whenever their start times
-		// drift. Keep a generous per-relay window and a bounded number of
-		// rounds; stop re-offering a file nobody accepts.
-		cfg.MaxConnectAttempts = 12
+		// a partner that starts a little later: a 10s window makes both sides
+		// miss each other whenever their start times drift.
+		//
+		// The total is deliberately bounded: when the two sides use DIFFERENT
+		// codes they land in different rooms (the room label is derived from
+		// the code), so they can never meet and both simply wait out the
+		// budget. 12 rounds x 45s made that take ten minutes, which reads as a
+		// hang. 6 rounds x 25s keeps a comfortable start-time window while
+		// failing in about two minutes.
+		cfg.MaxConnectAttempts = 6
 		cfg.MaxTransferAttempts = 3
-		cfg.PairWindow = min(cfg.PairWindow, 45*time.Second)
+		cfg.PairWindow = min(cfg.PairWindow, 25*time.Second)
 	}
 	return NewNode(cfg), nil
 }

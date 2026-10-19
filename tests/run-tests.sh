@@ -240,12 +240,16 @@ section "6. 端到端: 错误码"
 # 两端 code 不一致必须失败, 不能静默传输出错数据
 CODE3="right-code-$$"
 mkdir -p "$TMP/dst3"
-"$BIN" recv --relay "$WS" --code "wrong-code-$$" --name beta --out "$TMP/dst3" --stay=false \
-    > "$TMP/recv3.log" 2>&1 &
+# A short pair window is passed explicitly: the point of this case is that the
+# two sides never meet, and with production defaults that takes minutes
+# (they sit in different rooms until the retry budget runs out).
+"$BIN" recv --relay "$WS" --code "wrong-code-$$" --name beta --out "$TMP/dst3" \
+    --stay=false --pair-window 2s > "$TMP/recv3.log" 2>&1 &
 RECV3_PID=$!
 sleep 0.4
 "$BIN" send --relay "$WS" --code "$CODE3" --name alpha \
-    --file "$TMP/src/payload.bin" --stay=false > "$TMP/send3.log" 2>&1
+    --file "$TMP/src/payload.bin" --stay=false --pair-window 2s \
+    > "$TMP/send3.log" 2>&1
 SEND3_RC=$?
 wait "$RECV3_PID" 2>/dev/null
 RECV3_RC=$?
