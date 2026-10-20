@@ -469,3 +469,186 @@ window, and the removal of a 65:1 throughput starvation between two flows.
 The escape hatch matters and is documented: `DisableCongestionControl` restores
 the fixed window exactly, for a private link or a benchmark where there is no
 congestion to react to.
+
+## Round 15 — batched receive syscalls (`recvmmsg` / `recvmsg_x`)
+
+Round 13 batched the send direction and left the receive direction at one
+`ReadFrom` per datagram; its own ceiling note named that as the next lever
+("37% of CPU in the batched send syscalls and 38% in the receiver's per-datagram
+`ReadFrom` loop"). This round does the receive side, and it also turned up a
+protocol cost that was larger than either syscall.
+
+**What changed.**
+
+1. `recvmmsg(2)` on Linux and `recvmsg_x(2)` on Darwin, behind the same
+   `batchReader` interface the send side uses for `batchWriter`. The
+   `batchProvider` interface gained a `batchReader(limit)` method so a wrapping
+   `net.PacketConn` (the loss-injection proxy in `harness_test.go`) can keep its
+   per-datagram decision in front of the syscall. Other platforms fall back to
+   `ReadFrom`, and the fallback is the *same* read loop with a nil reader rather
+   than a second code path.
+2. `Config.RecvBatchSize` (default 32, same as `BatchSize`) and
+   `Config.DisableRecvBatching` for A/B and as an escape hatch.
+3. `sackState` gained a one-word `summary` so `snapshot` does not scan the whole
+   4096-bit ring to discover it is empty. This was the largest single win and it
+   is not a batching change at all — see below.
+4. Two allocations were removed from the receive path: the `rc.Read` callback
+   and its captured return slots had been escaping to the heap on every receive
+   syscall, and `sendAckNow`'s ACK buffer was escaping on every ACK.
+
+**Method.** Absolute wall-clock throughput on this machine is not stable to
+better than ±30%: the same configuration measured 153.99 and 213.9 MiB/s in one
+session, and 20%-loss runs span 11.5–15.6 MB/s across three sweeps. So the
+primary metric here is **process CPU time per transfer** (`getrusage`
+`RUSAGE_SELF`, both endpoints in one process), which measures the work the change
+removes and does not move when another process takes cycles. Wall clock is
+reported as best-of-N and only trusted as an interleaved A/B.
+
+### A. Where the receive CPU actually was
+
+A synthetic harness drove `readLoopBatched`'s exact calls from memory (no
+sockets) over one 464-fragment message:
+
+| stage | before | after | note |
+|---|---|---|---|
+| `sackState.snapshot` | **5798 ns/call** | **18.5 ns/call** | 313× — the ring scan |
+| receive-side protocol, per datagram | **6265 ns/pkt** | **379 ns/pkt** | 16.5× |
+| `decodePacket` | 26 ns/pkt | 26 ns/pkt | never the problem |
+
+The cause: `snapshot` walked down from `next+sackRingBits-1` on every call, and
+on a lossless transfer the ring is **empty** at every ACK — so it did 4096 bit
+tests to conclude "nothing above `una`". With one ACK per eight datagrams that
+was ~0.7 ms of a 2.4 ms transfer, spent proving there was nothing to say. The
+`summary` word makes the empty case a single compare.
+
+This is worth stating plainly because it changes the story of the round: the
+receive path was **not** syscall-bound, it was ACK-construction-bound. Batching
+the receive syscall alone measures as a rounding error (table B, "recv batch
+only"); the win came from the ring scan the profile pointed at once the syscalls
+were amortised.
+
+### B. Four-arm attribution, 512 KiB
+
+Send batching and receive batching, each on or off, interleaved in one loop
+(`BenchmarkTransferBatching`), CPU µs per transfer:
+
+| arm | @ 0% | @ 5% | @ 20% |
+|---|---|---|---|
+| both off (round-10 baseline) | 7334 | 9402 | 21827 |
+| send batch only (round 13) | 6575 | 8566 | 21786 |
+| recv batch only (this round) | 7102 | 9189 | 21594 |
+| **both batched (ships)** | **6702** | **7761** | **19909** |
+
+Ratios against "both off": **0.91× @ 0%**, **0.83× @ 5%**, **0.91× @ 20%**.
+
+Read the third row carefully: receive batching *on its own* is 0.97–0.98×. It
+only pays when the sender is also batching, because that is what puts more than
+one datagram in the socket queue per wakeup (mean receive depth 2.3–4.4 with
+batched send, 1.0 without). The two directions are one change, not two.
+
+### C. Wall clock, best of 60
+
+Same four arms, 60 transfers each, best and median (`TestBestOfMany`, run once on
+a loaded machine — see the caveat below):
+
+| arm | @ 0% best | @ 0% median | @ 5% best | @ 20% best |
+|---|---|---|---|---|
+| both off | 180.7 MiB/s | 161.0 | 116.5 | 34.2 |
+| send only | 213.9 MiB/s | 193.6 | 76.4 | 26.9 |
+| recv only | 180.8 MiB/s | 166.8 | 116.0 | 30.2 |
+| **both batched** | **212.9 MiB/s** | **201.3** | **157.8** | **33.8** |
+
+The 0% and 5% columns are the ones to read: 0% is flat versus round 13 (the
+send side is now the wall), 5% improves because a deeper receive queue lets more
+ACKs and retransmissions land per wakeup. The 20% column is inside the
+run-to-run spread — three repeat sweeps of the same arm gave 13.6, 14.5 and
+14.8 MB/s — so the honest statement is "unchanged", not "improved".
+
+**Caveat on the absolute numbers.** This machine was running an editor and a
+language server throughout, and load average was 1.3–1.8 on 10 cores. Every
+absolute figure here is a best-of-N under load, and the CPU column in table B is
+the trustworthy one. The earlier round-13 KPI recorded 209.5 MiB/s at 0% on an
+idle machine; 212.9 under load is consistent with that, not an improvement.
+
+### D. Depth curves
+
+Receive depth, 512 KiB @ 0% (`BenchmarkTransferRecvDepth`, CPU µs). Two sweeps
+are shown because the per-arm spread between sweeps (~±5%) is the same size as
+the differences between depths, which is itself the finding:
+
+| depth | 1 | 4 | 8 | 16 | 32 | 64 |
+|---|---|---|---|---|---|---|
+| cpu, sweep 1 | 6717 | 6675 | 6465 | 6381 | 6366 | 6317 |
+| cpu, sweep 2 | 6680 | 6865 | 6685 | 6674 | 6358 | 6632 |
+
+The curve is flat from 8 up: every depth ≥ 8 lands in 6317–6685 µs, and the
+ordering inside that band does not reproduce between sweeps. **32 stays the
+default**, matching the send side; 64 buys nothing measurable and doubles the
+preallocated buffer footprint (64 × 1200 B per connection). The one thing the
+table says reproducibly is that depth 1 is not worse than the rest — the same
+result as table B, and for the same reason: with the send side's pacing the queue
+is shallow, so receive depth is not where the time goes.
+
+### E. Ordering and completeness
+
+20 messages at each of 0/5/10/20% loss, receive batching on:
+**20/20 at all four rates**, byte-exact and in order
+(`TestKPIReceiveBatchOrdering`). Ordering holds by construction: both calls fill
+the array in arrival order, and the read loop consumes the returned prefix in
+index order.
+
+**Short returns are the normal case, not an error.** Mean datagrams per receive
+call in a real transfer: 2.4 @ 0%, 2.1 @ 5%, 1.8 @ 20%. The loop processes
+exactly `n` and calls again; a stale length in the tail of the buffer array can
+never be read as a datagram. Covered directly by `TestRecvBatchShortReturn`
+(a fake reader returning 3, 1, 2) and end to end by
+`TestRecvBatchShortReturnDeliversMessage` (a sender writing groups of 1–3).
+
+### F. Allocations
+
+512 KiB transfer, `allocs/op`:
+
+| | before this round | after |
+|---|---|---|
+| allocations | 1751 | **1214** |
+
+The two removed sources were both heap escapes in the receive path, found in the
+allocation profile after the ring-scan fix:
+
+- the `rc.Read` callback and its captured `got`/`rerr` — ~490 allocations per
+  transfer (30% of the total). Fixed by making the callback a method value bound
+  once per reader, with the return slots as reader fields.
+- `sendAckNow`'s `[40]byte` encode buffer — ~50 per transfer. It escaped because
+  it is passed through the `net.PacketConn` interface; it is now a `Conn` field
+  guarded by the `writeMu` the function already holds.
+
+`makeDataPacket` remains the largest single allocator (one buffer per fragment,
+retained by the send queue for retransmission). Pooling it needs reference
+counting, because a packet lives until it is acknowledged; that is not this
+round.
+
+### G. What is left
+
+The profile after this round is almost purely syscalls:
+
+| item | share of CPU |
+|---|---|
+| `sendmsg_x` (batched send) | 34% |
+| `recvmsg_x` (batched receive) | 26% |
+| `kevent` (poller) | 14% |
+| everything else | 26% |
+
+Both directions are already one syscall per 32 datagrams, and the raw socket
+ceiling on this machine (no protocol at all, 464 × 1200 B, both ends batched) is
+~330 MiB/s. A 512 KiB transfer at 212.9 MiB/s is therefore at **~65% of the raw
+UDP ceiling**, and the remaining 35% is per-datagram protocol work that batching
+cannot remove: `decodePacket`, SACK marking, the reassembly copy, and the
+per-datagram ACK decision.
+
+**Target status: 250 MiB/s not reached.** Best measured is 212.9 MiB/s @ 0% on a
+loaded machine (round 13 measured 209.5 idle, so the change is roughly neutral at
+0% and clearly positive at 5%). The reason the receive round does not move the 0%
+number much is table B: receive batching is worth ~2% on its own, and the
+remaining cost is the send syscall plus poller wakeups, neither of which a deeper
+receive batch touches. Reaching 250 would need fewer *send* syscalls per byte or
+fewer poller round trips, not a better receiver.

@@ -81,6 +81,12 @@ type batchSender interface {
 // per-datagram decisions in front of the syscall.
 type batchProvider interface {
 	batchWriter() batchWriter
+	// batchReader is the receive-side half of the same contract: a wrapper
+	// that injects loss on ReadFrom must return a reader that applies the same
+	// per-datagram decision, or nil to opt out of batched receives entirely.
+	// Returning nil is the safe default — the read loop then uses ReadFrom,
+	// which the wrapper forwards.
+	batchReader(limit int) batchReader
 }
 
 // senderFor returns the batch writer for pc, or nil when pc cannot batch. The

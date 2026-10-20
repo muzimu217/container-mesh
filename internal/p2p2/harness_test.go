@@ -106,6 +106,96 @@ func (l *lossyPacketConn) batchWriter() batchWriter {
 	return &lossyBatchWriter{conn: l, w: w}
 }
 
+// batchReader keeps this wrapper in front of the batched receive path, for the
+// same correctness reason as batchWriter: reading the embedded *net.UDPConn
+// directly would bypass ReadFrom and therefore bypass the loss injection, so
+// every loss test would measure a lossless path.
+//
+// The wrapped reader applies the same per-datagram coin flip and compacts the
+// survivors into the front of the batch, reporting how many survived. That is
+// the shape a short recvmmsg return already has, so the read loop needs no
+// special case for it.
+func (l *lossyPacketConn) batchReader(limit int) batchReader {
+	r := receiverFor(l.PacketConn, limit)
+	if r == nil {
+		return nil
+	}
+	return &lossyBatchReader{conn: l, r: r}
+}
+
+type lossyBatchReader struct {
+	conn *lossyPacketConn
+	r    batchReader
+
+	// out is this wrapper's own output buffers. Survivors are copied into them
+	// rather than moved inside the wrapped reader's arrays: a platform reader
+	// prebuilds its msghdr array with pointers into its own buffers, so
+	// reordering those elements would leave the kernel writing into the wrong
+	// slots. Copying is the price of keeping the wrapper out of that invariant,
+	// and it only happens in tests.
+	out  [][]byte
+	lens []int
+	// idx maps a compacted position back to the position the wrapped reader
+	// filled, so rawSource can still report the right sender for the datagrams
+	// that survived a drop.
+	idx []int
+}
+
+func (b *lossyBatchReader) maxBatch() int { return b.r.maxBatch() }
+
+func (b *lossyBatchReader) buffers() ([][]byte, []int) { return b.out, b.lens }
+
+func (b *lossyBatchReader) rawSource(i int) []byte {
+	if i >= 0 && i < len(b.idx) {
+		i = b.idx[i]
+	}
+	return b.r.rawSource(i)
+}
+
+func (b *lossyBatchReader) readBatch(n int) (int, error) {
+	in, inLens := b.r.buffers()
+	if n > len(in) {
+		n = len(in)
+	}
+	if len(b.out) < n {
+		b.out = make([][]byte, n)
+		for i := range b.out {
+			b.out[i] = make([]byte, MaxDatagram)
+		}
+		b.lens = make([]int, n)
+		b.idx = make([]int, n)
+	}
+	for {
+		got, err := b.r.readBatch(n)
+		if err != nil {
+			return got, err
+		}
+		kept := 0
+		for i := 0; i < got; i++ {
+			if b.conn.roll() < b.conn.drop {
+				b.conn.mu.Lock()
+				b.conn.dropped++
+				b.conn.mu.Unlock()
+				continue
+			}
+			if kept != i {
+				copy(b.out[kept], in[i][:inLens[i]])
+			} else {
+				b.out[i] = b.out[i][:cap(b.out[i])]
+				copy(b.out[i], in[i][:inLens[i]])
+			}
+			b.lens[kept] = inLens[i]
+			b.idx[kept] = i
+			kept++
+		}
+		if kept > 0 {
+			return kept, nil
+		}
+		// Everything in this batch was dropped. The caller must not see (0, nil),
+		// so read again rather than reporting an empty batch.
+	}
+}
+
 type lossyBatchWriter struct {
 	conn *lossyPacketConn
 	w    batchWriter
@@ -258,15 +348,22 @@ func newConnOn(t *testing.T, remote *net.UDPAddr, connID uint64, cfg Config) (*C
 // through a lossy wrapper on each side.
 func pair(t *testing.T, cfg Config, drop float64) (*Conn, *Conn) {
 	t.Helper()
+	return pairCfg(t, cfg, drop)
+}
+
+// pairCfg is pair for any testing.TB, so benchmarks can configure the pair
+// (pairTB cannot: it always builds a DefaultConfig pair).
+func pairCfg(tb testing.TB, cfg Config, drop float64) (*Conn, *Conn) {
+	tb.Helper()
 	const connID = 0x1122334455667788
 
 	la, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
 	lb, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
 
 	var pa, pb net.PacketConn = la, lb
@@ -280,7 +377,7 @@ func pair(t *testing.T, cfg Config, drop float64) (*Conn, *Conn) {
 
 	a := NewConn(pa, lb.LocalAddr(), connID, cfg)
 	b := NewConn(pb, la.LocalAddr(), connID, cfg)
-	t.Cleanup(func() { _ = a.Close(); _ = b.Close() })
+	tb.Cleanup(func() { _ = a.Close(); _ = b.Close() })
 	return a, b
 }
 

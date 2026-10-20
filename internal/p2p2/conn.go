@@ -118,7 +118,27 @@ type Config struct {
 	// DisableBatching forces one WriteTo per datagram. It exists for A/B
 	// measurement and as an escape hatch for a platform whose vectored send
 	// misbehaves; with it set the send path is exactly the pre-batching one.
+	//
+	// It is the send-side switch only. Receive batching has its own pair
+	// (RecvBatchSize, DisableRecvBatching) so the two directions can be measured
+	// independently.
 	DisableBatching bool
+
+	// RecvBatchSize is how many datagrams one receive syscall may carry on
+	// platforms that support a vectored receive (Linux recvmmsg, Darwin
+	// recvmsg_x). Zero means DefaultBatchSize, the same default as the send
+	// side.
+	//
+	// It is a syscall-amortisation knob like BatchSize, with one extra effect: it
+	// is also the number of datagram buffers the connection preallocates, so a
+	// connection configured for 32 holds 32 × MaxDatagram of receive space rather
+	// than growing it per call. It is capped by the platform limit.
+	RecvBatchSize int
+	// DisableRecvBatching forces one ReadFrom per datagram. It exists for A/B
+	// measurement of the receive path on its own, and as an escape hatch for a
+	// platform whose vectored receive misbehaves; with it set the read loop is
+	// exactly the pre-receive-batching one.
+	DisableRecvBatching bool
 }
 
 // DefaultBatchSize is how many datagrams one sendmmsg/sendmsg_x call carries by
@@ -149,6 +169,7 @@ func DefaultConfig() Config {
 		KeepAlivePeriod: 20 * time.Second,
 		IdleTimeout:     60 * time.Second,
 		BatchSize:       DefaultBatchSize,
+		RecvBatchSize:   DefaultBatchSize,
 	}
 }
 
@@ -193,6 +214,9 @@ func (c *Config) fill() {
 	if c.BatchSize <= 0 {
 		c.BatchSize = d.BatchSize
 	}
+	if c.RecvBatchSize <= 0 {
+		c.RecvBatchSize = d.RecvBatchSize
+	}
 	if c.IdleTimeout <= 0 {
 		c.IdleTimeout = d.IdleTimeout
 	}
@@ -214,6 +238,16 @@ type statsCounters struct {
 }
 
 func (s *statsCounters) incFailures() { s.failures.Add(1) }
+
+// recvBatchCounters counts the batched receive path. They are separate from
+// statsCounters because they are written by readLoop only, but read by Stats
+// from another goroutine, so they are still atomic.
+type recvBatchCounters struct {
+	calls   atomic.Uint64
+	packets atomic.Uint64
+	short   atomic.Uint64
+	max     int
+}
 
 // Stats is a snapshot of connection counters, for diagnostics and KPI runs.
 type Stats struct {
@@ -262,6 +296,20 @@ type Stats struct {
 	BatchSize    int
 	BatchEnabled bool
 
+	// RecvBatchCalls and RecvBatchPackets describe the batched receive path: how
+	// many recvmmsg/recvmsg_x calls the read loop made and how many datagrams
+	// they dequeued. RecvBatchEnabled is false on a platform with no vectored
+	// receive, on a socket that cannot expose a raw handle, and when the
+	// connection was built with DisableRecvBatching.
+	//
+	// A healthy batched transfer has RecvBatchPackets ≈ Recv and
+	// RecvBatchCalls ≪ RecvBatchPackets: the ratio is the syscall amortisation
+	// the receive path gained.
+	RecvBatchCalls   uint64
+	RecvBatchPackets uint64
+	RecvBatchSize    int
+	RecvBatchEnabled bool
+
 	SRTT time.Duration
 	RTO  time.Duration
 }
@@ -295,12 +343,27 @@ type Conn struct {
 	// cannot be affected by batching at all.
 	batcher atomic.Pointer[batchQueue]
 
+	// recvBatcher carries up to RecvBatchSize datagrams per receive syscall (see
+	// recvbatch.go). It is nil when the socket cannot batch or receive batching
+	// is disabled, in which case readLoop reads one datagram per call.
+	//
+	// Unlike batcher it is set once at construction and never cleared: the
+	// receive direction has no "destination the call cannot express", because a
+	// reader does not need a destination. It is a plain field for the same
+	// reason — only readLoop touches it.
+	recvBatcher batchReader
+	recvStats   *recvBatchCounters
+
 	// ackPending counts in-order data datagrams since the last ACK, and ackDue
 	// is when a partial batch must be flushed. Both are guarded by ackMu, which
 	// is never held across a write.
 	ackMu      sync.Mutex
 	ackPending int
 	ackDue     time.Time
+
+	// ackBuf is the encode buffer for a pure ACK. Guarded by writeMu, which
+	// sendAckNow holds across both the encode and the write.
+	ackBuf [commonHeaderSize + maxAckBlockSize]byte
 
 	// sendMu serialises Send: msgID order must match call order, and the peer
 	// layer sends one frame at a time. It also keeps the ACK-field patching of
@@ -350,6 +413,16 @@ func NewConn(pc net.PacketConn, remote net.Addr, connID uint64, cfg Config) *Con
 			if q := newBatchQueue(&cappedWriter{w: w, max: cfg.BatchSize}); q != nil {
 				c.batcher.Store(q)
 			}
+		}
+	}
+
+	// Same decision, other direction. The reader owns its datagram buffers, so it
+	// is sized by the configured depth; a nil reader means the read loop uses
+	// ReadFrom, one datagram per call.
+	if !cfg.DisableRecvBatching {
+		if r := receiverFor(pc, cfg.RecvBatchSize); r != nil {
+			c.recvBatcher = r
+			c.recvStats = &recvBatchCounters{max: r.maxBatch()}
 		}
 	}
 
@@ -745,7 +818,24 @@ func (c *Conn) writeLocked(b []byte) {
 }
 
 // readLoop turns datagrams into state changes.
+//
+// The batched path and the per-datagram path share everything after the read:
+// handleDatagram is the same function for both, so batching cannot change what
+// a datagram means. The only difference is how many arrive per syscall, and
+// that they arrive in the order the kernel dequeued them, which is the order
+// they were sent on a FIFO path and the order they arrived on any path.
 func (c *Conn) readLoop() {
+	if c.recvBatcher != nil {
+		c.readLoopBatched()
+		return
+	}
+	c.readLoopSingle()
+}
+
+// readLoopSingle is the pre-receive-batching path: one ReadFrom per datagram.
+// It is also the fallback on platforms with no vectored receive, and the
+// reference the batched path is compared against.
+func (c *Conn) readLoopSingle() {
 	buf := make([]byte, MaxDatagram)
 	for {
 		n, addr, err := c.pc.ReadFrom(buf)
@@ -755,34 +845,120 @@ func (c *Conn) readLoop() {
 			}
 			return
 		}
-		p, perr := decodePacket(buf[:n])
-		if perr != nil || p.connID != c.connID {
-			continue // stray traffic on the port
+		// Follow a source that differs from the current remote, and skip the lock
+		// when it does not. sameAddr is the allocation-free form of the
+		// addr.String() comparison this path used before; the semantics are
+		// identical.
+		if addr != nil && sameAddr(addr, c.remoteAddr()) {
+			addr = nil
 		}
-		c.stats.recv.Add(1)
-		c.lastRecv.Store(time.Now().UnixNano())
-
-		// The peer's address can differ from the one dialled (normal for
-		// symmetric NATs on the first reply). Follow it so ACKs go back the way
-		// the data came.
-		if addr != nil && addr.String() != c.remoteAddr().String() {
-			c.SetRemote(addr)
-		}
-
-		switch p.typ {
-		case pktData:
-			c.handleData(p)
-		case pktAck:
-			c.handleAck(p)
-		case pktPing:
-			c.writeControl(pktPong)
-		case pktPong:
-			// liveness already recorded above
-		case pktFin:
-			c.closeWith(ErrClosed)
+		if !c.handleDatagram(buf[:n], addr) {
 			return
 		}
 	}
+}
+
+// readLoopBatched dequeues up to RecvBatchSize datagrams per syscall.
+//
+// The buffers belong to the reader and are reused for the life of the
+// connection. That is safe because handleDatagram consumes each datagram
+// completely before the next is looked at: it decodes the header, copies the
+// payload into reassembly state, and never retains the slice. The packet
+// struct's payload aliases the buffer, and nothing outside handleData/handleAck
+// keeps a packet.
+//
+// A short return (fewer datagrams than the batch could hold) is not an error
+// and needs no retry: it just means the socket queue was shallower than the
+// batch, and the next call picks up whatever arrives next. Processing stops at
+// the returned count, so a stale length in the tail of the array can never be
+// read as a datagram.
+func (c *Conn) readLoopBatched() {
+	depth := c.recvBatcher.maxBatch()
+	if depth < 1 {
+		depth = 1
+	}
+	var src srcTracker
+
+	for {
+		got, err := c.recvBatcher.readBatch(depth)
+		if err != nil {
+			if !c.closed.Load() {
+				c.closeWith(fmt.Errorf("p2p2: read: %w", err))
+			}
+			return
+		}
+		if got <= 0 {
+			// The reader contract forbids this; treat it as fatal rather than
+			// spinning on a call that reports nothing.
+			c.closeWith(fmt.Errorf("p2p2: read: %w", errBatchRecvStalled))
+			return
+		}
+		// Taken after the read, not before: a wrapping reader may build its
+		// output buffers lazily, and a reader is allowed to hand back a
+		// different buffer set for a different depth.
+		bufs, lens := c.recvBatcher.buffers()
+		if got > len(bufs) || got > len(lens) {
+			c.closeWith(fmt.Errorf("p2p2: read: reader reported %d datagrams but holds %d buffers", got, len(bufs)))
+			return
+		}
+		if c.recvStats != nil {
+			c.recvStats.calls.Add(1)
+			c.recvStats.packets.Add(uint64(got))
+			if got < depth {
+				c.recvStats.short.Add(1)
+			}
+		}
+
+		// Read the current remote once per batch, not once per datagram: the
+		// common case is that no datagram in the batch changes it.
+		cur := c.remoteAddr()
+		for i := 0; i < got; i++ {
+			var addr net.Addr
+			if a, ok := src.changed(c.recvBatcher.rawSource(i), cur); ok {
+				addr = a
+				cur = a
+			}
+			if !c.handleDatagram(bufs[i][:lens[i]], addr) {
+				return
+			}
+		}
+	}
+}
+
+// handleDatagram applies one datagram to connection state. It returns false when
+// the connection ended and the read loop must stop.
+//
+// addr is non-nil only when the source of this datagram differs from the
+// connection's current remote; that is the read path's existing "follow the
+// peer" behaviour, decided by the caller so both read paths share it.
+func (c *Conn) handleDatagram(b []byte, addr net.Addr) bool {
+	p, perr := decodePacket(b)
+	if perr != nil || p.connID != c.connID {
+		return true // stray traffic on the port
+	}
+	c.stats.recv.Add(1)
+	c.lastRecv.Store(time.Now().UnixNano())
+
+	// The peer's address can differ from the one dialled (normal for symmetric
+	// NATs on the first reply). Follow it so ACKs go back the way the data came.
+	if addr != nil {
+		c.SetRemote(addr)
+	}
+
+	switch p.typ {
+	case pktData:
+		c.handleData(p)
+	case pktAck:
+		c.handleAck(p)
+	case pktPing:
+		c.writeControl(pktPong)
+	case pktPong:
+		// liveness already recorded above
+	case pktFin:
+		c.closeWith(ErrClosed)
+		return false
+	}
+	return true
 }
 
 func (c *Conn) handleData(p packet) {
@@ -861,12 +1037,17 @@ func (c *Conn) flushAck() {
 
 // sendAckNow emits an ACK unconditionally. It is the only place that builds one,
 // so the ACK format and the state it reports cannot drift apart.
+//
+// The buffer is a field rather than a local: it is passed to net.PacketConn's
+// WriteTo through an interface, which makes a local array escape and cost one
+// allocation per ACK (measured: 40k allocations per 800 transfers, 4% of the
+// transfer's total). The field is safe because it is only touched under writeMu,
+// which is held across the encode and the write.
 func (c *Conn) sendAckNow() {
 	c.writeMu.Lock()
 	ack := c.rcv.ackSnapshot()
-	var buf [commonHeaderSize + maxAckBlockSize]byte
-	n := encodeAck(buf[:], c.connID, &ack)
-	c.writeLocked(buf[:n])
+	n := encodeAck(c.ackBuf[:], c.connID, &ack)
+	c.writeLocked(c.ackBuf[:n])
 	c.writeMu.Unlock()
 }
 
@@ -991,6 +1172,13 @@ func (c *Conn) Stats() Stats {
 	s.BatchPackets = bs.packets
 	s.BatchSize = bs.max
 	s.BatchEnabled = bs.enabled
+
+	if rs := c.recvStats; rs != nil {
+		s.RecvBatchCalls = rs.calls.Load()
+		s.RecvBatchPackets = rs.packets.Load()
+		s.RecvBatchSize = rs.max
+		s.RecvBatchEnabled = c.recvBatcher != nil
+	}
 	return s
 }
 
