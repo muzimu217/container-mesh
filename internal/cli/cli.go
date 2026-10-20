@@ -109,6 +109,7 @@ type commonFlags struct {
 	name       string
 	pairWindow time.Duration
 	p2p        bool
+	p2pLegacy  bool
 	stun       string
 	expectSAS  string
 }
@@ -129,7 +130,10 @@ func addCommon(fs *flag.FlagSet, cf *commonFlags) {
 	// relay bandwidth or the extra RTT is the binding constraint, which needs
 	// a real wide-area link to evaluate.
 	fs.BoolVar(&cf.p2p, "p2p", false,
-		"try a direct UDP path before using the relay (experimental: slower on fast links)")
+		"try a direct UDP path (QUIC) before using the relay")
+	fs.BoolVar(&cf.p2pLegacy, "p2p-legacy", false,
+		"use the built-in reliability layer instead of QUIC for the direct path "+
+			"(kept for comparison; it loses messages under packet loss)")
 	fs.StringVar(&cf.stun, "stun", "",
 		"comma-separated STUN servers for candidate discovery (default: built-in list)")
 	fs.StringVar(&cf.expectSAS, "expect-sas", "",

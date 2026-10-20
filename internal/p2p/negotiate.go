@@ -27,6 +27,12 @@ type Signaller interface {
 type Result struct {
 	// Conn is the direct transport, nil when punching failed.
 	Conn *Conn
+	// Socket is the UDP socket hole punching used. It is returned so a caller
+	// can run a different transport (QUIC) on the same NAT mapping instead of
+	// the built-in one. Ownership passes to the caller when Conn is nil.
+	Socket net.PacketConn
+	// Remote is the address that answered the punch.
+	RemoteAddr *net.UDPAddr
 	// Remote is the address that answered.
 	Remote *net.UDPAddr
 	// RTT is the measured direct round trip.
@@ -199,17 +205,22 @@ func Negotiate(ctx context.Context, sig Signaller, opts Options) (*Result, error
 	// reader must block indefinitely.
 	_ = udp.SetReadDeadline(time.Time{})
 
+	// Build the built-in transport as well: --p2p-legacy uses it, and the QUIC
+	// path ignores it (the caller closes it).
 	conn := NewConn(udp, punch.Remote, connID, DefaultConfig())
+
 	opts.Logger.Info("p2p path established",
 		"remote", punch.Remote.String(),
 		"rtt", punch.RTT.Round(time.Millisecond).String(),
 		"candidates", len(gathered.Candidates))
 
 	return &Result{
-		Conn:   conn,
-		Remote: punch.Remote,
-		RTT:    punch.RTT,
-		Tried:  punchTried(punch),
+		Conn:       conn,
+		Socket:     udp,
+		RemoteAddr: punch.Remote,
+		Remote:     punch.Remote,
+		RTT:        punch.RTT,
+		Tried:      punchTried(punch),
 	}, nil
 }
 

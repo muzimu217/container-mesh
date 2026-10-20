@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/muzimu217/container-mesh/internal/p2p"
+	"github.com/muzimu217/container-mesh/internal/p2pquic"
 	"github.com/muzimu217/container-mesh/internal/peer"
 	"github.com/muzimu217/container-mesh/internal/secure"
 	"github.com/muzimu217/container-mesh/internal/wire"
@@ -53,6 +54,13 @@ type NodeConfig struct {
 	// P2P controls direct-path negotiation. When enabled, peers try to punch
 	// through their NATs and, on success, move the data plane off the relay.
 	P2P p2p.Options
+	// P2PLegacy uses the built-in reliability layer instead of QUIC for the
+	// direct path.
+	//
+	// It is kept because it has no third-party dependency, but it is not the
+	// default: under packet loss it can drop a message and deliver the next one
+	// in its place (measured with 20 messages at 10% loss).
+	P2PLegacy bool
 	// ExpectSAS, when non-empty, aborts the session unless the peer derives
 	// the same 6-digit short authentication string.
 	//
@@ -354,18 +362,66 @@ func (n *Node) negotiator() peer.Negotiator {
 			n.status("p2p-failed", err.Error())
 			return fmt.Errorf("p2p negotiation failed: %w", err)
 		}
-		if res == nil || res.Conn == nil {
+		if res == nil {
+			n.status("p2p-relay", "negotiation returned nothing")
+			return nil
+		}
+		if n.cfg.P2PLegacy {
+			// Built-in transport: Negotiate already produced it.
+			if res.Conn == nil {
+				n.status("p2p-relay", res.Describe())
+				return nil
+			}
+			if err := s.UpgradeToDirect(res.Conn); err != nil {
+				n.status("p2p-upgrade-failed", err.Error())
+				_ = res.Conn.Close()
+				return nil
+			}
+			n.status("p2p-direct", res.Describe()+" (legacy transport)")
+			return nil
+		}
+		if res.Socket == nil {
 			n.status("p2p-relay", res.Describe())
 			return nil
 		}
-		if err := s.UpgradeToDirect(res.Conn); err != nil {
-			n.status("p2p-upgrade-failed", err.Error())
-			_ = res.Conn.Close()
+
+		// Hole punching succeeded: run QUIC on the socket that just opened the
+		// NAT mapping, instead of the built-in reliability layer (which loses
+		// messages under loss — measured 20 messages at 10% loss, message 8
+		// dropped and 9 delivered in its place).
+		quicRes, qerr := n.bringUpQUIC(res)
+		if qerr != nil {
+			n.status("p2p-quic-failed", qerr.Error())
+			_ = res.Socket.Close()
 			return nil
 		}
-		n.status("p2p-direct", res.Describe())
+		if quicRes == nil || quicRes.Conn == nil {
+			n.status("p2p-relay", quicRes.Describe())
+			_ = res.Socket.Close()
+			return nil
+		}
+		if err := s.UpgradeToDirect(quicRes.Conn); err != nil {
+			n.status("p2p-upgrade-failed", err.Error())
+			_ = quicRes.Conn.Close()
+			return nil
+		}
+		n.status("p2p-direct", quicRes.Describe())
 		return nil
 	}
+}
+
+// bringUpQUIC starts QUIC on the punched socket.
+//
+// Which side dials and which listens is decided by the role: A dials, B
+// listens. Both already know the peer's address from the punch result.
+func (n *Node) bringUpQUIC(res *p2p.Result) (*p2pquic.Result, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	if n.cfg.Role == secure.RoleA {
+		return p2pquic.DialWithSocket(ctx, res.Socket, res.RemoteAddr, 12*time.Second)
+	}
+	return p2pquic.ListenOnSocket(ctx, res.Socket, res.RemoteAddr, 12*time.Second)
 }
 
 // handler builds the read-pump dispatch for every session this node owns.
