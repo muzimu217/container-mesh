@@ -20,9 +20,10 @@
 //
 // The reliability core follows KCP (cumulative una + selective ACK + fast
 // retransmit + RFC 6298 RTO), the message header follows ENet's fragment
-// header, and loss detection follows RFC 9002's packet threshold. Congestion
-// control, multiplexing, connection migration and FEC are out of scope: the
-// peer layer paces itself and the direct path carries one byte pipe.
+// header, loss detection follows RFC 9002's packet threshold, and the send
+// window is driven by a simplified Reno controller (see cc.go). Multiplexing,
+// connection migration and FEC are out of scope: the peer layer paces itself
+// and the direct path carries one byte pipe.
 //
 // The layer above (peer.Session) decrypts with a monotonically increasing
 // counter, so out-of-order delivery there is a hard protocol error, not a
@@ -45,7 +46,18 @@ type Config struct {
 	// both memory and the burst size; without a bound, a 512 KiB message would
 	// push 450 datagrams into the socket at once and overflow the receive
 	// buffer, which is indistinguishable from loss.
+	//
+	// Since congestion control exists this is the *ceiling*, not the operating
+	// window: the congestion window starts at 10 and grows towards this value as
+	// the path acknowledges data. Set DisableCongestionControl to get the old
+	// fixed-window behaviour back.
 	SendWindow int
+	// DisableCongestionControl turns off the Reno controller, restoring the fixed
+	// SendWindow as the operating window. It exists for A/B measurement and as an
+	// escape hatch: on a path with no congestion to speak of (a private link, a
+	// loopback benchmark) the controller can only cost throughput, because there
+	// is nothing for it to adapt to. Default is enabled.
+	DisableCongestionControl bool
 	// RecvWindow bounds how many incomplete messages may be tracked. A msgID
 	// this far ahead of the delivery point is dropped, which keeps the
 	// reassembly table bounded no matter what the peer sends.
@@ -92,7 +104,33 @@ type Config struct {
 	// long. It must exceed KeepAlivePeriod, otherwise a healthy idle connection
 	// times itself out.
 	IdleTimeout time.Duration
+
+	// BatchSize is how many datagrams one send syscall may carry on platforms
+	// that support a vectored send (Linux sendmmsg, Darwin sendmsg_x). Zero
+	// means DefaultBatchSize.
+	//
+	// The value is a syscall-amortisation knob, not a protocol parameter: the
+	// datagrams are identical, they leave in the same order, and a short send is
+	// retried for the tail, so nothing about delivery changes. It is capped by
+	// the platform limit (1024 on both) and by the number of fragments a Send has
+	// ready.
+	BatchSize int
+	// DisableBatching forces one WriteTo per datagram. It exists for A/B
+	// measurement and as an escape hatch for a platform whose vectored send
+	// misbehaves; with it set the send path is exactly the pre-batching one.
+	DisableBatching bool
 }
+
+// DefaultBatchSize is how many datagrams one sendmmsg/sendmsg_x call carries by
+// default.
+//
+// Chosen by measurement, not by feel: 8/16/32/64 were swept on 512 KiB at 0%
+// loss (KPI.md round 11). Throughput is flat from 16 upward because the win is
+// per-syscall and 16 datagrams already amortise it to within noise. 32 is taken
+// over 16 because it halves the syscall count again at no measured cost, and
+// over 64 because a batch holds its datagrams until it fills or Send ends, so a
+// larger batch adds latency to the front of a message for no gain.
+const DefaultBatchSize = 32
 
 // DefaultConfig returns production defaults.
 func DefaultConfig() Config {
@@ -110,6 +148,7 @@ func DefaultConfig() Config {
 		AckInterval:     2 * time.Millisecond,
 		KeepAlivePeriod: 20 * time.Second,
 		IdleTimeout:     60 * time.Second,
+		BatchSize:       DefaultBatchSize,
 	}
 }
 
@@ -151,6 +190,9 @@ func (c *Config) fill() {
 	if c.KeepAlivePeriod <= 0 {
 		c.KeepAlivePeriod = d.KeepAlivePeriod
 	}
+	if c.BatchSize <= 0 {
+		c.BatchSize = d.BatchSize
+	}
 	if c.IdleTimeout <= 0 {
 		c.IdleTimeout = d.IdleTimeout
 	}
@@ -190,6 +232,18 @@ type Stats struct {
 
 	// InFlight is the number of unacknowledged datagrams.
 	InFlight int
+	// Cwnd is the congestion window in datagrams, Ssthresh its slow-start
+	// threshold, and SendWindow the configured ceiling. All three are reported so
+	// a KPI run can see whether the sender was limited by the path (cwnd below
+	// the ceiling) or by its own configuration.
+	Cwnd       int
+	Ssthresh   int
+	SendWindow int
+	// CCEnabled reports whether the congestion controller is active, and
+	// CCReductions how many times it has reduced the window. Reductions counts
+	// congestion *events*, not lost datagrams.
+	CCEnabled    bool
+	CCReductions uint64
 	// ReasmEntries and ReasmBytes describe the reassembly table.
 	ReasmEntries int
 	ReasmBytes   int
@@ -197,6 +251,16 @@ type Stats struct {
 	// fragments discarded as duplicates or out of window.
 	Delivered uint64
 	Dropped   uint64
+
+	// BatchCalls and BatchPackets describe the batched send path: how many
+	// sendmmsg/sendmsg_x calls were made and how many datagrams they carried.
+	// Batching is unavailable (BatchEnabled false) when the platform has no
+	// vectored send, the socket is not a *net.UDPConn, or the connection was
+	// built with DisableBatching.
+	BatchCalls   uint64
+	BatchPackets uint64
+	BatchSize    int
+	BatchEnabled bool
 
 	SRTT time.Duration
 	RTO  time.Duration
@@ -218,6 +282,18 @@ type Conn struct {
 	done  chan struct{}
 	// closed is set exactly once, by closeWith.
 	closed atomic.Bool
+
+	// batcher carries the first transmission of a message in syscall-sized
+	// batches (see batch.go). It holds nil when the socket cannot batch or
+	// batching is disabled, in which case the send path writes one datagram per
+	// call.
+	//
+	// It is an atomic pointer, not a plain field, because it can be cleared at
+	// runtime (a destination the vectored call cannot express switches batching
+	// off) while Stats reads it from another goroutine. Only Send writes it, and
+	// the retransmission paths deliberately never touch it, so loss recovery
+	// cannot be affected by batching at all.
+	batcher atomic.Pointer[batchQueue]
 
 	// ackPending counts in-order data datagrams since the last ACK, and ackDue
 	// is when a partial batch must be flushed. Both are guarded by ackMu, which
@@ -265,6 +341,17 @@ func NewConn(pc net.PacketConn, remote net.Addr, connID uint64, cfg Config) *Con
 	c.rcv = newReceiver(connID, cfg.RecvWindow, cfg.MaxReasmBytes, c.deliver)
 	c.snd = newSender(cfg, c.stats, c.closeWith)
 	c.lastRecv.Store(time.Now().UnixNano())
+
+	// Decide batching once. A socket that cannot batch, or a connection with
+	// batching disabled, leaves c.batcher nil and the send path writes one
+	// datagram per call — the pre-batching behaviour, through the same code.
+	if !cfg.DisableBatching {
+		if w := senderFor(pc); w != nil {
+			if q := newBatchQueue(&cappedWriter{w: w, max: cfg.BatchSize}); q != nil {
+				c.batcher.Store(q)
+			}
+		}
+	}
 
 	// The kernel's default receive buffer holds only a few hundred of our
 	// 1200-byte datagrams while the send window allows 1024 in flight. A burst
@@ -317,11 +404,72 @@ func (c *Conn) Send(msg []byte) error {
 	msgID := c.allocMsgID()
 	out := &outMessage{remaining: int32(frags), done: make(chan struct{})}
 
+	// The batch is a run of consecutive fragments of this one message. It is
+	// flushed whenever it fills, whenever the window or the pacer says stop, and
+	// once more after the last fragment. Every datagram in it is encoded before
+	// the syscall, so a full batch costs one sendmmsg instead of one sendto per
+	// datagram — the change that takes the transfer off the syscall floor.
+	//
+	// Ordering is preserved by construction: fragments are encoded and appended
+	// in index order, and sendmmsg/sendmsg_x transmit the array in order. A short
+	// return re-submits the tail (see batchQueue.write), so a partially sent batch
+	// never reorders and never drops.
+	q := c.batcher.Load()
+	limit := q.limit()
+	var batch [][]byte
+	var batchPkts []*outPacket
+	if q != nil {
+		n := limit
+		if n > frags {
+			n = frags
+		}
+		batch = make([][]byte, 0, n)
+		batchPkts = make([]*outPacket, 0, n)
+	}
+
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		err := c.writeBatchData(q, batch, batchPkts)
+		batch = batch[:0]
+		batchPkts = batchPkts[:0]
+		return err
+	}
+
 	for i := 0; i < frags; i++ {
 		lo := i * MaxPayload
 		hi := lo + MaxPayload
 		if hi > len(msg) {
 			hi = len(msg)
+		}
+
+		// Flush a pending batch before blocking on the window, never after.
+		//
+		// A datagram in the batch already holds a sequence number and is counted
+		// in inFlight, but the peer has not seen it and nothing writes it until the
+		// batch fills. If the window is smaller than the batch limit the batch can
+		// never fill, so blocking here with a non-empty batch deadlocks the send
+		// path: the window cannot free because the datagrams that would free it
+		// are sitting in the buffer, and only the RTO timer eventually writes
+		// them.
+		//
+		// That is not hypothetical. The congestion window starts at 10 and the
+		// default batch limit is 32, so a congestion-controlled transfer that
+		// batched before waiting sent its first ten fragments and then waited out
+		// an RTO for every following group of ten: measured at 0.02 MiB/s on a
+		// simulated 4 MB/s link, against 0.6 MiB/s with the fixed window.
+		//
+		// The check is "would block", not "flush every time". Flushing
+		// unconditionally is correct but throws away batching: with a window of 10
+		// and a limit of 32 the batch would be written every ten datagrams, which
+		// is still an improvement over one syscall each but far below what the
+		// batching exists for. So the batch is flushed only when the window is
+		// full, which is exactly when waiting would deadlock.
+		if !c.snd.hasWindowRoom() {
+			if err := flush(); err != nil {
+				return c.err()
+			}
 		}
 
 		if !c.snd.waitForWindow(c.done) {
@@ -342,6 +490,17 @@ func (c *Conn) Send(msg []byte) error {
 		c.snd.enqueueLocked(p)
 		c.snd.mu.Unlock()
 
+		if q != nil {
+			batch = append(batch, data)
+			batchPkts = append(batchPkts, p)
+			if len(batch) >= limit {
+				if err := flush(); err != nil {
+					return c.err()
+				}
+			}
+			continue
+		}
+
 		// writeData refines the timestamp taken at enqueue. The enqueue stamp
 		// exists so the timer tick can never observe a packet with a zero
 		// send time; this one accounts for the time spent waiting here, which
@@ -349,6 +508,9 @@ func (c *Conn) Send(msg []byte) error {
 		// buffer and a stale timestamp makes the packet look overdue the instant
 		// it leaves.
 		c.writeData(data, p)
+	}
+	if err := flush(); err != nil {
+		return c.err()
 	}
 
 	select {
@@ -477,6 +639,89 @@ func (c *Conn) writeData(b []byte, p *outPacket) {
 	}
 	c.writeLocked(b)
 	c.writeMu.Unlock()
+}
+
+// writeBatchData transmits a run of encoded data datagrams in one syscall,
+// patching the current ACK state into each and stamping every packet's send
+// time.
+//
+// The whole run is patched under one hold of writeMu, which is what keeps the
+// ACK state consistent across the batch: a retransmission on another goroutine
+// cannot slip between two datagrams of the same batch and give the peer a
+// batch whose members report different receive windows. The datagrams carry
+// the same ACK block, so patching once and copying would be equivalent, but
+// patching each buffer in place avoids a copy per datagram.
+//
+// Timestamps are taken after the patch and before the syscall. They are all
+// within microseconds of each other, and every one of them precedes the moment
+// the kernel actually transmits, which is the safe direction for an RTO: a
+// stamp taken after the write would make a datagram look younger than it is.
+func (c *Conn) writeBatchData(q *batchQueue, bs [][]byte, ps []*outPacket) error {
+	if q == nil || c.batcher.Load() == nil {
+		// Batching was switched off at runtime (the destination is not an address
+		// family the vectored call can express). Fall back to one datagram per
+		// write rather than failing: the caller's fragments are already in the send
+		// queue and must reach the peer.
+		for i, b := range bs {
+			var p *outPacket
+			if i < len(ps) {
+				p = ps[i]
+			}
+			c.writeData(b, p)
+			if c.closed.Load() {
+				return c.err()
+			}
+		}
+		return nil
+	}
+
+	c.writeMu.Lock()
+	ack := c.rcv.ackSnapshot()
+	now := time.Now()
+	for i, b := range bs {
+		patchAck(b, &ack)
+		if i < len(ps) && ps[i] != nil {
+			p := ps[i]
+			c.snd.mu.Lock()
+			p.sentAt = now
+			if p.rto == 0 {
+				p.rto = c.snd.rto()
+			}
+			c.snd.mu.Unlock()
+		}
+	}
+	err := c.writeBatchLocked(q, bs)
+	c.writeMu.Unlock()
+	return err
+}
+
+// writeBatchLocked performs the batched syscall. The caller holds writeMu.
+//
+// A batch is atomic from the caller's point of view: either it was submitted
+// and every datagram in it left, or the connection is failed. There is no
+// partial-success return, because a caller that had to reason about "some of
+// these went out" would have to re-derive which ones, and the send queue
+// already knows — those datagrams are in flight and the loss detector owns
+// them. That is also why a write error fails the connection here exactly as it
+// does on the single-datagram path: a UDP write error means the socket is gone.
+func (c *Conn) writeBatchLocked(q *batchQueue, bs [][]byte) error {
+	if len(bs) == 0 {
+		return nil
+	}
+	c.lastSend.Store(time.Now().UnixNano())
+	if err := q.write(bs, c.remoteAddr()); err != nil {
+		// A destination the batched call cannot express is not a socket failure:
+		// disable batching and let the next flush take the per-datagram path.
+		// Any other error is fatal, as on the single-datagram path.
+		if errors.Is(err, errBatchUnsupported) {
+			c.batcher.Store(nil)
+			return nil
+		}
+		c.closeWith(fmt.Errorf("p2p2: write: %w", err))
+		return err
+	}
+	c.stats.sent.Add(uint64(len(bs)))
+	return nil
 }
 
 // write transmits a datagram whose encoding is complete.
@@ -717,9 +962,14 @@ func (c *Conn) keepAliveLoop() {
 func (c *Conn) Stats() Stats {
 	c.snd.mu.Lock()
 	s := Stats{
-		InFlight: c.snd.inFlight,
-		SRTT:     c.snd.srtt,
-		RTO:      c.snd.rto(),
+		InFlight:     c.snd.inFlight,
+		Cwnd:         c.snd.cc.window(),
+		Ssthresh:     c.snd.cc.threshold(),
+		SendWindow:   c.snd.cc.max,
+		CCEnabled:    c.snd.cc.enabled,
+		CCReductions: c.snd.cc.reductions,
+		SRTT:         c.snd.srtt,
+		RTO:          c.snd.rto(),
 	}
 	c.snd.mu.Unlock()
 
@@ -735,6 +985,12 @@ func (c *Conn) Stats() Stats {
 	s.RTOTimeouts = c.stats.rtoFires.Load()
 	s.FastRetrans = c.stats.fastFires.Load()
 	s.Failures = c.stats.failures.Load()
+
+	bs := c.batcher.Load().snapshot()
+	s.BatchCalls = bs.calls
+	s.BatchPackets = bs.packets
+	s.BatchSize = bs.max
+	s.BatchEnabled = bs.enabled
 	return s
 }
 

@@ -61,7 +61,17 @@ type outPacket struct {
 	rto           time.Duration
 	attempts      int
 	retransmitted bool // Karn's rule: never take an RTT sample from these
-	lost          bool // already declared lost; the RTO timer owns it now
+	// clockSkipped marks a packet whose timer was pushed forward without being
+	// retransmitted (timeoutScan's "queued behind the head" case). Its sentAt is
+	// a later time than the datagram actually left, so an ACK for it measures
+	// less than the true round trip. Karn's rule covers retransmissions; this
+	// covers the other way sentAt stops being the departure time. Without it a
+	// push-forward produces a microsecond "RTT" sample that drags minRTT down to
+	// nothing, which then collapses the reordering window and the retransmit
+	// throttle — measured as a 2 MiB transfer failing with ErrPeerUnreachable on
+	// a simulated 8 MB/s, 40 ms path.
+	clockSkipped bool
+	lost         bool // already declared lost; the RTO timer owns it now
 	// lostAtAcked is largestAcked at the moment this packet was last declared
 	// lost. A packet may only be re-declared once the peer has acknowledged
 	// something *newer* than that, because otherwise nothing has changed since
@@ -86,6 +96,11 @@ type sender struct {
 	nextSeq   uint32
 	nextMsgID uint32
 	inFlight  int
+
+	// cc is the congestion controller. It decides how many of the configured
+	// SendWindow datagrams may actually be in flight; the configured window stays
+	// the ceiling so memory and burst size remain bounded exactly as before.
+	cc *congestion
 
 	// largestAcked is the highest sequence number the peer has reported
 	// receiving, and haveAck says whether that is meaningful yet.
@@ -161,6 +176,7 @@ func newSender(cfg Config, stats *statsCounters, onFail func(error)) *sender {
 		cfg:        cfg,
 		stats:      stats,
 		onFail:     onFail,
+		cc:         newCongestion(cfg),
 		windowFree: make(chan struct{}, 1),
 	}
 }
@@ -224,6 +240,7 @@ func (s *sender) observeRTT(sample time.Duration) {
 	if s.srtt == 0 {
 		s.srtt = sample
 		s.rttvar = sample / 2
+		s.cc.srtt = s.srtt
 		return
 	}
 	diff := s.srtt - sample
@@ -232,17 +249,22 @@ func (s *sender) observeRTT(sample time.Duration) {
 	}
 	s.rttvar = (3*s.rttvar + diff) / 4
 	s.srtt = (7*s.srtt + sample) / 8
+	s.cc.srtt = s.srtt
 }
 
 // paceFor returns how long the caller should wait before sending one more
 // datagram, so that a full window is spread over one round trip.
 //
-// The value is the per-datagram slot: minRTT divided by the window. With the
-// default 1024-packet window and a 50µs loopback RTT that is 49ns — below the
-// cost of the write itself, so on loopback pacing is a no-op and full speed is
-// preserved. On a 20ms path it becomes 20µs, which still allows 50k datagrams
-// per second, far above any real link's capacity. Pacing therefore only bites
-// where it must: when the sender would otherwise outrun the path.
+// The value is the per-datagram slot: minRTT divided by the effective window.
+// The effective window is the congestion window, not the configured ceiling:
+// the rate a CC-controlled sender may use is cwnd per round trip by definition,
+// so pacing at the ceiling while cwnd is small would let a burst outrun what the
+// controller has authorised and re-create the queue the controller exists to
+// avoid. With the ceiling (1024) and a 50µs loopback RTT the slot is 49ns —
+// below the cost of the write itself, so on loopback pacing is a no-op and full
+// speed is preserved. On a 20ms path it becomes 20µs, which still allows 50k
+// datagrams per second, far above any real link's capacity. Pacing therefore
+// only bites where it must: when the sender would otherwise outrun the path.
 func (s *sender) paceFor() time.Duration {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -254,7 +276,7 @@ func (s *sender) paceLocked() time.Duration {
 	if rtt == 0 {
 		return 0
 	}
-	d := rtt / time.Duration(s.cfg.SendWindow)
+	d := rtt / time.Duration(s.cc.window())
 	// Below a microsecond the spacing is indistinguishable from noise and the
 	// timer would cost more than it saves.
 	if d < time.Microsecond {
@@ -297,14 +319,25 @@ func (s *sender) waitPacing(done <-chan struct{}) bool {
 			return true
 		}
 		deficit := s.nextSend.Sub(now)
-		s.nextSend = s.nextSend.Add(slot)
-		s.mu.Unlock()
-
 		if deficit < minPaceSleep {
-			// The debt is below the cost of a wakeup. Carry it: the following
-			// packets push nextSend further ahead until sleeping is worth it.
+			// The debt is below the cost of a wakeup. Carry it: advance the
+			// schedule by one slot without sleeping, so the following packets
+			// push nextSend further ahead until sleeping is worth it.
+			s.nextSend = s.nextSend.Add(slot)
+			s.mu.Unlock()
 			return true
 		}
+		// Do NOT advance the schedule here. nextSend is the time the next
+		// datagram becomes allowed; sleeping until it and then also pushing it
+		// forward by a slot means the loop always finds another slot of deficit
+		// and never returns. That is an infinite pacing loop, not a slow sender.
+		//
+		// It stayed hidden because the slot was below minPaceSleep in every
+		// configuration that existed: 1024 datagrams over a 50µs loopback RTT is
+		// 49ns. A small congestion window over a millisecond-scale RTT reaches the
+		// sleep branch (a 10-datagram window over 3ms is 300µs), and the transfer
+		// then hangs instead of pacing.
+		s.mu.Unlock()
 
 		t := time.NewTimer(deficit)
 		select {
@@ -373,12 +406,16 @@ func (s *sender) allocSeq() uint32 {
 	return seq
 }
 
-// waitForWindow blocks until fewer than SendWindow packets are in flight. It
-// returns false when the connection ends while waiting.
+// waitForWindow blocks until fewer than the effective window's worth of packets
+// are in flight. It returns false when the connection ends while waiting.
+//
+// The effective window is the congestion window, capped by SendWindow. With
+// congestion control disabled it is exactly SendWindow, which is the behaviour
+// before CC existed.
 func (s *sender) waitForWindow(done <-chan struct{}) bool {
 	for {
 		s.mu.Lock()
-		ok := s.inFlight < s.cfg.SendWindow
+		ok := s.inFlight < s.cc.window()
 		s.mu.Unlock()
 		if ok {
 			return true
@@ -389,6 +426,17 @@ func (s *sender) waitForWindow(done <-chan struct{}) bool {
 		case <-s.windowFree:
 		}
 	}
+}
+
+// hasWindowRoom reports whether one more datagram may be enqueued without
+// blocking. Send uses it to decide whether to flush a pending batch first: a
+// batch holds datagrams that are already counted in inFlight but have not been
+// written, so waiting with a non-empty batch is a deadlock when the window is
+// full (see the comment in Send).
+func (s *sender) hasWindowRoom() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.inFlight < s.cc.window()
 }
 
 // signalSpace releases one waiter. Non-blocking: a single token is enough,
@@ -421,6 +469,7 @@ func (s *sender) handleAck(ack ackBlock, now time.Time) ackResult {
 	var res ackResult
 	freed := false
 	cumAcked := false
+	acked := 0
 
 	// Cumulative part: a prefix of the queue, in order. Only the newest packet
 	// in the prefix yields an RTT sample: the older ones may have sat in a
@@ -435,8 +484,9 @@ func (s *sender) handleAck(ack ackBlock, now time.Time) ackResult {
 		s.removeLocked(p)
 		freed = true
 		cumAcked = true
+		acked++
 	}
-	if newestCum != nil && !newestCum.retransmitted {
+	if newestCum != nil && !newestCum.retransmitted && !newestCum.clockSkipped {
 		s.observeRTT(now.Sub(newestCum.sentAt))
 	}
 
@@ -454,13 +504,14 @@ func (s *sender) handleAck(ack ackBlock, now time.Time) ackResult {
 				newestSack = p
 				s.removeLocked(p)
 				freed = true
+				acked++
 			}
 			if seq == last {
 				break
 			}
 		}
 	}
-	if newestSack != nil && !newestSack.retransmitted {
+	if newestSack != nil && !newestSack.retransmitted && !newestSack.clockSkipped {
 		s.observeRTT(now.Sub(newestSack.sentAt))
 	}
 
@@ -479,14 +530,31 @@ func (s *sender) handleAck(ack ackBlock, now time.Time) ackResult {
 		s.ackUna, s.haveUna = ack.una, true
 	}
 
+	// Congestion accounting. Growth is applied before loss detection so that a
+	// single ACK which both acknowledges new data and reveals a hole is charged
+	// in the right order: the increase it earned is part of the window the loss
+	// then halves. A duplicate ACK (nothing new acknowledged, nothing declared
+	// lost) inflates the window during fast recovery, which is what keeps the
+	// pipe busy while the hole is repaired.
+	wake := false
+	if acked > 0 && s.cc.onAck(acked, s.largestAcked, s.haveAck) {
+		wake = true
+	}
+
 	if lost := s.detectLossLocked(now); len(lost) > 0 {
+		s.cc.onLoss(s.nextSeq, now)
 		res.retransmit = append(res.retransmit, lost...)
 		if s.failed {
 			return res
 		}
+	} else if acked == 0 && s.cc.onDupAck() {
+		wake = true
 	}
 
-	if freed {
+	// A window reduction is signalled too: waiters re-check the predicate, so a
+	// wakeup that finds less room simply parks again, while a wakeup that was
+	// missed after a recovery exit would strand Send until the next ACK.
+	if freed || wake {
 		s.signalSpace()
 	}
 	return res
@@ -583,10 +651,19 @@ func (s *sender) detectLossLocked(now time.Time) []*outPacket {
 // lossScan is the timer-side entry point for loss detection. It exists as a
 // separate method so the tick loop does not need to know about the lock
 // discipline inside the sender.
+//
+// A loss declared here is the same congestion signal as one declared on the ACK
+// path, and is charged the same way. It must be: on a burst-shaped workload most
+// holes are found by this timer, so charging only the ACK path would leave the
+// controller blind to exactly the losses it exists to react to.
 func (s *sender) lossScan(now time.Time) []*outPacket {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.detectLossLocked(now)
+	lost := s.detectLossLocked(now)
+	if len(lost) > 0 {
+		s.cc.onLoss(s.nextSeq, now)
+	}
+	return lost
 }
 
 // timeoutScan retransmits one expired packet and restarts the timers of the rest.
@@ -621,6 +698,9 @@ func (s *sender) timeoutScan(now time.Time) []*outPacket {
 	head.retransmitted = true
 	head.lost = true
 	head.sentAt = now
+	// A timeout is the strongest congestion signal available: the ACK clock has
+	// stopped, so the window is reset to the floor and slow start restarts.
+	s.cc.onRTO(s.nextSeq, now)
 	// Back off from the current estimate, scaled by this packet's attempt count,
 	// rather than doubling the stored value in place. The in-place form never
 	// recovers: a packet that needed three RTOs carries a timer eight times the
@@ -644,7 +724,12 @@ func (s *sender) timeoutScan(now time.Time) []*outPacket {
 			// Not yet known to be lost: push the timer forward instead of
 			// sending. It is most likely queued behind the head, and sending it
 			// now would duplicate a datagram the peer is about to receive.
+			//
+			// sentAt moves, so the packet may no longer be used as an RTT sample:
+			// its new sentAt is later than the moment it left, and the ACK would
+			// report a round trip shorter than the path's.
 			p.sentAt = now
+			p.clockSkipped = true
 			continue
 		}
 		// Already declared lost at least once, so its first retransmission did

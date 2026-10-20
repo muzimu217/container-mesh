@@ -89,6 +89,55 @@ func (l *lossyPacketConn) SetWriteBuffer(n int) error {
 	return nil
 }
 
+// batchWriter keeps this wrapper in front of the batched send path.
+//
+// Without it the transport would type-assert the embedded *net.UDPConn to
+// batchSender, call SyscallConn on it, and write straight to the socket —
+// bypassing WriteTo and therefore bypassing the loss injection above. Every
+// loss test would then run over a lossless path and pass for the wrong reason.
+// The wrapped writer applies the same per-datagram coin flip and reports the
+// undropped prefix, which is exactly the short-return contract the batch code
+// already has to handle.
+func (l *lossyPacketConn) batchWriter() batchWriter {
+	w := senderFor(l.PacketConn)
+	if w == nil {
+		return nil
+	}
+	return &lossyBatchWriter{conn: l, w: w}
+}
+
+type lossyBatchWriter struct {
+	conn *lossyPacketConn
+	w    batchWriter
+}
+
+func (b *lossyBatchWriter) maxBatch() int { return b.w.maxBatch() }
+
+func (b *lossyBatchWriter) writeBatch(msgs [][]byte, addr net.Addr) (int, error) {
+	// Every datagram is either dropped (and reported as sent, which is what the
+	// per-datagram WriteTo above does: a real network loses the datagram after
+	// the sender has handed it over) or written. The whole batch is therefore
+	// reported sent unless the socket itself errors, which is the same contract
+	// the platform writers have.
+	for i, m := range msgs {
+		if b.conn.roll() < b.conn.drop {
+			b.conn.mu.Lock()
+			b.conn.dropped++
+			b.conn.mu.Unlock()
+			continue
+		}
+		if _, err := b.conn.PacketConn.WriteTo(m, addr); err != nil {
+			if i == 0 {
+				return 0, err
+			}
+			// A prefix went out; report the prefix and let the caller re-submit the
+			// tail, which is the same short-return path a real sendmmsg takes.
+			return i, nil
+		}
+	}
+	return len(msgs), nil
+}
+
 // selectiveProxy forwards datagrams between two UDP sockets and drops
 // datagrams matching an exact predicate.
 //
