@@ -127,7 +127,6 @@ type Session struct {
 
 	// Outbound direction: one SendFile at a time; responses are routed here.
 	outMu      sync.Mutex
-	outbound   bool
 	outboundCh chan *wire.Frame
 
 	// Inbound direction: the transfer currently consuming chunk frames.

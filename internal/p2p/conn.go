@@ -44,7 +44,6 @@ type Conn struct {
 	srtt       time.Duration
 	rttvar     time.Duration
 	rto        time.Duration
-	lastAck    uint32
 	window     int
 	inFlight   int
 

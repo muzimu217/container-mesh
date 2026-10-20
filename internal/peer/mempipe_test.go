@@ -11,10 +11,9 @@ import (
 // memPipe is one endpoint of an in-memory message channel pair, used by tests
 // to exercise the session logic without any network.
 type memPipe struct {
-	out     chan []byte
-	in      chan []byte
-	shared  *sharedClose
-	recvErr error
+	out    chan []byte
+	in     chan []byte
+	shared *sharedClose
 }
 
 // sharedClose lets both endpoints close the same underlying channel exactly
