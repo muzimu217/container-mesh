@@ -34,9 +34,12 @@ type NodeConfig struct {
 	Name string
 	// Role is A (sender side) or B (receiver side).
 	Role secure.Role
-	// PairWindow bounds how long one relay attempt may take, including the
-	// wait for the partner to show up. After it expires the node moves to the
-	// next relay. Default 60s.
+	// PairWindow bounds how long one relay attempt may wait for the partner
+	// before moving to the next relay. Zero means "wait forever", which is
+	// what a long-lived node wants: reconnecting on a timer only kicks your
+	// own parked connection and restarts the wait from scratch.
+	//
+	// One-shot commands set a finite value so they can terminate.
 	PairWindow time.Duration
 	// OutDir receives inbound files.
 	OutDir string
@@ -96,9 +99,7 @@ type Node struct {
 
 // NewNode builds a node; Run drives it.
 func NewNode(cfg NodeConfig) *Node {
-	if cfg.PairWindow <= 0 {
-		cfg.PairWindow = 60 * time.Second
-	}
+	// PairWindow <= 0 means no deadline (see the field comment).
 	if cfg.Liveness.PingEvery == 0 {
 		cfg.Liveness = wsconn.DefaultLiveness()
 	}
@@ -289,6 +290,26 @@ func (n *Node) dialOne(ctx context.Context, relayURL string) (*peer.Session, err
 		}
 		ch <- result{s, nil}
 	}()
+
+	// A single relay with no explicit window means "park here until the peer
+	// shows up": rotating is pointless when there is nowhere to rotate to, and
+	// a timer would only kick our own parked connection. With several relays
+	// a window is still needed, or a dead relay would never be abandoned.
+	waitForever := n.cfg.PairWindow <= 0 && len(n.cfg.Relays) == 1
+	if waitForever {
+		// The connection's own keepalive is what detects a dead relay.
+		select {
+		case r := <-ch:
+			return r.sess, r.err
+		case <-ctx.Done():
+			_ = conn.Close()
+			r := <-ch
+			if r.sess != nil {
+				_ = r.sess.Close()
+			}
+			return nil, ctx.Err()
+		}
+	}
 
 	select {
 	case r := <-ch:

@@ -120,8 +120,8 @@ func addCommon(fs *flag.FlagSet, cf *commonFlags) {
 		"shared transfer code (env CMESH_CODE)")
 	fs.StringVar(&cf.name, "name", hostnameOr("peer"),
 		"name advertised to the peer")
-	fs.DurationVar(&cf.pairWindow, "pair-window", pairWindowDefault,
-		"how long one relay attempt may wait for the partner before rotating to the next relay")
+	fs.DurationVar(&cf.pairWindow, "pair-window", 0,
+		"how long to wait for the partner on one relay before trying the next (0 = wait forever; one-shot commands default to 25s)")
 	// Off by default: measured on loopback the user-space UDP path is ~16x
 	// slower than the relay path (13 MiB/s vs 256 MiB/s on a 1 GiB transfer),
 	// because it pays a syscall + AEAD operation per 1177-byte datagram while

@@ -349,14 +349,14 @@ func Punch(ctx context.Context, udp *net.UDPConn, opts PunchOptions) (*PunchResu
 					_, _ = udp.WriteToUDP(data, r.addr)
 				}
 				res.Remote = r.addr
-				res.RTT = time.Since(firstProbeOr(r.addr.String(), firstProbe, r.at))
+				res.RTT = measuredRTT(r.addr.String(), firstProbe, r.at)
 				res.Tried = append(res.Tried, PunchAttempt{
 					Addr: r.addr.String(), Kind: "stun", OK: true, RTT: res.RTT,
 				})
 				return res, nil
 			case pktPunchAck:
 				res.Remote = r.addr
-				res.RTT = time.Since(firstProbeOr(r.addr.String(), firstProbe, r.at))
+				res.RTT = measuredRTT(r.addr.String(), firstProbe, r.at)
 				res.Tried = append(res.Tried, PunchAttempt{
 					Addr: r.addr.String(), Kind: "stun", OK: true, RTT: res.RTT,
 				})
@@ -384,11 +384,18 @@ func Punch(ctx context.Context, udp *net.UDPConn, opts PunchOptions) (*PunchResu
 	}
 }
 
-func firstProbeOr(key string, m map[string]time.Time, fallback time.Time) time.Time {
-	if t, ok := m[key]; ok {
-		return t
+// measuredRTT returns the round trip to addr, or 0 when we never probed it.
+//
+// The peer sends its own punch at the same time as ours, so the first thing
+// that arrives may be its probe rather than a reply to one of ours. Timing
+// that from the arrival of an unrelated packet yields a meaningless
+// sub-millisecond figure; reporting 0 ("not measured") is honest.
+func measuredRTT(key string, probed map[string]time.Time, arrivedAt time.Time) time.Duration {
+	t, ok := probed[key]
+	if !ok {
+		return 0
 	}
-	return fallback
+	return arrivedAt.Sub(t)
 }
 
 // randomConnID returns a session identifier.

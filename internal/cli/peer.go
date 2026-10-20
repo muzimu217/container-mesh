@@ -122,7 +122,9 @@ func newNode(cf commonFlags, role secure.Role, outDir string, oneShot bool) (*No
 		// failing in about two minutes.
 		cfg.MaxConnectAttempts = 6
 		cfg.MaxTransferAttempts = 3
-		cfg.PairWindow = min(cfg.PairWindow, 25*time.Second)
+		if cfg.PairWindow <= 0 {
+			cfg.PairWindow = 25 * time.Second
+		}
 	}
 	return NewNode(cfg), nil
 }
