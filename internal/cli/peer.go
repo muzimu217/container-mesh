@@ -107,6 +107,7 @@ func newNode(cf commonFlags, role secure.Role, outDir string, oneShot bool) (*No
 		PairWindow: cf.pairWindow,
 		OutDir:     outDir,
 		P2P:        p2pOptions(cf),
+		ExpectSAS:  cf.expectSAS,
 	}
 	if oneShot {
 		// One-shot commands must terminate on their own, but must also survive

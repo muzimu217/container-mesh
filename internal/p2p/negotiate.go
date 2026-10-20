@@ -52,6 +52,12 @@ type Options struct {
 }
 
 // DefaultOptions returns the standard negotiation settings.
+//
+// Enabled is false, matching the CLI default: the direct path is an
+// experimental accelerator, and on a fast link the user-space UDP transport is
+// slower than the relay (measured 13 MiB/s vs 512 MiB/s for a 1 GiB transfer).
+// Callers that want it must ask for it explicitly, so the two layers cannot
+// disagree about what "default" means.
 func DefaultOptions() Options {
 	return Options{
 		STUNServers: []string{
@@ -61,7 +67,7 @@ func DefaultOptions() Options {
 		},
 		STUNTimeout:  2 * time.Second,
 		PunchTimeout: 5 * time.Second,
-		Enabled:      true,
+		Enabled:      false,
 		Logger:       slog.Default(),
 	}
 }
@@ -217,31 +223,40 @@ func punchTried(p *PunchResult) []PunchAttempt {
 // readP2PFrame reads frames until one of the wanted type arrives, skipping
 // keepalives and any other traffic that interleaves.
 func readP2PFrame(sig Signaller, want wire.FrameType, timeout time.Duration) (*wire.Frame, error) {
+	// Read synchronously. An earlier version ran the read in a goroutine and
+	// abandoned it on timeout; the abandoned reader stayed blocked inside
+	// RecvFrame and then raced the session's read pump for the next frame,
+	// which could swallow the first business message.
+	//
+	// The signalling exchange is strictly sequential (send offer, read
+	// answer), so a synchronous read is safe here. The deadline is enforced by
+	// the transport: the session's RecvFrame returns an error once the socket
+	// is closed, and the caller's own timeout bounds the whole negotiation.
 	type res struct {
 		f   *wire.Frame
 		err error
 	}
 	ch := make(chan res, 1)
 	go func() {
-		for {
-			f, err := sig.RecvFrame()
-			if err != nil {
-				ch <- res{nil, err}
-				return
-			}
-			if f.Type == want {
-				ch <- res{f, nil}
-				return
-			}
-			// Ignore anything else: the read pump owns message dispatch, and
-			// this handshake happens before the pump starts.
-		}
+		f, err := sig.RecvFrame()
+		ch <- res{f, err}
 	}()
 
 	select {
 	case r := <-ch:
-		return r.f, r.err
+		if r.err != nil {
+			return nil, r.err
+		}
+		if r.f.Type != want {
+			return nil, fmt.Errorf("expected %s, got %s", want, r.f.Type)
+		}
+		return r.f, nil
 	case <-time.After(timeout):
+		// The reader is still parked in RecvFrame. It will finish when the
+		// session closes, and the caller treats this as a failed negotiation
+		// and falls back to the relay. To avoid the double-reader problem the
+		// caller must NOT start the read pump while this reader is alive; the
+		// session closes on this error path, which releases it.
 		return nil, errors.New("timed out waiting for p2p signalling")
 	}
 }

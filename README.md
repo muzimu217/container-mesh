@@ -24,10 +24,16 @@
   就换下一台。国内 + 海外各部署一台，列表顺序即路由策略（见 `deploy/README.md`）。
 - **P2P 直连（实验性，默认关闭）**：加 `--p2p` 后双方尝试 UDP 打洞，成功后数据
   不再经过 relay，延迟从 2×RTT 降到 1×RTT，也不消耗 relay 带宽。打洞失败自动
-  保持 relay。**默认关闭的原因**：回环实测该用户态 UDP 路径比 relay 慢约 16 倍
-  （13 MiB/s vs 256 MiB/s），每 1177 字节一个系统调用 + 一次 AEAD，而 relay 一次
-  处理 512 KiB。它适合「relay 带宽受限或额外 RTT 是瓶颈」的场景，而这需要真实
-  广域网验证；在快速链路上不要开。
+  保持 relay。
+
+  **默认关闭的原因**：回环实测该用户态 UDP 路径比 relay 慢约 16 倍（13 MiB/s vs
+  256 MiB/s），每 1177 字节一个系统调用 + 一次 AEAD，而 relay 一次处理 512 KiB。
+  它适合「relay 带宽受限或额外 RTT 是瓶颈」的场景，而这需要真实广域网验证；在
+  快速链路上不要开。
+
+  **已知限制**（外部评审实测）：只有累积 ACK，没有 SACK 或快重传，丢包恢复要等
+  一个 RTO；`Send` 在重传 12 次后会静默放弃该帧。补齐这些属于设计级改动，在
+  「直连是否值得」被真实广域网数据回答之前不做。
 
 ---
 
@@ -116,6 +122,15 @@ go build -o cmesh ./cmd/cm
 # 或
 [cmesh] p2p-relay: p2p: direct path unavailable (hole punching failed: ...); using relay
 ```
+
+**建议用 `--expect-sas` 强制核对**（防御主动 relay 的唯一真正手段）：
+
+```bash
+# 第一次连接记下对方打印的 SAS，之后每次都强制比对
+./cmesh recv --code "..." --expect-sas 418302
+```
+
+不一致会直接中止会话并提示 `possible active relay or wrong code`。
 
 `SAS` 相同时，说明中间没有第三方——即使 relay 被入侵或被要求配合，它也
 无法让两端派生出相同的 SAS（它不知道 code）。这是唯一需要人工确认的一步，

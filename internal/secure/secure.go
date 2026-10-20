@@ -33,6 +33,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -116,9 +117,79 @@ func NewHandshake(code string, role Role) (*Handshake, error) {
 // Call it with in == nil to obtain the first outbound message. It returns the
 // bytes to send to the peer (nil if nothing needs to be sent yet) and whether
 // the handshake is complete.
+// maxHandshakeMsg bounds one PAKE message. A P-256 point plus JSON envelope is
+// well under 1 KiB; anything larger is either a bug or an attempt to make us
+// allocate.
+const maxHandshakeMsg = 8 << 10
+
+// validateHandshakeMsg checks the shape of a PAKE message before it reaches the
+// third-party library.
+//
+// The peer here is the relay, which is untrusted by design: it can send
+// anything it likes as the first handshake message. schollz/pake unmarshals
+// the bytes into a *Pake and dereferences it without a nil check, so a
+// four-byte binary "null" is enough to panic the process (SIGSEGV, exit 2) —
+// no code required, no pairing required. Validating first turns that into an
+// ordinary handshake failure.
+func validateHandshakeMsg(in []byte) error {
+	if len(in) == 0 {
+		return errors.New("empty handshake message")
+	}
+	if len(in) > maxHandshakeMsg {
+		return fmt.Errorf("handshake message too large (%d bytes, max %d)", len(in), maxHandshakeMsg)
+	}
+	// The library's wire format is a flat JSON object with a "Role" field and
+	// a set of curve-coordinate fields (Uᵤ, Uᵥ, Vᵤ, ...). Only the shape is
+	// checked here: a message carrying just a role, or no coordinates at all,
+	// is what makes the library dereference a nil point.
+	var probe map[string]json.RawMessage
+	if err := json.Unmarshal(in, &probe); err != nil {
+		return fmt.Errorf("handshake message is not valid JSON: %w", err)
+	}
+	roleRaw, ok := probe["Role"]
+	if !ok {
+		return errors.New("handshake message has no role")
+	}
+	var role int
+	if err := json.Unmarshal(roleRaw, &role); err != nil {
+		return errors.New("handshake message role is not a number")
+	}
+	// At least one coordinate must be present and non-null; a message of
+	// nothing but a role is the shape that panics.
+	points := 0
+	for k, v := range probe {
+		if k == "Role" {
+			continue
+		}
+		if string(v) == "null" {
+			continue
+		}
+		points++
+	}
+	if points == 0 {
+		return errors.New("handshake message has no curve points")
+	}
+	return nil
+}
+
 func (h *Handshake) Step(in []byte) (out []byte, done bool, err error) {
 	if h.finished {
 		return nil, true, errors.New("secure: handshake already finished")
+	}
+
+	if in != nil {
+		if verr := validateHandshakeMsg(in); verr != nil {
+			return nil, false, fmt.Errorf("secure: handshake message rejected: %w", verr)
+		}
+		// Belt and braces: pake is a third-party library and this path is
+		// reachable by an untrusted peer, so a panic here must not take the
+		// process down even if the validation above has a gap.
+		defer func() {
+			if r := recover(); r != nil {
+				out, done = nil, false
+				err = fmt.Errorf("secure: handshake library panicked on peer input: %v", r)
+			}
+		}()
 	}
 
 	if in == nil {

@@ -47,6 +47,12 @@ const (
 
 	// MaxPayload is the usable payload per datagram.
 	MaxPayload = MaxDatagram - headerSize
+
+	// maxFragments bounds how many datagrams one message may span. At
+	// MaxPayload per fragment this allows messages far larger than the peer
+	// layer ever sends (it chunks at 512 KiB), while keeping the reassembly
+	// map bounded by a constant instead of by whatever a peer chooses to send.
+	maxFragments = 4096
 )
 
 // packetType enumerates datagram kinds.

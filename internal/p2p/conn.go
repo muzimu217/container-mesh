@@ -77,7 +77,12 @@ type outFrame struct {
 	data     []byte
 	sentAt   time.Time
 	attempts int
-	lastSeq  uint32 // highest seq covered by this frame (for ACK accounting)
+	// rto is this frame's own retransmit timer. It is per frame rather than
+	// per connection because a connection-wide timer that doubles on every
+	// tick (whether or not anything was retransmitted) reaches MaxRTO within
+	// a few hundred milliseconds, turning a single lost datagram into a
+	// multi-second stall — measured as a 30x throughput loss.
+	rto time.Duration
 }
 
 // Config tunes a Conn.
@@ -136,6 +141,13 @@ func NewConn(udp *net.UDPConn, remote *net.UDPAddr, connID uint64, cfg Config) *
 		lastRecv:  time.Now(),
 	}
 	c.windowFree = sync.NewCond(&c.sendMu)
+	// The default receive buffer (~212 KiB on Linux) holds about 180 of our
+	// 1200-byte datagrams, while the send window allows 512 — so a full-window
+	// burst always overflowed and lost packets, which the cumulative ACK then
+	// amplified into a stall. Best effort: the kernel may cap these, and that
+	// is fine, it just means the window is larger than the buffer.
+	_ = c.udp.SetReadBuffer(8 << 20)
+	_ = c.udp.SetWriteBuffer(8 << 20)
 	go c.readLoop()
 	go c.retransmitLoop(cfg)
 	return c
@@ -210,7 +222,7 @@ func (c *Conn) sendFragment(payload []byte, flags uint8, total, index uint32) er
 		return err
 	}
 
-	c.sendBuf[seq] = &outFrame{data: data, sentAt: time.Now(), lastSeq: seq}
+	c.sendBuf[seq] = &outFrame{data: data, sentAt: time.Now(), rto: c.rto}
 	c.inFlight++
 	remote := c.remoteAddr()
 	c.sendMu.Unlock()
@@ -358,6 +370,15 @@ func (c *Conn) handleData(pkt *packet) {
 	index := getUint32(pkt.payload[4:8])
 	body := pkt.payload[8:]
 
+	// Validate the fragment header before it reaches the reassembly map.
+	// Without this a peer can put an arbitrary (total, index) pair in a single
+	// datagram and add a permanent entry to recvParts — one entry per packet,
+	// so memory grows with whatever the remote decides to send. A total of
+	// 2^31 also means "never completes", leaving the entries behind forever.
+	if total == 0 || total > maxFragments || index >= total {
+		return
+	}
+
 	c.recvMu.Lock()
 	// Advance the cumulative ACK over every datagram that has arrived,
 	// including out-of-order ones. This is what frees the sender's window;
@@ -420,7 +441,10 @@ func (c *Conn) handleAck(pkt *packet) {
 	freed := false
 	for seq, frame := range c.sendBuf {
 		if seqBefore(seq, pkt.ack) {
-			// RTT sample from the frame that was actually acknowledged.
+			// Karn's rule: an RTT sample from a frame that was retransmitted
+			// is ambiguous (the ACK may be for either copy), so it is ignored.
+			// Without this a 3-second retransmit backoff was fed back as the
+			// smoothed RTT, which then justified further multi-second waits.
 			if frame.attempts == 0 {
 				c.updateRTT(time.Since(frame.sentAt))
 			}
@@ -474,15 +498,22 @@ func (c *Conn) retransmitLoop(cfg Config) {
 
 		now := time.Now()
 		c.sendMu.Lock()
-		rto := c.rto
 		var resend [][]byte
 		freed := false
 		for seq, frame := range c.sendBuf {
-			if now.Sub(frame.sentAt) < rto {
+			if now.Sub(frame.sentAt) < frame.rto {
 				continue
 			}
 			frame.attempts++
 			frame.sentAt = now
+			// Back off this frame only, and only because it actually needed
+			// retransmitting.
+			if frame.rto < cfg.MaxRTO {
+				frame.rto *= 2
+				if frame.rto > cfg.MaxRTO {
+					frame.rto = cfg.MaxRTO
+				}
+			}
 			resend = append(resend, frame.data)
 			if frame.attempts > 12 {
 				// Give up on a path that has been dead for ~12 RTOs; the
@@ -492,13 +523,6 @@ func (c *Conn) retransmitLoop(cfg Config) {
 					c.inFlight--
 				}
 				freed = true
-			}
-		}
-		// Exponential backoff, capped.
-		if c.rto < cfg.MaxRTO {
-			c.rto *= 2
-			if c.rto > cfg.MaxRTO {
-				c.rto = cfg.MaxRTO
 			}
 		}
 		if freed && c.windowFree != nil {

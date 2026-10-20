@@ -108,6 +108,7 @@ type commonFlags struct {
 	pairWindow time.Duration
 	p2p        bool
 	stun       string
+	expectSAS  string
 }
 
 func addCommon(fs *flag.FlagSet, cf *commonFlags) {
@@ -129,6 +130,8 @@ func addCommon(fs *flag.FlagSet, cf *commonFlags) {
 		"try a direct UDP path before using the relay (experimental: slower on fast links)")
 	fs.StringVar(&cf.stun, "stun", "",
 		"comma-separated STUN servers for candidate discovery (default: built-in list)")
+	fs.StringVar(&cf.expectSAS, "expect-sas", "",
+		"abort unless the peer's 6-digit short authentication string matches (defends against an active relay)")
 }
 
 func envOr(key, def string) string {

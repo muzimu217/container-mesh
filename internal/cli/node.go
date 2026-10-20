@@ -50,6 +50,14 @@ type NodeConfig struct {
 	// P2P controls direct-path negotiation. When enabled, peers try to punch
 	// through their NATs and, on success, move the data plane off the relay.
 	P2P p2p.Options
+	// ExpectSAS, when non-empty, aborts the session unless the peer derives
+	// the same 6-digit short authentication string.
+	//
+	// This is the only real defence against an active relay: RoomID keeps the
+	// code out of the URL, but the room label is still a verifier for offline
+	// guessing, so a relay that records labels can attack weak codes. SAS
+	// comparison is what makes that attack detectable.
+	ExpectSAS string
 	// Liveness configures WebSocket keepalive. Default 20s ping / 60s idle.
 	Liveness wsconn.Liveness
 	// OnMessage receives inbound chat messages.
@@ -175,8 +183,20 @@ func (n *Node) Run(ctx context.Context) error {
 		// compare it out of band. A malicious relay can route the connection
 		// (it knows the room label) but cannot make both sides derive the same
 		// SAS without the code, so a mismatch is the signal to abort.
+		sas := sess.ShortAuth()
+		if n.cfg.ExpectSAS != "" && sas != n.cfg.ExpectSAS {
+			// Mismatch means the peer is not who the code says it is: an
+			// active relay (or a wrong code) sat in the middle. Refuse the
+			// session rather than carrying on.
+			err := fmt.Errorf("SAS mismatch: peer %s, expected %s — "+
+				"possible active relay or wrong code", sas, n.cfg.ExpectSAS)
+			n.status("sas-mismatch", err.Error())
+			_ = sess.Close()
+			n.finish(err)
+			return err
+		}
 		n.status("connected", fmt.Sprintf("%s  peer=%s  SAS=%s  fingerprint=%s",
-			relayURL, sess.PeerName, sess.ShortAuth(), sess.Fingerprint()))
+			relayURL, sess.PeerName, sas, sess.Fingerprint()))
 		n.setSession(sess)
 
 		// The session's read pump dispatches messages, offers and pings via
@@ -304,8 +324,14 @@ func (n *Node) negotiator() peer.Negotiator {
 		// before the read pump exists.
 		res, err := p2p.Negotiate(context.Background(), s, n.cfg.P2P)
 		if err != nil {
+			// A failed negotiation can leave a reader parked inside
+			// RecvFrame. Starting the read pump on the same session would give
+			// it two readers racing for the next frame, and the abandoned one
+			// could swallow the first business message. The session is closed
+			// instead, and the node reconnects on the relay — which is the
+			// documented fallback anyway.
 			n.status("p2p-failed", err.Error())
-			return nil
+			return fmt.Errorf("p2p negotiation failed: %w", err)
 		}
 		if res == nil || res.Conn == nil {
 			n.status("p2p-relay", res.Describe())

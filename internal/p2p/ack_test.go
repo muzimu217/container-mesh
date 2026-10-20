@@ -130,3 +130,60 @@ func TestAckDoesNotFreeUnsentFrames(t *testing.T) {
 		t.Errorf("inFlight = %d, want 1", inFlight)
 	}
 }
+
+// TestRejectsOutOfRangeFragment: a peer must not be able to grow the
+// reassembly map with arbitrary (total, index) values. Each bogus datagram
+// used to add a permanent entry, so memory grew with whatever the remote sent.
+func TestRejectsOutOfRangeFragment(t *testing.T) {
+	c := newTestConn(t)
+
+	cases := []struct {
+		name  string
+		total uint32
+		index uint32
+	}{
+		{"zero total", 0, 0},
+		{"index equals total", 4, 4},
+		{"index far beyond total", 2, 1 << 30},
+		{"total above cap", maxFragments + 1, 0},
+		{"absurd total", 1 << 31, 7},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body := make([]byte, 8+16)
+			putUint32(body[0:4], tc.total)
+			putUint32(body[4:8], tc.index)
+			c.handleData(&packet{
+				typ: pktData, connID: c.connID, seq: 0, payload: body,
+			})
+
+			c.recvMu.Lock()
+			n := len(c.recvParts)
+			c.recvMu.Unlock()
+			if n != 0 {
+				t.Errorf("reassembly map grew to %d entries from a bogus fragment", n)
+			}
+		})
+	}
+}
+
+// TestAcceptsValidFragment is the control: in-range fragments still reassemble.
+func TestAcceptsValidFragment(t *testing.T) {
+	c := newTestConn(t)
+
+	body := make([]byte, 8+4)
+	putUint32(body[0:4], 1) // total
+	putUint32(body[4:8], 0) // index
+	copy(body[8:], "data")
+
+	c.handleData(&packet{typ: pktData, connID: c.connID, seq: 0, payload: body})
+
+	select {
+	case msg := <-c.inbox:
+		if string(msg) != "data" {
+			t.Errorf("got %q", msg)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("valid single-fragment message was not delivered")
+	}
+}
