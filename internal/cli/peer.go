@@ -132,7 +132,7 @@ func runSend(args []string) error {
 	fs.SetOutput(os.Stderr)
 	var cf commonFlags
 	addCommon(fs, &cf)
-	file := fs.String("file", "", "file to transfer (optional)")
+	file := fs.String("file", "", "file or directory to transfer (optional)")
 	message := fs.String("message", "", "message to send after connecting (optional)")
 	stay := fs.Bool("stay", true, "keep the session open for further messages")
 	if err := fs.Parse(args); err != nil {

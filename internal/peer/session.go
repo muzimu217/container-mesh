@@ -525,16 +525,32 @@ drain:
 	if err != nil {
 		return nil, fmt.Errorf("peer: stat %s: %w", path, err)
 	}
+
+	// A directory is packed into a temporary tar and sent as one ordinary
+	// file. Packing first (rather than streaming) costs disk space but keeps
+	// the whole existing path — offer, resume, hash verification — unchanged,
+	// and a resumed transfer of a directory then works exactly like a file.
+	sendPath := path
+	sendName := filepath.Base(path)
 	if fi.IsDir() {
-		return nil, fmt.Errorf("peer: %s is a directory (only single files are supported)", path)
+		archive, packErr := packDirToTemp(path)
+		if packErr != nil {
+			return nil, packErr
+		}
+		defer os.Remove(archive)
+		sendPath = archive
+		sendName = ArchiveName(path)
+		if fi, err = os.Stat(archive); err != nil {
+			return nil, err
+		}
 	}
 
-	sum, err := HashFile(path)
+	sum, err := HashFile(sendPath)
 	if err != nil {
 		return nil, err
 	}
 	offer := wire.FileOffer{
-		Name:   filepath.Base(path),
+		Name:   sendName,
 		Size:   fi.Size(),
 		SHA256: sum,
 	}
@@ -563,7 +579,7 @@ drain:
 		return nil, fmt.Errorf("peer: nonsensical resume offset %d for %d-byte file", acc.ResumeFrom, fi.Size())
 	}
 
-	fh, err := os.Open(path)
+	fh, err := os.Open(sendPath)
 	if err != nil {
 		return nil, err
 	}
@@ -891,6 +907,15 @@ func (tr *InboundTransfer) accept(dir string, progress func(got, total int64)) (
 				// local error would leave it blocked until its timeout. Turn
 				// it into a rejection it can act on.
 				res = wire.FileResult{OK: false, Message: pubErr.Error()}
+			} else if IsArchiveName(offer.Name) {
+				// A packed directory: extract it next to the archive and
+				// remove the archive, so the receiver sees the tree it was
+				// sent rather than an opaque tar.
+				if upErr := UnpackArchive(finalPath, dir, s.cfg.ForceOverwrite); upErr != nil {
+					res = wire.FileResult{OK: false, Message: "unpack failed: " + upErr.Error()}
+				} else if rmErr := os.Remove(finalPath); rmErr != nil {
+					s.log.Warn("could not remove archive after unpack", "path", finalPath, "err", rmErr)
+				}
 			}
 		}
 	} else {

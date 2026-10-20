@@ -73,9 +73,11 @@ Usage:
         ever touch it, and it cannot read the traffic.
 
   cmesh send --relay URL[,URL2,...] --code CODE [--name NAME] [--file PATH]
-        Connect as role A, transfer the file (if given), then wait for
-        incoming messages until interrupted. While connected, type messages
-        on stdin; "/file PATH" offers another file at any time.
+        Connect as role A, transfer the file or directory (if given), then
+        wait for incoming messages until interrupted. While connected, type
+        messages on stdin; "/file PATH" offers another file or directory at
+        any time. A directory is packed into a tar stream and unpacked by the
+        receiver, so the far side sees the tree, not an archive.
 
   cmesh recv --relay URL[,URL2,...] --code CODE [--name NAME] [--out DIR]
         Connect as role B, receive the file (if one is offered), then wait
