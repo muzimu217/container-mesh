@@ -1390,6 +1390,37 @@ C4 的单流分支依赖现有的 `switchable` 包装，mux 分支依赖 PR #1 �
 **验收**：`-R` 无 `--allow-listen-port` 时零值拒绝；端口抢占场景被拒；
 完整 e2e + 4 项混沌测试全绿。
 
+### PR #2 实现记录（2026-10-21）
+
+实际交付与设计的差异，以及原因：
+
+| 设计 | 实现 | 原因 |
+|---|---|---|
+| `allow.go` 精简版约 90 行 | **约 300 行**（含 `NewAllowList` / `PortSet` / 解析） | 设计只写了「主机 + 端口精确匹配」，但匹配之前必须先有**解析并固定**的步骤，否则 DNS rebinding 的窗口就开着。`Permits` 返回 IP 这条从第一版就实现，测试 `TestAllowListPinsHostnameAtStartup` 直接验证「DNS 变了仍返回固定 IP」 |
+| `limits.go` 60 行（限流 + 超时） | **约 190 行**（含 `pendingGate` / `Limits.normalise`） | 令牌桶本身 40 行，但 `max-pending` 需要一个非阻塞信号量，超时字段需要一套零值归一化。三者共享同一组默认值，拆开只会让默认值散落 |
+| `pipe.go` 100 行 | **约 130 行** | 半关闭 + drain 超时 + 错误归一，实际就是这么长；没有可砍的抽象 |
+| `local.go` 190 行 | **约 250 行** | 多了 `ParseSpec`（含 IPv6 方括号处理）与 `Serve` 的 pending gate 接入 |
+| `manager.go` 150 行 | **约 290 行** | `Serve` 的 kind 分发、`Handle` 的四道闸、`dialApproved`（只拨已授权的 IP）、`reject`、`AddLocal`/`Close` 生命周期 |
+
+**实测数据（PR #2）**：
+
+| 项 | 结果 |
+|---|---|
+| 单测 | 31 个（wire 11 + forward 20），全过 |
+| fuzz `FuzzReadPreamble` | 20 s / **417 万次执行**，无 panic、无 OOM |
+| `-race` | 12/12 包全绿 |
+| e2e `--quick` | **35/35**（`send`/`recv` 零回归） |
+| e2e `--quick --large` | **37/37**（含 256 MiB） |
+| 512 MiB 吞吐 | **527 / 585 / 624 / 624 MiB/s**，与 PR #1 持平 |
+| `-L` 端到端 | 32 KiB 经真实 mux 转发到 echo，字节一致 |
+| `--accept` 关闭 | 目标侧零字节到达，本地连接被关闭 |
+| goroutine 基线 | 10 轮正常 EOF + 暴力断开后回落基线 ±2 |
+
+**两处实现时发现的设计问题：**
+
+1. **`net.Pipe` 不能用来测半关闭。** 它不实现 `CloseWrite`，所以基于它的测试走的是「整连接关闭」的降级路径，而生产路径（`*net.TCPConn` 目标、yamux 流）都支持半关闭。测试必须用真实 TCP，否则测的是错误的分支。
+2. **`Permits` 不能对主机名重新解析。** 第一版在 `Permits` 里对请求的主机名再查一次 DNS 再比对，结果 DNS 一变就把**已经授权过的目标**拒掉了——这既是可用性故障，也说明 rebinding 防护的位置错了。正确做法是：配置过的主机名按**名字**匹配并直接返回启动时固定的 IP，只有请求方给了未配置的名字时才解析并比对。
+
 ### 相对初版砍掉/推迟了什么
 
 | 初版设计 | 处理 | 理由 |
