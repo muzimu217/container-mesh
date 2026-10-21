@@ -88,6 +88,11 @@ type NodeConfig struct {
 	MaxTransferAttempts int
 }
 
+// defaultPairWindow is how long one relay is tried before moving to the next
+// when the caller did not specify a window. It only applies with several
+// relays; a single relay waits indefinitely.
+const defaultPairWindow = 60 * time.Second
+
 // Node is a long-lived peer endpoint: it keeps a session connected by
 // rotating through the relay list with backoff, re-running the SPAKE2
 // handshake after every drop. Messages and file offers flow again as soon as
@@ -303,7 +308,14 @@ func (n *Node) dialOne(ctx context.Context, relayURL string) (*peer.Session, err
 	// shows up": rotating is pointless when there is nowhere to rotate to, and
 	// a timer would only kick our own parked connection. With several relays
 	// a window is still needed, or a dead relay would never be abandoned.
-	waitForever := n.cfg.PairWindow <= 0 && len(n.cfg.Relays) == 1
+	// With several relays a window is required, or a dead relay would never be
+	// abandoned; a zero PairWindow there means "use the default", not "expire
+	// immediately".
+	window := n.cfg.PairWindow
+	waitForever := window <= 0 && len(n.cfg.Relays) == 1
+	if window <= 0 && !waitForever {
+		window = defaultPairWindow
+	}
 	if waitForever {
 		// The connection's own keepalive is what detects a dead relay.
 		select {
@@ -322,13 +334,13 @@ func (n *Node) dialOne(ctx context.Context, relayURL string) (*peer.Session, err
 	select {
 	case r := <-ch:
 		return r.sess, r.err
-	case <-time.After(n.cfg.PairWindow):
+	case <-time.After(window):
 		_ = conn.Close()
 		r := <-ch // the handshake goroutine unblocks once the socket closes
 		if r.sess != nil {
 			_ = r.sess.Close()
 		}
-		return nil, fmt.Errorf("no partner appeared within %s", n.cfg.PairWindow)
+		return nil, fmt.Errorf("no partner appeared within %s", window)
 	case <-ctx.Done():
 		_ = conn.Close()
 		r := <-ch
