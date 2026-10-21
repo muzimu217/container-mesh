@@ -13,6 +13,8 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 
@@ -21,11 +23,22 @@ import (
 
 func main() {
 	if err := cli.Run(os.Args[1:]); err != nil {
-		// cli.Run already printed a useful message; only exit non-zero.
-		if code, ok := err.(cli.ExitError); ok {
-			os.Exit(code.Code)
+		// Subcommands report their own progress, but a usage or validation
+		// error carries a message the user needs to see. Printing it here
+		// rather than in each subcommand keeps the wording in one place and
+		// means a new subcommand cannot silently exit non-zero with no reason.
+		//
+		// A plain exit (context cancelled by a signal) has nothing to say.
+		var exit cli.ExitError
+		if errors.As(err, &exit) {
+			if exit.Err != nil && !errors.Is(exit.Err, context.Canceled) {
+				fmt.Fprintln(os.Stderr, "cmesh:", exit.Err)
+			}
+			os.Exit(exit.Code)
 		}
-		fmt.Fprintln(os.Stderr, "cmesh:", err)
+		if !errors.Is(err, context.Canceled) {
+			fmt.Fprintln(os.Stderr, "cmesh:", err)
+		}
 		os.Exit(1)
 	}
 }

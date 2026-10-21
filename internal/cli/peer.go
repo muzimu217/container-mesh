@@ -78,6 +78,43 @@ func p2pOptions(cf commonFlags) p2p.Options {
 }
 
 // newNode assembles a Node from parsed common flags.
+// commonNodeConfig turns the shared connection flags into a NodeConfig.
+//
+// It is split out of newNode so `forward` can reuse the code-generation and
+// relay-parsing logic instead of duplicating it: a second copy would drift, and
+// the generated-code path is security-relevant.
+func commonNodeConfig(cf commonFlags) (NodeConfig, error) {
+	if cf.code == "" {
+		// The code is the only shared secret, and the room label derived from
+		// it is a verifier a relay can attack offline — so a weak code is a
+		// real weakness, not just a bad habit. Generating a strong one and
+		// printing it once is safer than making the user invent one, and it
+		// removes the temptation to reuse "test123".
+		generated, err := secure.GenerateCode()
+		if err != nil {
+			return NodeConfig{}, fmt.Errorf("cannot generate a code: %w", err)
+		}
+		fmt.Fprintf(os.Stderr,
+			"no --code given; generated one for this session:\n\n  %s\n\n"+
+				"Give the same code to the other side (or set --code / CMESH_CODE).\n",
+			generated)
+		cf.code = generated
+	}
+	relays, err := splitRelays(cf.relay)
+	if err != nil {
+		return NodeConfig{}, err
+	}
+	return NodeConfig{
+		Relays:     relays,
+		Code:       cf.code,
+		Name:       cf.name,
+		Role:       secure.RoleA,
+		PairWindow: cf.pairWindow,
+		P2P:        p2pOptions(cf),
+		ExpectSAS:  cf.expectSAS,
+	}, nil
+}
+
 func newNode(cf commonFlags, role secure.Role, outDir string, oneShot bool) (*Node, error) {
 	if cf.code == "" {
 		// The code is the only shared secret, and the room label derived from

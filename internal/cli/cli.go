@@ -47,6 +47,8 @@ func Run(args []string) error {
 		return runSend(args[1:])
 	case "recv":
 		return runRecv(args[1:])
+	case "forward":
+		return runForward(args[1:])
 	case "version", "-v", "--version":
 		fmt.Printf("cmesh %s\n", Version)
 		return nil
@@ -82,6 +84,13 @@ Usage:
   cmesh recv --relay URL[,URL2,...] --code CODE [--name NAME] [--out DIR]
         Connect as role B, receive the file (if one is offered), then wait
         for incoming messages until interrupted.
+
+  cmesh forward [connection flags] -L [bind:]port:host:port [--accept ...]
+        Open a local listener and forward each connection to a service the
+        peer can reach. Requires the peer to run with --accept and an
+        allow-list; nothing is dialled on the peer's behalf without one.
+        The local bind defaults to 127.0.0.1: pass 0.0.0.0 explicitly to
+        expose it on every interface.
 
   cmesh version
 
