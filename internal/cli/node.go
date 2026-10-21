@@ -110,6 +110,8 @@ type NodeConfig struct {
 	// The control stream is never delivered here: the node consumes it itself,
 	// because it carries the peer.Session frames.
 	OnStream func(*mux.Stream)
+	// OnForwardListen answers a peer's -R registration request.
+	OnForwardListen func([]wire.ForwardListenSpec) []wire.ForwardListenStatus
 }
 
 // defaultPairWindow is how long one relay is tried before moving to the next
@@ -567,6 +569,7 @@ func (n *Node) bringUpQUIC(res *p2p.Result) (*p2pquic.Result, error) {
 // handler builds the read-pump dispatch for every session this node owns.
 func (n *Node) handler() peer.Handler {
 	return peer.Handler{
+		OnForwardListen: n.cfg.OnForwardListen,
 		OnMessage: func(text string) {
 			if h := n.cfg.OnMessage; h != nil {
 				h(text)

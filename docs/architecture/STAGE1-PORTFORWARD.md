@@ -1416,6 +1416,50 @@ CLI 接线后测吞吐，数字从 624 MiB/s 掉到 214 MiB/s，看起来像回�
 **这条写进方法论的教训**：性能回归判定必须 A/B 同刻对照，不能用"历史最好值"
 当基线——宿主机负载、页缓存、后台进程都会让绝对值漂移数倍。
 
+### PR #3 实现记录（2026-10-21）
+
+`-R` 反向转发完成。进程级实测：应用连到 hoster 的 `127.0.0.1:19623` →
+隧道 → requester → 拨本地 `127.0.0.1:19600`，返回 `REV:hello-reverse`；
+10 条并发全部正确；请求 `19999`（不在 `--allow-listen-port`）被拒并给出
+`denied (port 19999 is not in --allow-listen-port)`。
+
+**`-R` 的拓扑容易想反，值得写清楚：**
+
+```
+应用 ──connect──> hoster:19623 ──OpenStream(kind=1)──> requester
+                                                       │ 按 ID 查本地配置
+                                                       └─dial──> 本地 target
+```
+
+**bind 端口的是 hoster（响应方），但打开回连流、拨最终目标的也是 hoster；
+requester 只做「查 ID → 拨本地配置的 target」**。所以：
+
+| 角色 | 需要什么 |
+|---|---|
+| hoster（`--accept-reverse` 侧） | `--allow-listen-port`：它要 bind 端口 |
+| requester（`-R` 侧） | 也要 `--accept-reverse`：它要**服务**回连的 reverse 流 |
+| requester | **不需要** `--allow-listen-port`：它不 bind 任何东西 |
+
+**实现时踩到的三个真 bug，都是进程级冒烟才暴露的：**
+
+1. **`Serve` 用 `--accept` 拦掉了所有 `kind=1` 流**，包括 reverse 流。结果 hoster
+   绑好了监听器，每条连接都被自己拒掉。修法：两个权限分开判——`--accept` 管
+   「可以拨我允许的目标」，`--accept-reverse` 管「可以让我 bind 端口」。
+   回归测试 `TestAcceptReverseAloneServesReverseStreams` 与
+   `TestAcceptReverseAloneRefusesDirectStreams` 分别锁住这两半。
+2. **重连时 rebind 必失败**：`bindOne` 先 `net.Listen` 再关旧监听器，新 bind 撞上
+   还没关的旧 bind，永远 "address already in use"。修法：**先关旧的再 bind**。
+   回归测试 `TestReverseRebindReplacesListener` 连做三次重绑。
+3. **requester 被强制要求 `--allow-listen-port`**：CLI 把
+   `--accept-reverse` 和端口白名单硬绑在一起。但 requester 不 bind 任何端口，
+   强制它写一个白名单只会教用户「随便填个宽范围让它过去」——正好抵消白名单的作用。
+   改成只在这侧确实要 host 监听器（即没有 `-R` 规格）时才要求。
+
+**单测 16 项**，覆盖：ID 查表（preamble 里的地址永不拨号）、未知 ID 拒绝、
+`--accept-reverse` 关闭时拒绝、端口白名单、非 loopback 需要 `--listen-all`、
+`BindFail` 与 `Denied` 可区分、rebind 替换、`Close` 释放端口、`-R` 路径的限流、
+以及两个权限分离的回归。
+
 ### PR #2.5 CLI 接线记录（2026-10-21）
 
 `cmesh forward -L` 可用。关键决定与实测：

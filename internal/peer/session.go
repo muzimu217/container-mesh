@@ -22,6 +22,7 @@
 package peer
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -94,6 +95,13 @@ type Handler struct {
 	// callers will run it in a goroutine and return immediately). Returning
 	// false rejects the offer right away. A nil OnOffer rejects every offer.
 	OnOffer func(tr *InboundTransfer) bool
+	// OnForwardListen receives a peer's request to host -R listeners and must
+	// answer with one status per spec.
+	//
+	// It runs on the read pump goroutine, so it must not block: binding a
+	// listener is fast, but dialling is not. A nil callback refuses every
+	// request, which is the correct default for a peer that never enabled -R.
+	OnForwardListen func(specs []wire.ForwardListenSpec) []wire.ForwardListenStatus
 }
 
 // Session is one peer's view of the conversation.
@@ -136,6 +144,12 @@ type Session struct {
 	// Inbound direction: the transfer currently consuming chunk frames.
 	inMu    sync.Mutex
 	inbound *InboundTransfer
+
+	// fwdMu serialises -R registration requests. Only one may be in flight: the
+	// reply carries a result list but no request id, so two concurrent requests
+	// could not tell their answers apart.
+	fwdMu     sync.Mutex
+	fwdResult chan []wire.ForwardListenStatus
 }
 
 // ErrHandshake is returned when the peers cannot agree on a key, which almost
@@ -415,6 +429,10 @@ func (s *Session) readPump() {
 			}
 		case wire.FrameFileAccept, wire.FrameFileReject, wire.FrameFileResult:
 			s.deliverOutbound(f)
+		case wire.FrameForwardListen:
+			s.handleForwardListen(f)
+		case wire.FrameForwardListenResult:
+			s.deliverForwardResult(f)
 		default:
 			// Ignore unknown frames so the protocol can grow.
 		}
@@ -454,6 +472,113 @@ func (s *Session) handleOffer(f *wire.Frame) {
 	}
 	if !taken {
 		tr.Reject("offer not accepted")
+	}
+}
+
+// RequestForwardListen asks the peer to host the given listeners and waits for
+// the answer.
+//
+// Only one request may be in flight at a time: the reply carries a result list
+// but no request id, so two concurrent requests could not tell their answers
+// apart. The mutex turns that into a queue rather than a silent mix-up.
+func (s *Session) RequestForwardListen(ctx context.Context, specs []wire.ForwardListenSpec) ([]wire.ForwardListenStatus, error) {
+	s.fwdMu.Lock()
+	defer s.fwdMu.Unlock()
+
+	ch := make(chan []wire.ForwardListenStatus, 1)
+	s.errMu.Lock()
+	s.fwdResult = ch
+	s.errMu.Unlock()
+	defer func() {
+		s.errMu.Lock()
+		s.fwdResult = nil
+		s.errMu.Unlock()
+	}()
+
+	payload, err := json.Marshal(struct {
+		Specs []wire.ForwardListenSpec `json:"specs"`
+	}{Specs: specs})
+	if err != nil {
+		return nil, err
+	}
+	if err := s.SendFrame(&wire.Frame{Type: wire.FrameForwardListen, Payload: payload}); err != nil {
+		return nil, err
+	}
+
+	select {
+	case res := <-ch:
+		return res, nil
+	case <-s.done:
+		return nil, s.Err()
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// deliverForwardResult hands a result list to the goroutine waiting in
+// RequestForwardListen. A result with nobody waiting is a stray from an
+// abandoned request and is dropped.
+func (s *Session) deliverForwardResult(f *wire.Frame) {
+	var res struct {
+		Results []wire.ForwardListenStatus `json:"results"`
+	}
+	if err := json.Unmarshal(f.Payload, &res); err != nil {
+		s.log.Warn("bad forward-listen result payload", "err", err)
+		return
+	}
+	s.errMu.Lock()
+	ch := s.fwdResult
+	s.errMu.Unlock()
+	if ch == nil {
+		s.log.Debug("dropping unmatched forward-listen result")
+		return
+	}
+	select {
+	case ch <- res.Results:
+	default:
+	}
+}
+
+// handleForwardListen answers a peer's -R registration.
+//
+// A refusal is a normal answer, not an error: the peer asked for something this
+// side does not permit, and the status says which. Returning an error here would
+// tear down a session that is otherwise healthy.
+func (s *Session) handleForwardListen(f *wire.Frame) {
+	var req struct {
+		Specs []wire.ForwardListenSpec `json:"specs"`
+	}
+	if err := json.Unmarshal(f.Payload, &req); err != nil {
+		s.log.Warn("bad forward-listen payload", "err", err)
+		s.replyForwardListen(nil)
+		return
+	}
+	if s.handler.OnForwardListen == nil {
+		out := make([]wire.ForwardListenStatus, 0, len(req.Specs))
+		for _, sp := range req.Specs {
+			out = append(out, wire.ForwardListenStatus{
+				ID: sp.ID, Status: wire.StatusDenied,
+				Message: "reverse forwarding is disabled on this peer",
+			})
+		}
+		s.replyForwardListen(out)
+		return
+	}
+	s.replyForwardListen(s.handler.OnForwardListen(req.Specs))
+}
+
+// replyForwardListen sends the answer, ignoring send failures: the peer may
+// already be gone, and that is not worth failing the session over.
+func (s *Session) replyForwardListen(results []wire.ForwardListenStatus) {
+	payload, err := json.Marshal(struct {
+		Results []wire.ForwardListenStatus `json:"results"`
+	}{Results: results})
+	if err != nil {
+		s.log.Warn("could not encode forward-listen result", "err", err)
+		return
+	}
+	if err := s.SendFrame(&wire.Frame{Type: wire.FrameForwardListenResult, Payload: payload}); err != nil {
+		s.log.Debug("could not send forward-listen result", "err", err)
 	}
 }
 

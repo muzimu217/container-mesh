@@ -71,6 +71,15 @@ const (
 	// Stream field is deliberately left zero: multiplexing belongs to yamux, and
 	// reusing wire.Frame.Stream would create a second, conflicting stream id.
 	FrameStreamData
+	// FrameForwardListen asks the peer to host listeners for -R. Payload is
+	// JSON {"specs":[{"id","host","port"}]}.
+	//
+	// It travels on the control stream, not on a stream of its own: it is a
+	// one-shot control message, and peer.Session already dispatches by type.
+	FrameForwardListen
+	// FrameForwardListenResult answers it. Payload is JSON
+	// {"results":[{"id","status","message"}]}.
+	FrameForwardListenResult
 )
 
 // MaxStreamData bounds one FrameStreamData payload.
@@ -118,6 +127,10 @@ func (t FrameType) String() string {
 		return "mux-start"
 	case FrameStreamData:
 		return "stream-data"
+	case FrameForwardListen:
+		return "forward-listen"
+	case FrameForwardListenResult:
+		return "forward-listen-result"
 	default:
 		return fmt.Sprintf("frame(%d)", uint8(t))
 	}

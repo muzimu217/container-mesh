@@ -19,6 +19,7 @@ import (
 	"github.com/muzimu217/container-mesh/internal/forward"
 	"github.com/muzimu217/container-mesh/internal/mux"
 	"github.com/muzimu217/container-mesh/internal/secure"
+	"github.com/muzimu217/container-mesh/internal/wire"
 )
 
 // shutdownGrace bounds how long teardown may take after a signal. A terminal
@@ -72,14 +73,27 @@ func runForward(args []string) error {
 		return ExitError{Code: 2, Err: errors.New(
 			"nothing to do: pass -L, -R, --accept or --accept-reverse")}
 	}
-	if len(reverses) > 0 {
-		return ExitError{Code: 2, Err: errors.New(
-			"-R (reverse forwarding) is not implemented yet; use -L")}
+	reverseSpecs := make([]forward.Spec, 0, len(reverses))
+	for _, raw := range reverses {
+		sp, err := forward.ParseSpec(raw, true)
+		if err != nil {
+			return ExitError{Code: 2, Err: err}
+		}
+		reverseSpecs = append(reverseSpecs, sp)
 	}
-	if *acceptReverse && *allowListenPorts == "" {
+	// --allow-listen-port bounds which ports this side may BIND on request.
+	// It is therefore required only when this side is the one that hosts
+	// listeners, i.e. when it has no -R of its own: a pure -R requester never
+	// binds anything, it only serves the streams the hoster sends it.
+	//
+	// Requiring it on both sides would force a requester to name ports it will
+	// never use, which teaches operators to pass a wide range "to make it
+	// work" -- the opposite of what the whitelist is for.
+	hostsListeners := len(reverseSpecs) == 0
+	if *acceptReverse && hostsListeners && *allowListenPorts == "" {
 		return ExitError{Code: 2, Err: errors.New(
-			"--accept-reverse needs --allow-listen-port: binding a port on request " +
-				"must be an explicit, bounded permission")}
+			"--accept-reverse needs --allow-listen-port: hosting listeners on " +
+				"request must be an explicit, bounded permission")}
 	}
 
 	specs := make([]forward.Spec, 0, len(locals))
@@ -133,23 +147,38 @@ func runForward(args []string) error {
 	})
 	defer mgr.Close()
 
+	// Register the -R targets locally. The binding happens on the peer; what we
+	// keep is the ID -> local target table, so an inbound reverse stream can be
+	// served without ever trusting an address from the wire.
+	if err := mgr.PrepareReverse(reverseSpecs); err != nil {
+		return ExitError{Code: 2, Err: err}
+	}
+
 	// ---- node wiring ------------------------------------------------------
 
 	cfg, err := commonNodeConfig(cf)
 	if err != nil {
 		return ExitError{Code: 2, Err: err}
 	}
-	// The side that listens (-L) is the initiator: it opens the control stream
-	// and the forwarded streams. A pure --accept peer is the responder. With
-	// both, -L wins, because two initiators would both wait for a control
-	// stream that neither opens.
-	if len(specs) > 0 {
+	// The side that requests something (-L or -R) is the initiator: it opens
+	// the control stream, and -R additionally sends FrameForwardListen over it.
+	// A pure --accept / --accept-reverse peer is the responder. If both sides
+	// were initiators they would each wait for a control stream the other never
+	// opens, which deadlocks.
+	if len(specs) > 0 || len(reverseSpecs) > 0 {
 		cfg.Role = secure.RoleA
 	} else {
 		cfg.Role = secure.RoleB
 	}
 	cfg.UseMux = true
 	cfg.OnStream = func(st *mux.Stream) { mgr.Serve(context.Background(), st) }
+	// The provider is needed by reverse listeners, which open a stream back to
+	// the peer for every accepted connection. It is built before the node so
+	// the closure can capture it.
+	provider := &nodeProvider{node: nil}
+	cfg.OnForwardListen = func(wireSpecs []wire.ForwardListenSpec) []wire.ForwardListenStatus {
+		return mgr.BindReverseListeners(provider, wireSpecs)
+	}
 
 	node := NewNode(cfg)
 
@@ -178,7 +207,7 @@ func runForward(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	provider := &nodeProvider{node: node}
+	provider.node = node
 	for _, lf := range listeners {
 		go func(lf *forward.LocalForward) {
 			if err := lf.Serve(ctx, provider); err != nil && ctx.Err() == nil {
@@ -189,6 +218,13 @@ func runForward(args []string) error {
 
 	runErr := make(chan error, 1)
 	go func() { runErr <- node.Run(ctx) }()
+
+	// Ask the peer to host the -R listeners. This needs a live mux session, so
+	// it runs after Run starts and retries across reconnects: a reconnect
+	// rebuilds the session and the peer's listeners must be requested again.
+	if len(reverseSpecs) > 0 {
+		go registerReverse(ctx, node, mgr, reverseSpecs)
+	}
 
 	var ret error
 	select {
@@ -296,4 +332,79 @@ func splitCSV(s string) []string {
 		}
 	}
 	return out
+}
+
+// registerReverse asks the peer to host the -R listeners, and keeps asking after
+// every reconnect.
+//
+// A reconnect rebuilds the mux session, so the peer's listeners are gone with
+// it. Re-sending the same specs is safe: the peer replaces a listener with the
+// same ID rather than leaking the old bind.
+func registerReverse(ctx context.Context, node *Node, mgr *forward.Manager, specs []forward.Spec) {
+	wireSpecs, err := forward.ReverseSpecs(specs)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "cmesh: -R: %v\n", err)
+		return
+	}
+
+	var lastSession *mux.Session
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		ms, err := node.Mux(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+		if ms == lastSession {
+			// Same session: nothing to re-register. Wait for a change.
+			select {
+			case <-ctx.Done():
+				return
+			case <-ms.Done():
+			case <-time.After(time.Second):
+			}
+			continue
+		}
+
+		results, err := requestReverse(ctx, node, wireSpecs)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "cmesh: -R registration failed: %v\n", err)
+		} else {
+			for _, r := range results {
+				if r.Status == wire.StatusOK {
+					fmt.Fprintf(os.Stderr, "reverse  %s (hosted by the peer)\n", r.ID)
+					continue
+				}
+				fmt.Fprintf(os.Stderr, "cmesh: -R %s refused: %s (%s)\n",
+					r.ID, r.Status.String(), r.Message)
+			}
+		}
+		lastSession = ms
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-ms.Done():
+		}
+	}
+}
+
+// requestReverse sends FrameForwardListen on the control stream and waits for
+// the matching result.
+//
+// It goes through the peer session rather than a fresh mux stream because the
+// request is a one-shot control message: peer.Session already dispatches by
+// frame type, and adding a second control plane would mean two things could
+// disagree about session state.
+func requestReverse(ctx context.Context, node *Node, specs []wire.ForwardListenSpec) ([]wire.ForwardListenStatus, error) {
+	sess, err := node.waitSession(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return sess.RequestForwardListen(ctx, specs)
 }

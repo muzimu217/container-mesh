@@ -85,10 +85,15 @@ type Manager struct {
 
 	dialer Dialer
 
-	mu      sync.Mutex
-	locals  []*LocalForward
-	closed  bool
-	closeCh chan struct{}
+	mu     sync.Mutex
+	locals []*LocalForward
+	// reverse maps a -R listener ID to the local target it serves. The ID comes
+	// from the peer's preamble, but the target comes from local configuration:
+	// that separation is what makes -R structurally safe.
+	reverse      map[string]string
+	revListeners map[string]*reverseListener
+	closed       bool
+	closeCh      chan struct{}
 }
 
 // New builds a Manager. It applies the policy defaults but binds nothing.
@@ -108,6 +113,7 @@ func New(cfg Config) *Manager {
 		gate:    newPendingGate(cfg.Limits.MaxPending),
 		dialer:  d,
 		closeCh: make(chan struct{}),
+		reverse: make(map[string]string),
 	}
 	if cfg.Limits.MaxStreamsPerSec > 0 {
 		// Burst equals the per-second rate: a legitimate client opening a
@@ -125,12 +131,18 @@ func New(cfg Config) *Manager {
 func (m *Manager) Serve(ctx context.Context, st Stream) {
 	switch st.Kind() {
 	case mux.KindForward:
-		if !m.cfg.Accept {
+		// -L and -R are two different permissions and must be gated
+		// separately: --accept means "you may dial targets I allow",
+		// --accept-reverse means "you may ask me to bind a port". Checking only
+		// --accept here would refuse every reverse stream, which is exactly the
+		// bug this comment prevents.
+		if !m.cfg.Accept && !m.cfg.AcceptReverse {
 			// Do not even read the preamble. Answering immediately means a peer
 			// without permission cannot use us as a timing or reachability
 			// oracle for targets of its choosing, and a malformed preamble
 			// never reaches the parser.
-			m.reject(st, wire.StatusDenied, "forwarding is disabled (--accept)")
+			m.reject(st, wire.StatusDenied,
+				"forwarding is disabled (needs --accept or --accept-reverse)")
 			return
 		}
 		m.Handle(ctx, st)
@@ -165,11 +177,18 @@ func (m *Manager) Handle(ctx context.Context, st Stream) {
 	// session with no typing).
 	_ = st.SetDeadline(time.Time{})
 
+	if p.Kind == wire.KindDirect && !m.cfg.Accept {
+		// The peer may only have --accept-reverse; a direct stream still needs
+		// --accept, because dialling targets is the bigger permission.
+		m.reject(st, wire.StatusDenied, "direct forwarding is disabled (--accept)")
+		return
+	}
+
 	if p.Kind == wire.KindReverse {
-		// -R streams are handled by the reverse path, not here. In PR #2 there
-		// is no reverse support yet, so this is an explicit refusal rather than
-		// a silent one.
-		m.reject(st, wire.StatusDenied, "reverse forwarding is not enabled on this build")
+		// A reverse stream names one of our listeners; the reverse path owns
+		// the lookup and the dial. It has already consumed the preamble, so it
+		// gets the parsed value rather than re-reading the stream.
+		m.serveReverseParsed(ctx, st, p)
 		return
 	}
 
@@ -271,6 +290,7 @@ func (m *Manager) Close() error {
 			errs = append(errs, err)
 		}
 	}
+	m.CloseReverseListeners()
 	return errors.Join(errs...)
 }
 
