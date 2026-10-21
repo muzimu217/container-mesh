@@ -72,6 +72,15 @@ type Config struct {
 	// (0 = default). Without it the map grows once per distinct claimed
 	// address, which is a remotely triggerable memory leak.
 	LimiterSweepInterval time.Duration
+	// TLSCert and TLSKey are paths to a certificate and key. When both are
+	// set the relay serves HTTPS/WSS directly, which lets it own port 443
+	// without a reverse proxy in front.
+	//
+	// This matters for the deployment that motivated it: a container behind a
+	// restrictive egress policy can usually reach 443 and almost nothing else,
+	// so terminating TLS here removes both a port requirement and a hop.
+	TLSCert string
+	TLSKey  string
 	// Logger receives structured events.
 	Logger *slog.Logger
 }
@@ -225,10 +234,18 @@ func (s *Server) HTTPServer() *http.Server {
 }
 
 // ListenAndServe runs the relay until the process exits.
+//
+// When TLSCert and TLSKey are configured it serves WSS directly, so a client
+// can use wss://host/ws with no reverse proxy in between.
 func (s *Server) ListenAndServe() error {
-	s.log.Info("relay listening", "addr", s.cfg.Addr, "path", s.cfg.Path)
 	s.StartMaintenance()
-	return s.HTTPServer().ListenAndServe()
+	hs := s.HTTPServer()
+	if s.cfg.TLSCert != "" && s.cfg.TLSKey != "" {
+		s.log.Info("relay listening (TLS)", "addr", s.cfg.Addr, "path", s.cfg.Path)
+		return hs.ListenAndServeTLS(s.cfg.TLSCert, s.cfg.TLSKey)
+	}
+	s.log.Info("relay listening", "addr", s.cfg.Addr, "path", s.cfg.Path)
+	return hs.ListenAndServe()
 }
 
 // StartMaintenance begins periodic cleanup of limiter and contest state.

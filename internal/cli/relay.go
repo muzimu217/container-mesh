@@ -22,6 +22,8 @@ func runRelay(args []string) error {
 		pairTimeout = fs.Duration("pair-timeout", relay.DefaultConfig().PairTimeout, "how long the first peer waits for its partner")
 		maxRooms    = fs.Int("max-rooms", relay.DefaultConfig().MaxRooms, "maximum concurrent rooms")
 		verbose     = fs.Bool("v", false, "verbose (debug) logging")
+		tlsCert     = fs.String("tls-cert", "", "certificate file; with --tls-key the relay serves wss:// directly")
+		tlsKey      = fs.String("tls-key", "", "private key file for --tls-cert")
 	)
 	if err := fs.Parse(args); err != nil {
 		return ExitError{Code: 2, Err: err}
@@ -38,6 +40,8 @@ func runRelay(args []string) error {
 		Path:        *path,
 		PairTimeout: *pairTimeout,
 		MaxRooms:    *maxRooms,
+		TLSCert:     *tlsCert,
+		TLSKey:      *tlsKey,
 		Logger:      log,
 	})
 	if err := srv.ListenAndServe(); err != nil {
