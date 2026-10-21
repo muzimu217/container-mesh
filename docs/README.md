@@ -5,6 +5,7 @@
 | 文档 | 内容 |
 |---|---|
 | [`architecture/ARCHITECTURE-SDWAN.md`](architecture/ARCHITECTURE-SDWAN.md) | **总体架构设计**：混合权限 Overlay SD-WAN 的分层、三种接入模式、四阶段路线、关键约束与风险清单。所有结论引用下方研究的实测数据。 |
+| [`architecture/STAGE1-PORTFORWARD.md`](architecture/STAGE1-PORTFORWARD.md) | **阶段 1 详细设计**：包结构、Go 接口、协议扩展、CLI、四层安全防御、测试计划、8 步实施路线。可直接指导编码。 |
 
 ## 研究报告
 

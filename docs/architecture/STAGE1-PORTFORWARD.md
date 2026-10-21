@@ -1,0 +1,1391 @@
+# container-mesh 阶段 1：端口转发详细技术设计
+
+- 版本：v1.0（设计稿，不含实现代码）
+- 日期：2026-10-21
+- 代码基线：`container-mesh@be15796`
+- 上游文档：
+  - [`ARCHITECTURE-SDWAN.md`](ARCHITECTURE-SDWAN.md)（总体架构，阶段 1 见 §4.3、§6）
+  - [`../research/mux-and-portforward.md`](../research/mux-and-portforward.md)（yamux 选型、端口转发原型、开放代理防御）
+- 证据标注沿用上游口径：**`[实测]`** = 研究或项目历史实际跑出的数字；**`[查证]`** = 读源码确认；**`[推断]`** = 工程判断，未实测
+- 标注约定：**【必须】** = 不做就会出错或不安全；**【可选】** = 可以在后续迭代补
+
+---
+
+## 0. 摘要
+
+本阶段交付 `cmesh forward -L/-R`：在一条已加密的 relay/QUIC 连接上，用 yamux 开出多条 TCP 流，把本地端口映射到对端可达的服务（SSH、MySQL、HTTP）。零特权、零 TUN、零设备创建。
+
+**五个核心结论：**
+
+1. **分层顺序是 `transport → secure → 记录泵 → yamux → 业务流`，研究二的「mux 在 secure 之下」不能照字面实现。** `secure.Session` 是每方向一个严格递增计数器、且要求帧严格按发送顺序到达的 AEAD 通道（`secure.go:399-417`）。yamux 的 `recvLoop`（`session.go:548`）在应用读取之前就经 `handleStreamMessage`（`session.go:578-630`）按 streamID 把帧分发到各流的缓冲区，跨 stream 的到达顺序在那一刻就丢了。若多个 goroutine 各自解密，它们会看到**乱序的全局计数器**，解密必然失败。记录泵把「多流并发」重新收敛成「单序列」，`secure.go` 一行不改。
+
+2. **`wire.Version` 不升到 2。** 帧格式（10 字节头、1 MiB 上限）完全不变，新增帧类型是纯增量；而 `exchangeHello` 在版本不一致时直接返回 `ErrProtocol`、没有降级路径（`session.go:244-246`），升版本会让**现有 `send`/`recv` 在新旧二进制之间直接不可用**——这是纯粹的功能倒退。改用 hello 里的 `caps` 能力位协商，旧对端自动退化为「不支持转发」，文件传输完全不受影响。这是对 ARCHITECTURE-SDWAN §A1 的修正（理由见 §3.4）。
+
+3. **记录大小取 512 KiB，不是 64 KiB。** ARCHITECTURE-SDWAN §6 阶段 1 交付物 2（第 674 行）写的是 `FrameStreamData` payload ≤ 64 KiB，与项目自己的实测矛盾：D11/README 记录 512 KiB 分块回环 **539.3 MiB/s**，64 KiB 分块时代只有 **211.9 MiB/s** `[实测]`，差 2.5 倍。D28 的教训（1177 B/包只有 13 MiB/s，512 KiB/帧约 512 MiB/s）说的是同一件事：固定开销按帧摊销。取 512 KiB 与 `peer.ChunkSize` 对齐，一次 AEAD 覆盖一次 `ChunkSize`。
+
+4. **`-R` 比 `-L` 危险一个量级，需要独立的授权开关和端口白名单。** `-L` 是「我允许你拨我配置好的目标」，`-R` 是「我允许你在我这里开一个监听端口」。后者可以让持有 code 的攻击者在受害容器里绑定任意空闲 loopback 端口、向本地进程提供内容（例如冒充一个本地开发服务器）。研究二 §3.4 的 5 层里只有一层（第 1 层）管「是否启用」，且正文写 `--allow-forward`、参数表写 `--accept`，本身不一致；`-R` 没有任何独立授权。本设计增加 `--accept-reverse` + `--allow-listen-port`（零值拒绝一切）。
+
+5. **白名单必须「先解析成 IP、再比对、再用同一个 IP 拨号」。** 研究二原型的 `Permits(addr)`（§8 关键片段 3，第 974-1004 行）拿主机名做字符串比对，随后 `net.DialTimeout("tcp", p.Addr, ...)`（第 961 行）再解析一次——这是典型的 check-then-dial TOCTOU，DNS rebinding 可以绕过。本设计把 `Permits` 的返回值定义为**要拨的具体 IP**，拨号只用它。
+
+**工作量**：约 2,575 行生产代码 + 约 2,750 行测试，8 个工程日。研究二估的 880 行低估了四件事：记录泵（泵 + 控制流适配 + 会话改造，约 500 行）、`internal/mux`（410 行，研究二只算了 ~200）、`-R` 的注册控制面（~200 行）、安全加固与审计（~350 行）。
+
+---
+
+## 1. 包结构与文件划分
+
+### 1.1 依赖方向（无环）
+
+```
+cmd/cm
+ └── internal/cli          forward.go（新）；node.go（改 ~60 行）
+      ├── internal/forward   策略 + 监听器 + 双向 pipe
+      │     ├── internal/mux     yamux 包装（只依赖 yamux + stdlib）
+      │     └── internal/wire    前置头/状态码/控制帧（纯编解码）
+      ├── internal/peer       session.go（改 ~90 行）、pump.go（新）、frameconn.go（新）
+      │     ├── internal/secure   【不改】
+      │     └── internal/wire
+      └── internal/wsconn / p2pquic / p2p   【不改】
+```
+
+关键约束：`internal/mux` **不导入** `wire`/`peer`/`secure`。它只认识「一条有序字节流」和「一个字节的 stream kind」，因此 yamux 的 v0.x API 变动被完全隔离在这一个包里（研究二 §7 的风险缓解）。
+
+### 1.2 新建文件
+
+| 文件 | 职责 | 预计行数（生产/测试） |
+|---|---|---|
+| **`internal/wire/forward.go`** | 转发子协议的全部线格式：`Preamble` 编解码、`Status` 编解码、`ForwardListenSpec/Status` 结构、状态码常量。放在 `wire` 而不是 `forward`：否则 `forward` 定义状态码、`wire` 定义帧 payload 会形成导入环 | 170 / 200 |
+| **`internal/wire/frame.go`**（改） | 新增 4 个 `FrameType` 与其 `String()`；`MaxStreamData` 常量 | +35 / +20 |
+| **`internal/peer/pump.go`** | **记录泵**。唯一持有 `*secure.Session` 的组件；引导模式直通帧，复用模式把字节流封成 `FrameStreamData` | 280 / 320 |
+| **`internal/peer/frameconn.go`** | `FrameConn` 接口 + `streamFrameConn`（在 yamux 控制流上收发 `wire.Frame`）+ `writeFull` | 130 / 160 |
+| **`internal/peer/session.go`**（改） | `conn`+`sec` 两个字段换成 `frames FrameConn` + `pump *Pump`；新增 `StartMuxed`/`AttachControl` | 改 ~90 / +120 |
+| **`internal/mux/config.go`** | `Config` + 默认值 + 内存预算换算（窗口 × 流数 ≤ 预算） | 80 / 90 |
+| **`internal/mux/mux.go`** | `Session` 包装：`New`、`Open`、`Serve`（单 accept 循环 + kind 路由）、流数信号量、`Close` | 200 / 220 |
+| **`internal/mux/stream.go`** | `Stream`：`Read/Write/CloseWrite/Close/SetDeadline`、`Kind`、`Limited`、信号量归还 | 130 / 170 |
+| **`internal/forward/allow.go`** | `AllowList`：主机名启动时解析成 IP 集、CIDR、端口/端口段、`Permits` 返回要拨的 IP、拒绝 `0.0.0.0/0` | 210 / 260 |
+| **`internal/forward/limits.go`** | 流数/速率/超时/寿命；令牌桶 | 100 / 120 |
+| **`internal/forward/pipe.go`** | 双向 pipe + 半关闭传播 + 错误归一 | 100 / 130 |
+| **`internal/forward/local.go`** | `-L`：本地 listener 只建一次、每连接开流、前置头+状态、挂到当前 session | 190 / 200 |
+| **`internal/forward/reverse.go`** | `-R`：注册请求、托管对端请求的 listener、按 ID 匹配、本地拨号 | 200 / 220 |
+| **`internal/forward/manager.go`** | `Manager`：装配、`Serve` 的 kind 分发、审计日志、启动横幅 | 230 / 240 |
+| **`internal/cli/forward.go`** | `-L`/`-R` 解析（表驱动）、全部策略 flag、`--also-recv-files`、生命周期 | 340 / 220 |
+| **`internal/cli/node.go`**（改） | `UseMux`、`OnMux` 钩子、`dialOne` 里插入 mux 引导、`Mux(ctx)` 访问器 | 改 ~60 / +60 |
+| **`internal/cli/cli.go`**（改） | 子命令注册 + usage 文本 | +30 / — |
+
+合计：**约 2,400–2,600 生产 / 约 2,750 测试**（上表逐项相加为 2,575 / 2,750）。
+
+### 1.3 不新建、不修改的包
+
+| 包 | 处置 | 理由 |
+|---|---|---|
+| `internal/secure` | **一行不改** | 记录泵的全部意义就在于让它继续只看到「一条有序的帧序列」。`SealFrame`/`OpenFrame` 的现有测试（重放/篡改/计数器）继续有效 |
+| `internal/wsconn` / `p2pquic` / `p2p` | 不改 | 它们只提供 `MessageConn`，与 mux 正交 |
+| `internal/p2p`（打洞） | 不改 | `Negotiator` 的时机天然在 mux 之前（`session.go:271-289`），满足 A8 |
+| `internal/p2p2` | 不接入 | A12 冻结策略 |
+| `internal/relay` | 不改 | relay 只转发密文；消息数会从约 2 条/MiB 升到约 4–13 条/MiB（研究二 §4.9 `[实测]`），仍在 `MaxMessageBytes=16 MiB` 与限流之内 |
+
+---
+
+## 2. 接口定义
+
+### 2.1 记录泵（`internal/peer/pump.go`）
+
+记录泵是**唯一接触 `secure.Session` 的组件**，也是 `MessageConn`（消息语义）与 yamux（字节流语义）之间的适配器。它不是研究二 §2.5 那个 `messageStream`——那个适配器位于 secure **之下**，会让 secure 看到多流交错的密文。
+
+```go
+package peer
+
+// Pump owns the encrypted frame channel. It has exactly two modes:
+//
+//   bootstrap: SendFrame/RecvFrame are the only entry points, and they are
+//     byte-for-byte what peer.Session did before the mux existed. hello and
+//     the p2p signalling run here.
+//
+//   muxed: StartMux has completed; one goroutine reads the transport and one
+//     writes it, and the pair presents a single ordered byte stream to yamux.
+//
+// The invariant that makes the whole design work: exactly one goroutine ever
+// calls secure.OpenFrame, and exactly one ever calls secure.SealFrame. That is
+// what the strictly increasing counter in secure requires, and it is why
+// multiplexing cannot sit below secure.
+type Pump struct {
+    conn MessageConn      // the *switchable, so a p2p upgrade still works
+    sec  *secure.Session
+
+    // bootstrap-side serialisation. After StartMux these are unused: the
+    // writer goroutine is then the only seal path.
+    bootMu sync.Mutex
+
+    st      atomic.Int32 // pumpBootstrap -> pumpDraining -> pumpMuxed -> pumpClosed
+    rwc     *pumpLink    // non-nil once muxed
+    readQ   *byteQueue   // inbound records, bounded (see BufBytes)
+    writeQ  *byteQueue   // outbound records, bounded
+
+    closeOnce sync.Once
+    closeErr  error
+    done      chan struct{}
+}
+
+type PumpConfig struct {
+    // RecordSize is the largest FrameStreamData payload. 512 KiB matches
+    // peer.ChunkSize and the measured optimum (D11: 539.3 MiB/s at 512 KiB
+    // versus 211.9 MiB/s at 64 KiB).
+    RecordSize int
+    // BufBytes bounds each direction's queue. 1 MiB is two records, enough to
+    // keep the transport busy across one AEAD + one Send, and small enough
+    // that a dead peer cannot pin more than 2 MiB per session.
+    BufBytes int
+    Logger   *slog.Logger
+}
+
+func NewPump(conn MessageConn, sec *secure.Session, cfg PumpConfig) *Pump
+
+// ---- bootstrap mode -------------------------------------------------------
+
+// SendFrame seals and sends one frame. Safe for concurrent use, though during
+// bootstrap only one goroutine (hello, then negotiation) is ever writing.
+func (p *Pump) SendFrame(f *wire.Frame) error
+
+// RecvFrame reads and opens one frame. Only the caller that owns the read side
+// may call it: exchangeHello, then p2p.Negotiate, then nobody.
+func (p *Pump) RecvFrame() (*wire.Frame, error)
+
+// ---- barrier --------------------------------------------------------------
+
+// StartMux performs the FrameMuxStart barrier and hands back the byte stream
+// yamux runs on.
+//
+// Sequence (both peers run it symmetrically, right after negotiation):
+//
+//   1. seal+send FrameMuxStart
+//   2. read frames until the peer's FrameMuxStart arrives; anything else is
+//      logged and dropped (it can only be a stray pong: the read pump has not
+//      started and the application cannot be writing yet)
+//   3. start the reader goroutine (transport.Recv + OpenFrame) and the writer
+//      goroutine (SealFrame + transport.Send)
+//   4. return the link
+//
+// Steps 1-2 run on the caller's goroutine, so the "one reader" invariant holds
+// across the hand-off: before StartMux the caller reads, after it the pump
+// goroutine reads, and there is no moment when two readers exist.
+func (p *Pump) StartMux(ctx context.Context) (io.ReadWriteCloser, error)
+
+// ---- lifecycle / accessors ------------------------------------------------
+
+// Close shuts the pump down. Closing the link also closes yamux (its recvLoop
+// and sendLoop both error out), which fails every stream.
+func (p *Pump) Close() error
+func (p *Pump) Done() <-chan struct{}
+func (p *Pump) Err() error
+
+// Delegated accessors so peer.Session and cli.Node keep their current API.
+func (p *Pump) ShortAuth() string
+func (p *Pump) Fingerprint() string
+func (p *Pump) RecvCounter() uint64
+
+// pumpLink is what yamux sees: an ordered, reliable, closeable byte stream.
+type pumpLink struct{ p *Pump }
+
+func (l *pumpLink) Read(b []byte) (int, error)   // drains p.readQ
+func (l *pumpLink) Write(b []byte) (int, error)  // appends to p.writeQ
+func (l *pumpLink) Close() error                 // p.Close()
+```
+
+**核心循环（伪代码，实现者按此写）：**
+
+```go
+// reader — the only goroutine that touches transport.Recv and OpenFrame
+func (p *Pump) readLoop() {
+    defer p.fail(errPumpRead)
+    for {
+        msg, err := p.conn.Recv()
+        if errors.Is(err, ErrTransportSwitched) {
+            // A direct path replaced the relay underneath us. The session key
+            // and the counters are unchanged, so keep going. Forgetting this
+            // branch is the single most likely regression: it would turn a
+            // successful --p2p upgrade into a dead session.
+            continue
+        }
+        if err != nil { p.fail(err); return }
+
+        f, err := p.sec.OpenFrame(msg)   // single reader => counters stay in order
+        if err != nil { p.fail(err); return }
+
+        switch f.Type {
+        case wire.FrameStreamData:
+            if err := p.readQ.Put(f.Payload); err != nil { p.fail(err); return }
+        default:
+            // Nothing legitimate travels outside FrameStreamData after the
+            // barrier. Drop it rather than kill the session: a ping that was
+            // in flight when the peer hit the barrier is harmless.
+            p.log.Debug("dropping non-stream frame in mux mode", "type", f.Type)
+        }
+    }
+}
+
+// writer — the only goroutine that touches SealFrame and transport.Send
+func (p *Pump) writeLoop() {
+    defer p.fail(errPumpWrite)
+    buf := make([]byte, p.cfg.RecordSize)
+    for {
+        n, err := p.writeQ.Get(buf)   // blocks; returns whatever is available
+        if err != nil { p.fail(err); return }
+        // One record = one frame = one AEAD = one transport message. The frame
+        // header's Stream field stays 0: multiplexing belongs to yamux, and
+        // wire.Frame.Stream must not become a second, conflicting stream id.
+        f := &wire.Frame{Type: wire.FrameStreamData, Payload: buf[:n]}
+        sealed, err := p.sec.SealFrame(f)
+        if err != nil { p.fail(err); return }
+        if err := p.conn.Send(sealed); err != nil { p.fail(err); return }
+    }
+}
+```
+
+**必须处理的四个细节：**
+
+1. **`ErrTransportSwitched` 必须继续。** `readPump` 现在有这条分支（`session.go:307-313`），搬进泵时不能丢。
+2. **`fail` 必须同时关闭两个队列和 link。** 只关一端会让 yamux 的另一个 loop 永久阻塞，整个会话停摆（ARCHITECTURE-SDWAN §6 已列为风险）。
+3. **队列是有界阻塞的，不是丢弃的。** 满时阻塞写侧，这是正确的背压（传输慢 → yamux `sendLoop` 慢 → 各流的 `Write` 慢 → 应用的 `write()` 慢），不是 bug。`BufBytes=1 MiB` 下，11–12 MiB/s 的跨公网链路约 85 ms 排空，远小于 yamux 的 `ConnectionWriteTimeout=10 s` 安全阀。
+4. **`SealFrame` 成功但 `Send` 失败时计数器已经消耗。** 会话必须判死，不能重试——这与现有 `SendFrame` 的行为一致（`session.go:423-431`），不是新增缺陷。
+
+**【可选】写入合并（coalescing）**：写侧 `Get` 返回「当前队列里已有的字节」（最多 `RecordSize`），因此 yamux 的 `Write(hdr)` + `Write(body)` 两次调用**有机会**落进同一条记录，不需要任何定时器。研究二 §4.9 实测未合并时是 13 条消息/MiB、平均 81.8 KiB/条；合并能把 header-only 记录消掉，但不是必需——13 条/MiB 仍在 relay 的承受范围内。**不做基于延时的 flush**：研究二试过并因 flush 时机出 bug 未跑通，不值得在 v1 引入一个时序依赖。
+
+### 2.2 `FrameConn`：把 yamux 接进 `peer.Session` 的接缝
+
+**这是整个改造的关键抽象。** `peer.Session` 现在同时持有传输（`conn *switchable`）和加密（`sec *secure.Session`）。改成只持有一个 `FrameConn`：
+
+```go
+package peer
+
+// FrameConn is the session's frame source and sink. There are exactly two
+// implementations, and which one is installed changes exactly once per
+// session, at the mux barrier:
+//
+//   *Pump           bootstrap: transport messages + AEAD
+//   streamFrameConn muxed:     wire frames on a yamux control stream
+//
+// peer.Session never learns which one it has. That is what keeps the file
+// transfer code (offers, resume, hash verification, duplex) untouched.
+type FrameConn interface {
+    SendFrame(*wire.Frame) error
+    RecvFrame() (*wire.Frame, error)
+    Close() error
+}
+```
+
+`streamFrameConn` 就是「消息语义 ↔ 流语义」在**控制流**上的适配器：
+
+```go
+// streamFrameConn carries wire frames on a byte stream.
+//
+// Note there is no extra length prefix: wire.Frame already encodes its own
+// payload length (frame.go:118-130), so wire.DecodeFrame(io.Reader) reads
+// exactly one frame. Adding a second length prefix (the "one Write = one
+// message" adapter from research §2.5) would be pure overhead here.
+type streamFrameConn struct {
+    rw     io.ReadWriteCloser
+    rd     *bufio.Reader   // 64 KiB: wire.DecodeFrame does two Reads per frame
+    sendMu sync.Mutex      // one frame must not interleave with another
+}
+
+func newStreamFrameConn(rw io.ReadWriteCloser) *streamFrameConn {
+    return &streamFrameConn{rw: rw, rd: bufio.NewReaderSize(rw, 64<<10)}
+}
+
+func (c *streamFrameConn) SendFrame(f *wire.Frame) error {
+    b, err := f.Encode(nil)   // reuse the existing encoder: header + payload
+    if err != nil { return err }
+    c.sendMu.Lock()
+    defer c.sendMu.Unlock()
+    // writeFull, not Write: a short write would desynchronise the frame
+    // boundary for the rest of the session.
+    return writeFull(c.rw, b)
+}
+
+func (c *streamFrameConn) RecvFrame() (*wire.Frame, error) {
+    return wire.DecodeFrame(c.rd)   // frame.go:133-154, unchanged
+}
+
+func (c *streamFrameConn) Close() error { return c.rw.Close() }
+```
+
+**为什么不用研究二 §2.5 的 `messageStream`：**
+
+| | 研究二的 `messageStream` | 本设计的记录泵 |
+|---|---|---|
+| 位置 | secure **之下**（yamux 直接包在 `MessageConn` 上） | secure **之上**（yamux 包在泵提供的字节流上） |
+| secure 看到什么 | 多流交错的密文，需要按 streamID 重排 | 一条有序的字节序列，计数器天然递增 |
+| 能否满足 `OpenFrame` 的顺序要求 | 不能：`recvLoop` 在应用读取前就按流分发 | 能：单读者 |
+| 每流密钥 | 必须派生（nonce 空间风险） | 不需要 |
+
+`messageStream` 唯一还需要的场景是「把一条 yamux 流当成 `Send`/`Recv` 消息管道」。控制流不需要它（帧自带长度），转发流也不需要它（直接 `io.Copy`）。所以**不实现它**。
+
+### 2.3 `peer.Session` 的改动
+
+```go
+type Session struct {
+    cfg Config
+    frames FrameConn   // was: conn *switchable + sec *secure.Session
+    pump   *Pump       // nil only for sessions built by tests that inject frames
+    // ... 其余字段不变
+}
+
+// StartMuxed is StartWithNegotiation with a mux bootstrap step inserted
+// between the p2p negotiation and the read pump. The order is load-bearing:
+//
+//   hello -> negotiation (+ transport switch) -> mux barrier -> control stream -> read pump
+//
+// A8: the transport may only change before yamux exists. The read pump may
+// only start once the frame source is the control stream, or it would race
+// StartMux for the next frame on the raw transport.
+func (s *Session) StartMuxed(h Handler, neg Negotiator, boot MuxBoot) error
+
+// MuxBoot is supplied by the CLI. It performs the barrier, builds the yamux
+// session, starts its accept loop, and returns the control stream.
+type MuxBoot func(*Session) (io.ReadWriteCloser, error)
+
+// AttachControl installs the control stream as the frame source. Called from
+// the accept loop's kind=0 branch (responder side).
+func (s *Session) AttachControl(rw io.ReadWriteCloser) error
+
+// 既有访问器改为委托，node.go 无需改动：
+func (s *Session) ShortAuth() string  { return s.pump.ShortAuth() }
+func (s *Session) Fingerprint() string { return s.pump.Fingerprint() }
+func (s *Session) UpgradeToDirect(next MessageConn) error { return s.pump.UpgradeToDirect(next) }
+func (s *Session) OnDirect() bool { return s.pump.OnDirect() }
+func (s *Session) FramesSinceStart() uint64 { /* pump.RecvCounter() - recvAtStart */ }
+```
+
+`SendFrame`/`recvFrame` 变成两行：
+
+```go
+func (s *Session) SendFrame(f *wire.Frame) error { return s.frames.SendFrame(f) }
+func (s *Session) recvFrame() (*wire.Frame, error) { return s.frames.RecvFrame() }
+```
+
+原来的 `sendMu`（「密封 + 发送必须原子」，`session.go:416-431`）职责上移到两个实现里：`Pump.SendFrame` 用 `bootMu`，`streamFrameConn.SendFrame` 用 `sendMu`。**必须**保留这个语义，否则并发 `SealFrame` 会让高计数器先上线。
+
+### 2.4 `internal/mux`
+
+```go
+package mux
+
+// Kind is the first byte of every stream. It tells the accept loop what the
+// stream is for before any protocol bytes are read.
+const (
+    KindControl byte = 0 // the peer.Session control stream (opener: initiator)
+    KindForward byte = 1 // one forwarded TCP connection
+)
+
+type Role int
+const (
+    RoleClient Role = iota // yamux client: opens odd stream ids (role A)
+    RoleServer             // yamux server: opens even stream ids (role B)
+)
+
+type Config struct {
+    Role Role
+    // Window is yamux MaxStreamWindowSize. 256 KiB is the yamux floor and the
+    // memory-safe default (2*Window per active stream, measured 514.8 KiB).
+    // 1 MiB is worth ~13% on loopback but is required on WAN: 256 KiB over a
+    // 50 ms RTT caps a stream at ~40 Mbit/s.
+    Window uint32
+    // MaxStreams bounds concurrently open streams on both sides.
+    MaxStreams int
+    // AcceptBacklog must be >= MaxStreams, or a burst of inbound streams is
+    // RST by yamux before the accept loop can drain it.
+    AcceptBacklog int
+    // StreamOpenTimeout: yamux closes the WHOLE session when one stream's SYN
+    // is not acknowledged in time (session.go:213-230). 75 s is too tight when
+    // a relay hiccups; 120 s costs nothing.
+    StreamOpenTimeout time.Duration
+    // StreamCloseTimeout: how long a half-closed stream may linger. The yamux
+    // default of 5 min would hold 2*Window for 5 min per abandoned forward.
+    StreamCloseTimeout time.Duration
+    ConnectionWriteTimeout time.Duration
+    KeepAliveInterval      time.Duration
+    Logger *slog.Logger
+}
+
+type Session struct {
+    y   *yamux.Session
+    cfg Config
+    sem chan struct{}  // MaxStreams, shared by Open and Accept
+    log *slog.Logger
+}
+
+func New(rwc io.ReadWriteCloser, cfg Config) (*Session, error)
+
+// Open opens one stream and writes its kind byte. It blocks while the stream
+// limit is reached, honouring ctx. Checking NumStreams first avoids the case
+// where yamux's own StreamOpenTimeout fires while we are waiting for a slot.
+func (s *Session) Open(ctx context.Context, kind byte) (*Stream, error)
+
+// Serve runs the single accept loop. Each accepted stream is dispatched in its
+// own goroutine. When the limit is reached the stream is still accepted and
+// marked Limited: refusing to accept makes yamux RST it, and the opener would
+// see a reset instead of an explicit "too many" status.
+func (s *Session) Serve(ctx context.Context, dispatch func(*Stream)) error
+
+func (s *Session) NumStreams() int
+func (s *Session) Ping() (time.Duration, error)
+func (s *Session) Close() error
+func (s *Session) Done() <-chan struct{}
+
+type Stream struct {
+    st      *yamux.Stream
+    kind    byte
+    limited bool
+    sem     chan struct{}
+    once    sync.Once
+}
+
+func (s *Stream) Read([]byte) (int, error)
+func (s *Stream) Write([]byte) (int, error)
+
+// CloseWrite half-closes the write side. yamux has no CloseWrite, but
+// Stream.Close is exactly a FIN: stream.go:324-379 only sets
+// streamLocalClose and sends FIN, and Read keeps working (stream.go:100-106).
+// Measured: an 18-byte response was still readable after Close.
+func (s *Stream) CloseWrite() error
+func (s *Stream) Close() error      // releases the semaphore exactly once
+func (s *Stream) SetDeadline(t time.Time) error
+func (s *Stream) Kind() byte
+func (s *Stream) Limited() bool
+func (s *Stream) ID() uint32
+```
+
+**yamux 参数取值与理由：**
+
+| 参数 | yamux 默认 | 本设计 | 为什么 |
+|---|---|---|---|
+| `MaxStreamWindowSize` | 256 KiB | 256 KiB（`--mux-window` 可调） | 每活跃流 ≈ 2×窗口 `[实测]`：256 KiB → 514.8 KiB，1 MiB → 2.0 MiB。默认取内存安全值 |
+| `MaxStreams` | 无上限 | 256，且被预算硬压 | yamux 只限「未 Accept 的流」（`AcceptBacklog`），已建立流数没有上限。不设限 = 对端可开无限流耗尽内存 |
+| `AcceptBacklog` | 256 | `max(256, MaxStreams)` | 小于 MaxStreams 时突发会被 RST |
+| `StreamOpenTimeout` | 75 s | **120 s** | 失败会关整个 session（`session.go:213-228` `[查证]`） |
+| `StreamCloseTimeout` | 5 min | **60 s** | 半关闭后等对端 FIN 的上限；5 分钟太长，一条废弃转发会占 2×窗口 5 分钟 |
+| `ConnectionWriteTimeout` | 10 s | 10 s | 安全阀：写不出去就认为连接坏了。跨公网 11–12 MiB/s 下 1 MiB 队列 85 ms 排空，10 s 足够 |
+| `KeepAliveInterval` | 30 s | 30 s | 与 wsconn 的 20 s ping 重叠但无害；yamux 的 keepalive 失败会主动关 session，是有用的第二道检测 |
+| `LogOutput` | `os.Stderr` | **必须显式设置** | `VerifyConfig` 要求 `LogOutput`/`Logger` 二选一非空（`mux.go:86-91`）；默认值会往 CLI stderr 吐日志，污染输出 |
+| 窗口与流数的预算 | — | `MaxStreams = min(--max-streams, StreamBudget/(2*Window))` | 128 MiB 预算下：256 KiB → 256 流；1 MiB → 64 流。A9 的两套预算由此自动对齐，启动时打印实际生效值 |
+
+### 2.5 转发器接口（`internal/forward`）
+
+```go
+package forward
+
+// Mux is the slice of a multiplexed session the forwarder needs. Keeping it an
+// interface lets the whole package be tested with a fake, with no yamux and no
+// network.
+type Mux interface {
+    Open(ctx context.Context, kind byte) (Stream, error)
+    NumStreams() int
+}
+
+type Stream interface {
+    io.ReadWriteCloser
+    SetDeadline(t time.Time) error
+}
+
+// Provider supplies the session that is currently live. The node reconnects
+// and rebuilds the session on every drop (node.go:136-246), so a forwarder
+// must never cache one: it asks for the current session per connection.
+type Provider interface {
+    Current(ctx context.Context) (Mux, error)
+}
+
+type Config struct {
+    // Accept serves -L streams arriving from the peer. Off by default.
+    Accept bool
+    // AcceptReverse hosts listeners the peer asked for (-R). Off by default:
+    // binding a port is a categorically bigger permission than dialling one.
+    AcceptReverse bool
+    // ListenAll permits a -R request to bind a non-loopback address.
+    ListenAll bool
+    Allow         AllowList   // zero value denies everything
+    ListenPorts   PortSet     // zero value denies every -R port
+    Limits        Limits
+    // Dialer is swapped in tests to prove policy runs before dialling.
+    Dialer        Dialer
+    Logger        *slog.Logger
+}
+
+type Manager struct{ /* ... */ }
+
+func New(cfg Config) *Manager
+
+// AddLocal installs one -L listener. The listener is created ONCE and survives
+// reconnects: rebuilding it per session would briefly unbind the port and race
+// a concurrent bind (research §3.6).
+func (m *Manager) AddLocal(sp Spec) (*LocalForward, error)
+
+// RegisterReverse handles a peer's FrameForwardListen. It applies policy and
+// returns one status per spec; it never returns an error, because a refusal is
+// a normal answer, not a failure.
+func (m *Manager) RegisterReverse(ctx context.Context, specs []wire.ForwardListenSpec) []wire.ForwardListenStatus
+
+// Handle serves one inbound kind=1 stream: read preamble, check policy, dial,
+// reply status, pipe.
+func (m *Manager) Handle(ctx context.Context, st Stream)
+
+// Serve is the kind dispatcher handed to mux.Session.Serve.
+func (m *Manager) Serve(ctx context.Context, st Stream)
+
+func (m *Manager) Close() error
+
+// LocalForward is one -L mapping.
+type LocalForward struct{ /* ... */ }
+func (lf *LocalForward) Addr() net.Addr   // resolved address, for ":0" tests
+func (lf *LocalForward) Serve(ctx context.Context, p Provider)
+func (lf *LocalForward) Close() error
+
+// Spec is one -L or -R entry, after parsing.
+type Spec struct {
+    Reverse bool
+    Bind    string // "127.0.0.1:8080" — for -R this is a REQUEST to the peer
+    Target  string // "db:5432"
+    ID      string // Bind, normalized; -R matches the peer's stream by this
+}
+```
+
+`Manager.Serve` 的分发逻辑（**必须**，这是 kind 语义的唯一执行点）：
+
+```go
+func (m *Manager) Serve(ctx context.Context, st Stream) {
+    switch st.Kind() {
+    case mux.KindForward:
+        if !m.cfg.Accept {
+            // Do not even read the preamble: answering Denied immediately
+            // means a peer without permission cannot use us as a timing or
+            // reachability oracle for its own targets.
+            _ = wire.WriteStatus(st, wire.StatusDenied, "forwarding is disabled (--accept)")
+            st.Close()
+            return
+        }
+        m.Handle(ctx, st)
+    case mux.KindControl:
+        // Only the responder expects this, and only during bootstrap.
+        m.sink(st)
+    default:
+        _ = wire.WriteStatus(st, wire.StatusBadRequest, "unknown stream kind")
+        st.Close()
+    }
+}
+```
+
+---
+
+## 3. 协议扩展
+
+### 3.1 新增帧类型
+
+```go
+const (
+    // ... 既有 FrameHello..FrameP2PAnswer 不变 ...
+
+    // FrameStreamData carries an opaque byte block of the multiplexed byte
+    // stream. Payload is raw bytes, <= MaxStreamData. The Frame.Stream field
+    // MUST stay 0: multiplexing is yamux's job, and giving wire.Frame a second
+    // stream id would let the two disagree.
+    FrameStreamData
+
+    // FrameMuxStart is the mux barrier. Payload is one byte: the mux protocol
+    // version (1). Both peers send one and wait for the other's. No nonce is
+    // needed: secure's strictly increasing counters already make a replayed
+    // or reordered barrier impossible.
+    FrameMuxStart
+
+    // FrameForwardListen asks the peer to host listeners for -R. Payload is
+    // JSON {"specs":[{"id","host","port"}]}.
+    FrameForwardListen
+
+    // FrameForwardListenResult answers it. Payload is JSON
+    // {"results":[{"id","status","message"}]}.
+    FrameForwardListenResult
+)
+
+// MaxStreamData bounds one FrameStreamData payload. 512 KiB = peer.ChunkSize:
+// the measured optimum (D11). It is also far below wire.MaxPayload (1 MiB) and
+// the relay's 16 MiB message ceiling.
+const MaxStreamData = 512 << 10
+```
+
+`FrameForwardListen*` 走**控制流**（也就是 `peer.Session` 的帧分发），不新开 stream kind。理由：它们是一次性控制消息，天然属于会话控制面；`peer.Session` 已经有按类型分发的 `readPump`（`session.go:317-344`），加两个 case 即可。
+
+### 3.2 转发握手 preamble
+
+每条 `kind=1` 的流以一个小前置头开始，之后才是双向字节流。
+
+```
+偏移  长度  字段
+0     1    version = 1
+1     1    kind: 1 = direct (-L), 2 = reverse (-R)
+2     1    addrLen (0..255)
+3     n    addr (UTF-8)
+```
+
+- **`direct`（`-L`）**：`addr` 是**请求对端拨号的目标**（`"db:5432"`）。对端必须用白名单校验它。
+- **`reverse`（`-R`）**：`addr` 是**请求方配置的监听器 ID**（`"127.0.0.1:9000"`），**不是拨号目标**。对端按这个 ID 查自己的 `-R` 配置，拨本地配置里的 target。
+
+```go
+package wire
+
+const PreambleVersion byte = 1
+
+const (
+    KindDirect  byte = 1 // opener asks the acceptor to dial Addr
+    KindReverse byte = 2 // opener reports which of the acceptor's -R listeners fired
+)
+
+type Preamble struct {
+    Version byte
+    Kind    byte
+    Addr    string
+}
+
+// WritePreamble writes the 3+n byte header in a single Write.
+func WritePreamble(w io.Writer, p Preamble) error
+
+// ReadPreamble parses it strictly. Every field is attacker-controlled.
+func ReadPreamble(r io.Reader) (Preamble, error)
+```
+
+**为什么 `-R` 要带一个 ID，而不是研究二说的「Addr 仅用于日志」：** 研究二的方案在只有一个 `-R` 时能工作，但有两条 `-R`（`9000→:3000`、`9001→:3001`）时，接收方无法知道对面那条流是从哪个监听器来的，只能猜。用一个确定性的 ID（= 请求的 `bind` 规范化后的 `host:port`）匹配，既不需要额外协商，也让「目标只来自本地配置」这条结构性保证成立：**ID 只用于查表，绝不用于拨号**。若 ID 不在本端配置里 → `StatusDenied`。
+
+**严格解析规则【必须】**：
+
+| 检查 | 拒绝条件 | 理由 |
+|---|---|---|
+| 版本 | `Version != 1` | 前向兼容 |
+| kind | 不是 1/2 | 未知语义 |
+| addrLen | `> 255` | 有界分配 |
+| addr | 空、含 NUL 或控制字符、非 UTF-8 | 日志注入 / 解析歧义 |
+| addr | `net.SplitHostPort` 失败 | 必须是 `host:port` |
+| host | 空 | `:22` 会被解析成任意本地地址 |
+| port | 非数字、`<1`、`>65535` | `port 0` 会让 dial 语义变成「随机端口」 |
+
+### 3.3 状态码
+
+```go
+type Status uint32
+
+const (
+    StatusOK         Status = 0 // dialled; the stream is now a byte pipe
+    StatusDenied     Status = 1 // policy: not allowed (allow-list, no --accept, unknown listener)
+    StatusDialFail   Status = 2 // policy allowed it, the target did not answer
+    StatusTooMany    Status = 3 // stream or rate limit
+    StatusBadRequest Status = 4 // malformed preamble, unknown kind/version
+    StatusBindFail   Status = 5 // only in ForwardListenResult: listener could not bind
+)
+
+// Wire form: status(4 BE) then an optional reason:
+//   reasonLen(2 BE) + reason(<=200 bytes UTF-8)
+// The reason is for the operator, never for control flow.
+func WriteStatus(w io.Writer, s Status, reason string) error
+func ReadStatus(r io.Reader) (Status, string, error)
+```
+
+研究二 §3.2 的实测教训是「没有状态码时，被拒绝的连接只表现为流立刻关闭，客户端分不清策略拒绝和目标挂了」。加了状态码后，日志从「连接被重置」变成明确的 `peer refused target ... (status 1)` `[实测]`。
+
+本设计在研究二 4 个状态码的基础上加了 `BadRequest` 和 `BindFail`：
+- `BadRequest` 让协议错误与策略拒绝可区分（否则畸形 preamble 会被记成「被拒绝」，掩盖攻击或 bug）；
+- `BindFail` 让 `-R` 注册失败（端口被占用、权限不足）能与「策略拒绝」区分，用户才知道该换端口还是改配置。
+
+**顺序是安全属性，不是风格**【必须】：
+
+```go
+// 先查策略，再拨号。顺序反了，被拒绝的请求也会产生一次出站连接，
+// 攻击者就能用它做端口扫描（响应时间 + 状态码）和放大。
+if ip, err := m.allow.Permits(ctx, p.Addr); err != nil {
+    _ = wire.WriteStatus(st, wire.StatusDenied, err.Error())  // 不拨号
+    return
+}
+target, err := m.dialer.DialContext(ctx, "tcp", net.JoinHostPort(ip, port))
+if err != nil {
+    _ = wire.WriteStatus(st, wire.StatusDialFail, "target unreachable")
+    return
+}
+_ = wire.WriteStatus(st, wire.StatusOK, "")
+pipe(st, target)
+```
+
+### 3.4 `wire.Version`：不升到 2（对 ARCHITECTURE-SDWAN §A1 的修正）
+
+ARCHITECTURE-SDWAN §A1 的结论是「新增帧类型与 mux 属于不兼容变更，`wire.Version` 提升到 2」。**本设计不同意，理由是代码事实：**
+
+| 事实 | 证据 |
+|---|---|
+| 帧格式完全不变：10 字节头（type/flags/stream/length），payload ≤ 1 MiB | `frame.go:104-130` `[查证]` |
+| 新增帧类型是纯增量：`readPump` 的 `default` 分支忽略未知类型 | `session.go:341-343` `[查证]` |
+| 版本不一致时**没有降级路径**，直接 `ErrProtocol` | `session.go:244-246` `[查证]` |
+
+也就是说：升到 2 之后，**新二进制的 `send` 无法与旧二进制的 `recv` 通信，连传文件都不行**。这是为了一个「不存在的不兼容」而制造一个真实的功能倒退。项目自己的原则（拒绝 smux，因为它静默丢数据）就是「宁可明确失败，也不要隐蔽地坏」，但这里根本不需要失败。
+
+**决定【必须】：`wire.Version` 保持 1；用 hello 的 `caps` 协商 mux。**
+
+```go
+// hello payload（既有字段不变，新增两个可选字段）
+type Hello struct {
+    Version int      `json:"version"`          // 仍是 1
+    Name    string   `json:"name"`
+    Role    string   `json:"role"`
+    // Caps advertises optional capabilities. Absent means "none", which is
+    // exactly what a v1 binary sends: it never enters the mux path, and its
+    // file transfer is untouched.
+    Caps    []string `json:"caps,omitempty"`   // "mux", "forward"
+    Mux     int      `json:"mux,omitempty"`    // mux protocol version (1)
+}
+```
+
+判定逻辑：
+
+| 本端 | 对端 | 结果 |
+|---|---|---|
+| `send`/`recv`（不设 `UseMux`） | 任意 | **不建 mux**，代码路径与今天逐字节相同 |
+| `forward` | 旧版（无 `caps`） | `ErrProtocol` + 明确提示「peer does not support forwarding; upgrade both sides」 |
+| `forward` | `forward` | 建 mux，正常转发 |
+| `forward` | `send` | 同上：对端没有 `caps` → 明确拒绝 |
+
+**什么时候才该升版本**：改动帧头布局、改变既有帧类型的语义、或需要单方面拒绝旧对端时。届时 `caps` 机制让升级成为一行改动（把 `Version` 改成 2 即可），所以本设计对两种选择都兼容——只是当前没有理由选 2。
+
+**这条修正必须同步写进 `ARCHITECTURE-SDWAN.md` §A1**，否则实现者会照旧文档升版本。
+
+### 3.5 握手时序
+
+**屏障（两端对称）**
+
+```
+A（initiator / yamux client）                B（responder / yamux server）
+  │ hello(version=1,caps=[mux,forward],mux=1) │
+  │<──────────────────────────────────────────>│
+  │ (可选) p2p 协商 + UpgradeToDirect           │   ← 必须在 mux 之前（A8）
+  │ FrameMuxStart{1} ─────────────────────────>│
+  │<───────────────────────── FrameMuxStart{1} │
+  │ ── 两边同时切换：读/写 goroutine 启动 ──    │
+  │ OpenStream(kind=0) ───────────────────────>│
+  │ 控制流上跑 peer.Session（消息/文件）        │
+```
+
+**`-L`（本地监听 → 对端拨号）**
+
+```
+本地 cmesh                                   远端 cmesh
+  │ accept() on 127.0.0.1:8080                 │
+  │ OpenStream(kind=1) ───────────────────────>│
+  │ Preamble{v1, direct, "db:5432"} ──────────>│
+  │                                            │ allow.Permits → 得到 IP
+  │                                            │ 不在白名单 → Status(1)，不拨号
+  │                                            │ DialTimeout(5s) 拨 IP
+  │<──────────────────────── Status(0) ────────│
+  │<────────────── 双向字节 + 半关闭 ──────────>│
+```
+
+**`-R`（对端监听 → 回连本地）**
+
+```
+本地 cmesh（-R 请求方）                       远端 cmesh
+  │ FrameForwardListen{[{id:"127.0.0.1:9000",   │
+  │   host:"127.0.0.1", port:9000}]} ─────────>│
+  │                                            │ --accept-reverse? 
+  │                                            │ --allow-listen-port 含 9000?
+  │                                            │ loopback? 否则要 --listen-all
+  │                                            │ bind → 失败则 StatusBindFail
+  │<───────────── ForwardListenResult ─────────│
+  │                                            │ (远端应用 connect 127.0.0.1:9000)
+  │                                            │ OpenStream(kind=1) ─────────>
+  │<── Preamble{v1, reverse, "127.0.0.1:9000"} │
+  │ 按 ID 查本地 -R 配置 → target              │
+  │ 查不到 → Status(1)                         │
+  │ 拨 target（本地配置，不是 preamble）       │
+  │<──────────────── Status(0) ───────────────>│
+  │<──────────── 双向字节 + 半关闭 ───────────>│
+```
+
+---
+
+## 4. CLI 设计
+
+### 4.1 语法
+
+```
+cmesh forward [连接参数] [转发规格] [策略参数]
+```
+
+```bash
+# ssh -L 等价：本地 8080 → 对端拨 db:5432
+cmesh forward --code CODE -L 127.0.0.1:8080:db:5432
+
+# 多条转发，一条隧道
+cmesh forward --code CODE \
+    -L 127.0.0.1:8080:db:5432 \
+    -L 127.0.0.1:9090:api:80
+
+# ssh -R 等价：请对端监听 127.0.0.1:9000，回连我这里的 127.0.0.1:3000
+cmesh forward --code CODE -R 127.0.0.1:9000:127.0.0.1:3000
+
+# 纯接受端：不开本地监听，只服务对端的 -L
+cmesh forward --code CODE --accept \
+    --allow-host db.internal --allow-port 5432 --expect-sas 123456
+
+# 同时接收文件（同一个 session）
+cmesh forward --code CODE -L 127.0.0.1:8080:db:5432 --also-recv-files --out ./inbox
+```
+
+### 4.2 参数表
+
+**连接参数（复用 `commonFlags`，`cli.go:117-141`）**
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--relay` | `ws://127.0.0.1:8080/ws` | 逗号分隔多 relay，按序故障切换（env `CMESH_RELAY`） |
+| `--code` | 空（自动生成并打印） | 共享口令（env `CMESH_CODE`） |
+| `--name` | 主机名 | 对端可见的名字 |
+| `--pair-window` | 0（单 relay 永久等待） | 一个 relay 上等对端的时长 |
+| `--p2p` / `--p2p-legacy` / `--stun` | false / false / 内置 | 直连打洞，与 `send`/`recv` 一致 |
+| `--expect-sas` | 空 | **启用转发时强烈建议**；不一致直接中止（D38） |
+
+**转发规格（可重复）**
+
+| 参数 | 语法 | 说明 |
+|---|---|---|
+| `-L [bind:]port:host:port` | 最少 3 段 | 本地监听 `bind:port`（bind 省略 = `127.0.0.1`），对端拨 `host:port` |
+| `-R [bind:]port:host:port` | 最少 3 段 | **请求**对端监听 `bind:port`（省略 = `127.0.0.1`），本端拨 `host:port` |
+
+**接受端策略（本端服务对端）**
+
+| 参数 | 默认 | 层 | 说明 |
+|---|---|---|---|
+| `--accept` | **false** | 1 | 允许服务对端的 `-L` 流 |
+| `--accept-reverse` | **false** | 1b | 允许托管对端请求的 `-R` 监听器 |
+| `--allow-host HOST\|CIDR` | 空 = **拒绝一切** | 2 | 可重复；主机名在启动时解析并**固定成 IP** |
+| `--allow-port PORT\|LO-HI` | 空 = 任意端口 | 2 | 可重复；仅在 `--allow-host` 非空时有意义 |
+| `--allow-listen-port PORT\|LO-HI` | 空 = **拒绝一切** | 2b | 可重复；`-R` 请求的端口必须命中 |
+| `--listen-all` | false | 3 | 允许 `-R` 绑非 loopback；启动时打印警告 |
+| `--deny-close N` | 0（从不） | 3b | 连续 N 次拒绝后关闭会话 |
+
+**上限与调优**
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--max-streams N` | 256 | 并发流转发上限；会被内存预算压低（见下） |
+| `--max-streams-per-sec N` | 32 | 防连接风暴 |
+| `--max-pending N` | 128 | 已 accept 但还没拿到 mux 流的本地连接数；超出直接关 TCP |
+| `--dial-timeout D` | 5s | 防半开连接堆积 |
+| `--handshake-timeout D` | 10s | preamble + status 交换的上限 |
+| `--max-lifetime D` | 0（不限） | 到点强制关流 |
+| `--mux-window SIZE` | 256KiB | yamux `MaxStreamWindowSize`；WAN 建议 1MiB |
+| `--stream-budget SIZE` | 128MiB | `MaxStreams × 2 × Window` 的上限；启动时打印实际生效的流数 |
+
+**其他**
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--also-recv-files` | false | 在同一 session 上接受文件（复用现有 `OnOffer`） |
+| `--out DIR` | `.` | `--also-recv-files` 的落盘目录 |
+| `--quiet` | false | 只打错误 |
+| `--json` | false | 结构化日志（便于 CI 断言） |
+
+### 4.3 `-L`/`-R` 解析
+
+**从右往左切两段 `host:port`，剩下的作为 bind（或本地端口）。** 必须处理方括号。
+
+```go
+// parseSpec splits "[bind:]port:host:port" without breaking on IPv6 colons.
+//
+// The grammar is deliberately right-associative: the last two fields are the
+// target, and whatever remains is the local side. That makes
+//   8080:db:5432           -> local port 8080,  target db:5432
+//   127.0.0.1:8080:db:5432 -> local 127.0.0.1:8080, target db:5432
+//   [::1]:8080:db:5432     -> local [::1]:8080, target db:5432
+//   8080:[::1]:5432        -> local 8080,      target [::1]:5432
+// all unambiguous. Fewer than three fields is rejected rather than guessed.
+func parseSpec(s string, reverse bool) (Spec, error)
+```
+
+表驱动测试必须覆盖（ARCHITECTURE-SDWAN §6 明确要求）：`8080:h:1`、`1.2.3.4:8080:h:1`、`[::1]:8080:h:1`、`8080:[::1]:1`，外加：
+`8080:db:5432`（省略 bind）、`[::1]:8080:[::2]:5432`（两端 IPv6）、`8080:db:5432:extra`（4 段但 bind 非法）、`8080:db`（2 段，拒绝）、`8080:db:0`（port 0 拒绝）、`0.0.0.0:8080:db:5432`（`-L` 允许但警告；`-R` 需要 `--listen-all`）、`[::1]:8080:db:5432` 与 `::1:8080:db:5432`（后者必须拒绝并提示加方括号）。
+
+`-L 0:db:5432`（ephemeral 端口）**允许**并打印实际端口——测试与临时调试很有用。
+
+### 4.4 与 `send`/`recv` 的共存
+
+| 问题 | 决定 | 理由 |
+|---|---|---|
+| `forward` 能不能同时收文件？ | **能**，`--also-recv-files` | 控制流上跑的就是完整的 `peer.Session`，`FrameFileOffer`/`Chunk`/`Done` 全部照旧，零额外协议。研究二 §3.5 也建议了这一点 |
+| `forward` 能不能发文件？ | **v1 不做** | 发文件需要 REPL（`/file PATH`）或一次性参数；`forward` 的终端应留给状态输出。**可选**后续加 `--send-file` |
+| `send`/`recv` 会不会建 mux？ | **不会** | `UseMux=false` 时完全不进入 mux 路径，行为与今天逐字节相同。这是既有 e2e 套件（39 个断言）不退化最重要的保证 |
+| `forward` 对上 `send`/`recv`？ | 明确失败 | hello 的 `caps` 没有 `mux` → `ErrProtocol` + 「peer does not support forwarding; upgrade both sides」。不会静默降级成「能连但转发不工作」 |
+| `forward` 对上 `forward`，但两边都没有 `-L`/`-R`？ | 允许 | 纯接受端（只 `--accept`）是合法用法 |
+| 两边都没有规格也没有 `--accept*`？ | 启动即报错 | 「nothing to do」比连上后无事可做更好 |
+
+### 4.5 启动横幅（**必须**）
+
+启动时**必须**打印一行摘要，让操作者看清自己暴露了什么。这是第四层防御的「人」的部分：
+
+```
+[cmesh] forward: 2 local listeners, accepting=-L:yes(-R:no)
+[cmesh]   -L 127.0.0.1:8080 -> db:5432
+[cmesh]   -L 127.0.0.1:9090 -> api:80
+[cmesh]   allow: db.internal(10.0.0.7/32), 10.0.0.0/8 ports 5432,6379
+[cmesh]   mux window 256KiB, max streams 256 (budget 128MiB), dial timeout 5s
+[cmesh]   SAS 123456 (compare out of band; pass --expect-sas to enforce)
+[cmesh] WARNING: --accept is on without --expect-sas: a leaked code is enough
+        to reach every allow-listed target
+```
+
+`--accept` 且没有 `--expect-sas` 时**必须**打警告；`--listen-all` 时必须打更强的警告。
+
+---
+
+## 5. 安全设计
+
+### 5.1 威胁模型
+
+cmesh 的信任模型是「知道 code 的人就是合法对端」（`secure.go:4-15`）。但 **code 会泄露**：截图、终端滚动历史、共享屏幕、CI 日志、`CMESH_CODE` 环境变量泄漏。而转发的破坏力**远大于**传文件：
+
+- 传文件：攻击者能写一个文件到工作目录（已有 `--allow-hidden`、覆盖保护、16 GiB 上限）。
+- `-L` 转发：攻击者能**连接容器能到达的任何地址**，包括云元数据服务、内网数据库、集群 API。
+- `-R` 转发：攻击者能**在容器里开一个监听端口**，向本地进程提供内容。
+
+结论：转发必须默认关闭，且关闭的默认值必须是**结构性的**（零值即拒绝），不能靠「记得配」。
+
+### 5.2 四层防御（全部默认拒绝）
+
+#### 第 1 层：默认不启用
+
+| 开关 | 默认 | 保护什么 |
+|---|---|---|
+| `--accept` | false | 不服务任何入站 `-L` 流 |
+| `--accept-reverse` | false | 不托管任何 `-R` 监听器 |
+
+分成两个开关而不是一个，是因为两种权限的量级不同：`--accept` 是「允许你拨我允许的地址」，`--accept-reverse` 是「允许你在我这里开端口」。研究二 §3.4 只用一个开关（且正文的 `--allow-forward` 与参数表的 `--accept` 不一致），**不够**。
+
+实现上，`--accept=false` 时收到 `kind=1` 流**连 preamble 都不读**就回 `StatusDenied` 并关闭——这样即使 preamble 解析器有漏洞，未授权的对端也触达不到它。
+
+#### 第 2 层：目标白名单（结构性）
+
+```go
+// AllowList decides whether a target may be dialled.
+//
+// The zero value permits NOTHING. That is deliberate: a forgotten
+// configuration must not turn the container into an open proxy. Note that an
+// empty Hosts list is not "allow all" — it is "allow none".
+type AllowList struct {
+    // hosts are pinned at startup: a hostname entry is resolved once, and the
+    // resulting IPs are what get compared. Re-resolving per dial would let a
+    // DNS answer change between the check and the connect.
+    hosts []hostRule   // {name string; ips []net.IP; cidr *net.IPNet}
+    ports PortSet      // empty = any port
+    resolver Resolver  // injectable for tests
+}
+
+// Permits returns the concrete IP to dial, or an error explaining the refusal.
+//
+// Returning the IP (not a bool) is what closes the check-then-dial window: the
+// caller dials exactly the address that was authorised. A bool would force the
+// caller to re-resolve the name, which is a TOCTOU bug.
+func (a AllowList) Permits(ctx context.Context, addr string) (net.IP, error)
+```
+
+**必须**的解析期拒绝（不是警告，是错误）：
+
+| 输入 | 结果 | 理由 |
+|---|---|---|
+| 零值 `AllowList` | 拒绝一切 | 忘记配置不能等于开放 |
+| `--allow-host 0.0.0.0/0` | **启动失败** | ARCHITECTURE-SDWAN §8 明确「不做 `--allow-any`」。要放宽就写具体 CIDR |
+| `--allow-host ::/0` | **启动失败** | 同上 |
+| `--allow-host` 解析失败 | 启动失败 | 静默忽略一个白名单项比报错危险得多 |
+| `--allow-port` 空但 `--allow-host` 非空 | 允许任意端口 | 与 ssh 的 `AllowTcpForwarding local` 一致；文档写明「建议同时限制端口」 |
+
+**`-R` 的监听端口白名单（第 2b 层）**：
+
+```go
+// PortSet gates which ports a peer may ask us to listen on. The zero value
+// denies every port. This is a separate list from AllowList.Ports because the
+// risk is different: AllowList.Ports bounds what we dial out to, PortSet
+// bounds what we expose inward.
+type PortSet struct{ ranges []portRange }  // zero value = deny all
+```
+
+为什么必须有：没有它，持有 code 的攻击者可以让受害容器 bind `127.0.0.1:8080`，然后向本地进程提供内容（冒充本地开发服务器、抢在真正服务启动前占位、给本地 CLI 喂恶意响应）。研究二 §3.4 的 `--accept` 无法阻止这一点。
+
+#### 第 3 层：监听地址约束
+
+- `-L` 的 bind 默认 `127.0.0.1`（不是 `0.0.0.0`）。`-L 0.0.0.0:8080:...` 允许但打印警告。
+- `-R` 的 bind 是**请求**，由**对端**裁决：非 loopback 必须对端有 `--listen-all`，否则 `StatusDenied`。
+- **这条与 ssh 的 `GatewayPorts no` 是同一个设计**，而且裁决权必须在暴露端口的那一侧——如果让请求方自己决定，防线就不存在。
+
+#### 第 4 层：流数 / 速率 / 超时
+
+| 限制 | 默认 | 触发时 |
+|---|---|---|
+| `MaxStreams` | 256（受预算压低） | `StatusTooMany`，流被关闭，进程不受影响 |
+| `MaxStreamsPerSec` | 32 | `StatusTooMany` |
+| `MaxPending` | 128 | 直接关闭已 accept 的本地 TCP 连接（不消耗 mux 流） |
+| `DialTimeout` | 5s | `StatusDialFail` |
+| `HandshakeTimeout` | 10s | 关闭该流（opener 侧读 status 也有同样期限） |
+| `MaxLifetime` | 0 | 到点关闭 |
+| `deny-close` | 0 | 连续拒绝 N 次后关闭整个会话 |
+
+内存上界的算式（**必须**在启动时算并打印）：
+
+```
+每活跃流 ≈ 2 × Window          （研究二 §4.5 [实测]：256KiB→514.8KiB，1MiB→2.0MiB）
+MaxStreams = min(--max-streams, StreamBudget / (2 × Window))
+```
+
+128 MiB 预算下：256 KiB 窗口 → 256 流；1 MiB 窗口 → 64 流。ARCHITECTURE-SDWAN A9 的「两套预算各自硬顶」由此落地为一条可执行公式。
+
+#### 额外要求（不是「层」，但必须做）
+
+1. **`--expect-sas` 强烈建议**：`--accept` 且未设 `--expect-sas` 时启动警告。理由：转发是持续双向通道，MITM 长期利用的后果比一次性传文件严重（D38 的方向）。
+2. **`-R` 的拨号目标只来自本地配置**，preamble 的 `Addr` 只用于查表，绝不直接拨。这是结构性保证：即使对端发来 `Addr="169.254.169.254:80"`，本端也只会查自己的 `-R` 表，查不到就拒绝。
+3. **审计日志**：每次允许/拒绝都记 `peer`, `target`, `status`, `stream_id`, `duration`。日志只在本地，relay 只能看到密文。
+4. **不做 `--allow-any`**。ARCHITECTURE-SDWAN §8 已明确列为「不做的事」。
+
+### 5.3 攻击场景推演（code 已泄露）
+
+假设攻击者拿到了完整 code，能完成 SPAKE2，因此 SAS 也一致（SAS 只防主动 MITM，不防 code 泄露）。逐场景分析：
+
+| # | 攻击 | 默认配置下的结果 | 若操作者放宽了配置 | 限制手段 |
+|---|---|---|---|---|
+| 1 | 当 `-L` 的 opener，请求拨 `169.254.169.254:80`（云元数据） | `--accept=false` → 连 preamble 都不读，`StatusDenied` | 若白名单写了 `169.254.169.254` 才会成功 | 白名单零值拒绝；文档明示「不要把 link-local 写进白名单」 |
+| 2 | 端口扫描内网：快速尝试 1000 个 `host:port` | 全部 `StatusDenied`；速率限制 32/s；连续拒绝可触发 `deny-close` | 若白名单是 `10.0.0.0/8` + 任意端口，则**扫描成功**——这是配置问题，不是实现问题 | 白名单要求具体端口；启动横幅明确打印生效范围 |
+| 3 | 用状态码区分「在白名单但挂了」和「不在白名单」 | 能区分（`DialFail` vs `Denied`）。这是刻意的：运维需要它 | 同上 | 速率限制 + 审计日志 + `deny-close`；文档写明「状态码是诊断信息，也是探测信息」 |
+| 4 | 请求 `-R` 监听 `127.0.0.1:6379`（抢占本地 Redis 端口） | `--accept-reverse=false` → `StatusDenied` | 若开了 `--accept-reverse` 但 `--allow-listen-port` 不含 6379 → 仍拒绝 | 端口白名单零值拒绝 |
+| 5 | 请求 `-R` 监听 `0.0.0.0:9000`（对局域网暴露） | 对端 `--listen-all=false` → `StatusDenied` | 需要操作者显式开 `--listen-all` 并看到警告 | 裁决权在暴露侧 |
+| 6 | 开 10000 条流耗尽内存 | `MaxStreams=256` → 第 257 条起 `StatusTooMany`；内存上限 128 MiB | — | 信号量 + 预算公式 |
+| 7 | 打开 `kind=0` 想劫持控制流 | responder 只接受**一次**控制流，第二次 → 协议错误 → 关会话 | — | 控制流只接受一次；initiator 侧收到 `kind=0` 直接判协议错误 |
+| 8 | 发畸形 preamble（255 字节、无端口、NUL、非 UTF-8） | 严格解析器拒绝 → `StatusBadRequest`；fuzz 测试覆盖 | — | §3.2 的检查表 |
+| 9 | DNS rebinding：白名单写 `db.internal`，攻击者控制其解析 | 启动时解析并固定 IP；`Permits` 返回该 IP，拨号只用它 → **攻击失败** | 若显式开 `--allow-resolve-per-dial`（本设计不提供）才会成功 | check 与 dial 用同一个 IP |
+| 10 | 通过转发做数据外泄（读允许目标的响应） | 只能读白名单内的服务。**这是授权的本意** | — | 白名单粒度；`--max-lifetime` 限制持续时间 |
+| 11 | 半开连接堆积：开流后不发 preamble | `HandshakeTimeout=10s` 关闭 | — | 读 preamble 带 deadline |
+| 12 | 大量本地连接打 `-L` 监听器（耗尽 fd/goroutine） | `MaxPending=128` 后直接关 TCP；`MaxStreams` 限制 mux 流 | — | 两层队列上限 |
+| 13 | 慢速读（slowloris）：开流后不读，撑满窗口 | 该流自己阻塞在窗口上，其他流不受影响（每流独立流控 `[实测]`：一条流在 192 KiB 处精确阻塞，健康流仍 1251–1680 MiB/s） | — | yamux 每流窗口；`StreamCloseTimeout` 回收废弃流 |
+| 14 | 冒充对端让本端连到错误的 relay | 与转发无关，属既有威胁模型；`--expect-sas` 防主动 MITM | — | D38 |
+
+**必须诚实说明的边界**：如果 code 真的泄露且白名单配置宽松，**转发就是授权给攻击者的能力**。没有任何协议层机制能在「持有同一 code」的前提下区分合法用户与攻击者——那需要额外的身份（证书、OIDC）。本阶段不做，但要在文档里写清楚，并建议：`--accept` 只用于可信网络；敏感服务用 `--allow-host` + 具体端口；启用转发时设 `--expect-sas`。
+
+### 5.4 防御清单（实现者逐条核对）
+
+- [ ] `--accept` 默认 false；为 false 时不读 preamble 就拒绝
+- [ ] `--accept-reverse` 默认 false
+- [ ] `AllowList` 零值拒绝一切；空 `Hosts` ≠ 允许全部
+- [ ] `--allow-host 0.0.0.0/0`、`::/0` **启动失败**（不是警告）
+- [ ] 白名单主机名启动时解析并固定 IP；`Permits` 返回 IP
+- [ ] 拨号只用 `Permits` 返回的 IP，不再解析名字
+- [ ] `PortSet`（`--allow-listen-port`）零值拒绝一切 `-R`
+- [ ] `-R` 的非 loopback bind 需要**对端** `--listen-all`
+- [ ] `-L` 的 bind 默认 `127.0.0.1`
+- [ ] 策略检查在 dial 之前（有单测证明 dialer 未被调用）
+- [ ] `MaxStreams` / `MaxStreamsPerSec` / `MaxPending` / `DialTimeout` / `HandshakeTimeout`
+- [ ] 流数被内存预算压低，启动时打印实际值
+- [ ] 控制流只接受一次
+- [ ] preamble 严格解析（版本/kind/长度/UTF-8/host/port）
+- [ ] 所有拒绝都有审计日志，日志不含 code
+- [ ] `--accept` 无 `--expect-sas` 时启动警告
+- [ ] 不存在 `--allow-any`
+- [ ] 启动横幅打印完整暴露面
+
+---
+
+## 6. 测试计划
+
+### 6.1 单元测试
+
+| 包 | 用例 | 断言 |
+|---|---|---|
+| `wire` | preamble 往返 | 4 种 IPv4/IPv6 组合字节精确 |
+| `wire` | preamble 拒绝表 | 版本≠1、kind∉{1,2}、len>255、空、NUL、非 UTF-8、无端口、port 0/65536、空 host |
+| `wire` | `FuzzReadPreamble` | 任意输入不 panic、不越界分配（10 分钟无 crash） |
+| `wire` | status 往返 | 5 个状态码 + 可选 reason；reason 超 200 字节被截断 |
+| `wire` | `ForwardListen` JSON 往返 | 空列表、重复 ID、超长 ID |
+| `peer/pump` | 引导直通 | 封/开出的帧与改造前逐字节一致；计数器序列一致 |
+| `peer/pump` | 屏障 | 两端各发 `FrameMuxStart` 后切换；屏障前到达的非 mux 帧被丢弃且不致命 |
+| `peer/pump` | **顺序不变量** | 8 个 goroutine 并发 `Write` 32 MiB → 对端 `OpenFrame` 计数器严格递增、无解密失败（这是整个设计的核心性质） |
+| `peer/pump` | 背压 | 读侧停 2 s，写侧阻塞而不丢字节；恢复后字节数与 SHA-256 一致（对照研究二 §4.4 的 yamux 结论） |
+| `peer/pump` | 传输切换 | `Recv` 返回 `ErrTransportSwitched` 后泵继续，不关会话 |
+| `peer/pump` | 关闭 | `Close` 后 `Read`/`Write` 都返回错误；无 goroutine 泄漏（`goleak`） |
+| `peer/frameconn` | 短写 | 底层 `Write` 返回 `n<len` 时 `writeFull` 补齐 |
+| `peer/frameconn` | 并发 `SendFrame` | 100 个并发小帧 → 对端逐帧解出，无交错 |
+| `peer/session` | 委托访问器 | `ShortAuth`/`Fingerprint`/`FramesSinceStart` 在 mux 前后都正确 |
+| `mux` | kind 路由 | `KindControl`/`KindForward`/未知 kind 各自的行为 |
+| `mux` | 流 ID 奇偶 | client 开奇数、server 开偶数（防两端都选 client） |
+| `mux` | `MaxStreams` | `Open` 在第 N+1 条阻塞；`Accept` 返回 `Limited()==true` |
+| `mux` | 信号量归还 | 每条流 `Close` 恰好归还一次（重复 `Close` 不 double-free） |
+| `mux` | 半关闭 | `CloseWrite` 后对端读到 EOF，且仍能写回（研究二 §4.2 的同形态断言） |
+| `mux` | `LogOutput` | 配置后 yamux 日志不出现在 stderr（用 buffer 断言） |
+| `forward/allow` | 零值 | `AllowList{}` 拒绝一切 |
+| `forward/allow` | CIDR / 主机名固定 | 启动解析一次；模拟 DNS 改变后仍拨旧 IP |
+| `forward/allow` | `0.0.0.0/0` | 构造期返回错误 |
+| `forward/allow` | 端口/端口段 | `5432`、`6000-7000`、边界 |
+| `forward` | 策略先于 dial | 注入假 `Dialer`，被拒绝时断言调用次数为 0 |
+| `forward` | `-R` 目标只来自本地 | preamble 里放 `169.254.169.254:80`，断言只拨本地配置的 target |
+| `forward` | 速率限制 | 32/s 后返回 `TooMany` |
+| `forward` | 半关闭 pipe | `net.Pipe` + 假 stream，HTTP/1.0 形态不挂起 |
+| `cli` | `parseSpec` 表驱动 | §4.3 全部用例 + 4 段非法 + 2 段拒绝 + 无方括号 IPv6 |
+| `cli` | 策略组合 | `--accept-reverse` 缺 `--allow-listen-port` → 启动失败并给指引 |
+| `cli` | 预算公式 | `--mux-window 1MiB` + `--max-streams 256` → 生效值 64，横幅打印 |
+
+### 6.2 集成测试（真实 TCP）
+
+| 用例 | 步骤 | 门槛 |
+|---|---|---|
+| I1 `-L` 并发正确性 | 对端起 echo 服务；`forward -L`；10 并发 × 8 轮 × 512 KiB，每流独立字节模式 | 10/10 字节精确（对照研究二 §4.1 原型 `[实测]`） |
+| I2 半关闭 | HTTP/1.0 客户端发请求后 `CloseWrite`，等服务端响应 | 收到完整响应，不挂起 |
+| I3 服务端先说话 | 假 SMTP banner（连接即发 `220 ...`） | 客户端在发任何字节前收到 banner |
+| I4 大文件 | 1 GiB 经 `-L` 转发，双向 SHA-256 | 一致；吞吐见 P2 |
+| I5 多条规格 | 2 个 `-L` + 1 个 `-R` 同一 session 并发 | 三条路径同时可用，互不干扰 |
+| I6 `-R` 端到端 | 远端 listener accept，本端拨本地 target | 字节精确；对端应用能连上 |
+| I7 白名单拒绝 | 目标不在白名单 | `StatusDenied`；对端目标**没有**收到连接（用只记录不响应的 listener 断言） |
+| I8 默认拒绝 | 不传 `--accept` | 所有入站 `-L` 流被拒 |
+| I9 `-R` 授权 | 不传 `--accept-reverse` / 传了但 `--allow-listen-port` 不含该端口 | `StatusDenied`，远端没有 bind |
+| I10 `--listen-all` | 请求 `0.0.0.0:9000`，远端未开 `--listen-all` | `StatusDenied` |
+| I11 流数上限 | 开到 257 条 | 第 257 条 `StatusTooMany`，进程存活，已有流不受影响 |
+| I12 重连 | 杀 relay → 重启 → 旧连接 EOF → 新连接可用 | listener 仍在（不重新 bind），新连接成功 |
+| I13 版本互操作 | `forward` ↔ `send` | 明确报错「peer does not support forwarding」，不静默 |
+| I14 文件共存 | `--also-recv-files` + 转发同时进行 | 文件 SHA-256 一致，转发吞吐下降 < 20% |
+| I15 控制流劫持 | 对端主动开 `kind=0`（模拟攻击） | 会话被关闭，日志有记录 |
+
+### 6.3 安全测试
+
+| 用例 | 方法 | 通过条件 |
+|---|---|---|
+| S1 preamble fuzz | `go test -fuzz=FuzzReadPreamble -fuzztime=10m` | 无 panic、无 OOM（配合 `-race`） |
+| S2 code 泄露 + 默认配置 | 用正确 code 起一个攻击者客户端，尝试 100 个内网目标 | 100% 被拒，目标侧连接计数为 0 |
+| S3 code 泄露 + 宽松白名单 | 白名单 `10.0.0.0/8` + 任意端口 | 记录为**已知风险**：这是配置授权，不是漏洞；断言有审计日志 |
+| S4 拒绝探测 | 交替请求「在白名单但不可达」与「不在白名单」 | 状态码可区分（`DialFail` vs `Denied`），速率受限，日志完整 |
+| S5 rebinding | 假 resolver：第一次返回白名单 IP，第二次返回攻击者 IP | 拨的是第一次的 IP |
+| S6 `0.0.0.0/0` | 构造 `AllowList` | 返回错误，进程拒绝启动 |
+| S7 `-R` 端口抢占 | 请求 bind `127.0.0.1:<一个空闲端口>`，`--allow-listen-port` 不含它 | 拒绝；该端口仍可被本地进程 bind |
+| S8 流洪泛 | 1 秒内 1000 次 open | 429 级拒绝；RSS 增量 < 预算；无 goroutine 爆炸 |
+| S9 控制流劫持 | 见 I15 | 会话关闭 |
+| S10 日志脱敏 | 全流程抓 stderr | 不出现 code；不出现完整 target（只出现请求方给的字符串或本地配置，二者都不是秘密，但要确认没有把解析后的内网 IP 回给对端） |
+
+### 6.4 性能测试
+
+**基线**：现有文件传输回环 512 MiB = **539.3 MiB/s**（README/D11 `[实测]`）。
+
+| 编号 | 指标 | 门槛 | 依据 |
+|---|---|---|---|
+| P1 | 文件传输回归（512 MiB，512 KiB 分块） | **≥ 485 MiB/s**（下降 ≤ 10%） | ARCHITECTURE-SDWAN A10 的回归门槛 |
+| P2 | 单流 `-L` 转发吞吐（回环，512 MiB） | **≥ 200 MiB/s** | ARCHITECTURE-SDWAN 验收 1.7。`[推断]` 实际应在 300–500 MiB/s（库层 yamux+AEAD 1957–2748 MiB/s，全栈参照 539 MiB/s） |
+| P3 | 10 流聚合（回环） | **≥ 500 MiB/s** | 验收 1.7。研究二实测 10 流 1962 MiB/s（库层），全栈打折后仍应远超 500 |
+| P4 | 连接建立延迟（`-L`，2000 次） | p50 ≤ 2 ms，p95 ≤ 5 ms | 每次连接 = TCP accept + stream open + preamble + status（2 个 RTT 级） |
+| P5 | 已建立流的往返延迟（2000 次 ping-pong） | p50 ≤ 1 ms，p95 ≤ 3 ms | 研究二 yamux 空闲 p50 18 µs、9 条满载 191 µs `[实测]`；留出全栈余量 |
+| P6 | 100 条活跃流转发时 RSS | **< 80 MiB** | ARCHITECTURE-SDWAN 验收 1.9 |
+| P7 | 100 条空闲流转发时 RSS | < 40 MiB | 每空闲流 1.7–2.5 KiB `[实测]` |
+| P8 | relay 消息数 | 记录实测值，目标 ≤ 13 条/MiB | 研究二 §4.9 `[实测]` 的参照；若 > 20 则启用合并优化 |
+| P9 | 文件传输 + 转发并发 | 转发吞吐下降 < 20%，文件传输下降 < 15% | 单 `sendLoop` 串行化是已知代价 |
+
+**P2–P5 的 `[推断]` 门槛必须在实现后第一次实测时替换为真实数字**，并把实测值写回本表——不能沿用推断值冒充验收。
+
+---
+
+## 7. 与现有代码的冲突分析
+
+### 7.1 改动面
+
+| 文件 | 改动 | 影响的功能 |
+|---|---|---|
+| `internal/peer/session.go` | `conn`+`sec` → `frames FrameConn` + `pump *Pump`；新增 `StartMuxed`/`AttachControl`；`ShortAuth`/`Fingerprint`/`UpgradeToDirect`/`OnDirect`/`FramesSinceStart` 改为委托 | 全部会话功能（但语义不变） |
+| `internal/peer/pump.go`（新） | 记录泵 | — |
+| `internal/peer/frameconn.go`（新） | `FrameConn` + 控制流实现 | — |
+| `internal/wire/frame.go` | 4 个新帧类型 + `MaxStreamData` | 无（纯增量） |
+| `internal/cli/node.go` | `UseMux`、`OnMux`、`dialOne` 插入 mux 引导、`Mux(ctx)` | 连接/重连生命周期 |
+| `internal/cli/cli.go` | 子命令注册 + usage | 无 |
+| `internal/secure` | **不改** | — |
+| `internal/wsconn`/`p2pquic`/`p2p` | **不改** | — |
+
+### 7.2 逐项回归风险
+
+| 风险 | 触发条件 | 影响 | 缓解 |
+|---|---|---|---|
+| **R-1 `ErrTransportSwitched` 分支丢失** | `--p2p` 打洞成功后升级传输 | 升级瞬间会话判死，`--p2p` 完全不可用 | 泵的 `readLoop` 必须有该分支；专门的单测（切换传输后继续收发） |
+| **R-2 `sendMu` 语义弱化** | 并发 `SendFrame`（`SendFile` + ping 回复 + 转发控制） | 高计数器先上线 → 对端解密失败 → 会话死 | `Pump.bootMu` / `streamFrameConn.sendMu` 各自保证「密封+发送」或「整帧写入」原子；`TestConcurrentSendsStayOrdered` 扩展成 mux 版本 |
+| **R-3 `FramesSinceStart` 语义变化** | mux 模式下它数的是 record 而非控制帧 | `Node.Run` 的「零帧会话立即重试」判断失准 | mux 模式下所有业务字节都走 record，`RecvCounter` 仍单调增；加单测覆盖「mux 会话有数据」与「mux 会话无数据」两种 |
+| **R-4 记录泵死锁** | 读队列满 + 写队列满 + 传输卡住 | 整个会话停摆 | 有界队列 + 单 drainer + `fail()` 同时关两端；yamux `ConnectionWriteTimeout=10s` 作为安全阀；压测 P2/P9 |
+| **R-5 流数预算算错** | `--mux-window 1MiB` 但 `--max-streams` 仍是 256 | 512 MiB 内存，K8s 256 MiB limit 下 OOM | 预算公式自动压低并在横幅打印；单测断言生效值 |
+| **R-6 `StreamOpenTimeout` 关整个会话** | 一条流的 SYN 没被 ACK（对端忙/relay 抖动） | 所有转发 + 文件传输一起断 | 120 s；`Open` 前检查 `NumStreams`；重连后 listener 仍在（A11） |
+| **R-7 控制流失败连坐** | 控制流被 reset | 所有转发流一起死 | 这是**刻意**的：控制流承载 `peer.Session`，它死了对端已处于异常状态；统一关闭比「一半活着」更可预测。写进文档 |
+| **R-8 `node.go` 重连时旧 mux 未关** | relay 抖动 | 旧 mux 的 goroutine 与流泄漏 | `Node` 在发布新 mux 前先 `Close` 旧的；`goleak` 测试跑重连场景 |
+| **R-9 `-R` listener 跨重连泄漏** | 每次重连都注册一次 | 端口 bind 冲突 / 监听器堆积 | `RegisterReverse` 按 ID 幂等：同 ID 已存在则复用；会话结束时只关**该会话**创建的、且不再被引用的 listener |
+| **R-10 旧二进制互操作** | `forward` 对上旧 `send` | 明确报错 | `caps` 协商；I13 覆盖 |
+
+### 7.3 如何保证既有 e2e 套件不退化
+
+`tests/run-tests.sh` 全量运行（含 `--large`）实测 **39 项通过**（`--quick` 模式为 35 项，跳过 4 项单测断言）。覆盖构建、单测、vet、gofmt、probe 退出码、消息+文件、零字节、覆盖保护、自动 code、断点续传、错误 code、安全单测、断线重连、多 relay 故障切换、大文件。
+
+> 验收口径按 **39 项全绿**（`bash tests/run-tests.sh` 全量）。`--quick` 模式跳过 4 项，因此基线是 35。
+
+**保证机制（三道）：**
+
+1. **结构上隔离**：`send`/`recv` 不设 `UseMux`，因此**不创建 pump 的复用模式、不创建 mux、不碰 `FrameMuxStart`**。它们唯一的变化是「`Session` 内部把 `seal+Send` 换成 `pump.SendFrame`」，而后者在引导模式下的实现就是原来那三行。`wire.Version` 保持 1，所以新旧二进制也互通。
+2. **行为等价性单测**：`TestPumpBootstrapMatchesLegacy` 用同一个 `memPipe` 对跑「旧路径（直接 `sec.SealFrame`+`conn.Send`）」与「新路径（`pump.SendFrame`）」，断言**输出的密文字节完全相同**、计数器序列相同。这条测试是 R-1/R-2 的定点护栏。
+3. **数值门槛**：P1 要求 512 MiB 回环 ≥ 485 MiB/s（基线 539.3 的 90%）。低于门槛即视为回归，不进阶段 2（G1 决策门）。
+
+**执行顺序**：每一步实施（§8）结束都跑 `bash tests/run-tests.sh --large`（含 1 GiB）与 `go test -race ./...`；第 2 步（pump 重构）单独作为一次提交，便于 `git bisect` 定位。
+
+---
+
+## 8. 分步实施计划
+
+每步都可独立验证、独立提交、独立回滚。步骤顺序保证「每一步之后主分支都是可发布的」。
+
+### 步骤 1：`wire` 协议层（0.5 天）
+
+**内容**：4 个新 `FrameType` + `MaxStreamData`；`internal/wire/forward.go`（preamble/status/listen 编解码）；严格解析；fuzz 目标。
+
+**验收**：
+- `go test ./internal/wire/` 全绿，含 `FuzzReadPreamble` 跑 2 分钟无 crash
+- `go build ./...` 通过；二进制增量 < 2 KB
+- 既有 `frame_test.go` 不改一行仍通过
+
+**回滚**：删除新文件 + 4 个常量，无副作用。
+
+### 步骤 2：记录泵 + `FrameConn` 重构（1.5 天，风险最高）
+
+**内容**：`pump.go`、`frameconn.go`；`session.go` 改为持有 `FrameConn`；`StartMuxed`/`AttachControl`（此时还没有 mux，`boot` 传 nil 走原路径）。
+
+**验收**：
+- `TestPumpBootstrapMatchesLegacy`：密文字节与旧路径完全一致
+- `TestPumpOrderingUnderConcurrency`：8 goroutine 并发写，计数器严格递增
+- `TestPumpTransportSwitch`：切换后继续
+- `go test -race ./...` 全绿；`bash tests/run-tests.sh --large` 39/39 通过
+- 512 MiB 回环 ≥ 485 MiB/s
+
+**回滚**：`session.go` 恢复到 `conn`+`sec` 版本（单文件）。
+
+**这一步单独提交，是整条路线的 bisect 锚点。**
+
+### 步骤 3：`internal/mux` + mux 上的文件传输（1.5 天）
+
+**内容**：`mux` 包（session/stream/config/serve）；`NodeConfig.UseMux` + `OnMux` + `dialOne` 引导；hello 的 `caps`。
+
+**验收**：
+- 单测：kind 路由、流 ID 奇偶、`MaxStreams`（Open 阻塞 / Accept 标记 Limited）、`CloseWrite` 半关闭、`LogOutput` 不污染 stderr、信号量恰好归还
+- 集成：**在 mux 上跑完整文件传输**（512 MiB，SHA-256 一致），证明控制流可用
+- 互操作：`UseMux=false` 的 `send`↔`recv` 与今天行为一致；`UseMux=true` 对上 `UseMux=false` 时明确报错
+- `-race` 全绿；既有 e2e 39 项全绿
+
+**回滚**：`UseMux` 默认 false，等价于功能未启用。
+
+### 步骤 4：`internal/forward` 策略核心 + `-L`（1 天）
+
+**内容**：`allow.go`/`limits.go`/`pipe.go`/`local.go`/`manager.go`；`-L` 全链路；假 mux 测试。
+
+**验收**：
+- 四层防御的单测全绿，特别是「拒绝时 dialer 调用次数为 0」
+- 假 mux 下 `-L` 端到端：10/10 字节精确、半关闭、banner-first
+- `-L` 解析表驱动全绿
+
+**回滚**：`forward` 子命令尚未注册，包不被引用。
+
+### 步骤 5：`-L` 接进 CLI 并端到端（1 天）
+
+**内容**：`cli/forward.go` 参数与生命周期；`--accept` + `--allow-*`；启动横幅；`Provider` 接到 `Node.Mux(ctx)`。
+
+**验收**：
+- 新增 e2e 段（`tests/run-tests.sh` 的 section 11）：I1/I2/I7/I8/I11/I12 全绿
+- `--accept` 无 `--expect-sas` 时警告可见
+- 既有 39 项仍全绿
+
+### 步骤 6：`-R`（1 天）
+
+**内容**：`FrameForwardListen*` 在 `peer` 的分发（`Handler.OnForwardListen`）；`reverse.go`；`--accept-reverse`/`--allow-listen-port`/`--listen-all`。
+
+**验收**：
+- I6/I9/I10 全绿
+- 多 `-R` 规格按 ID 正确匹配（两个监听器同时可用）
+- 重连后 listener 不重复 bind（R-9）
+- 远端 `--listen-all` 缺失时明确拒绝
+
+### 步骤 7：安全加固与审计（1 天）
+
+**内容**：审计日志、`deny-close`、速率限制打磨、日志脱敏、fuzz 扩面、S1–S10 测试、文档（README + `decisions.md` 新条目 + 本文件的状态更新）。
+
+**验收**：
+- S1–S10 全绿；`-fuzztime=10m` 无 crash
+- 日志不含 code（自动断言）
+- §5.4 的 18 条清单逐条勾选
+
+### 步骤 8：性能验收与决策门（0.5 天）
+
+**内容**：P1–P9 全量测量；把实测值写回 §6.4；更新 `ARCHITECTURE-SDWAN.md` 的 §A1（版本策略）与 §3.1（记录大小）修正；更新 `docs/README.md` 索引。
+
+**验收（G1 决策门）**：
+- P1 ≥ 485 MiB/s
+- P2 ≥ 200 MiB/s，P3 ≥ 500 MiB/s
+- P6 < 80 MiB
+- 既有 39 项 + 新增 e2e 全绿，`-race` 全绿
+- 不达标 → **不进入阶段 2**，先修回归
+
+**总计：约 8 个工程日**（含缓冲；ARCHITECTURE-SDWAN 估的 3–5 天基于研究二的 880 行，本设计因记录泵、控制流重构、`-R` 控制面与安全加固而上调）。
+
+---
+
+## 9. 主要风险
+
+| 编号 | 风险 | 严重度 | 触发条件 | 缓解 |
+|---|---|---|---|---|
+| X1 | **开放代理**：宽松白名单 + code 泄露 | **高** | `--accept` + `10.0.0.0/8` + 任意端口 | 四层防御；零值拒绝；拒绝 `0.0.0.0/0`；`--deny-close`；审计；启动横幅 |
+| X2 | **`-R` 端口抢占**：攻击者让受害容器 bind 任意 loopback 端口 | **高** | `--accept-reverse` 开着且没有端口白名单 | `--allow-listen-port` 零值拒绝；裁决权在暴露侧 |
+| X3 | **记录泵死锁** | **高** | 读/写队列同时满 + 传输卡住 | 有界队列 + 单 drainer + `fail()` 关两端；`ConnectionWriteTimeout` 安全阀；P2/P9 压测 |
+| X4 | **`peer.Session` 重构引入回归** | 中高 | 步骤 2 的改动遗漏 `ErrTransportSwitched` 或 `sendMu` | 密文等价性单测；`-race`；既有 e2e；P1 门槛；单独提交便于 bisect |
+| X5 | **`StreamOpenTimeout` 关整个会话** | 中 | 单条流 SYN 未 ACK | 120 s；`Open` 前查 `NumStreams`；重连后 listener 存活 |
+| X6 | **内存超预算** | 中 | 1 MiB 窗口 + 256 流 | 预算公式自动压低流数；P6 |
+| X7 | **relay 消息数上升** | 低 | mux 启用 | 实测 P8；目标 ≤ 13 条/MiB；必要时启用写侧合并（**可选**） |
+| X8 | **`-R` 目标被对端指定**（研究二原方案的漏洞） | 中 | 实现者照研究二写「Addr 仅用于日志」但忘了查表 | 结构性设计：Addr = 监听器 ID，只查表不拨号；S7 + 单测 |
+| X9 | **白名单 TOCTOU / DNS rebinding** | 中 | 白名单写主机名 | `Permits` 返回 IP，拨号只用它；启动时固定；S5 |
+| X10 | **yamux v0.x API 变动** | 低 | 升级 yamux | `internal/mux` 完全隔离；协议 spec 稳定；pin v0.1.2 |
+| X11 | **新旧二进制互操作失败** | 低 | `forward` 对上旧 `send` | `caps` 协商 + 明确错误信息（I13） |
+| X12 | **`-R` listener 跨重连泄漏** | 低 | 每次重连都注册 | 按 ID 幂等；会话结束清理；R-9 测试 |
+| X13 | **单 `sendLoop` 在满载时抬高延迟** | 低 | 文件传输 + 多条转发同时跑 | 已知代价（研究二实测 p50 18 µs → 191 µs）；P9 记录；文档说明 |
+
+---
+
+## 10. 对上游文档的修正清单
+
+实现前必须先把这几条写回上游文档，否则实现者会照旧文档做出错误选择。
+
+| # | 上游位置 | 原文 | 修正 | 依据 |
+|---|---|---|---|---|
+| 1 | `ARCHITECTURE-SDWAN.md` §A1、§6 阶段 1 | 「`wire.Version` 提升到 2，两端必须同时升级」 | **保持 1**，用 hello 的 `caps` 协商 | 帧格式未变，新帧类型是增量，`readPump` 的 default 分支忽略未知类型（`session.go:341-343`）；升版本会让 `send`/`recv` 在新旧二进制间不可用 |
+| 2 | `ARCHITECTURE-SDWAN.md` §6 阶段 1 交付物 2（第 674 行） | 「新增 `FrameStreamData`（payload = 任意字节块，≤64 KiB）」 | **512 KiB**（`MaxStreamData = peer.ChunkSize`） | D11/README：512 KiB → 539.3 MiB/s，64 KiB → 211.9 MiB/s `[实测]` |
+| 3 | `ARCHITECTURE-SDWAN.md` §A9 预算表（第 604 行）与 §6 风险段（第 706 行） | 「记录泵缓冲 每方向 4 × 64 KiB」 | **每方向 1 MiB（2 × 512 KiB）** | 记录大小改为 512 KiB 后，64 KiB 缓冲会强制把每条记录切成 8 份；2 MiB 总量相对 128 MiB 的 yamux 预算可忽略 |
+| 4 | `research/mux-and-portforward.md` §3.2 | `Preamble` 定义在 `internal/forward/proto.go` | 移到 `internal/wire/forward.go` | 状态码与帧 payload 都在 `wire`；放 `forward` 会形成 `forward→wire` 与 `wire→forward` 的环 |
+| 5 | `research/mux-and-portforward.md` §3.4 | 5 层防御中只有第 1 层管「是否启用」，且 `-R` 与 `-L` 共用同一个 `--accept`（正文还写作 `--allow-forward`，与参数表不一致） | 拆出 `--accept-reverse` + `--allow-listen-port`（零值拒绝） | `-R` 让攻击者在受害容器内开监听端口，风险量级不同于 `-L` |
+| 6 | `research/mux-and-portforward.md` §8 关键片段 3（第 974-1004 行）与第 961 行 | `Permits(addr)` 用主机名比对，然后 `net.DialTimeout("tcp", p.Addr)` 再解析一次 | `Permits` 返回**要拨的 IP**，拨号只用它 | check-then-dial TOCTOU / DNS rebinding |
+| 7 | `research/mux-and-portforward.md` §3.3 时序图（第 443 行）与 §3.4 末条（第 507 行） | 「`-R` 时 preamble 的 `Addr` 仅用于日志/审计」 | `Addr` 改为**监听器 ID**，用于查本地配置 | 多条 `-R` 时无法区分是哪条监听器触发；ID 只查表不拨号，保留「目标来自本地配置」的结构性保证 |
+| 8 | `research/mux-and-portforward.md` §2.5 | `messageStream` 适配器（mux 包在 `MessageConn` 上） | 不实现；由记录泵承担消息↔字节流的转换，且位于 secure **之上** | secure 的严格递增计数器要求单读者，mux 在 secure 之下会让多流解密看到乱序计数器 |
+
+---
+
+## 11. 附：一页纸的决策摘要
+
+| 决策 | 选择 | 性质 |
+|---|---|---|
+| 复用库 | `hashicorp/yamux v0.1.2`（+33 KB，零传递依赖，MPL-2.0） | 必须（研究二已否决 smux/QUIC 多流） |
+| 分层 | `transport → secure → 记录泵 → yamux → 业务流` | 必须 |
+| `secure.go` | 不改 | 必须 |
+| 记录大小 | 512 KiB | 必须 |
+| 记录泵缓冲 | 每方向 1 MiB，有界阻塞 | 必须 |
+| 写入合并 | v1 不做（无定时器；自然合并已够） | 可选 |
+| `wire.Version` | 保持 1 + `caps` 协商 | 必须 |
+| 控制流 | yamux stream，`kind=0`，initiator 打开，只接受一次 | 必须 |
+| 流 kind | 0=控制，1=转发 | 必须 |
+| `-L` 默认 bind | `127.0.0.1` | 必须 |
+| `-R` 默认 bind | `127.0.0.1`（请求），由对端裁决 | 必须 |
+| `-R` 授权 | `--accept-reverse` + `--allow-listen-port`（零值拒绝） | 必须 |
+| 白名单 | 零值拒绝一切；启动时固定 IP；`Permits` 返回 IP | 必须 |
+| `0.0.0.0/0`、`::/0` | 启动失败 | 必须 |
+| 状态码 | 0 OK / 1 Denied / 2 DialFail / 3 TooMany / 4 BadRequest / 5 BindFail | 必须 |
+| 策略与拨号顺序 | 先策略后拨号 | 必须 |
+| `MaxStreams` | 256，被 128 MiB 预算自动压低 | 必须 |
+| `StreamOpenTimeout` | 120 s | 必须 |
+| `StreamCloseTimeout` | 60 s | 必须 |
+| `yamux.LogOutput` | 显式设为 slog 适配器或 `io.Discard` | 必须 |
+| 传输切换 | 只在 mux 建立前（A8） | 必须 |
+| 重连 | listener 只建一次；所有流断开；不做流级续传（A11） | 必须 |
+| 文件共存 | 控制流承载完整 `peer.Session`；`--also-recv-files` 免费获得 | 必须 |
+| `forward` 发文件 | v1 不做 | 可选 |
+| `--allow-any` | 永远不做 | 必须 |

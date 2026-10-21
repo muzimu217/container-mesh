@@ -495,7 +495,14 @@ cmesh forward --code CODE --accept \
 
 **一个必须处理的生命周期细节**：`peer.Session` 现在把 `secure.Session` 的 `ShortAuth`/`Fingerprint` 暴露给 `Node`，而 `Node` 在 `dialOne` 里先建 `peer.Session`、再打印 SAS。引入记录泵后，SAS 仍来自同一个 `secure.Session`（泵持有它），所以只需把访问器从 `peer.Session` 转挂到泵或 `Node`，不需要改密钥派生。
 
-**协议版本**：新增帧类型与 mux 属于不兼容变更。现有 `exchangeHello` 在版本不一致时**直接返回 `ErrProtocol`**（`session.go:218-253` `[查证]`），没有降级路径；因此 `wire.Version` 提升到 2 意味着**两端必须同时升级**。若需要灰度，可在 hello 里新增独立的 `caps` 字段（不参与版本校验），由双方取交集决定是否启用 mux；版本号本身不做“降级协商”。
+**协议版本：保持 1，不升级**（修正自阶段 1 详细设计）。帧格式未变，新帧类型是增量，
+`readPump` 的 `default` 分支本来就忽略未知类型，所以旧二进制遇到新帧只会忽略而非
+崩溃。而升到 2 会让 `exchangeHello` 直接返回 `ErrProtocol`（`session.go:218-253`
+`[查证]`，无降级路径），**使现有的 `send`/`recv` 在新旧二进制之间立刻不可用** ——
+为并不存在的不兼容制造了真实的功能倒退。
+
+灰度改用 hello 里的独立 `caps` 字段（不参与版本校验），双方取交集决定是否启用
+mux。版本号本身不做“降级协商”。
 
 **证据**：`secure.go:399-417`、`session.go:423-431`、`session.go:218-253` `[查证]`；yamux `recvLoop`/`sendLoop` `[查证]`；研究二 §2.2–§2.5 `[实测/查证]`。
 
@@ -675,7 +682,7 @@ MTU 只要**大于**隧道实际可承载的值，TCP 在第一个满尺寸段�
    - 单读者：`transport.Recv → secure.OpenFrame → 缓冲管道`；单写者：`缓冲管道 → secure.SealFrame → transport.Send`。
    - **引导阶段**：`FrameMuxStart` 屏障之前，hello 与 p2p 协商仍走现有的“帧直发”路径（`peer.Session.SendFrame/RecvFrame`），记录泵尚未启动；屏障之后所有帧都包在 `FrameStreamData` 里。这样 p2p 切换仍然发生在 mux 之前（A8），且引导阶段不需要 mux 存在。
    - `secure.go` **不改**；`peer.Session` 改为在控制流上收发 `wire.Frame`；`ShortAuth`/`Fingerprint` 上移到 Node。
-   - **协议版本**：`wire.Version` 提升到 2；现有 `exchangeHello` 在版本不一致时直接 `ErrProtocol`（无降级），因此两端必须同时升级。需要灰度时在 hello 增加独立的 `caps` 字段，由双方取交集。
+   - **协议版本**：保持 1。新帧类型是增量，旧版 `readPump` 忽略未知类型；升版本反而会让现有 `send`/`recv` 在新旧二进制间不可用。灰度用 hello 的 `caps` 字段取交集。
 3. `internal/forward`
    - `Preamble`/`Status`、`AllowList`（零值拒绝一切）、`Limits`、双向 pipe、半关闭。
 4. `internal/cli/forward.go`
@@ -964,3 +971,44 @@ MTU 只要**大于**隧道实际可承载的值，TCP 在第一个满尺寸段�
 ---
 
 *本文档只做设计与路线，不含实现代码。所有数字均标注了 `[实测]` / `[查证]` / `[推断]`；阶段验收门槛中的 `[推断]` 项必须在对应阶段用实测替换，不能沿用。*
+
+---
+
+## 阶段 1 详细设计对本文档的修正
+
+阶段 1 的详细设计（[`STAGE1-PORTFORWARD.md`](STAGE1-PORTFORWARD.md)）在细化过程中
+发现本文档有八处需要修正，其中三条是实质性的。这些修正已回写到上文，此处集中
+记录以免混淆。
+
+### 实质性修正
+
+**1. `wire.Version` 保持 1，不升到 2。**
+帧格式没有变化，新帧类型是纯增量，`readPump` 的 `default` 分支本来就忽略未知
+类型。升版本会让 `exchangeHello` 直接返回 `ErrProtocol`（无降级路径），使现有的
+`send`/`recv` 在新旧二进制之间立刻不可用——为并不存在的不兼容制造真实的功能
+倒退。灰度改用 hello 的独立 `caps` 字段取交集。
+
+**2. 记录大小是 512 KiB，不是 64 KiB。**
+项目自身实测：512 KiB 分块 → 539.3 MiB/s，64 KiB → 211.9 MiB/s，差 2.5 倍。
+记录泵的缓冲因此定为 1 MiB/方向，而不是 4×64 KiB。
+
+**3. `-R` 需要独立授权与端口白名单。**
+`-L` 和 `-R` 的风险量级不同：`-L` 由本端决定拨往何处，`-R` 让**对端**在本端
+开监听器。因此需要独立的 `--accept-reverse` 开关，以及 `--allow-listen-port`
+白名单（零值拒绝一切），否则对端可以抢占本端端口（例如绑掉本地 Redis 的 6379）。
+
+### 其余修正
+
+4. `Preamble` 类型放在 `wire` 包，避免 `peer` 与 `forward` 之间的导入环。
+5. `Permits` 返回**要拨的 IP** 而不是 bool，封死 check-then-dial 的 TOCTOU 窗口。
+6. `-R` 的 `Addr` 字段改为**监听器 ID**，多监听器按 ID 匹配，重连不重复 bind。
+7. 记录泵的队列必须是**有界阻塞**而非丢弃：丢字节对数据库协议意味着静默损坏。
+8. 泵的 `readLoop` 必须保留 `ErrTransportSwitched` 分支，否则 `--p2p` 升级会
+   瞬间杀死会话——这是最可能的回归点。
+
+### 验收口径
+
+`bash tests/run-tests.sh` 全量运行实测 **39 项通过**（`--quick` 模式 35 项，跳过
+4 项单测断言）。阶段 1 的验收基线是这 39 项全绿，且性能不低于 485 MiB/s
+（现有 539.3 MiB/s 的 −10%）。
+
