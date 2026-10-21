@@ -23,6 +23,17 @@
 [`decisions.md`](decisions.md) —— 按时间顺序记录所有技术与工程决策（D1 至今），
 包含**被否决的方案及原因**。提 PR 前请先读与改动相关的条目。
 
+## 打包与分发
+
+[`../packaging/`](../packaging/) —— 生成可直接上传到服务器的 Demo 包：
+
+```bash
+./packaging/build-demo.sh          # 产出 dist/cmesh-demo.tar.gz
+```
+
+包含 linux/amd64 + arm64 静态二进制、`start.sh`（自动选架构、自动挑空闲端口）、
+`stop.sh` 与一份即开即用指南。
+
 ## 快速导航
 
 - **想知道某条限制为什么存在** → 先查 `decisions.md` 的 D 编号
