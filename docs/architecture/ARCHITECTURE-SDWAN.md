@@ -684,7 +684,7 @@ MTU 只要**大于**隧道实际可承载的值，TCP 在第一个满尺寸段�
    - 流前置头：`kind(1)`；forward 流再带 `Preamble{Kind, Addr}`。
    - 适配器：`MessageConn` ↔ `io.ReadWriteCloser`（yamux 需要字节流）。
 2. **记录泵（record pump）**
-   - 新增 `FrameStreamData`（payload = 任意字节块，≤32 KiB；写侧最多 16 条合并成一次 transport 写）与 `FrameMuxStart`（双向屏障）。
+   - 新增 `FrameStreamData`（payload = 任意字节块，≤32 KiB；一条记录一次 transport 写，不合并）与 `FrameMuxStart`（双向屏障）。
    - 单读者：`transport.Recv → secure.OpenFrame → 缓冲管道`；单写者：`缓冲管道 → secure.SealFrame → transport.Send`。
    - **引导阶段**：`FrameMuxStart` 屏障之前，hello 与 p2p 协商仍走现有的“帧直发”路径（`peer.Session.SendFrame/RecvFrame`），记录泵尚未启动；屏障之后所有帧都包在 `FrameStreamData` 里。这样 p2p 切换仍然发生在 mux 之前（A8），且引导阶段不需要 mux 存在。
    - `secure.go` **不改**；`peer.Session` 改为在控制流上收发 `wire.Frame`；`ShortAuth`/`Fingerprint` 上移到 Node。
@@ -716,7 +716,7 @@ MTU 只要**大于**隧道实际可承载的值，TCP 在第一个满尺寸段�
 - **`StreamOpenTimeout` 失败会关整个 session**（研究二 §1.2 查证）：设长（120 s），并在 `Open` 前检查 `NumStreams`。
 - **开放代理**：A5 四层防御；任何一层缺失都视为阻断性问题。
 - **`secure` 改造风险**：本设计**不改 `secure.go`**，只加记录泵；`SealFrame`/`OpenFrame` 的现有测试全部继续有效。
-- **记录泵的背压**：裸 `io.Pipe` 无缓冲，写侧会阻塞 yamux 的 `sendLoop`。用显式的有界缓冲（每方向 1 MiB，即 32 条 32 KiB 记录）并在缓冲满时阻塞写侧——这是正确的背压，不是 bug；但必须保证读侧 goroutine 永远在跑，且 `Close` 时同时关闭管道两端，否则整个会话停摆。缓冲之所以是 1 MiB 而不是几条记录，是因为写侧要凑够 16 条才能做一次批量写。
+- **记录泵的背压**：裸 `io.Pipe` 无缓冲，写侧会阻塞 yamux 的 `sendLoop`。用显式的有界缓冲（每方向 1 MiB，即 32 条 32 KiB 记录）并在缓冲满时阻塞写侧——这是正确的背压，不是 bug；但必须保证读侧 goroutine 永远在跑，且 `Close` 时同时关闭管道两端，否则整个会话停摆。缓冲的深度是为了吸收一次 AEAD + 一次 Send 的抖动，不是为了攒批（合并在实现时被否掉，见下）。
 - **重连断流**：预期行为，文档写清楚，不做 stream 续传。
 
 **工作量**：约 8 工程日，分 3 个 PR（研究二估 880 生产 + 900 测试行偏低：记录泵、控制流重构、`-R` 控制面与安全加固都会超；详细拆分见 [`STAGE1-PORTFORWARD.md`](STAGE1-PORTFORWARD.md) §7–§8）。
@@ -994,13 +994,17 @@ MTU 只要**大于**隧道实际可承载的值，TCP 在第一个满尺寸段�
 `send`/`recv` 在新旧二进制之间立刻不可用——为并不存在的不兼容制造真实的功能
 倒退。灰度改用 hello 的独立 `caps` 字段取交集。
 
-**2. 记录大小是 32 KiB，配 16 条批量写（初版写 512 KiB，已推翻）。**
+**2. 记录大小是 32 KiB，一条记录一次 transport 写（初版 512 KiB，批量方案也已否决）。**
 512 KiB 的依据是回环吞吐（512 KiB 分块 539.3 MiB/s vs 64 KiB 的 211.9 MiB/s），
 但那把优化目标选错了：AEAD 在任何真实链路上都不是瓶颈（32 KiB 实测仍有
 1408 MB/s），而一条 512 KiB 记录在 2 MiB/s 链路上要传 250 ms——这期间所有共享
 连接的流都得等，等于给 SSH 会话加一个 250 ms 的队头阻塞。32 KiB 把这个下限降到
-15.6 ms，同时用「16 条合并成一次 transport 写」把写次数拉回与 512 KiB 相同。
-记录泵的缓冲因此是 1 MiB/方向（32 条），而不是 4×64 KiB。
+15.6 ms。
+
+设计阶段还试过「16 条合并成一次 transport 写」来补回 syscall 次数，实现时否决：
+接收端必须收齐整条 AEAD 消息才能解密，合并后加密单元又是 512 KiB，队头阻塞原样
+回来，而且只在链路忙时触发。实测 512 MiB 回环 515 / 615 / 594 MiB/s，证明
+syscall 不是瓶颈。记录泵的缓冲是 1 MiB/方向（32 条），而不是 4×64 KiB。
 
 **3. `-R` 需要独立授权与端口白名单。**
 `-L` 和 `-R` 的风险量级不同：`-L` 由本端决定拨往何处，`-R` 让**对端**在本端

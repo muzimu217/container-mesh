@@ -21,7 +21,8 @@
 
 2. **`wire.Version` 不升到 2。** 帧格式（10 字节头、1 MiB 上限）完全不变，新增帧类型是纯增量；而 `exchangeHello` 在版本不一致时直接返回 `ErrProtocol`、没有降级路径（`session.go:244-246`），升版本会让**现有 `send`/`recv` 在新旧二进制之间直接不可用**——这是纯粹的功能倒退。改用 hello 里的 `caps` 能力位协商，旧对端自动退化为「不支持转发」，文件传输完全不受影响。这是对 ARCHITECTURE-SDWAN §A1 的修正（理由见 §3.4）。
 
-3. **记录大小取 32 KiB，配 16 条批量写**（本项经评审后修正，原方案为 512 KiB）。
+3. **记录大小取 32 KiB，一条记录一次 transport 写（不合并）**（本项经评审后两次修正：
+   原方案 512 KiB，评审后改 32 KiB + 16 条批量，实现时实测又否掉了批量）。
 
    最初的推理是「512 KiB 比 64 KiB 快 2.5 倍（539.3 vs 211.9 MiB/s），所以
    取 512 KiB」。这个推理错在**优化目标选错了**：那两个数字都是回环测出来的，
@@ -41,9 +42,18 @@
 
    一边 `scp` 传大文件、一边在同一隧道里敲 SSH，512 KiB 会让终端明显卡顿。
 
-   512 KiB 买到的吞吐改由**写侧批量**补回：512 MiB 用 512 KiB 记录是 1024 次
-   写；用 32 KiB 记录、每 16 条合并一次写，**也是 1024 次写**，而延迟下限小了
-   16 倍 `[实测]`。这正是 TLS 1.3 把 record 上限定在 16 KiB 的理由。
+   **批量合并（16 条拼成一次 transport 写）在实现阶段被否掉了。** 理由是它把
+   刚砍掉的队头阻塞原封不动装回来：接收端必须收齐整条 AEAD 消息才能解密，所以
+   16 × 32 KiB = **512 KiB 一条**，在 2 MiB/s 链路上又是 250 ms；而且它恰好只在
+   「链路正忙」时才触发，正是交互流量最需要低延迟的时刻。
+
+   代价是 syscall 次数：512 MiB 从 1024 次写变成 16384 次。实测表明这个代价可以
+   接受——`[实测]` 512 MiB 回环三次为 **515 / 615 / 594 MiB/s**，全部高于 485
+   MiB/s 的回归门槛。如果将来 syscall 真的成为瓶颈，优化应该落在传输层
+   （sendmmsg 式批量），而不是加大加密单元。
+
+   这条与 TLS 1.3 把 record 上限定在 16 KiB 是同一个道理：**加密单元的大小就是
+   延迟下限，不能为了省 syscall 而放大它。**
 
 4. **`-R` 比 `-L` 危险一个量级，需要独立的授权开关和端口白名单。** `-L` 是「我允许你拨我配置好的目标」，`-R` 是「我允许你在我这里开一个监听端口」。后者可以让持有 code 的攻击者在受害容器里绑定任意空闲 loopback 端口、向本地进程提供内容（例如冒充一个本地开发服务器）。研究二 §3.4 的 5 层里只有一层（第 1 层）管「是否启用」，且正文写 `--allow-forward`、参数表写 `--accept`，本身不一致；`-R` 没有任何独立授权。本设计增加 `--accept-reverse` + `--allow-listen-port`（零值拒绝一切）。
 
@@ -170,19 +180,13 @@ type PumpConfig struct {
     // record arrives, so an interactive stream waits behind it. At 32 KiB that
     // floor is 15.6 ms.
     //
-    // The throughput that 512 KiB bought is recovered on the write side by
-    // batching (see BatchedRecords), which yields the same number of writes:
-    // 512 MiB as 512 KiB records is 1024 writes; as 32 KiB records batched 16
-    // at a time it is also 1024 writes, with a 16x smaller latency floor.
+    // The write side sends one record per transport message. Batching was
+    // designed in and then removed: concatenating N records means the receiver
+    // cannot decrypt any of them until all N arrive, which puts the 250 ms
+    // head-of-line floor back on exactly the busy links where the low floor
+    // matters most. Measured cost of per-record sends: 515-615 MiB/s on
+    // loopback for 512 MiB, above the 485 MiB/s regression gate.
     RecordSize int
-    // BatchedRecords is how many records the write side coalesces into one
-    // transport write. 16 keeps the syscall count equal to the 512 KiB scheme:
-    // 512 MiB / 32 KiB = 16384 records, / 16 = 1024 writes.
-    //
-    // This is not a latency knob. The drainer takes whatever is queued (up to
-    // 16) and sends immediately; there is no timer, so an idle connection
-    // still sends a single record with one syscall.
-    BatchedRecords int
     // BufBytes bounds each direction's queue. 1 MiB is 32 records at the
     // default size: enough to keep the transport busy across one AEAD + one
     // Send, small enough that a dead peer cannot pin more than 2 MiB.
@@ -323,18 +327,22 @@ func (p *Pump) writeLoop() {
 3. **队列是有界阻塞的，不是丢弃的。** 满时阻塞写侧，这是正确的背压（传输慢 → yamux `sendLoop` 慢 → 各流的 `Write` 慢 → 应用的 `write()` 慢），不是 bug。`BufBytes=1 MiB` 下，11–12 MiB/s 的跨公网链路约 85 ms 排空，远小于 yamux 的 `ConnectionWriteTimeout=10 s` 安全阀。
 4. **`SealFrame` 成功但 `Send` 失败时计数器已经消耗。** 会话必须判死，不能重试——这与现有 `SendFrame` 的行为一致（`session.go:423-431`），不是新增缺陷。
 
-**写入合并（coalescing）是必须的，不是可选。** 记录从 512 KiB 降到 32 KiB 后，
-若不合并，同样的 512 MiB 会从 1024 次 transport 写变成 16384 次——16 倍的 syscall
-与 16 倍的帧头开销，正好把缩小记录买到的延迟又还回去。
+**不做写入合并（coalescing）。** 设计初稿把「16 条合并成一次 transport 写」定为
+必须，实现时发现它与本设计的核心目标冲突，已删除：
 
-规则：写侧 drainer 一次从 `writeQ` 取**至多 `BatchedRecords=16` 条**（取到什么算什么，
-队列不满就少取），拼成一个缓冲区后**一次 `transport.Send`**。没有定时器，没有
-「攒够 N 微秒就发」——队列空就立刻发单条，队列满就一次发 16 条，flush 时机完全由
-现有背压决定。研究二 §4.9 实测未合并时是 13 条消息/MiB、平均 81.8 KiB/条；
-合并后每条记录承载多条 yamux 帧，header-only 记录基本消失。
+- **接收端必须收齐整条 AEAD 消息才能解密**，所以 16 条 32 KiB 记录合并后是一个
+  **512 KiB 的加密单元**，在 2 MiB/s 链路上仍是 250 ms 的队头等待——正是缩小记录
+  想消除的那个数字。
+- **它只在链路忙时才触发**，也就是交互流量最需要低延迟的时候。空闲链路上队列里
+  只有一条记录，合并根本不发生。所以「空闲时延迟低、繁忙时延迟高」恰好是反的。
+- **收益只是 syscall 次数**，而实测表明这不是瓶颈：一条 32 KiB 记录已经把一次
+  写摊销到 32 KiB 上，512 MiB 回环三次为 515 / 615 / 594 MiB/s。
 
-**不做基于延时的 flush**：研究二试过并因 flush 时机出 bug 未跑通，
-不值得在 v1 引入一个时序依赖。批量只由「队列里现在有多少」决定。
+如果将来 syscall 真的成为瓶颈，正确的做法是在**传输层**做批量（`sendmmsg` 式，
+一次系统调用写多条消息），而不是放大加密单元。后者会同时放大延迟下限和丢包代价
+（一条消息丢失 = 16 条记录重传）。
+
+**不做基于延时的 flush** 这条结论不变：研究二试过并因 flush 时机出 bug 未跑通。
 
 ### 2.2 `FrameConn`：把 yamux 接进 `peer.Session` 的接缝
 
@@ -1268,7 +1276,7 @@ MaxStreams = min(--max-streams, StreamBudget / (2 × Window))
 | P5 | 已建立流的往返延迟（2000 次 ping-pong） | p50 ≤ 1 ms，p95 ≤ 3 ms | 研究二 yamux 空闲 p50 18 µs、9 条满载 191 µs `[实测]`；留出全栈余量 |
 | P6 | 100 条活跃流转发时 RSS | **< 80 MiB** | ARCHITECTURE-SDWAN 验收 1.9 |
 | P7 | 100 条空闲流转发时 RSS | < 40 MiB | 每空闲流 1.7–2.5 KiB `[实测]` |
-| P8 | relay 消息数 | 记录实测值，目标 **≤ 13 条/MiB**（研究二未合并时的实测值） | 合并是必做的（§2.1），因此这条应**显著低于** 13；若反而更高，说明批量写没生效 |
+| P8 | relay 消息数 | 记录实测值，参照 **≤ 13 条/MiB**（研究二实测值） | 32 KiB 记录对应约 32 条/MiB。这个数字偏高是**已知且接受的代价**：换来的是 15.6 ms 而非 250 ms 的延迟下限。若 relay 的 `MaxMessageBytes` 或限流承压，再考虑传输层批量（§2.1） |
 | P9 | 文件传输 + 转发并发 | 转发吞吐下降 < 20%，文件传输下降 < 15% | 单 `sendLoop` 串行化是已知代价 |
 
 **P2–P5 的 `[推断]` 门槛必须在实现后第一次实测时替换为真实数字**，并把实测值写回本表——不能沿用推断值冒充验收。
@@ -1296,8 +1304,8 @@ C1 的实现提示与判据说明：
 - **为什么文件传输要限到 1.2 MiB/s 而不是打满 2 MiB/s**：在一条被单个大流打满的
   FIFO 字节流上，交互请求必然排在整队数据之后，此时 P99 由队列深度决定（1 MiB
   缓冲 = 500 ms），与记录大小无关。打满时任何记录大小都过不了 40 ms，那样的门槛
-  不可判定。留 40% 余量后，排队主要由「一次记录/一次批量写占用链路多久」决定，
-  正是本设计要优化的量。
+  不可判定。留 40% 余量后，排队主要由「一条记录占用链路多久」决定，正是本设计
+  要优化的量。
 - **打满时的真实行为要如实写进 README**：单连接里大文件会挤占交互流量，这不是
   记录大小的 bug，是单流 FIFO 的固有性质。要彻底解决得给控制流做优先级队列，
   属于阶段 2 之后（见 §9 的 X13）。
@@ -1456,7 +1464,7 @@ P6 < 80 MiB、§6.5 的混沌测试 C1–C4 全绿、既有 39 项 + 新增 e2e 
 | X4 | **`peer.Session` 重构引入回归** | 中高 | PR #1 步 1.2 的改动遗漏 `ErrTransportSwitched` 或 `sendMu` | 密文等价性单测；`-race`；既有 e2e；P1 门槛；单独提交便于 bisect |
 | X5 | **`StreamOpenTimeout` 关整个会话** | 中 | 单条流 SYN 未 ACK | 120 s；`Open` 前查 `NumStreams`；重连后 listener 存活 |
 | X6 | **内存超预算** | 中 | 1 MiB 窗口 + 256 流 | 预算公式自动压低流数；P6 |
-| X7 | **relay 消息数上升** | 低 | mux 启用 | P8 实测；合并已必做，正常应显著低于 13 条/MiB。若反而更高，先查批量写是否生效 |
+| X7 | **relay 消息数上升** | 中 | mux 启用 | 32 KiB 记录约 32 条/MiB，比研究二基线的 13 条高。这是换取低延迟下限的已知代价；P8 实测记录，若 relay 限流承压则在传输层做 sendmmsg 式批量 |
 | X8 | **`-R` 目标被对端指定**（研究二原方案的漏洞） | 中 | 实现者照研究二写「Addr 仅用于日志」但忘了查表 | 结构性设计：Addr = 监听器 ID，只查表不拨号；S7 + 单测 |
 | X9 | **白名单 TOCTOU / DNS rebinding** | 中 | 白名单写主机名 | `Permits` 返回 IP，拨号只用它；启动时固定；S5 |
 | X10 | **yamux v0.x API 变动** | 低 | 升级 yamux | `internal/mux` 完全隔离；协议 spec 稳定；pin v0.1.2 |
@@ -1477,8 +1485,8 @@ P6 < 80 MiB、§6.5 的混沌测试 C1–C4 全绿、既有 39 项 + 新增 e2e 
 | # | 上游位置 | 原文 | 修正 | 依据 |
 |---|---|---|---|---|
 | 1 | `ARCHITECTURE-SDWAN.md` §A1、§6 阶段 1 | 「`wire.Version` 提升到 2，两端必须同时升级」 | **保持 1**，用 hello 的 `caps` 协商 | 帧格式未变，新帧类型是增量，`readPump` 的 default 分支忽略未知类型（`session.go:341-343`）；升版本会让 `send`/`recv` 在新旧二进制间不可用 |
-| 2 | `ARCHITECTURE-SDWAN.md` §6 阶段 1 交付物 2（第 674 行） | 「新增 `FrameStreamData`（payload = 任意字节块，≤64 KiB）」 | **32 KiB**（写侧 16 条批量合并） | 512 KiB 在 2 MiB/s 链路上有 250 ms 队头阻塞，而 AEAD 在 32 KiB 仍有 1408 MB/s；批量写把写次数拉回与 512 KiB 相同 `[实测]` |
-| 3 | `ARCHITECTURE-SDWAN.md` §A9 预算表（第 604 行）与 §6 风险段（第 706 行） | 「记录泵缓冲 每方向 4 × 64 KiB」 | **每方向 1 MiB（32 条 × 32 KiB）** | 缓冲要能装下若干整条记录才能做批量写；1 MiB = 32 条，够 16 条批量凑两次。2 MiB 总量相对 128 MiB 的 yamux 预算可忽略 |
+| 2 | `ARCHITECTURE-SDWAN.md` §6 阶段 1 交付物 2（第 674 行） | 「新增 `FrameStreamData`（payload = 任意字节块，≤64 KiB）」 | **32 KiB，一条记录一次 transport 写** | 512 KiB 在 2 MiB/s 链路上有 250 ms 队头阻塞；AEAD 在 32 KiB 仍有 1408 MB/s。合并在实现时被否掉：它会把加密单元重新放大到 512 KiB `[实测]` |
+| 3 | `ARCHITECTURE-SDWAN.md` §A9 预算表（第 604 行）与 §6 风险段（第 706 行） | 「记录泵缓冲 每方向 4 × 64 KiB」 | **每方向 1 MiB（32 条 × 32 KiB）** | 队列要有足够深度吸收一次 AEAD + 一次 Send 的抖动，又不能大到让死对端钉住内存。1 MiB 是 32 条记录；2 MiB 总量相对 128 MiB 的 yamux 预算可忽略 |
 | 4 | `research/mux-and-portforward.md` §3.2 | `Preamble` 定义在 `internal/forward/proto.go` | 移到 `internal/wire/forward.go` | 状态码与帧 payload 都在 `wire`；放 `forward` 会形成 `forward→wire` 与 `wire→forward` 的环 |
 | 5 | `research/mux-and-portforward.md` §3.4 | 5 层防御中只有第 1 层管「是否启用」，且 `-R` 与 `-L` 共用同一个 `--accept`（正文还写作 `--allow-forward`，与参数表不一致） | 拆出 `--accept-reverse` + `--allow-listen-port`（零值拒绝） | `-R` 让攻击者在受害容器内开监听端口，风险量级不同于 `-L` |
 | 6 | `research/mux-and-portforward.md` §8 关键片段 3（第 974-1004 行）与第 961 行 | `Permits(addr)` 用主机名比对，然后 `net.DialTimeout("tcp", p.Addr)` 再解析一次 | `Permits` 返回**要拨的 IP**，拨号只用它 | check-then-dial TOCTOU / DNS rebinding |
@@ -1494,9 +1502,9 @@ P6 < 80 MiB、§6.5 的混沌测试 C1–C4 全绿、既有 39 项 + 新增 e2e 
 | 复用库 | `hashicorp/yamux v0.1.2`（+33 KB，零传递依赖，MPL-2.0） | 必须（研究二已否决 smux/QUIC 多流） |
 | 分层 | `transport → secure → 记录泵 → yamux → 业务流` | 必须 |
 | `secure.go` | 不改 | 必须 |
-| 记录大小 | **32 KiB**（写侧 16 条批量合并） | 必须 |
-| 记录泵缓冲 | 每方向 1 MiB（32 条），有界阻塞 | 必须 |
-| 写入合并 | **v1 做**：最多 16 条合并成一次 transport 写，无定时器（写侧凑满即发） | 必须 |
+| 记录大小 | **32 KiB**，一条记录一次 transport 写 | 必须 |
+| 记录泵缓冲 | 每方向 1 MiB（32 条 32 KiB 记录），有界阻塞 | 必须 |
+| 写入合并 | **不做**：会把加密单元放大回 512 KiB，重新引入队头阻塞 | 必须（明确不做） |
 | `wire.Version` | 保持 1 + `caps` 协商 | 必须 |
 | 控制流 | yamux stream，`kind=0`，initiator 打开，只接受一次 | 必须 |
 | 流 kind | 0=控制，1=转发 | 必须 |

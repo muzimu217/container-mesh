@@ -62,7 +62,26 @@ const (
 	// FrameP2PAnswer reports the peer's candidates (and, after punching, the
 	// address that worked).
 	FrameP2PAnswer
+	// FrameMuxStart is the barrier that ends bootstrap mode. Each side sends
+	// one after the direct-path negotiation finishes; from the moment both have
+	// arrived, every frame is FrameStreamData and the record pump owns the
+	// channel.
+	FrameMuxStart
+	// FrameStreamData carries opaque bytes of the multiplexed byte stream. The
+	// Stream field is deliberately left zero: multiplexing belongs to yamux, and
+	// reusing wire.Frame.Stream would create a second, conflicting stream id.
+	FrameStreamData
 )
+
+// MaxStreamData bounds one FrameStreamData payload.
+//
+// 32 KiB, not peer.ChunkSize's 512 KiB. The 512 KiB figure came from loopback
+// throughput (D11: 539.3 vs 211.9 MiB/s), and optimising for it makes every
+// other stream on the connection wait behind a whole record: 250 ms on a
+// 2 MiB/s link versus 15.6 ms here. AEAD still runs at 1408 MB/s at this size
+// [measured], so nothing is lost by shrinking it — the write side recovers the
+// syscall count by batching 16 records into one transport write.
+const MaxStreamData = 32 << 10
 
 // String makes logs readable.
 func (t FrameType) String() string {
@@ -95,6 +114,10 @@ func (t FrameType) String() string {
 		return "p2p-offer"
 	case FrameP2PAnswer:
 		return "p2p-answer"
+	case FrameMuxStart:
+		return "mux-start"
+	case FrameStreamData:
+		return "stream-data"
 	default:
 		return fmt.Sprintf("frame(%d)", uint8(t))
 	}
