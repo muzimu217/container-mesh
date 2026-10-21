@@ -389,7 +389,19 @@ bash tests/run-tests.sh # 全量
 
 ---
 
-## 8. 相关项目
+## 8. 设计与研究文档
+
+完整的技术设计与实测研究见 [`docs/`](docs/README.md)：
+
+| 文档 | 内容 |
+|---|---|
+| [架构设计](docs/architecture/ARCHITECTURE-SDWAN.md) | 混合权限 Overlay SD-WAN 的分层、接入模式、落地路线 |
+| [用户态网络栈研究](docs/research/userspace-netstack.md) | 无 TUN 容器的虚拟网络能力边界（含 MTU 黑洞等实测发现） |
+| [多路复用与端口转发研究](docs/research/mux-and-portforward.md) | yamux 选型、端口转发设计与开放代理防御 |
+| [可靠传输复刻研究](docs/research/reliable-transport.md) | 自研 UDP 传输的蓝本与根因分析 |
+| [决策记录](docs/decisions.md) | 所有技术决策，含被否决的方案及原因 |
+
+## 9. 相关项目
 
 本仓库是**双向组网**这一侧。配套的姊妹项目负责**单向远程运维入口**，两者定位互补、不重叠：
 
@@ -413,7 +425,7 @@ bash tests/run-tests.sh # 全量
 
 ---
 
-## 9. 许可
+## 10. 许可
 
 Copyright (C) 2026 muzimu217
 
