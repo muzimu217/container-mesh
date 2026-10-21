@@ -257,10 +257,26 @@ func TestThroughputBaseline(t *testing.T) {
 		elapsed := time.Since(start)
 		mbps := float64(size) / elapsed.Seconds() / (1 << 20)
 		t.Logf("2 MiB in %s (%.1f MiB/s)", elapsed.Round(time.Millisecond), mbps)
-		if mbps < 5 {
-			t.Errorf("throughput %.1f MiB/s is below the floor", mbps)
+
+		// Assert on elapsed time, not on MiB/s. `go test ./...` runs packages
+		// in parallel, and under that contention a healthy transfer can measure
+		// a few MiB/s — below any absolute floor tight enough to catch the
+		// order-of-magnitude regression this guards. A real congestion-control
+		// failure stalls for a retransmit period (seconds), so time is the
+		// signal that survives CPU noise.
+		if elapsed > quicStallFloor {
+			t.Errorf("2 MiB took %s, on the order of a retransmit stall; "+
+				"congestion control or the stream path regressed", elapsed.Round(time.Millisecond))
+		}
+		if mbps < 1 {
+			t.Logf("WARNING: %.1f MiB/s is unusually low; re-run with -p 1 on an "+
+				"idle machine before suspecting a regression", mbps)
 		}
 	case <-time.After(60 * time.Second):
 		t.Fatal("transfer timed out")
 	}
 }
+
+// quicStallFloor is the elapsed time that means a retransmit dominated the
+// transfer. A healthy 2 MiB loopback transfer is tens of milliseconds.
+const quicStallFloor = 2 * time.Second

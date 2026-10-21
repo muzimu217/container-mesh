@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/url"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/muzimu217/container-mesh/internal/mux"
 	"github.com/muzimu217/container-mesh/internal/p2p"
 	"github.com/muzimu217/container-mesh/internal/p2pquic"
 	"github.com/muzimu217/container-mesh/internal/peer"
@@ -86,6 +88,30 @@ type NodeConfig struct {
 	// verified (the auto-resume behaviour). One-shot commands use a small
 	// cap so a missing receiver terminates the process.
 	MaxTransferAttempts int
+
+	// UseMux makes every session cross the multiplexing barrier, so the
+	// connection can carry forwarded streams alongside the control stream.
+	//
+	// Off by default and left off by send/recv: those need nothing beyond the
+	// single frame channel, and keeping them on the old path is what guarantees
+	// they behave byte-for-byte as before.
+	UseMux bool
+	// OnMux is called once per session, after the barrier, with the live
+	// multiplexed session. It runs on the session's own goroutine, so it must
+	// not block for the life of the session: start the accept loop in a
+	// goroutine and return.
+	//
+	// A nil OnMux with UseMux set still works; the streams are then simply
+	// never served, which is useful for a peer that only opens them.
+	OnMux func(*mux.Session)
+	// OnStream receives every inbound non-control stream. It is called on its
+	// own goroutine per stream and must eventually close the stream.
+	//
+	// The control stream is never delivered here: the node consumes it itself,
+	// because it carries the peer.Session frames.
+	OnStream func(*mux.Stream)
+	// OnForwardListen answers a peer's -R registration request.
+	OnForwardListen func([]wire.ForwardListenSpec) []wire.ForwardListenStatus
 }
 
 // defaultPairWindow is how long one relay is tried before moving to the next
@@ -104,6 +130,7 @@ type Node struct {
 
 	mu       sync.Mutex
 	sess     *peer.Session
+	msess    *mux.Session // non-nil while the current session is muxed
 	terminal error
 	notify   chan struct{}
 	runDone  chan struct{}
@@ -220,6 +247,16 @@ func (n *Node) Run(ctx context.Context) error {
 		case <-ctx.Done():
 		}
 		n.clearSession(sess)
+		// Tear the mux session down with the transport: its streams are dead
+		// either way, and leaving it registered would hand the next connection
+		// a session that cannot carry anything.
+		n.mu.Lock()
+		ms := n.msess
+		n.mu.Unlock()
+		if ms != nil {
+			_ = ms.Close()
+			n.clearMuxSession(ms)
+		}
 		_ = sess.Close()
 		if ctx.Err() != nil {
 			n.finish(nil)
@@ -293,7 +330,14 @@ func (n *Node) dialOne(ctx context.Context, relayURL string) (*peer.Session, err
 			AllowHidden:    n.cfg.AllowHidden,
 			ForceOverwrite: n.cfg.ForceOverwrite,
 		})
-		if err == nil {
+		if err != nil {
+			_ = conn.Close()
+			ch <- result{nil, err}
+			return
+		}
+		if n.cfg.UseMux {
+			err = s.StartMuxed(n.handler(), n.negotiator(), n.muxBoot())
+		} else {
 			err = s.StartWithNegotiation(n.handler(), n.negotiator())
 		}
 		if err != nil {
@@ -348,6 +392,92 @@ func (n *Node) dialOne(ctx context.Context, relayURL string) (*peer.Session, err
 			_ = r.sess.Close()
 		}
 		return nil, ctx.Err()
+	}
+}
+
+// muxBoot builds the multiplexed session that sits on top of the record pump.
+//
+// It runs after the hello exchange and the p2p negotiation, and before the
+// session's read pump starts, which is the only window where the transport may
+// still change (A8).
+//
+// Role decides yamux's stream-id parity: A opens odd ids, B even. Both sides
+// open exactly one stream — the control stream — and only the initiator opens
+// it; the responder accepts it. Anything else would need a tie-break the
+// protocol does not have.
+func (n *Node) muxBoot() peer.MuxBoot {
+	return func(s *peer.Session) (io.ReadWriteCloser, error) {
+		link, err := s.Pump().StartMux(context.Background())
+		if err != nil {
+			return nil, fmt.Errorf("mux barrier: %w", err)
+		}
+
+		role := mux.RoleClient
+		if n.cfg.Role == secure.RoleB {
+			role = mux.RoleServer
+		}
+		cfg := mux.DefaultConfig(role)
+		// Keep the budget honest: 256 streams at a 1 MiB window would reserve
+		// 512 MiB. DefaultConfig's 256 KiB window fits inside 128 MiB.
+		cfg.MaxStreams = mux.BudgetedStreams(cfg.MaxStreams, cfg.Window, 128<<20)
+
+		ms, err := mux.New(link, cfg)
+		if err != nil {
+			return nil, fmt.Errorf("mux session: %w", err)
+		}
+		n.setMuxSession(ms)
+
+		// Hand the session to the caller's dispatcher before serving, so a
+		// forwarder can install its handler without racing the first stream.
+		if n.cfg.OnMux != nil {
+			n.cfg.OnMux(ms)
+		}
+
+		if role == mux.RoleServer {
+			// Responder: accept the control stream the initiator opens, and
+			// serve any other stream through the same dispatcher.
+			ctlCh := make(chan io.ReadWriteCloser, 1)
+			go func() {
+				_ = ms.Serve(context.Background(), func(st *mux.Stream) {
+					if st.Kind() == mux.KindControl {
+						select {
+						case ctlCh <- st:
+						default:
+							// A second control stream is a protocol error; drop
+							// it rather than letting it shadow the real one.
+							_ = st.Close()
+						}
+						return
+					}
+					if n.cfg.OnStream != nil {
+						n.cfg.OnStream(st)
+						return
+					}
+					_ = st.Close()
+				})
+			}()
+			select {
+			case ctl := <-ctlCh:
+				return ctl, nil
+			case <-ms.Done():
+				return nil, errors.New("mux session closed before the control stream arrived")
+			case <-time.After(30 * time.Second):
+				return nil, errors.New("timed out waiting for the control stream")
+			}
+		}
+
+		// Initiator: serve inbound streams in the background and open the
+		// control stream ourselves.
+		go func() {
+			_ = ms.Serve(context.Background(), func(st *mux.Stream) {
+				if n.cfg.OnStream != nil {
+					n.cfg.OnStream(st)
+					return
+				}
+				_ = st.Close()
+			})
+		}()
+		return ms.Open(context.Background(), mux.KindControl)
 	}
 }
 
@@ -439,6 +569,7 @@ func (n *Node) bringUpQUIC(res *p2p.Result) (*p2pquic.Result, error) {
 // handler builds the read-pump dispatch for every session this node owns.
 func (n *Node) handler() peer.Handler {
 	return peer.Handler{
+		OnForwardListen: n.cfg.OnForwardListen,
 		OnMessage: func(text string) {
 			if h := n.cfg.OnMessage; h != nil {
 				h(text)
@@ -469,6 +600,50 @@ func (n *Node) handler() peer.Handler {
 			}()
 			return true
 		},
+	}
+}
+
+// setMuxSession records the multiplexed session for the current connection.
+func (n *Node) setMuxSession(ms *mux.Session) {
+	n.mu.Lock()
+	n.msess = ms
+	n.mu.Unlock()
+}
+
+func (n *Node) clearMuxSession(ms *mux.Session) {
+	n.mu.Lock()
+	if n.msess == ms {
+		n.msess = nil
+	}
+	n.mu.Unlock()
+}
+
+// Mux returns the current multiplexed session, waiting for one if necessary.
+//
+// It fails when the node is not running with UseMux: a caller that asks for a
+// multiplexed session on a single-stream node has a wiring bug, and returning a
+// nil session would turn it into a nil dereference later.
+func (n *Node) Mux(ctx context.Context) (*mux.Session, error) {
+	if !n.cfg.UseMux {
+		return nil, errors.New("node is not running with mux enabled")
+	}
+	for {
+		n.mu.Lock()
+		ms := n.msess
+		term := n.terminal
+		n.mu.Unlock()
+		if ms != nil && !ms.IsClosed() {
+			return ms, nil
+		}
+		if term != nil {
+			return nil, term
+		}
+		select {
+		case <-n.notify:
+		case <-n.runDone:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
 }
 

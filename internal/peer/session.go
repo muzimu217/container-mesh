@@ -22,6 +22,7 @@
 package peer
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -94,17 +95,28 @@ type Handler struct {
 	// callers will run it in a goroutine and return immediately). Returning
 	// false rejects the offer right away. A nil OnOffer rejects every offer.
 	OnOffer func(tr *InboundTransfer) bool
+	// OnForwardListen receives a peer's request to host -R listeners and must
+	// answer with one status per spec.
+	//
+	// It runs on the read pump goroutine, so it must not block: binding a
+	// listener is fast, but dialling is not. A nil callback refuses every
+	// request, which is the correct default for a peer that never enabled -R.
+	OnForwardListen func(specs []wire.ForwardListenSpec) []wire.ForwardListenStatus
 }
 
 // Session is one peer's view of the conversation.
 type Session struct {
 	cfg Config
-	// conn is the switchable transport wrapper: it starts on the relay
-	// WebSocket and may be replaced by a direct UDP path once hole punching
-	// succeeds. All reads/writes go through it.
-	conn *switchable
-	sec  *secure.Session
-	log  *slog.Logger
+	// pump owns the encrypted channel: it is the only component that touches
+	// secure.Session, and it also serves as the bootstrap FrameConn (transport
+	// messages + AEAD).
+	pump *Pump
+	// frames is where frames come from and go to. In bootstrap mode it is the
+	// pump itself; once StartMuxed has run it is the yamux control stream. The
+	// session never learns which, which is what keeps the transfer code
+	// untouched by the mux work.
+	frames FrameConn
+	log    *slog.Logger
 
 	// PeerName is filled by the hello exchange.
 	PeerName string
@@ -132,6 +144,12 @@ type Session struct {
 	// Inbound direction: the transfer currently consuming chunk frames.
 	inMu    sync.Mutex
 	inbound *InboundTransfer
+
+	// fwdMu serialises -R registration requests. Only one may be in flight: the
+	// reply carries a result list but no request id, so two concurrent requests
+	// could not tell their answers apart.
+	fwdMu     sync.Mutex
+	fwdResult chan []wire.ForwardListenStatus
 }
 
 // ErrHandshake is returned when the peers cannot agree on a key, which almost
@@ -199,10 +217,18 @@ func Handshake(conn MessageConn, cfg Config) (*Session, error) {
 	if cfg.MaxFileSize == 0 {
 		cfg.MaxFileSize = DefaultMaxFileSize
 	}
+	// The pump is both the bootstrap FrameConn and the owner of the encrypted
+	// channel; handing it the switchable wrapper is what keeps a p2p upgrade
+	// working before the mux barrier.
+	pump := NewPump(newSwitchable(conn), sec, PumpConfig{
+		RecordSize: wire.MaxStreamData,
+		BufBytes:   1 << 20,
+		Logger:     cfg.Logger,
+	})
 	return &Session{
 		cfg:        cfg,
-		conn:       newSwitchable(conn),
-		sec:        sec,
+		pump:       pump,
+		frames:     pump,
 		log:        cfg.Logger,
 		done:       make(chan struct{}),
 		outboundCh: make(chan *wire.Frame, 8),
@@ -282,14 +308,74 @@ func (s *Session) StartWithNegotiation(h Handler, neg Negotiator) error {
 			return err
 		}
 	}
-	s.recvAtStart = s.sec.RecvCounter()
+	s.recvAtStart = s.pump.RecvCounter()
 	s.log.Info("session established", "peer", s.PeerName, "role", s.cfg.Role.String())
 	go s.readPump()
 	return nil
 }
 
+// MuxBoot performs the mux barrier, builds the yamux session, starts its accept
+// loop, and returns the control stream. The CLI supplies it; the peer package
+// stays free of a yamux dependency.
+type MuxBoot func(*Session) (io.ReadWriteCloser, error)
+
+// StartMuxed is StartWithNegotiation with a mux bootstrap step inserted between
+// the negotiation and the read pump.
+//
+// The order is load-bearing:
+//
+//	hello -> negotiation (+ transport switch) -> mux barrier -> control stream -> read pump
+//
+// A8: the transport may only change before yamux exists, so negotiation comes
+// first. The read pump may only start once the frame source is the control
+// stream, or it would race StartMux for the next frame on the raw transport.
+func (s *Session) StartMuxed(h Handler, neg Negotiator, boot MuxBoot) error {
+	if err := s.exchangeHello(); err != nil {
+		return err
+	}
+	s.handler = h
+	if neg != nil {
+		if err := neg(s); err != nil {
+			return err
+		}
+	}
+	if boot == nil {
+		return errors.New("peer: StartMuxed needs a boot function")
+	}
+	ctl, err := boot(s)
+	if err != nil {
+		return err
+	}
+	if err := s.AttachControl(ctl); err != nil {
+		return err
+	}
+	s.log.Info("session established (muxed)", "peer", s.PeerName, "role", s.cfg.Role.String())
+	go s.readPump()
+	return nil
+}
+
+// AttachControl installs a byte stream as the frame source.
+//
+// It must be called after the mux barrier and before the read pump starts.
+// Once installed, frames travel as wire.Frame records on the control stream
+// instead of as separate encrypted transport messages.
+func (s *Session) AttachControl(rw io.ReadWriteCloser) error {
+	if rw == nil {
+		return errors.New("peer: nil control stream")
+	}
+	if !s.pump.Muxed() {
+		return ErrPumpBootstrap
+	}
+	s.frames = newStreamFrameConn(rw)
+	s.recvAtStart = s.pump.RecvCounter()
+	return nil
+}
+
+// Pump exposes the record pump so the CLI can run the mux barrier.
+func (s *Session) Pump() *Pump { return s.pump }
+
 // readPump is the single reader. Everything inbound is dispatched here; no
-// other goroutine may call Recv.
+// other goroutine may call RecvFrame.
 func (s *Session) readPump() {
 	var pumpErr error
 	defer func() {
@@ -297,7 +383,7 @@ func (s *Session) readPump() {
 		s.pumpErr = pumpErr
 		s.errMu.Unlock()
 		// Unblock anyone waiting in waitOutbound/InboundTransfer.next.
-		_ = s.conn.Close()
+		_ = s.frames.Close()
 		close(s.done)
 	}()
 
@@ -308,6 +394,11 @@ func (s *Session) readPump() {
 				// A direct path replaced the relay transport. The session key
 				// is unchanged (the switch happens inside the encrypted
 				// channel), so simply continue reading on the new transport.
+				//
+				// This branch only applies in single-stream mode. Once the
+				// record pump is muxed it refuses a mid-stream switch itself
+				// (see Pump.readLoop), because a half-read record would be
+				// lost and every yamux stream would die with it.
 				s.log.Info("transport switched to direct path")
 				continue
 			}
@@ -338,6 +429,10 @@ func (s *Session) readPump() {
 			}
 		case wire.FrameFileAccept, wire.FrameFileReject, wire.FrameFileResult:
 			s.deliverOutbound(f)
+		case wire.FrameForwardListen:
+			s.handleForwardListen(f)
+		case wire.FrameForwardListenResult:
+			s.deliverForwardResult(f)
 		default:
 			// Ignore unknown frames so the protocol can grow.
 		}
@@ -380,6 +475,113 @@ func (s *Session) handleOffer(f *wire.Frame) {
 	}
 }
 
+// RequestForwardListen asks the peer to host the given listeners and waits for
+// the answer.
+//
+// Only one request may be in flight at a time: the reply carries a result list
+// but no request id, so two concurrent requests could not tell their answers
+// apart. The mutex turns that into a queue rather than a silent mix-up.
+func (s *Session) RequestForwardListen(ctx context.Context, specs []wire.ForwardListenSpec) ([]wire.ForwardListenStatus, error) {
+	s.fwdMu.Lock()
+	defer s.fwdMu.Unlock()
+
+	ch := make(chan []wire.ForwardListenStatus, 1)
+	s.errMu.Lock()
+	s.fwdResult = ch
+	s.errMu.Unlock()
+	defer func() {
+		s.errMu.Lock()
+		s.fwdResult = nil
+		s.errMu.Unlock()
+	}()
+
+	payload, err := json.Marshal(struct {
+		Specs []wire.ForwardListenSpec `json:"specs"`
+	}{Specs: specs})
+	if err != nil {
+		return nil, err
+	}
+	if err := s.SendFrame(&wire.Frame{Type: wire.FrameForwardListen, Payload: payload}); err != nil {
+		return nil, err
+	}
+
+	select {
+	case res := <-ch:
+		return res, nil
+	case <-s.done:
+		return nil, s.Err()
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// deliverForwardResult hands a result list to the goroutine waiting in
+// RequestForwardListen. A result with nobody waiting is a stray from an
+// abandoned request and is dropped.
+func (s *Session) deliverForwardResult(f *wire.Frame) {
+	var res struct {
+		Results []wire.ForwardListenStatus `json:"results"`
+	}
+	if err := json.Unmarshal(f.Payload, &res); err != nil {
+		s.log.Warn("bad forward-listen result payload", "err", err)
+		return
+	}
+	s.errMu.Lock()
+	ch := s.fwdResult
+	s.errMu.Unlock()
+	if ch == nil {
+		s.log.Debug("dropping unmatched forward-listen result")
+		return
+	}
+	select {
+	case ch <- res.Results:
+	default:
+	}
+}
+
+// handleForwardListen answers a peer's -R registration.
+//
+// A refusal is a normal answer, not an error: the peer asked for something this
+// side does not permit, and the status says which. Returning an error here would
+// tear down a session that is otherwise healthy.
+func (s *Session) handleForwardListen(f *wire.Frame) {
+	var req struct {
+		Specs []wire.ForwardListenSpec `json:"specs"`
+	}
+	if err := json.Unmarshal(f.Payload, &req); err != nil {
+		s.log.Warn("bad forward-listen payload", "err", err)
+		s.replyForwardListen(nil)
+		return
+	}
+	if s.handler.OnForwardListen == nil {
+		out := make([]wire.ForwardListenStatus, 0, len(req.Specs))
+		for _, sp := range req.Specs {
+			out = append(out, wire.ForwardListenStatus{
+				ID: sp.ID, Status: wire.StatusDenied,
+				Message: "reverse forwarding is disabled on this peer",
+			})
+		}
+		s.replyForwardListen(out)
+		return
+	}
+	s.replyForwardListen(s.handler.OnForwardListen(req.Specs))
+}
+
+// replyForwardListen sends the answer, ignoring send failures: the peer may
+// already be gone, and that is not worth failing the session over.
+func (s *Session) replyForwardListen(results []wire.ForwardListenStatus) {
+	payload, err := json.Marshal(struct {
+		Results []wire.ForwardListenStatus `json:"results"`
+	}{Results: results})
+	if err != nil {
+		s.log.Warn("could not encode forward-listen result", "err", err)
+		return
+	}
+	if err := s.SendFrame(&wire.Frame{Type: wire.FrameForwardListenResult, Payload: payload}); err != nil {
+		s.log.Debug("could not send forward-listen result", "err", err)
+	}
+}
+
 // deliverInbound hands a chunk frame to the active inbound transfer. It
 // reports whether one existed. Blocking here is deliberate backpressure: the
 // receiver's disk is the slowest link in the chain.
@@ -415,19 +617,12 @@ func (s *Session) clearInbound(tr *InboundTransfer) {
 
 // SendFrame seals and sends one frame. It is safe for concurrent use.
 //
-// The seal and the send must happen under the same lock. The receiver rejects
-// any frame whose counter is not exactly the next expected value, so if two
-// goroutines sealed concurrently and then raced to the socket, the higher
-// counter could hit the wire first and the session would fail with a decrypt
-// error.
+// The pump holds the seal/send lock, so the counter order on the wire always
+// matches the counter order the receiver expects.
 func (s *Session) SendFrame(f *wire.Frame) error {
 	s.sendMu.Lock()
 	defer s.sendMu.Unlock()
-	b, err := s.sec.SealFrame(f)
-	if err != nil {
-		return err
-	}
-	return s.conn.Send(b)
+	return s.frames.SendFrame(f)
 }
 
 // RecvFrame reads and opens one frame.
@@ -440,17 +635,23 @@ func (s *Session) RecvFrame() (*wire.Frame, error) { return s.recvFrame() }
 // recvFrame reads and opens one frame. Only the read pump (and the phases
 // before it starts: hello and p2p negotiation) may call this.
 func (s *Session) recvFrame() (*wire.Frame, error) {
-	b, err := s.conn.Recv()
-	if err != nil {
-		return nil, err
-	}
-	return s.sec.OpenFrame(b)
+	return s.frames.RecvFrame()
 }
 
 // SendMessage sends a small text message.
 func (s *Session) SendMessage(text string) error {
 	return s.SendFrame(&wire.Frame{Type: wire.FrameMsg, Payload: []byte(text)})
 }
+
+// ErrPathLocked is returned by UpgradeToDirect once the record pump has passed
+// the mux barrier.
+//
+// A switch after that point is not a small risk: the pump cuts the byte stream
+// into records, and a switch mid-record discards the bytes already read from
+// the old transport. The half-record is unrecoverable, so the next OpenFrame
+// is misaligned and every multiplexed stream dies at once. Refusing loudly is
+// better than pretending to migrate losslessly.
+var ErrPathLocked = errors.New("peer: transport path is locked for the life of a muxed session")
 
 // UpgradeToDirect replaces the relay transport with a direct one.
 //
@@ -460,24 +661,37 @@ func (s *Session) SendMessage(text string) error {
 //
 // The caller must have completed the p2p handshake on the *encrypted* channel,
 // so the session key and frame counters continue unchanged.
+//
+// Once the pump is muxed this returns ErrPathLocked: see the type comment on
+// ErrPathLocked for why a hot switch is not attempted.
 func (s *Session) UpgradeToDirect(next MessageConn) error {
 	if next == nil {
 		return errors.New("peer: nil transport")
 	}
-	return s.conn.Switch(next)
+	if s.pump.Muxed() {
+		return ErrPathLocked
+	}
+	sw, ok := s.pump.conn.(*switchable)
+	if !ok {
+		return errors.New("peer: transport is not switchable")
+	}
+	return sw.Switch(next)
 }
 
 // OnDirect reports whether the session is currently on a direct path.
-func (s *Session) OnDirect() bool { return s.conn.Switched() }
+func (s *Session) OnDirect() bool {
+	sw, ok := s.pump.conn.(*switchable)
+	return ok && sw.Switched()
+}
 
 // ShortAuth returns the 6-digit short authentication string both peers derive
 // from the session key. Users compare it out of band; a mismatch means a third
 // party sat in the middle (the relay knows the room label, so it can route but
 // must not be trusted to have paired the intended peers).
-func (s *Session) ShortAuth() string { return s.sec.ShortAuth() }
+func (s *Session) ShortAuth() string { return s.pump.ShortAuth() }
 
 // Fingerprint is a longer digest of the same key, for logs and audit trails.
-func (s *Session) Fingerprint() string { return s.sec.Fingerprint() }
+func (s *Session) Fingerprint() string { return s.pump.Fingerprint() }
 
 // FramesSinceStart reports how many frames arrived after the session was
 // established (the hello exchange itself is excluded).
@@ -487,7 +701,7 @@ func (s *Session) Fingerprint() string { return s.sec.Fingerprint() }
 // with a live one, and the splice then fails on its first read. Callers use
 // this to retry immediately instead of treating it as a normal disconnect.
 func (s *Session) FramesSinceStart() uint64 {
-	now := s.sec.RecvCounter()
+	now := s.pump.RecvCounter()
 	if now <= s.recvAtStart {
 		return 0
 	}
@@ -951,7 +1165,9 @@ func (s *Session) Err() error {
 // call while another goroutine waits on Done.
 func (s *Session) Close() error {
 	s.closeOnce.Do(func() {
-		s.closeErr = s.conn.Close()
+		// Close the pump first: it owns the transport and it also unblocks the
+		// record queues that a muxed session's yamux is parked on.
+		s.closeErr = s.pump.Close()
 	})
 	return s.closeErr
 }

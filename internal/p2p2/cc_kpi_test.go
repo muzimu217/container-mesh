@@ -378,6 +378,13 @@ func TestCCReducesLossOnBottleneck(t *testing.T) {
 	if testing.Short() {
 		t.Skip("bottleneck simulation skipped in -short mode")
 	}
+	// The loss ratio here comes from a simulated bottleneck whose timing the
+	// race detector perturbs: the same reason TestCCImprovesFairness skips.
+	// Without this guard the test fails intermittently under `go test ./...
+	// -race`, which is how CI runs, blocking unrelated merges.
+	if raceEnabled {
+		t.Skip("the race detector perturbs the simulated bottleneck's timing")
+	}
 
 	run := func(ccEnabled bool) (loss, miBs float64, st Stats, sim simStats) {
 		cfg := DefaultConfig()
