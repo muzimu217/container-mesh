@@ -5,7 +5,8 @@
 | 文档 | 内容 |
 |---|---|
 | [`architecture/ARCHITECTURE-SDWAN.md`](architecture/ARCHITECTURE-SDWAN.md) | **总体架构设计**：混合权限 Overlay SD-WAN 的分层、三种接入模式、四阶段路线、关键约束与风险清单。所有结论引用下方研究的实测数据。 |
-| [`architecture/STAGE1-PORTFORWARD.md`](architecture/STAGE1-PORTFORWARD.md) | **阶段 1 详细设计**：包结构、Go 接口、协议扩展、CLI、四层安全防御、测试计划、8 步实施路线。可直接指导编码。 |
+| [`architecture/STAGE1-PORTFORWARD.md`](architecture/STAGE1-PORTFORWARD.md) | **阶段 1 详细设计**：包结构、Go 接口、协议扩展、CLI、四层安全防御、测试计划（含 4 项混沌测试）、按 3 个 PR 拆分的实施路线。可直接指导编码。 |
+| [`architecture/REVIEW-RESPONSE-STAGE1.md`](architecture/REVIEW-RESPONSE-STAGE1.md) | **阶段 1 架构评审答复**：对 5 项质疑 + 4 项混沌测试要求的逐条回应。记录哪些接受了、哪些没接受及理由（尤其是「限流不能删」）。 |
 
 ## 研究报告
 
@@ -26,5 +27,5 @@
 
 - **想知道某条限制为什么存在** → 先查 `decisions.md` 的 D 编号
 - **想改传输层** → 读 `research/reliable-transport.md` 与 `decisions.md` 的 D43–D46
-- **想加端口转发 / 多路复用** → 读 `architecture/ARCHITECTURE-SDWAN.md` 的阶段 1
+- **想加端口转发 / 多路复用** → 读 `architecture/ARCHITECTURE-SDWAN.md` 的阶段 1 与 `STAGE1-PORTFORWARD.md`
 - **想引入 gVisor 或 TUN** → 读 `research/userspace-netstack.md` 的约束章节

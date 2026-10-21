@@ -21,13 +21,40 @@
 
 2. **`wire.Version` 不升到 2。** 帧格式（10 字节头、1 MiB 上限）完全不变，新增帧类型是纯增量；而 `exchangeHello` 在版本不一致时直接返回 `ErrProtocol`、没有降级路径（`session.go:244-246`），升版本会让**现有 `send`/`recv` 在新旧二进制之间直接不可用**——这是纯粹的功能倒退。改用 hello 里的 `caps` 能力位协商，旧对端自动退化为「不支持转发」，文件传输完全不受影响。这是对 ARCHITECTURE-SDWAN §A1 的修正（理由见 §3.4）。
 
-3. **记录大小取 512 KiB，不是 64 KiB。** ARCHITECTURE-SDWAN §6 阶段 1 交付物 2（第 674 行）写的是 `FrameStreamData` payload ≤ 64 KiB，与项目自己的实测矛盾：D11/README 记录 512 KiB 分块回环 **539.3 MiB/s**，64 KiB 分块时代只有 **211.9 MiB/s** `[实测]`，差 2.5 倍。D28 的教训（1177 B/包只有 13 MiB/s，512 KiB/帧约 512 MiB/s）说的是同一件事：固定开销按帧摊销。取 512 KiB 与 `peer.ChunkSize` 对齐，一次 AEAD 覆盖一次 `ChunkSize`。
+3. **记录大小取 32 KiB，配 16 条批量写**（本项经评审后修正，原方案为 512 KiB）。
+
+   最初的推理是「512 KiB 比 64 KiB 快 2.5 倍（539.3 vs 211.9 MiB/s），所以
+   取 512 KiB」。这个推理错在**优化目标选错了**：那两个数字都是回环测出来的，
+   而真实链路是 2–12 MiB/s，AEAD 从来不是瓶颈（实测 32 KiB 记录仍有
+   **1408 MB/s**）。
+
+   真正被牺牲的是**延迟**。记录泵必须收齐整条记录、通过 AEAD 认证，才能交给
+   yamux 分发；在 2 MiB/s 链路上，一条 512 KiB 记录要传 **250 ms**，这期间
+   同一连接上的其他流全部等待：
+
+   | 记录大小 | 2 MiB/s 链路上的队头等待 | 回环固定开销占比 |
+   |---|---|---|
+   | 16 KiB | 7.8 ms | 6.4% |
+   | **32 KiB** | **15.6 ms** | **3.2%** |
+   | 64 KiB | 31.3 ms | 1.6% |
+   | 512 KiB | **250 ms** | 0.2% `[实测]` |
+
+   一边 `scp` 传大文件、一边在同一隧道里敲 SSH，512 KiB 会让终端明显卡顿。
+
+   512 KiB 买到的吞吐改由**写侧批量**补回：512 MiB 用 512 KiB 记录是 1024 次
+   写；用 32 KiB 记录、每 16 条合并一次写，**也是 1024 次写**，而延迟下限小了
+   16 倍 `[实测]`。这正是 TLS 1.3 把 record 上限定在 16 KiB 的理由。
 
 4. **`-R` 比 `-L` 危险一个量级，需要独立的授权开关和端口白名单。** `-L` 是「我允许你拨我配置好的目标」，`-R` 是「我允许你在我这里开一个监听端口」。后者可以让持有 code 的攻击者在受害容器里绑定任意空闲 loopback 端口、向本地进程提供内容（例如冒充一个本地开发服务器）。研究二 §3.4 的 5 层里只有一层（第 1 层）管「是否启用」，且正文写 `--allow-forward`、参数表写 `--accept`，本身不一致；`-R` 没有任何独立授权。本设计增加 `--accept-reverse` + `--allow-listen-port`（零值拒绝一切）。
 
 5. **白名单必须「先解析成 IP、再比对、再用同一个 IP 拨号」。** 研究二原型的 `Permits(addr)`（§8 关键片段 3，第 974-1004 行）拿主机名做字符串比对，随后 `net.DialTimeout("tcp", p.Addr, ...)`（第 961 行）再解析一次——这是典型的 check-then-dial TOCTOU，DNS rebinding 可以绕过。本设计把 `Permits` 的返回值定义为**要拨的具体 IP**，拨号只用它。
 
-**工作量**：约 2,575 行生产代码 + 约 2,750 行测试，8 个工程日。研究二估的 880 行低估了四件事：记录泵（泵 + 控制流适配 + 会话改造，约 500 行）、`internal/mux`（410 行，研究二只算了 ~200）、`-R` 的注册控制面（~200 行）、安全加固与审计（~350 行）。
+**工作量**：初版估 2,575 行生产 + 2,750 行测试。评审认为对阶段 1 偏重，据此砍掉了
+重复包装与冗余生命周期，并把完整 ACL 推到 PR #3，总量降到
+**2,275 行生产 + 2,460 行测试**，拆成 3 个可独立合并的 PR（§7）。
+与评审估的 800–1,200 行仍有差距，逐项差额见 §7.1——结论是那三处（记录泵的双模式
+与屏障、mux 的内存预算与日志接管、`peer.Session` 的结构改造）都不是抽象层，
+而是现有功能不被破坏的前提。
 
 ---
 
@@ -60,18 +87,24 @@ cmd/cm
 | **`internal/peer/session.go`**（改） | `conn`+`sec` 两个字段换成 `frames FrameConn` + `pump *Pump`；新增 `StartMuxed`/`AttachControl` | 改 ~90 / +120 |
 | **`internal/mux/config.go`** | `Config` + 默认值 + 内存预算换算（窗口 × 流数 ≤ 预算） | 80 / 90 |
 | **`internal/mux/mux.go`** | `Session` 包装：`New`、`Open`、`Serve`（单 accept 循环 + kind 路由）、流数信号量、`Close` | 200 / 220 |
-| **`internal/mux/stream.go`** | `Stream`：`Read/Write/CloseWrite/Close/SetDeadline`、`Kind`、`Limited`、信号量归还 | 130 / 170 |
-| **`internal/forward/allow.go`** | `AllowList`：主机名启动时解析成 IP 集、CIDR、端口/端口段、`Permits` 返回要拨的 IP、拒绝 `0.0.0.0/0` | 210 / 260 |
-| **`internal/forward/limits.go`** | 流数/速率/超时/寿命；令牌桶 | 100 / 120 |
+| **`internal/mux/stream.go`** | `Stream`：`Read/Write/CloseWrite/Close/SetDeadline`、`Kind`、`Limited`。信号量归还与 kind 表放在 `mux.go`，不在这里再包一层 | 70 / 100 |
+| **`internal/forward/allow.go`** | `AllowList`：主机名启动时解析成 IP 集、CIDR、端口/端口段、`Permits` 返回要拨的 IP、拒绝 `0.0.0.0/0` | 130 / 180 |
+| **`internal/forward/limits.go`** | 流数、**建流速率（手写令牌桶，约 40 行）**、空闲超时、会话寿命 | 60 / 70 |
 | **`internal/forward/pipe.go`** | 双向 pipe + 半关闭传播 + 错误归一 | 100 / 130 |
 | **`internal/forward/local.go`** | `-L`：本地 listener 只建一次、每连接开流、前置头+状态、挂到当前 session | 190 / 200 |
 | **`internal/forward/reverse.go`** | `-R`：注册请求、托管对端请求的 listener、按 ID 匹配、本地拨号 | 200 / 220 |
-| **`internal/forward/manager.go`** | `Manager`：装配、`Serve` 的 kind 分发、审计日志、启动横幅 | 230 / 240 |
-| **`internal/cli/forward.go`** | `-L`/`-R` 解析（表驱动）、全部策略 flag、`--also-recv-files`、生命周期 | 340 / 220 |
+| **`internal/forward/manager.go`** | `Manager`：装配、`Serve` 的 kind 分发、审计日志、启动横幅 | 150 / 170 |
+| **`internal/cli/forward.go`** | `-L`/`-R` 解析（表驱动）、全部策略 flag、`--also-recv-files`、生命周期 | 300 / 200 |
 | **`internal/cli/node.go`**（改） | `UseMux`、`OnMux` 钩子、`dialOne` 里插入 mux 引导、`Mux(ctx)` 访问器 | 改 ~60 / +60 |
 | **`internal/cli/cli.go`**（改） | 子命令注册 + usage 文本 | +30 / — |
 
-合计：**约 2,400–2,600 生产 / 约 2,750 测试**（上表逐项相加为 2,575 / 2,750）。
+合计：**2,275 生产 / 2,460 测试**（上表逐项相加）。
+
+> 初版是 2,575 / 2,750。评审后收紧了五处：`stream.go` 不再重复包一层（信号量与
+> kind 表并入 `mux.go`，−60）、`allow.go` 收紧（−80）、`manager.go` 收紧（−80）、
+> `cli/forward.go` 去掉冗余生命周期封装（−40）。**令牌桶保留但重写**（100 → 60，
+> 理由见 §7.1）。剩下的每一行都对应一个可指名的验收项——见 §7 的分批依据与 §8
+> 的逐步自证。
 
 ### 1.3 不新建、不修改的包
 
@@ -126,13 +159,33 @@ type Pump struct {
 }
 
 type PumpConfig struct {
-    // RecordSize is the largest FrameStreamData payload. 512 KiB matches
-    // peer.ChunkSize and the measured optimum (D11: 539.3 MiB/s at 512 KiB
-    // versus 211.9 MiB/s at 64 KiB).
+    // RecordSize is the largest FrameStreamData payload.
+    //
+    // 32 KiB, not 512 KiB. The 512 KiB figure came from loopback throughput
+    // (D11: 539.3 vs 211.9 MiB/s) and is the wrong optimisation target here:
+    // AEAD is not the bottleneck on any real link (measured: 1408 MB/s at
+    // 32 KiB), while a large record is a latency floor for every other stream
+    // sharing the connection. A 512 KiB record takes 250 ms to cross a
+    // 2 MiB/s link, and nothing can be decrypted or dispatched until the whole
+    // record arrives, so an interactive stream waits behind it. At 32 KiB that
+    // floor is 15.6 ms.
+    //
+    // The throughput that 512 KiB bought is recovered on the write side by
+    // batching (see BatchedRecords), which yields the same number of writes:
+    // 512 MiB as 512 KiB records is 1024 writes; as 32 KiB records batched 16
+    // at a time it is also 1024 writes, with a 16x smaller latency floor.
     RecordSize int
-    // BufBytes bounds each direction's queue. 1 MiB is two records, enough to
-    // keep the transport busy across one AEAD + one Send, and small enough
-    // that a dead peer cannot pin more than 2 MiB per session.
+    // BatchedRecords is how many records the write side coalesces into one
+    // transport write. 16 keeps the syscall count equal to the 512 KiB scheme:
+    // 512 MiB / 32 KiB = 16384 records, / 16 = 1024 writes.
+    //
+    // This is not a latency knob. The drainer takes whatever is queued (up to
+    // 16) and sends immediately; there is no timer, so an idle connection
+    // still sends a single record with one syscall.
+    BatchedRecords int
+    // BufBytes bounds each direction's queue. 1 MiB is 32 records at the
+    // default size: enough to keep the transport busy across one AEAD + one
+    // Send, small enough that a dead peer cannot pin more than 2 MiB.
     BufBytes int
     Logger   *slog.Logger
 }
@@ -242,12 +295,46 @@ func (p *Pump) writeLoop() {
 
 **必须处理的四个细节：**
 
-1. **`ErrTransportSwitched` 必须继续。** `readPump` 现在有这条分支（`session.go:307-313`），搬进泵时不能丢。
+1. **`ErrTransportSwitched` 必须继续，但 mux 模式下禁止中途切换。**
+
+   `readPump` 现在有这条分支（`session.go:307-313`），搬进泵时不能丢——丢了会让
+   `--p2p` 打洞成功后瞬间判死会话。
+
+   但**在 mux 模式下，这条分支必须改成「锁定当前路径」而不是「继续读」**。
+   原因是记录泵会把字节流切成记录，而切换会丢弃旧连接上在途的字节：
+
+   `[实测]` 若切换发生在一条记录的中途，已读到的半条记录永久损坏（测试读到
+   24/49 字节后连接关闭，剩余 25 字节再也不会到达）。`secure.OpenFrame` 的下一个
+   帧因此与计数器/字节边界都不对齐，必然解密失败，`fail()` 关掉两端，
+   **所有 yamux 流同时断掉** —— 所谓热切换退化成「切换即断连」。
+
+   阶段 1 的规则：
+
+   | 模式 | 切换语义 |
+   |---|---|
+   | 单流（现有 `send`/`recv`） | 允许，行为不变（帧边界清晰，最多丢一帧，上层重传） |
+   | **mux（`cmesh forward`）** | **建连后锁定路径**。P2P 打洞只在 `StartMuxed` 之前尝试；一旦 mux 跑起来，`Switch` 返回错误而不是替换连接 |
+
+   这样代价明确：mux 会话的生命周期内路径不变。路径真的坏了，会话失败、上层重连
+   （`Node.Run` 已经会重建 session），而不是假装能无损迁移。真正的无损迁移需要
+   在记录泵之下加一层带序列号与重传缓冲的虚拟会话层，那是阶段 3 之后的事，不在
+   阶段 1 的范围内。
 2. **`fail` 必须同时关闭两个队列和 link。** 只关一端会让 yamux 的另一个 loop 永久阻塞，整个会话停摆（ARCHITECTURE-SDWAN §6 已列为风险）。
 3. **队列是有界阻塞的，不是丢弃的。** 满时阻塞写侧，这是正确的背压（传输慢 → yamux `sendLoop` 慢 → 各流的 `Write` 慢 → 应用的 `write()` 慢），不是 bug。`BufBytes=1 MiB` 下，11–12 MiB/s 的跨公网链路约 85 ms 排空，远小于 yamux 的 `ConnectionWriteTimeout=10 s` 安全阀。
 4. **`SealFrame` 成功但 `Send` 失败时计数器已经消耗。** 会话必须判死，不能重试——这与现有 `SendFrame` 的行为一致（`session.go:423-431`），不是新增缺陷。
 
-**【可选】写入合并（coalescing）**：写侧 `Get` 返回「当前队列里已有的字节」（最多 `RecordSize`），因此 yamux 的 `Write(hdr)` + `Write(body)` 两次调用**有机会**落进同一条记录，不需要任何定时器。研究二 §4.9 实测未合并时是 13 条消息/MiB、平均 81.8 KiB/条；合并能把 header-only 记录消掉，但不是必需——13 条/MiB 仍在 relay 的承受范围内。**不做基于延时的 flush**：研究二试过并因 flush 时机出 bug 未跑通，不值得在 v1 引入一个时序依赖。
+**写入合并（coalescing）是必须的，不是可选。** 记录从 512 KiB 降到 32 KiB 后，
+若不合并，同样的 512 MiB 会从 1024 次 transport 写变成 16384 次——16 倍的 syscall
+与 16 倍的帧头开销，正好把缩小记录买到的延迟又还回去。
+
+规则：写侧 drainer 一次从 `writeQ` 取**至多 `BatchedRecords=16` 条**（取到什么算什么，
+队列不满就少取），拼成一个缓冲区后**一次 `transport.Send`**。没有定时器，没有
+「攒够 N 微秒就发」——队列空就立刻发单条，队列满就一次发 16 条，flush 时机完全由
+现有背压决定。研究二 §4.9 实测未合并时是 13 条消息/MiB、平均 81.8 KiB/条；
+合并后每条记录承载多条 yamux 帧，header-only 记录基本消失。
+
+**不做基于延时的 flush**：研究二试过并因 flush 时机出 bug 未跑通，
+不值得在 v1 引入一个时序依赖。批量只由「队列里现在有多少」决定。
 
 ### 2.2 `FrameConn`：把 yamux 接进 `peer.Session` 的接缝
 
@@ -467,6 +554,8 @@ func (s *Stream) ID() uint32
 | `KeepAliveInterval` | 30 s | 30 s | 与 wsconn 的 20 s ping 重叠但无害；yamux 的 keepalive 失败会主动关 session，是有用的第二道检测 |
 | `LogOutput` | `os.Stderr` | **必须显式设置** | `VerifyConfig` 要求 `LogOutput`/`Logger` 二选一非空（`mux.go:86-91`）；默认值会往 CLI stderr 吐日志，污染输出 |
 | 窗口与流数的预算 | — | `MaxStreams = min(--max-streams, StreamBudget/(2*Window))` | 128 MiB 预算下：256 KiB → 256 流；1 MiB → 64 流。A9 的两套预算由此自动对齐，启动时打印实际生效值 |
+| **EOF 后的拆除期限** | — | **5 s**（`--pipe-drain`） | 双向 `io.Copy` 里一侧读到 EOF 后，给另一侧 5 s 把剩余数据送完；超时直接 `Reset()`。没有这条，对端不主动关连接时 goroutine 与 2×窗口 会永久残留 `[实测：500 连接随机掐断后需显式拆除才能让 goroutine 回落]` |
+| **preamble 读超时** | — | **10 s**（`--handshake-timeout`，与 status 交换共用一个预算） | 流建立后必须在 10 s 内读完前置头，否则关流并回 `StatusBadRequest`。这是半开连接的**第二道**防线：第一道是 `--max-pending`（已 accept 但还没拿到流的本地连接上限 128，超出直接关 TCP），第二道就是这里——对端拿到了流却连上不说话（端口扫描器、健康检查、`nc` 后忘了打字）时，流会一直挂着占 2×窗口。C3 两层都验 |
 
 ### 2.5 转发器接口（`internal/forward`）
 
@@ -603,10 +692,15 @@ const (
     FrameForwardListenResult
 )
 
-// MaxStreamData bounds one FrameStreamData payload. 512 KiB = peer.ChunkSize:
-// the measured optimum (D11). It is also far below wire.MaxPayload (1 MiB) and
-// the relay's 16 MiB message ceiling.
-const MaxStreamData = 512 << 10
+// MaxStreamData bounds one FrameStreamData payload.
+//
+// 32 KiB, not peer.ChunkSize's 512 KiB. The 512 KiB figure came from loopback
+// throughput (D11: 539.3 vs 211.9 MiB/s), and optimising for it makes every
+// other stream on the connection wait behind a whole record: 250 ms on a
+// 2 MiB/s link versus 15.6 ms here. AEAD still runs at 1408 MB/s at this size
+// [measured], so nothing is lost by shrinking it — the write side recovers the
+// syscall count by batching 16 records into one transport write.
+const MaxStreamData = 32 << 10
 ```
 
 `FrameForwardListen*` 走**控制流**（也就是 `peer.Session` 的帧分发），不新开 stream kind。理由：它们是一次性控制消息，天然属于会话控制面；`peer.Session` 已经有按类型分发的 `readPump`（`session.go:317-344`），加两个 case 即可。
@@ -1174,154 +1268,183 @@ MaxStreams = min(--max-streams, StreamBudget / (2 × Window))
 | P5 | 已建立流的往返延迟（2000 次 ping-pong） | p50 ≤ 1 ms，p95 ≤ 3 ms | 研究二 yamux 空闲 p50 18 µs、9 条满载 191 µs `[实测]`；留出全栈余量 |
 | P6 | 100 条活跃流转发时 RSS | **< 80 MiB** | ARCHITECTURE-SDWAN 验收 1.9 |
 | P7 | 100 条空闲流转发时 RSS | < 40 MiB | 每空闲流 1.7–2.5 KiB `[实测]` |
-| P8 | relay 消息数 | 记录实测值，目标 ≤ 13 条/MiB | 研究二 §4.9 `[实测]` 的参照；若 > 20 则启用合并优化 |
+| P8 | relay 消息数 | 记录实测值，目标 **≤ 13 条/MiB**（研究二未合并时的实测值） | 合并是必做的（§2.1），因此这条应**显著低于** 13；若反而更高，说明批量写没生效 |
 | P9 | 文件传输 + 转发并发 | 转发吞吐下降 < 20%，文件传输下降 < 15% | 单 `sendLoop` 串行化是已知代价 |
 
 **P2–P5 的 `[推断]` 门槛必须在实现后第一次实测时替换为真实数字**，并把实测值写回本表——不能沿用推断值冒充验收。
 
 ---
 
-## 7. 与现有代码的冲突分析
+### 6.5 混沌测试（评审补充，G1 门槛）
 
-### 7.1 改动面
+这四项不是「锦上添花」，而是针对本设计三个最可能翻车的地方（队头阻塞、内存无界、
+半开连接泄漏）以及「P2P 切换」这条现有能力在 mux 下的行为，给出可判定的通过条件。
+全部在 PR #3 合并前跑，结果写回本节。
 
-| 文件 | 改动 | 影响的功能 |
-|---|---|---|
-| `internal/peer/session.go` | `conn`+`sec` → `frames FrameConn` + `pump *Pump`；新增 `StartMuxed`/`AttachControl`；`ShortAuth`/`Fingerprint`/`UpgradeToDirect`/`OnDirect`/`FramesSinceStart` 改为委托 | 全部会话功能（但语义不变） |
-| `internal/peer/pump.go`（新） | 记录泵 | — |
-| `internal/peer/frameconn.go`（新） | `FrameConn` + 控制流实现 | — |
-| `internal/wire/frame.go` | 4 个新帧类型 + `MaxStreamData` | 无（纯增量） |
-| `internal/cli/node.go` | `UseMux`、`OnMux`、`dialOne` 插入 mux 引导、`Mux(ctx)` | 连接/重连生命周期 |
-| `internal/cli/cli.go` | 子命令注册 + usage | 无 |
-| `internal/secure` | **不改** | — |
-| `internal/wsconn`/`p2pquic`/`p2p` | **不改** | — |
-
-### 7.2 逐项回归风险
-
-| 风险 | 触发条件 | 影响 | 缓解 |
+| 编号 | 场景 | 判据 | 针对的风险 |
 |---|---|---|---|
-| **R-1 `ErrTransportSwitched` 分支丢失** | `--p2p` 打洞成功后升级传输 | 升级瞬间会话判死，`--p2p` 完全不可用 | 泵的 `readLoop` 必须有该分支；专门的单测（切换传输后继续收发） |
-| **R-2 `sendMu` 语义弱化** | 并发 `SendFrame`（`SendFile` + ping 回复 + 转发控制） | 高计数器先上线 → 对端解密失败 → 会话死 | `Pump.bootMu` / `streamFrameConn.sendMu` 各自保证「密封+发送」或「整帧写入」原子；`TestConcurrentSendsStayOrdered` 扩展成 mux 版本 |
-| **R-3 `FramesSinceStart` 语义变化** | mux 模式下它数的是 record 而非控制帧 | `Node.Run` 的「零帧会话立即重试」判断失准 | mux 模式下所有业务字节都走 record，`RecvCounter` 仍单调增；加单测覆盖「mux 会话有数据」与「mux 会话无数据」两种 |
-| **R-4 记录泵死锁** | 读队列满 + 写队列满 + 传输卡住 | 整个会话停摆 | 有界队列 + 单 drainer + `fail()` 同时关两端；yamux `ConnectionWriteTimeout=10s` 作为安全阀；压测 P2/P9 |
-| **R-5 流数预算算错** | `--mux-window 1MiB` 但 `--max-streams` 仍是 256 | 512 MiB 内存，K8s 256 MiB limit 下 OOM | 预算公式自动压低并在横幅打印；单测断言生效值 |
-| **R-6 `StreamOpenTimeout` 关整个会话** | 一条流的 SYN 没被 ACK（对端忙/relay 抖动） | 所有转发 + 文件传输一起断 | 120 s；`Open` 前检查 `NumStreams`；重连后 listener 仍在（A11） |
-| **R-7 控制流失败连坐** | 控制流被 reset | 所有转发流一起死 | 这是**刻意**的：控制流承载 `peer.Session`，它死了对端已处于异常状态；统一关闭比「一半活着」更可预测。写进文档 |
-| **R-8 `node.go` 重连时旧 mux 未关** | relay 抖动 | 旧 mux 的 goroutine 与流泄漏 | `Node` 在发布新 mux 前先 `Close` 旧的；`goleak` 测试跑重连场景 |
-| **R-9 `-R` listener 跨重连泄漏** | 每次重连都注册一次 | 端口 bind 冲突 / 监听器堆积 | `RegisterReverse` 按 ID 幂等：同 ID 已存在则复用；会话结束时只关**该会话**创建的、且不再被引用的 listener |
-| **R-10 旧二进制互操作** | `forward` 对上旧 `send` | 明确报错 | `caps` 协商；I13 覆盖 |
+| **C1** | 2 MiB/s 限速链路上并发：1 条 512 MiB 文件传输（**限速到 1.2 MiB/s，留出 40% 余量**）+ 8 条小请求转发（4 KiB 请求/响应，每 100 ms 一次） | 转发请求 **P99 往返 ≤ 40 ms**，无一条超过 200 ms；文件传输完成且 SHA-256 一致。**对照组**：同样场景把 `RecordSize` 设成 512 KiB，P99 必须明显更差（≥ 2×）——这一条才是「32 KiB 有用」的证据 | 质疑 1：记录过大导致的队头阻塞 |
+| **C2** | 慢读者：对端开一条流后完全停止读取，本端持续 `Write` 直到阻塞 | 本进程 RSS 增量 **≤ 50 MiB**（= 每方向 1 MiB 记录泵 + yamux 流窗口 + Go 堆余量），且 `Write` 在预算耗尽后阻塞而非继续吃内存；关掉慢读者后 `Write` 恢复并送达全部字节 | 质疑 4：内存无界。验证「有界阻塞」不是口号 |
+| **C3** | 500 条半开连接：建立 500 条 TCP 连接到 `-L` listener，**不发送任何字节**（preamble 都没发），保持 30 s，然后全部 RST | ① 第 129 条起应被 `--max-pending=128` 立刻关掉（断言只收到 128 条被 accept）；② 剩下 128 条在 `--handshake-timeout=10s` 后被清理；③ 30 s 后 goroutine 回落到基线 ±10，RSS 增量 ≤ 20 MiB；④ 期间正常连接的 P99 建连延迟不受影响 | 质疑 4：半开连接泄漏。**两层防线分别断言**，不能只测一层 |
+| **C4** | P2P 切换：`send` 传输 100 MiB 过程中，在第 30 MiB 处让 P2P 路径失效（`iptables -j DROP` 打掉 UDP，或直接 `Close` 直连 socket） | 传输**继续完成**（回退到 relay），最终 SHA-256 一致；或者——若走的是 mux 模式——`Switch` 返回错误、会话明确失败并给出可读原因，**不允许**静默丢字节。两种结果都算通过，第三种（卡住不动超过 60 s）算失败 | 质疑 2：切换语义。单流模式必须能救回来，mux 模式必须明确失败 |
 
-### 7.3 如何保证既有 e2e 套件不退化
+C1 的实现提示与判据说明：
 
-`tests/run-tests.sh` 全量运行（含 `--large`）实测 **39 项通过**（`--quick` 模式为 35 项，跳过 4 项单测断言）。覆盖构建、单测、vet、gofmt、probe 退出码、消息+文件、零字节、覆盖保护、自动 code、断点续传、错误 code、安全单测、断线重连、多 relay 故障切换、大文件。
+- 限速必须作用在**记录泵之下**（transport 层），否则测的是应用层而不是链路。
+- yamux 的 `MaxStreamWindowSize` 要和记录泵预算一起调，否则慢链路上窗口会先把流
+  卡住，测出来的不是队头阻塞。
+- **为什么文件传输要限到 1.2 MiB/s 而不是打满 2 MiB/s**：在一条被单个大流打满的
+  FIFO 字节流上，交互请求必然排在整队数据之后，此时 P99 由队列深度决定（1 MiB
+  缓冲 = 500 ms），与记录大小无关。打满时任何记录大小都过不了 40 ms，那样的门槛
+  不可判定。留 40% 余量后，排队主要由「一次记录/一次批量写占用链路多久」决定，
+  正是本设计要优化的量。
+- **打满时的真实行为要如实写进 README**：单连接里大文件会挤占交互流量，这不是
+  记录大小的 bug，是单流 FIFO 的固有性质。要彻底解决得给控制流做优先级队列，
+  属于阶段 2 之后（见 §9 的 X13）。
 
-> 验收口径按 **39 项全绿**（`bash tests/run-tests.sh` 全量）。`--quick` 模式跳过 4 项，因此基线是 35。
+**这条替代了「32 KiB 一定够快」的直觉判断**：我们买的是「非饱和时的低延迟」和
+「饱和时不会更差」，不是「饱和时也快」。
 
-**保证机制（三道）：**
+C4 的单流分支依赖现有的 `switchable` 包装，mux 分支依赖 PR #1 的锁路径。
+**这两条要分别断言**，不能只测一个然后推断另一个。
 
-1. **结构上隔离**：`send`/`recv` 不设 `UseMux`，因此**不创建 pump 的复用模式、不创建 mux、不碰 `FrameMuxStart`**。它们唯一的变化是「`Session` 内部把 `seal+Send` 换成 `pump.SendFrame`」，而后者在引导模式下的实现就是原来那三行。`wire.Version` 保持 1，所以新旧二进制也互通。
-2. **行为等价性单测**：`TestPumpBootstrapMatchesLegacy` 用同一个 `memPipe` 对跑「旧路径（直接 `sec.SealFrame`+`conn.Send`）」与「新路径（`pump.SendFrame`）」，断言**输出的密文字节完全相同**、计数器序列相同。这条测试是 R-1/R-2 的定点护栏。
-3. **数值门槛**：P1 要求 512 MiB 回环 ≥ 485 MiB/s（基线 539.3 的 90%）。低于门槛即视为回归，不进阶段 2（G1 决策门）。
+## 7. 分步实施计划（按 PR 拆分）
 
-**执行顺序**：每一步实施（§8）结束都跑 `bash tests/run-tests.sh --large`（含 1 GiB）与 `go test -race ./...`；第 2 步（pump 重构）单独作为一次提交，便于 `git bisect` 定位。
+原设计是一次交付、约 2,575 行生产代码。经评审，这个体量对阶段 1 偏重，
+且把「基础转发」和「完整 ACL/限流」捆在一起，导致第一个 PR 就难以审查。
 
----
+改为 **3 个独立可合并的 PR**，每个都能单独通过 CI 并保留可回退点：
 
-## 8. 分步实施计划
+### 7.1 为什么不是 800–1,200 行
 
-每步都可独立验证、独立提交、独立回滚。步骤顺序保证「每一步之后主分支都是可发布的」。
+评审估的是「yamux 包装 + 记录泵（60–120 行）+ `-L`/`-R` + 端口白名单 ≈ 800–1,200 行」。
+逐项对一下，差额集中在三处，而且都不是抽象层：
 
-### 步骤 1：`wire` 协议层（0.5 天）
+| 评审的估算 | 实际 | 差额来源 |
+|---|---|---|
+| 记录泵 60–120 行 | **280 行** | 评审按「一条 `io.Copy` 加个信封」估的。实际要同时承担：① 引导期直通（hello/p2p 协商还在裸帧上跑）与复用期封 record 两种模式；② `FrameMuxStart` 双向屏障（两端都发出才能切，且屏障前到达的非 mux 帧要丢弃而不致命）；③ 两个方向各一个**有界阻塞**队列 + 单 drainer；④ 保留 `ErrTransportSwitched` 分支，否则 `--p2p` 升级会当场杀死会话。少任何一条都会破坏现有功能，不是可选装饰 |
+| `internal/mux` 未单列 | **350 行** | 评审把「用 yamux」当成零成本。实际要有：`Config` 与内存预算换算（窗口 × 流数 ≤ 预算，否则 256 流 × 512 KiB 窗口 = 128 MiB 直接爆）、流数信号量、kind 路由、`CloseWrite` 映射、`LogOutput` 显式接管（yamux 默认写 `os.Stderr`，会污染 CLI 输出——研究二实测） |
+| `peer.Session` 改造未计入 | **150 行**（含 `frameconn.go`） | 把 `conn`+`sec` 两个字段换成 `FrameConn` + `Pump`，是**改现有 1138 行文件的核心结构**，不是加个适配器。评审的 800–1,200 行里这一项是 0，但它恰恰是回归风险最高的地方（风险 X4） |
 
-**内容**：4 个新 `FrameType` + `MaxStreamData`；`internal/wire/forward.go`（preamble/status/listen 编解码）；严格解析；fuzz 目标。
+评审说对的部分已经照做：完整 ACL（CIDR + 主机名解析）从 PR #2 推到 PR #3，
+`stream.go` 不再重复包一层（信号量与 kind 表并入 `mux.go`），`manager.go` 从 230
+收到 150，`cli/forward.go` 去掉一层只为测试而存在的生命周期封装。
+合计从 2,575 降到 **2,275**。
 
-**验收**：
-- `go test ./internal/wire/` 全绿，含 `FuzzReadPreamble` 跑 2 分钟无 crash
-- `go build ./...` 通过；二进制增量 < 2 KB
-- 既有 `frame_test.go` 不改一行仍通过
+有一处我**没有**照做，而且是有意为之：评审把「限流」也归为越界功能。但
+`MaxStreams` 限的是**并发**，不限**速率**——256 条流里每秒建/关上千次，
+内网扫描的速率完全不受约束。§5.3 攻击场景 2 与 S8 都依赖这一层，
+删掉它是拿安全性换行数。所以我保留限流，但把它从 100 行的四合一模块重写成
+**60 行的手写令牌桶 + 三个超时字段**，不做配额/寿命/突发平滑那些阶段 1 用不到的机制。
 
-**回滚**：删除新文件 + 4 个常量，无副作用。
+**如果还要再砍，唯一的办法是把 `-R` 整个移出阶段 1**（省 540 行，降到约 1,735）。
+但那等于承认「只能从本端拨出去，不能被拨进来」，而 `-R` 正是「让没有公网 IP 的
+容器对外提供服务」这个核心场景。我不建议为了行数达标而砍掉它——**行数不是验收指标，
+§6.5 的 C1–C4 与 §8 的决策门 G1 才是**。
 
-### 步骤 2：记录泵 + `FrameConn` 重构（1.5 天，风险最高）
+### PR #1 —— 记录泵 + yamux 封装（940 生产 / 1,070 测试）
 
-**内容**：`pump.go`、`frameconn.go`；`session.go` 改为持有 `FrameConn`；`StartMuxed`/`AttachControl`（此时还没有 mux，`boot` 传 nil 走原路径）。
+| 交付 | 内容 |
+|---|---|
+| `internal/peer/pump.go` | 记录泵：引导模式直通、复用模式封 record、`ErrTransportSwitched` 锁路径 |
+| `internal/peer/frameconn.go` | `FrameConn` + `streamFrameConn` + `writeFull` |
+| `internal/mux/config.go` | `Config`、默认值、内存预算换算 |
+| `internal/mux/mux.go` | `Session` 包装、`Open`、`Serve`、流数信号量 |
 
-**验收**：
-- `TestPumpBootstrapMatchesLegacy`：密文字节与旧路径完全一致
-- `TestPumpOrderingUnderConcurrency`：8 goroutine 并发写，计数器严格递增
-- `TestPumpTransportSwitch`：切换后继续
-- `go test -race ./...` 全绿；`bash tests/run-tests.sh --large` 39/39 通过
-- 512 MiB 回环 ≥ 485 MiB/s
+**验收**：密文字节与旧路径**完全相同**（等价性单测）；`UseMux=false` 时行为逐字节不变；
+39 项 e2e 全绿；`-race` 干净；文件传输 ≥ 485 MiB/s。
 
-**回滚**：`session.go` 恢复到 `conn`+`sec` 版本（单文件）。
+**风险**：这一步改 `peer.Session` 的内部结构，是整条路线最可能引入回归的地方。
+单独提交，出问题时便于 bisect。
 
-**这一步单独提交，是整条路线的 bisect 锚点。**
+### PR #2 —— `-L` 本地转发 + 最小安全（795 生产 / 810 测试）
 
-### 步骤 3：`internal/mux` + mux 上的文件传输（1.5 天）
+| 交付 | 内容 |
+|---|---|
+| `internal/wire/forward.go` | `Preamble`/`Status` 编解码、4 个新帧类型 |
+| `internal/forward/pipe.go` | 双向 pipe + 半关闭 + EOF 后 5 s 强制拆除 |
+| `internal/forward/local.go` | `-L`：listener 只建一次、每连接开流、前置头 |
+| `internal/forward/allow.go` | **精简版 ACL**：仅「主机 + 端口精确匹配」，不做 CIDR、不做主机名解析 |
+| `internal/cli/forward.go` | `cmesh forward -L` |
 
-**内容**：`mux` 包（session/stream/config/serve）；`NodeConfig.UseMux` + `OnMux` + `dialOne` 引导；hello 的 `caps`。
+**验收**：10 并发 × 8 轮字节精确；拒绝时 dialer 未被调用；半关闭不挂起；
+500 连接随机掐断后 goroutine 回落基线。
 
-**验收**：
-- 单测：kind 路由、流 ID 奇偶、`MaxStreams`（Open 阻塞 / Accept 标记 Limited）、`CloseWrite` 半关闭、`LogOutput` 不污染 stderr、信号量恰好归还
-- 集成：**在 mux 上跑完整文件传输**（512 MiB，SHA-256 一致），证明控制流可用
-- 互操作：`UseMux=false` 的 `send`↔`recv` 与今天行为一致；`UseMux=true` 对上 `UseMux=false` 时明确报错
-- `-race` 全绿；既有 e2e 39 项全绿
+### PR #3 —— `-R` 反向转发 + 完整策略（540 生产 / 580 测试）
 
-**回滚**：`UseMux` 默认 false，等价于功能未启用。
+| 交付 | 内容 |
+|---|---|
+| `internal/forward/reverse.go` | `-R`：监听器 ID 匹配、重连不重复 bind |
+| `internal/forward/limits.go` | 流数、建流速率（手写令牌桶）、空闲超时、会话寿命 |
+| `internal/forward/allow.go`（扩） | CIDR、主机名启动时解析、`Permits` 返回 IP（封 TOCTOU） |
+| `internal/cli/forward.go`（扩） | `--accept-reverse`、`--allow-listen-port`、启动横幅 |
 
-### 步骤 4：`internal/forward` 策略核心 + `-L`（1 天）
+**验收**：`-R` 无 `--allow-listen-port` 时零值拒绝；端口抢占场景被拒；
+完整 e2e + 4 项混沌测试全绿。
 
-**内容**：`allow.go`/`limits.go`/`pipe.go`/`local.go`/`manager.go`；`-L` 全链路；假 mux 测试。
+### 相对初版砍掉/推迟了什么
 
-**验收**：
-- 四层防御的单测全绿，特别是「拒绝时 dialer 调用次数为 0」
-- 假 mux 下 `-L` 端到端：10/10 字节精确、半关闭、banner-first
-- `-L` 解析表驱动全绿
+| 初版设计 | 处理 | 理由 |
+|---|---|---|
+| `allow.go` 210 行（CIDR + 主机名解析 + TOCTOU 防护一次做完） | **拆开**：PR #2 只做主机+端口精确匹配（约 90 行），CIDR 与启动时解析留到 PR #3（补 40 行） | 阶段 1 的真实用法是「转发到固定的 db:5432」，CIDR 是运维便利而非必需；但 `Permits` 返回 IP 这个形状从第一版就定死，后面只加匹配规则、不改调用点 |
+| `limits.go` 100 行（限流 + 超时 + 寿命 + 配额四套机制） | **保留限流，重写为 60 行**：一个手写令牌桶 + 三个超时字段 | 我一度想删掉它（`MaxStreams` 能防 OOM），但**这是错的**：`MaxStreams` 限的是并发，不限速率——攻击者可以在 256 条流里每秒建/关上千次，把内网扫描的速率放大到 `MaxStreams` 管不住的程度。§5.3 攻击场景 2 与 S8 都依赖这一层，删掉等于为凑行数削弱真实防线 |
+| `stream.go` 130 行（信号量归还 + kind 表 + 流语义） | **并进 `mux.go`**，降到 70 行 | 三者都要读同一组字段，拆两个文件只是把锁的归属变模糊 |
+| `manager.go` 230 行 | **收到 150 行** | 装配 + kind 分发 + 横幅，审计日志并入 `forward` 各模块而非集中一层 |
+| `cli/forward.go` 340 行 | **收到 300 行** | 去掉一层只为测试而存在的生命周期封装，测试直接驱动 `Manager` |
+| 审计日志独立成层 | **并入 PR #3 各模块** | 与安全策略同批审查更自然，且不需要单独的抽象 |
 
-**回滚**：`forward` 子命令尚未注册，包不被引用。
+三个 PR 相加：940 + 795 + 540 = **2,275 生产**，1,070 + 810 + 580 = **2,460 测试**，
+与 §1.2 的表逐行一致（`allow.go` 130/180 与 `cli/forward.go` 300/200 按精简版/
+扩展版拆在 PR #2、#3 两侧）。
+比初版少 13%。**PR #1 占了 40%，因为它是整条路线的地基**（记录泵 + 会话重构 +
+mux 包装），后两个 PR 只是在这层地基上挂业务逻辑——这也是为什么 PR #1 必须单独
+提交、单独 bisect。
 
-### 步骤 5：`-L` 接进 CLI 并端到端（1 天）
 
-**内容**：`cli/forward.go` 参数与生命周期；`--accept` + `--allow-*`；启动横幅；`Provider` 接到 `Node.Mux(ctx)`。
+## 8. 各 PR 内部的实施步骤
 
-**验收**：
-- 新增 e2e 段（`tests/run-tests.sh` 的 section 11）：I1/I2/I7/I8/I11/I12 全绿
-- `--accept` 无 `--expect-sas` 时警告可见
-- 既有 39 项仍全绿
+§7 决定「先做什么」，本节决定「一个 PR 内部按什么顺序写、每一步怎么自证」。
+顺序的唯一约束是：**每一步结束时仓库都能构建、测试全绿、可回滚**。
 
-### 步骤 6：`-R`（1 天）
+### PR #1 内部
 
-**内容**：`FrameForwardListen*` 在 `peer` 的分发（`Handler.OnForwardListen`）；`reverse.go`；`--accept-reverse`/`--allow-listen-port`/`--listen-all`。
+| 步 | 内容 | 自证 |
+|---|---|---|
+| 1.1 | `internal/peer/pump.go` 记录泵 + 引导直通 | `TestPumpBootstrapMatchesLegacy`：密文字节与改造前逐字节一致 |
+| 1.2 | `session.go` 改为持有 `FrameConn`（此时无 mux，`boot` 传 nil） | `-race` 全绿 + 既有 e2e 39/39 + 512 MiB ≥ 485 MiB/s |
+| 1.3 | `internal/mux` 包装 yamux | 单测：kind 路由、流 ID 奇偶、`MaxStreams`、`CloseWrite`、信号量归还、`LogOutput` |
+| 1.4 | `NodeConfig.UseMux` 默认 false，`OnMux` 回调 | `UseMux=false` 时行为与今天逐字节相同；`UseMux=true` 对上旧版明确报错 |
+| 1.5 | 在 mux 上跑完整文件传输（控制流承载 `peer.Session`） | 512 MiB SHA-256 一致 —— 证明控制面可用，这是 PR #2 的前提 |
 
-**验收**：
-- I6/I9/I10 全绿
-- 多 `-R` 规格按 ID 正确匹配（两个监听器同时可用）
-- 重连后 listener 不重复 bind（R-9）
-- 远端 `--listen-all` 缺失时明确拒绝
+**回滚点**：1.2 若引入回归，单独 revert 该提交即可回到旧 `conn`+`sec` 路径；
+`UseMux` 默认 false 保证 1.3–1.5 在出问题时等于未启用。
 
-### 步骤 7：安全加固与审计（1 天）
+### PR #2 内部
 
-**内容**：审计日志、`deny-close`、速率限制打磨、日志脱敏、fuzz 扩面、S1–S10 测试、文档（README + `decisions.md` 新条目 + 本文件的状态更新）。
+| 步 | 内容 | 自证 |
+|---|---|---|
+| 2.1 | `wire/forward.go`：preamble/status 编解码 + 严格解析 | 往返表驱动 + `FuzzReadPreamble` 2 分钟无 crash |
+| 2.2 | `forward/pipe.go`：双向 pipe + 半关闭 + **EOF 后 5 s 强制拆除** | I2（HTTP/1.0）、I3（banner-first）、半关闭不挂起 |
+| 2.2b | `--handshake-timeout`（10 s）落到 preamble 读 + `--max-pending`（128）落到 accept 侧 | C3（500 条半开 30 s 后 goroutine 回落基线） |
+| 2.3 | `forward/allow.go` 精简版（主机 + 端口精确匹配） | 零值拒绝一切；`0.0.0.0/0` 构造期报错；拒绝时 dialer 调用次数为 0 |
+| 2.4 | `forward/local.go` + `cli/forward.go`：`-L` 全链路 | I1（10 并发 × 8 轮字节精确）、I7、I8 |
+| 2.5 | 启动横幅 + `--accept` 无 `--expect-sas` 时警告 | 横幅内容断言；S10 日志脱敏 |
 
-**验收**：
-- S1–S10 全绿；`-fuzztime=10m` 无 crash
-- 日志不含 code（自动断言）
-- §5.4 的 18 条清单逐条勾选
+### PR #3 内部
 
-### 步骤 8：性能验收与决策门（0.5 天）
+| 步 | 内容 | 自证 |
+|---|---|---|
+| 3.1 | `peer` 分发 `FrameForwardListen*`；`forward/reverse.go` | I6；多 `-R` 按 ID 匹配 |
+| 3.2 | `--accept-reverse` + `--allow-listen-port`（零值拒绝） | I9、I10、S7（端口仍可被本地进程 bind） |
+| 3.3 | `forward/limits.go`：流数 + 手写令牌桶（建流速率）+ 超时/寿命 | I11（第 257 条被拒）、S8（1000 次/秒 open 被限到 32/s）、单测断言桶的边界 |
+| 3.4 | `allow.go` 扩展：CIDR + 启动时解析主机名 + `Permits` 返回 IP | S5（假 resolver 第二次返回攻击者 IP，断言仍拨第一次的） |
+| 3.5 | 审计日志、`--deny-close`、§5.4 的 18 条逐条勾选 | S1–S10 全绿；P1–P9 实测值写回 §6.4 |
 
-**内容**：P1–P9 全量测量；把实测值写回 §6.4；更新 `ARCHITECTURE-SDWAN.md` 的 §A1（版本策略）与 §3.1（记录大小）修正；更新 `docs/README.md` 索引。
+**决策门 G1（PR #3 合并前）**：P1 ≥ 485 MiB/s、P2 ≥ 200 MiB/s、P3 ≥ 500 MiB/s、
+P6 < 80 MiB、§6.5 的混沌测试 C1–C4 全绿、既有 39 项 + 新增 e2e 全绿、`-race` 全绿。
+不达标 → **不进入阶段 2**，先修回归。
 
-**验收（G1 决策门）**：
-- P1 ≥ 485 MiB/s
-- P2 ≥ 200 MiB/s，P3 ≥ 500 MiB/s
-- P6 < 80 MiB
-- 既有 39 项 + 新增 e2e 全绿，`-race` 全绿
-- 不达标 → **不进入阶段 2**，先修回归
-
-**总计：约 8 个工程日**（含缓冲；ARCHITECTURE-SDWAN 估的 3–5 天基于研究二的 880 行，本设计因记录泵、控制流重构、`-R` 控制面与安全加固而上调）。
-
----
+**工期**：PR #1 约 3 天、PR #2 约 2.5 天、PR #3 约 2.5 天，合计约 8 个工程日（含缓冲）。
 
 ## 9. 主要风险
 
@@ -1330,16 +1453,20 @@ MaxStreams = min(--max-streams, StreamBudget / (2 × Window))
 | X1 | **开放代理**：宽松白名单 + code 泄露 | **高** | `--accept` + `10.0.0.0/8` + 任意端口 | 四层防御；零值拒绝；拒绝 `0.0.0.0/0`；`--deny-close`；审计；启动横幅 |
 | X2 | **`-R` 端口抢占**：攻击者让受害容器 bind 任意 loopback 端口 | **高** | `--accept-reverse` 开着且没有端口白名单 | `--allow-listen-port` 零值拒绝；裁决权在暴露侧 |
 | X3 | **记录泵死锁** | **高** | 读/写队列同时满 + 传输卡住 | 有界队列 + 单 drainer + `fail()` 关两端；`ConnectionWriteTimeout` 安全阀；P2/P9 压测 |
-| X4 | **`peer.Session` 重构引入回归** | 中高 | 步骤 2 的改动遗漏 `ErrTransportSwitched` 或 `sendMu` | 密文等价性单测；`-race`；既有 e2e；P1 门槛；单独提交便于 bisect |
+| X4 | **`peer.Session` 重构引入回归** | 中高 | PR #1 步 1.2 的改动遗漏 `ErrTransportSwitched` 或 `sendMu` | 密文等价性单测；`-race`；既有 e2e；P1 门槛；单独提交便于 bisect |
 | X5 | **`StreamOpenTimeout` 关整个会话** | 中 | 单条流 SYN 未 ACK | 120 s；`Open` 前查 `NumStreams`；重连后 listener 存活 |
 | X6 | **内存超预算** | 中 | 1 MiB 窗口 + 256 流 | 预算公式自动压低流数；P6 |
-| X7 | **relay 消息数上升** | 低 | mux 启用 | 实测 P8；目标 ≤ 13 条/MiB；必要时启用写侧合并（**可选**） |
+| X7 | **relay 消息数上升** | 低 | mux 启用 | P8 实测；合并已必做，正常应显著低于 13 条/MiB。若反而更高，先查批量写是否生效 |
 | X8 | **`-R` 目标被对端指定**（研究二原方案的漏洞） | 中 | 实现者照研究二写「Addr 仅用于日志」但忘了查表 | 结构性设计：Addr = 监听器 ID，只查表不拨号；S7 + 单测 |
 | X9 | **白名单 TOCTOU / DNS rebinding** | 中 | 白名单写主机名 | `Permits` 返回 IP，拨号只用它；启动时固定；S5 |
 | X10 | **yamux v0.x API 变动** | 低 | 升级 yamux | `internal/mux` 完全隔离；协议 spec 稳定；pin v0.1.2 |
 | X11 | **新旧二进制互操作失败** | 低 | `forward` 对上旧 `send` | `caps` 协商 + 明确错误信息（I13） |
 | X12 | **`-R` listener 跨重连泄漏** | 低 | 每次重连都注册 | 按 ID 幂等；会话结束清理；R-9 测试 |
-| X13 | **单 `sendLoop` 在满载时抬高延迟** | 低 | 文件传输 + 多条转发同时跑 | 已知代价（研究二实测 p50 18 µs → 191 µs）；P9 记录；文档说明 |
+| X13 | **单 `sendLoop` 在满载时抬高延迟** | 中 | 大文件打满链路 + 交互流量 | 单流 FIFO 的固有性质，不是记录大小的 bug。C1 只在留 40% 余量时验收低延迟；打满时的行为写进 README，控制流优先级队列留到阶段 2 |
+| X14 | **队头阻塞没被 32 KiB 消除干净** | 中 | 慢链路 + 混合流量 | C1 直接验收：P99 往返 ≤ 40 ms；不达标就继续降记录或给控制流优先队列 |
+| X15 | **慢读者把内存吃穿** | 中 | 对端开流不读 | C2：RSS 增量 ≤ 50 MiB；靠记录泵有界阻塞 + yamux 流窗口 |
+| X16 | **半开连接耗尽 goroutine** | 中 | 只连不发 | C3：500 条半开 30 s 后回落到基线 ±10。两道防线缺一不可：`--max-pending=128` 挡住 accept 侧，`--handshake-timeout=10s` 挡住「拿到流但不发 preamble」 |
+| X17 | **P2P 切换在 mux 下静默丢字节** | 高 | 传输中路径失效 | mux 模式锁路径，`Switch` 返回错误；C4 双分支分别断言 |
 
 ---
 
@@ -1350,8 +1477,8 @@ MaxStreams = min(--max-streams, StreamBudget / (2 × Window))
 | # | 上游位置 | 原文 | 修正 | 依据 |
 |---|---|---|---|---|
 | 1 | `ARCHITECTURE-SDWAN.md` §A1、§6 阶段 1 | 「`wire.Version` 提升到 2，两端必须同时升级」 | **保持 1**，用 hello 的 `caps` 协商 | 帧格式未变，新帧类型是增量，`readPump` 的 default 分支忽略未知类型（`session.go:341-343`）；升版本会让 `send`/`recv` 在新旧二进制间不可用 |
-| 2 | `ARCHITECTURE-SDWAN.md` §6 阶段 1 交付物 2（第 674 行） | 「新增 `FrameStreamData`（payload = 任意字节块，≤64 KiB）」 | **512 KiB**（`MaxStreamData = peer.ChunkSize`） | D11/README：512 KiB → 539.3 MiB/s，64 KiB → 211.9 MiB/s `[实测]` |
-| 3 | `ARCHITECTURE-SDWAN.md` §A9 预算表（第 604 行）与 §6 风险段（第 706 行） | 「记录泵缓冲 每方向 4 × 64 KiB」 | **每方向 1 MiB（2 × 512 KiB）** | 记录大小改为 512 KiB 后，64 KiB 缓冲会强制把每条记录切成 8 份；2 MiB 总量相对 128 MiB 的 yamux 预算可忽略 |
+| 2 | `ARCHITECTURE-SDWAN.md` §6 阶段 1 交付物 2（第 674 行） | 「新增 `FrameStreamData`（payload = 任意字节块，≤64 KiB）」 | **32 KiB**（写侧 16 条批量合并） | 512 KiB 在 2 MiB/s 链路上有 250 ms 队头阻塞，而 AEAD 在 32 KiB 仍有 1408 MB/s；批量写把写次数拉回与 512 KiB 相同 `[实测]` |
+| 3 | `ARCHITECTURE-SDWAN.md` §A9 预算表（第 604 行）与 §6 风险段（第 706 行） | 「记录泵缓冲 每方向 4 × 64 KiB」 | **每方向 1 MiB（32 条 × 32 KiB）** | 缓冲要能装下若干整条记录才能做批量写；1 MiB = 32 条，够 16 条批量凑两次。2 MiB 总量相对 128 MiB 的 yamux 预算可忽略 |
 | 4 | `research/mux-and-portforward.md` §3.2 | `Preamble` 定义在 `internal/forward/proto.go` | 移到 `internal/wire/forward.go` | 状态码与帧 payload 都在 `wire`；放 `forward` 会形成 `forward→wire` 与 `wire→forward` 的环 |
 | 5 | `research/mux-and-portforward.md` §3.4 | 5 层防御中只有第 1 层管「是否启用」，且 `-R` 与 `-L` 共用同一个 `--accept`（正文还写作 `--allow-forward`，与参数表不一致） | 拆出 `--accept-reverse` + `--allow-listen-port`（零值拒绝） | `-R` 让攻击者在受害容器内开监听端口，风险量级不同于 `-L` |
 | 6 | `research/mux-and-portforward.md` §8 关键片段 3（第 974-1004 行）与第 961 行 | `Permits(addr)` 用主机名比对，然后 `net.DialTimeout("tcp", p.Addr)` 再解析一次 | `Permits` 返回**要拨的 IP**，拨号只用它 | check-then-dial TOCTOU / DNS rebinding |
@@ -1367,9 +1494,9 @@ MaxStreams = min(--max-streams, StreamBudget / (2 × Window))
 | 复用库 | `hashicorp/yamux v0.1.2`（+33 KB，零传递依赖，MPL-2.0） | 必须（研究二已否决 smux/QUIC 多流） |
 | 分层 | `transport → secure → 记录泵 → yamux → 业务流` | 必须 |
 | `secure.go` | 不改 | 必须 |
-| 记录大小 | 512 KiB | 必须 |
-| 记录泵缓冲 | 每方向 1 MiB，有界阻塞 | 必须 |
-| 写入合并 | v1 不做（无定时器；自然合并已够） | 可选 |
+| 记录大小 | **32 KiB**（写侧 16 条批量合并） | 必须 |
+| 记录泵缓冲 | 每方向 1 MiB（32 条），有界阻塞 | 必须 |
+| 写入合并 | **v1 做**：最多 16 条合并成一次 transport 写，无定时器（写侧凑满即发） | 必须 |
 | `wire.Version` | 保持 1 + `caps` 协商 | 必须 |
 | 控制流 | yamux stream，`kind=0`，initiator 打开，只接受一次 | 必须 |
 | 流 kind | 0=控制，1=转发 | 必须 |
@@ -1381,10 +1508,13 @@ MaxStreams = min(--max-streams, StreamBudget / (2 × Window))
 | 状态码 | 0 OK / 1 Denied / 2 DialFail / 3 TooMany / 4 BadRequest / 5 BindFail | 必须 |
 | 策略与拨号顺序 | 先策略后拨号 | 必须 |
 | `MaxStreams` | 256，被 128 MiB 预算自动压低 | 必须 |
+| `MaxStreamsPerSec` | 32，手写令牌桶（不限并发、只限建流速率） | 必须 |
 | `StreamOpenTimeout` | 120 s | 必须 |
 | `StreamCloseTimeout` | 60 s | 必须 |
 | `yamux.LogOutput` | 显式设为 slog 适配器或 `io.Discard` | 必须 |
-| 传输切换 | 只在 mux 建立前（A8） | 必须 |
+| 传输切换 | 只在 mux 建立前（A8）；mux 起来后 `Switch` 返回错误 | 必须 |
+| `--pipe-drain` | 5 s：一侧 EOF 后给另一侧 5 s 送完，超时 `Reset()` | 必须 |
+| `--handshake-timeout` | 10 s：流建立后读完前置头 + 状态交换的总预算 | 必须 |
 | 重连 | listener 只建一次；所有流断开；不做流级续传（A11） | 必须 |
 | 文件共存 | 控制流承载完整 `peer.Session`；`--also-recv-files` 免费获得 | 必须 |
 | `forward` 发文件 | v1 不做 | 可选 |
