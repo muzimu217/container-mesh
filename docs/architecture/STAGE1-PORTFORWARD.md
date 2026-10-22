@@ -1416,6 +1416,48 @@ CLI 接线后测吞吐，数字从 624 MiB/s 掉到 214 MiB/s，看起来像回�
 **这条写进方法论的教训**：性能回归判定必须 A/B 同刻对照，不能用"历史最好值"
 当基线——宿主机负载、页缓存、后台进程都会让绝对值漂移数倍。
 
+### 配对等待：接收端用默认 `--stay`，不要用一次性模式（2026-10-22）
+
+实测踩到的一个坑，值得写下来因为**看起来像网络问题，其实是模式选错**。
+
+现象：在 Cloud Studio 容器里跑 `recv --stay=false`，日志反复出现
+`no partner appeared within 25s`，重试若干次后放弃；发送端随后到达时，
+relay 日志显示 `paired` 但紧接着 `B->A recv: close 1000 (normal)` —— 配对成功
+的瞬间接收端正好在退场。
+
+根因在 `--stay=false` 强制把配对窗口压到 25 秒：
+
+```go
+// internal/cli/peer.go  newNode()
+if oneShot {                          // --stay=false
+    cfg.MaxConnectAttempts = 6
+    if cfg.PairWindow <= 0 {
+        cfg.PairWindow = 25 * time.Second
+    }
+}
+```
+
+而默认模式（`--stay`）在单 relay 下是无限等待的：
+
+```go
+// internal/cli/node.go  dialOne()
+waitForever := window <= 0 && len(n.cfg.Relays) == 1
+```
+
+**所以正确做法不是「给慢启动的容器调大 pair-window」，而是接收端保持默认
+`--stay`**——它天生就无限等，零调参。只有确实需要一次性退出时才用
+`--stay=false`，此时等待预算 = 尝试次数(6) × pair-window：
+
+| 场景 | 命令 | 实际等待 |
+|---|---|---|
+| **接收端等对方（推荐）** | `recv`（默认 `--stay`） | 单 relay **无限等**；多 relay 每台 60 s 轮换 |
+| 一次性接收 | `recv --stay=false` | 6 × 25 s = **150 s 总预算** |
+| 一次性接收 + 对方可能很晚才来 | `recv --stay=false --pair-window 4m` | 6 × 4m = **24 分钟** |
+| 发送端 | `send --stay=false` | 6 次尝试，每次 25 s |
+
+演示脚本里如果两端由同一条命令同时拉起，接收端必须用默认模式，否则 150 秒
+预算一旦被冷启动或人工操作拖过去，就会出现「明明网络是通的却配不上」。
+
 ### PR #3 实现记录（2026-10-21）
 
 `-R` 反向转发完成。进程级实测：应用连到 hoster 的 `127.0.0.1:19623` →

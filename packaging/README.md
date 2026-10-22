@@ -262,6 +262,12 @@ rm -rf /tmp/cmesh-demo
 99% 是 `--code` 不一致。房间号由 code 派生，code 不同就永远在两个房间。
 用 `--pair-window 8s` 让它快速失败而不是干等。
 
+**但如果你看到 `no partner appeared within 25s` 反复出现，先看是不是给接收端
+加了 `--stay=false`。** 一次性模式会把配对窗口压到 25 秒、总共 6 次尝试，
+也就是 150 秒预算；对方晚到一点就错过。**接收端去掉 `--stay=false`
+（用默认值）在单 relay 下是无限等待的**，这才是「先起接收端等发送端」该用的模式。
+确实需要一次性退出时，显式给预算：`--pair-window 4m`（6 × 4m = 24 分钟）。
+
 **端口转发报 `denied`**
 看对端日志里的 `reason`：`--accept` 是否开了、`--allow-host` / `--allow-port`
 是否包含你要的目标。默认是**拒绝一切**，这是刻意的。
