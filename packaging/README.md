@@ -11,14 +11,29 @@
 
 ```
 cmesh-demo/
-├── cmesh-linux-amd64    # x86_64 机器用这个
-├── cmesh-linux-arm64    # ARM64（含 Apple Silicon 上的 Linux 容器）用这个
-├── start.sh             # 一键起中继
-├── stop.sh              # 停掉后台中继
-└── README.md            # 本文件
+├── cmesh-linux-amd64         # x86_64 服务器
+├── cmesh-linux-arm64         # ARM64 服务器（含云厂商的 ARM 实例）
+├── cmesh-darwin-arm64        # Apple Silicon Mac（M1/M2/M3…）
+├── cmesh-darwin-amd64        # Intel Mac
+├── cmesh-windows-amd64.exe   # Windows 64 位
+├── start.sh                  # 一键起中继（Linux）
+├── stop.sh                   # 停掉后台中继
+└── README.md                 # 本文件
 ```
 
-`start.sh` 会自己按 `uname -m` 选二进制，不用你判断。
+**同一个包同时覆盖服务端和桌面端。** 全部是静态二进制，不需要装 Go、不需要装运行库。
+
+| 你的机器 | 用哪个 | 备注 |
+|---|---|---|
+| Linux 服务器 | `cmesh-linux-amd64` / `-arm64` | `start.sh` 会自动选 |
+| Mac（Apple Silicon） | `cmesh-darwin-arm64` | 直接在终端跑 |
+| Mac（Intel） | `cmesh-darwin-amd64` | |
+| Windows | `cmesh-windows-amd64.exe` | 在 PowerShell 或 cmd 里跑 |
+
+> **macOS 首次运行**会被 Gatekeeper 拦一次（未签名）。解决办法：
+> `xattr -d com.apple.quarantine cmesh-darwin-arm64`，或在「系统设置 → 隐私与安全性」里点「仍要打开」。
+
+`start.sh` 只在 Linux 上有意义（它是给服务器一键起中继用的）；桌面端直接调二进制即可。
 
 ---
 
@@ -74,12 +89,22 @@ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8080/ws
 
 ### A. 用同一个包里的二进制（推荐）
 
-把 `cmesh-linux-amd64` 或 `cmesh-linux-arm64` 拷到本地。
+包里已经包含你本地要用的那个：
 
-- **Linux x86_64 / ARM64**：直接 `chmod +x` 后使用。
-- **macOS（Intel / Apple Silicon）**：这两个是 Linux 二进制，不能直接在 macOS 上跑。
-  用 `go install github.com/muzimu217/container-mesh/cmd/cm@develop`（需要 Go 1.24+），
-  或者用 Docker：`docker run --rm -it -v $PWD:/w -w /w golang:1.24 go run github.com/muzimu217/container-mesh/cmd/cm@develop ...`
+```bash
+# macOS（Apple Silicon）
+chmod +x cmesh-darwin-arm64
+xattr -d com.apple.quarantine cmesh-darwin-arm64 2>/dev/null || true
+./cmesh-darwin-arm64 version
+
+# macOS（Intel）
+chmod +x cmesh-darwin-amd64
+
+# Windows（PowerShell）
+.\cmesh-windows-amd64.exe version
+```
+
+不需要装 Go，也不需要 Docker。
 
 ### B. 传文件
 
