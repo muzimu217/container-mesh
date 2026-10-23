@@ -1,0 +1,40 @@
+flowchart TB
+    subgraph L4["④ 应用能力"]
+        direction LR
+        A1["消息"] ~~~ A2["文件传输"] ~~~ A3["端口转发"]
+    end
+    subgraph L3["③ 端到端加密 · X25519 + AES-GCM ⭐新增<br/>中转节点解不开这一层"]
+        direction LR
+        E1["deviceID_A ↔ deviceID_B"]
+    end
+    subgraph L2["③ 路由 · 距离向量 + 实测 RTT ⭐新增<br/>直连优先 → 失败经成员中转 → 配额限制"]
+        direction LR
+        R1["选路"] ~~~ R2["路径切换"] ~~~ R3["防环"]
+    end
+    subgraph L1["② 连接（复用阶段 1）"]
+        direction LR
+        C1["打洞 STUN"] ~~~ C2["QUIC 直连"] ~~~ C3["WebSocket 中转"]
+    end
+    subgraph L0["② 多路复用 + 会话加密（复用阶段 1）"]
+        direction LR
+        M1["记录泵 32 KiB"] ~~~ M2["yamux"] ~~~ M3["SPAKE2 每跳独立"]
+    end
+    subgraph LA["① 发现 ⭐新增"]
+        direction LR
+        D1["成员列表"] ~~~ D2["心跳 30s"] ~~~ D3["地址广播"]
+    end
+    subgraph LB["⓪ 身份 ⭐新增"]
+        direction LR
+        I1["Ed25519 密钥对"] ~~~ I2["账号 → 设备证书"] ~~~ I3["撤销 = 删公钥"]
+    end
+
+    L4 --> L3 --> L2 --> L1 --> L0
+    L0 -.-> LA -.-> LB
+
+    style L3 fill:#ffe6cc,stroke:#d79b00,stroke-width:2px
+    style L2 fill:#ffe6cc,stroke:#d79b00,stroke-width:2px
+    style LA fill:#ffe6cc,stroke:#d79b00,stroke-width:2px
+    style LB fill:#ffe6cc,stroke:#d79b00,stroke-width:2px
+    style L1 fill:#d5e8d4,stroke:#82b366
+    style L0 fill:#d5e8d4,stroke:#82b366
+    style L4 fill:#dae8fc,stroke:#6c8ebf
