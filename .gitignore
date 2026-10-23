@@ -23,3 +23,6 @@ probe.json
 
 # 外部评审报告（不纳入版本控制）
 /reports/
+
+# 服务器迁移备份（含生产 .env 与数据库 dump，绝不入库）
+/.migration-backup/
