@@ -95,6 +95,11 @@ type Handler struct {
 	// callers will run it in a goroutine and return immediately). Returning
 	// false rejects the offer right away. A nil OnOffer rejects every offer.
 	OnOffer func(tr *InboundTransfer) bool
+	// OnStatus receives user-facing lifecycle notes that are not errors and not
+	// routine progress: a resumed transfer, for instance. It exists because a
+	// log line at Info level is invisible at the default verbosity, and some
+	// events are too important to hide behind a flag.
+	OnStatus func(event, detail string)
 	// OnForwardListen receives a peer's request to host -R listeners and must
 	// answer with one status per spec.
 	//
@@ -800,6 +805,15 @@ drain:
 	defer fh.Close()
 
 	if acc.ResumeFrom > 0 {
+		// Report the resume on the session's own status channel rather than
+		// only through slog. Resuming is user-visible behaviour ("this is why
+		// the progress bar started at 40%"), so it must not depend on a log
+		// level: the default level hides Info, and a resume that prints
+		// nothing looks like a transfer that silently skipped data.
+		if s.handler.OnStatus != nil {
+			s.handler.OnStatus("resuming", fmt.Sprintf("%s from %d of %d bytes",
+				offer.Name, acc.ResumeFrom, fi.Size()))
+		}
 		s.log.Info("resuming transfer", "file", offer.Name, "from", acc.ResumeFrom, "total", fi.Size())
 		if _, err := fh.Seek(acc.ResumeFrom, io.SeekStart); err != nil {
 			return nil, err

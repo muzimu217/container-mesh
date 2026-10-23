@@ -150,7 +150,7 @@ func NewNode(cfg NodeConfig) *Node {
 	}
 	return &Node{
 		cfg:     cfg,
-		log:     slog.Default(),
+		log:     log(),
 		notify:  make(chan struct{}, 1),
 		runDone: make(chan struct{}),
 	}
@@ -570,6 +570,9 @@ func (n *Node) bringUpQUIC(res *p2p.Result) (*p2pquic.Result, error) {
 func (n *Node) handler() peer.Handler {
 	return peer.Handler{
 		OnForwardListen: n.cfg.OnForwardListen,
+		OnStatus: func(event, detail string) {
+			n.status(event, detail)
+		},
 		OnMessage: func(text string) {
 			if h := n.cfg.OnMessage; h != nil {
 				h(text)

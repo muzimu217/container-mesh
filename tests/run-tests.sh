@@ -284,7 +284,9 @@ assert_eq "续传 send 退出码" "0" "$SEND2_RC"
 assert_eq "续传 recv 退出码" "0" "$RECV2_RC"
 assert_file_eq "续传后文件一致" "$TMP/src/payload.bin" "$TMP/dst2/payload.bin"
 
-if grep -q "resuming transfer.*from=400000" "$TMP/send2.log"; then
+# The sender reports the resume through its status channel, not through a log
+# level, so this line is present at the default verbosity.
+if grep -q "resuming:.*from 400000" "$TMP/send2.log"; then
     ok "从 400000 字节处续传"
 else
     bad "从 400000 字节处续传" "日志中没有续传记录"

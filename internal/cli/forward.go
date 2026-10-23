@@ -8,7 +8,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"log/slog"
 	"net"
 	"os"
 	"os/signal"
@@ -143,7 +142,7 @@ func runForward(args []string) error {
 			PipeDrain:        *pipeDrain,
 			DialTimeout:      *dialTimeout,
 		},
-		Logger: slog.Default(),
+		Logger: log(),
 	})
 	defer mgr.Close()
 
