@@ -49,6 +49,10 @@ func Run(args []string) error {
 		return runRecv(args[1:])
 	case "forward":
 		return runForward(args[1:])
+	case "init":
+		return runInit(args[1:])
+	case "account":
+		return runAccount(args[1:])
 	case "version", "-v", "--version":
 		fmt.Printf("cmesh %s\n", Version)
 		return nil
@@ -91,6 +95,16 @@ Usage:
         allow-list; nothing is dialled on the peer's behalf without one.
         The local bind defaults to 127.0.0.1: pass 0.0.0.0 explicitly to
         expose it on every interface.
+
+  cmesh init [--state DIR]
+        Generate this machine's mesh identity: an Ed25519 key pair whose
+        public half derives a 16-character device ID. The private key is
+        stored encrypted with a passphrase and never leaves this machine.
+
+  cmesh account create | device-add | show
+        The account is the "same identity, many devices" anchor. create
+        generates the account key (keep it on your most trusted machine);
+        device-add signs this machine's device ID into the account.
 
   cmesh version
 

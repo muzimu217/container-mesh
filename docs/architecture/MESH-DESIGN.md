@@ -181,10 +181,15 @@ func (c *DeviceCert) Verify(accountPub ed25519.PublicKey) error
 //
 // Partitions: a revoked node that never hears the broadcast keeps its cached
 // sessions until reconnect. Mitigation: every e2e frame carries the member-
-// list version it was sealed under; on receipt the receiver compares, and a
-// session whose version is older than a revocation it knows about is dropped.
-// The revoked side cannot forge a newer version -- it cannot sign as a member
-// it no longer is.
+// list version it was sealed under -- but the DISCONNECT TEST IS MEMBERSHIP,
+// NOT VERSION ORDERING. On receipt the receiver checks
+// !memberList.Contains(senderID); it drops the session only when the SENDER
+// is absent from the list it currently holds. A plain Version bump from an
+// unrelated change (a new device joining, an endpoint refresh) must NOT kill
+// anything: pushes propagate with tens of milliseconds of skew, and a
+// "frame.Version >= local.Version" rule would tear down healthy sessions the
+// instant the list grows. The version exists to detect that a revocation
+// happened, never to rank unrelated updates.
 type MemberList struct {
     AccountID string
     Members   map[DeviceID]Member
@@ -629,6 +634,19 @@ cmesh://join?acct=<accountID>&disc=<discovery-addr>&k=<account-pub-b32>
 
 **验收**：任意两台 `dial` 直连成功；`mesh ping` p95 < 5 ms（同机）。
 **依赖**：PR-M2。
+
+**QUIC 超时必须显式配置**（评审备忘，M3b 的隐性前提）：
+`kill -9` 会让内核立刻发 FIN/RST，但**拔网线、宿主机断电、容器网络命名空间
+直接销毁**这些场景没有任何包发出——QUIC 只能靠 Idle Timeout 感知。quic-go 的
+默认 `MaxIdleTimeout` 远大于 10 s，不显式改掉，M3b 的 `≤10 s` 验收线在静默
+断网下必挂。初始化 `quic.Config` 时：
+
+```go
+quic.Config{
+    MaxIdleTimeout:   10 * time.Second, // M3b 验收线
+    KeepAlivePeriod:  3 * time.Second,  // 让"活着"在超时窗内至少证明两次
+}
+```
 
 ### PR-M4 —— 端到端加密 + 中转路由（约 800 生产 + 800 测试）
 

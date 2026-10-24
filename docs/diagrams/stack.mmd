@@ -3,11 +3,11 @@ flowchart TB
         direction LR
         A1["消息"] ~~~ A2["文件传输（512 KiB 应用块）"] ~~~ A3["端口转发 -L/-R"]
     end
-    subgraph L3a["③ 路由（3a）⭐新增"]
+    subgraph L3aX["③ 路由（3a）⭐新增 · 选路并把密文帧塞入下一跳干线"]
         direction LR
         R1["距离向量"] ~~~ R2["实测 RTT"] ~~~ R3["中转配额"]
     end
-    subgraph L3b["③ 端到端加密（3b）⭐新增 · SIGMA/X25519 + AES-256-GCM"]
+    subgraph L3bX["③ 端到端加密（3b）⭐新增 · SIGMA/X25519 + AES-256-GCM · 内含 yamux(e2e)"]
         E1["密钥只有通信双方持有 · 中转节点解不开"]
     end
     subgraph L2["② 连接（复用阶段 1）"]
@@ -26,15 +26,15 @@ flowchart TB
         I1["Ed25519 设备密钥"] ~~~ I2["账号→设备证书"] ~~~ I3["撤销=删公钥+主动广播"]
     end
 
-    L4 --> L3a
-    L3a --- L3b
-    L3b --> L2
+    L4 --> L3bX
+    L3bX --- L3aX
+    L3aX --> L2
     L2 --- L2m
     L2m -.-> L1
     L1 -.-> L0
 
-    style L3a fill:#ffe6cc,stroke:#d79b00,stroke-width:2px
-    style L3b fill:#ffe6cc,stroke:#d79b00,stroke-width:2px
+    style L3aX fill:#ffe6cc,stroke:#d79b00,stroke-width:2px
+    style L3bX fill:#ffe6cc,stroke:#d79b00,stroke-width:2px
     style L1 fill:#ffe6cc,stroke:#d79b00,stroke-width:2px
     style L0 fill:#ffe6cc,stroke:#d79b00,stroke-width:2px
     style L2 fill:#d5e8d4,stroke:#82b366
