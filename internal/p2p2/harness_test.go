@@ -346,6 +346,48 @@ func newConnOn(t *testing.T, remote *net.UDPAddr, connID uint64, cfg Config) (*C
 
 // pair returns two Conns wired to each other over real UDP loopback, optionally
 // through a lossy wrapper on each side.
+// holdPacketConn delays the DELIVERY of datagrams: ReadFrom sleeps before
+// delegating, so datagrams sit "in the pipe" for a fixed time, while writes
+// pass through immediately.
+//
+// This is the shape latency tests actually need, and the reason slowPair's
+// first attempt (delaying WriteTo) failed to make in-flight observable:
+// delaying WriteTo serializes the SENDER, which paces the burst one delay per
+// datagram, so nothing ever accumulates. Delaying ReadFrom on the receiver
+// holds a full un-paced burst in flight for the delay duration — exactly the
+// window the test wants to catch.
+type holdPacketConn struct {
+	net.PacketConn
+	delay time.Duration
+}
+
+func (h *holdPacketConn) ReadFrom(b []byte) (int, net.Addr, error) {
+	time.Sleep(h.delay)
+	return h.PacketConn.ReadFrom(b)
+}
+
+// slowPair gives the a→b direction a delivery hold on b, leaving b→a (the
+// ACK direction) fast. The sender can therefore write a full window
+// back-to-back; those datagrams are counted in-flight and stay so for the
+// hold duration.
+func slowPair(t *testing.T, cfg Config, hold time.Duration) (*Conn, *Conn) {
+	t.Helper()
+	const connID = 0x1122334455667788
+	la, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lb, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pb := &holdPacketConn{PacketConn: lb, delay: hold}
+	a := NewConn(la, lb.LocalAddr(), connID, cfg)
+	b := NewConn(pb, la.LocalAddr(), connID, cfg)
+	t.Cleanup(func() { _ = a.Close(); _ = b.Close(); _ = la.Close(); _ = lb.Close() })
+	return a, b
+}
+
 func pair(t *testing.T, cfg Config, drop float64) (*Conn, *Conn) {
 	t.Helper()
 	return pairCfg(t, cfg, drop)

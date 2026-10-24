@@ -5,6 +5,7 @@ package p2p2
 
 import (
 	"bytes"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -287,18 +288,45 @@ func TestKarnRuleSkipsRetransmittedSamples(t *testing.T) {
 func TestSendWindowBoundsInFlight(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.SendWindow = 16
-	a, b := pair(t, cfg, 0)
+	// Two traps had to be understood before this test exercised anything:
+	//
+	// 1. Delaying WriteTo (the obvious way to add latency) SERIALIZES the
+	//    sender: each datagram blocks inside its write for the delay, so the
+	//    burst is paced one delay per datagram and in-flight never builds
+	//    up. slowPair therefore holds datagrams on the RECEIVER's read path
+	//    and leaves writes (and the ACK direction) fast.
+	// 2. The keep-alive loop starts at NewConn and its first RTT sets minRTT
+	//    before Send runs, which enables pacing from datagram one. With
+	//    KeepAlivePeriod pushed past the test, minRTT stays zero until the
+	//    message's own first ACK, so the first window's worth of datagrams
+	//    goes out un-paced and only the window gate limits them.
+	//
+	// Together: the sender pushes up to SendWindow back-to-back, those
+	// datagrams are held in flight for the 50 ms read hold, and a 1 ms
+	// sampler catches the peak. Verified the test means something: breaking
+	// the gate produced "in flight reached 84, above the 16 window".
+	cfg.KeepAlivePeriod = time.Hour
+	a, b := slowPair(t, cfg, 50*time.Millisecond)
 
 	// Never read from b, so ACKs stop after the socket buffer fills. Send must
 	// still stay within the window rather than pushing the whole message.
 	msg := make([]byte, 200*MaxPayload)
+	var sendErr atomic.Value
 	go func() {
 		if err := a.Send(msg); err != nil {
-			t.Logf("send returned %v", err)
+			sendErr.Store(err.Error())
 		}
 	}()
 
-	deadline := time.Now().Add(3 * time.Second)
+	// Wait until something is observably in flight, then keep sampling to
+	// catch a violation. The original form sampled a fixed 3 s window and
+	// failed with "nothing was ever in flight" when the sender goroutine had
+	// not been scheduled within it — which happens on a -race build on a
+	// 2-core shared runner, where instrumentation slows startup by more than
+	// the window allowed. Waiting for the observation (rather than requiring
+	// it inside a fixed window) keeps the invariant check and removes the
+	// startup race. The bound is checked on every sample either way.
+	deadline := time.Now().Add(15 * time.Second)
 	var maxInFlight int
 	for time.Now().Before(deadline) {
 		st := a.Stats()
@@ -308,10 +336,22 @@ func TestSendWindowBoundsInFlight(t *testing.T) {
 		if maxInFlight > cfg.SendWindow {
 			t.Fatalf("in flight reached %d, above the %d window", maxInFlight, cfg.SendWindow)
 		}
-		time.Sleep(time.Millisecond)
+		time.Sleep(1 * time.Millisecond)
+	}
+	final := a.Stats()
+	if e, ok := sendErr.Load().(string); ok {
+		t.Fatalf("send returned early: %s; stats: %+v", e, final)
+	}
+	// The transfer must have progressed enough that the window bound was
+	// actually exercised. With one-way latency L and pacing slot L*2/window,
+	// the first window's worth of datagrams is all in flight simultaneously
+	// by construction; if nothing was ever observed the sampling was too
+	// coarse or the send never started, and the test proved nothing.
+	if final.Sent < uint64(cfg.SendWindow) {
+		t.Fatalf("only %d datagrams sent in 15 s; the window was never full, so the bound was not exercised", final.Sent)
 	}
 	if maxInFlight == 0 {
-		t.Fatal("nothing was ever in flight")
+		t.Fatalf("nothing was ever in flight though %d were sent; sampling too coarse", final.Sent)
 	}
 	_ = b.Close()
 	_ = a.Close()
