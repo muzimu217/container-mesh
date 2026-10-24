@@ -1,29 +1,98 @@
 # 文档索引
 
-## 设计文档
+三层结构，**顺序不可颠倒**：需求 → 设计 → 技术。
+
+> **当前状态**
+> 阶段 1（端口转发 + 多路复用）已合并 `main`，**冻结**——不再新增功能，但保留复用。
+> 阶段 2（**组网**）正在设计，尚未实现。
+> 产品定义在 2026-10-23 从「两台机器之间的传输工具」改为「N 台机器组网」，见 `REQUIREMENTS.md` 开头。
+
+```
+① 要解决什么        REQUIREMENTS.md
+        ↓
+② 用什么结构解决     DESIGN.md  +  diagrams/
+        ↓
+③ 具体怎么做         architecture/  +  research/  +  decisions.md
+        +
+④ 怎么干            CONVENTIONS.md
+```
+
+---
+
+## ① 需求层
+
+| 文档 | 回答什么 |
+|---|---|
+| [`REQUIREMENTS.md`](REQUIREMENTS.md) | 谁的什么问题、功能清单（`R-*`）、非功能门槛（`P-*` / `C-*` / `O-*`）、硬边界（`N-*`）、验收标准 |
+
+**当前产品定义（R2）**：把散落各处的机器连成一张**自己的网**——同一身份下多设备共存、
+任意两台可直达、每台都是节点。不是「两台机器之间的传输工具」。
+
+**这是唯一的「要不要做」的判据。** 没有需求编号的功能不做。
+
+---
+
+## ② 设计层
+
+| 文档 | 回答什么 |
+|---|---|
+| [`DESIGN.md`](DESIGN.md) | **四层架构**：身份 → 发现 → 连接 → 路由；模块划分、关键决策、数据流、部署拓扑、演进路线 |
+| [`diagrams/`](diagrams/) | `mesh.png` 网状拓扑、`stack.png` 协议栈；另有三张阶段 1 的图备查 |
+
+**这是唯一的「用什么结构」的判据。** 实现与设计冲突时先改设计。
+
+---
+
+## ③ 技术层
+
+### 架构细节
 
 | 文档 | 内容 |
 |---|---|
-| [`architecture/ARCHITECTURE-SDWAN.md`](architecture/ARCHITECTURE-SDWAN.md) | **总体架构设计**：混合权限 Overlay SD-WAN 的分层、三种接入模式、四阶段路线、关键约束与风险清单。所有结论引用下方研究的实测数据。 |
-| [`architecture/STAGE1-PORTFORWARD.md`](architecture/STAGE1-PORTFORWARD.md) | **阶段 1 详细设计**：包结构、Go 接口、协议扩展、CLI、四层安全防御、测试计划（含 4 项混沌测试）、按 3 个 PR 拆分的实施路线。可直接指导编码。 |
-| [`architecture/REVIEW-RESPONSE-STAGE1.md`](architecture/REVIEW-RESPONSE-STAGE1.md) | **阶段 1 架构评审答复**：对 5 项质疑 + 4 项混沌测试要求的逐条回应。记录哪些接受了、哪些没接受及理由（尤其是「限流不能删」）。 |
+| [`architecture/ARCHITECTURE-SDWAN.md`](architecture/ARCHITECTURE-SDWAN.md) | 总体架构：分层、三种接入模式、四阶段路线、风险清单 |
+| [`architecture/STAGE1-PORTFORWARD.md`](architecture/STAGE1-PORTFORWARD.md) | 阶段 1 详细设计：包结构、Go 接口、协议扩展、CLI、四层防御、测试计划（含 4 项混沌测试）、按 PR 拆分的实施路线 |
+| [`architecture/REVIEW-RESPONSE-STAGE1.md`](architecture/REVIEW-RESPONSE-STAGE1.md) | 对 5 项架构质疑 + 4 项混沌测试要求的逐条答复（含没照办的两处及理由） |
+| [`architecture/MESH-DESIGN.md`](architecture/MESH-DESIGN.md) | **阶段 2（组网）详细设计**：身份/发现/路由/e2e 的 Go 接口、线协议、CLI、威胁模型、5 个 PR 的拆分。可直接指导编码 |
 
-## 研究报告
+### 研究报告
 
-每份报告都标注了结论的来源（`[实测]` / `[查证]` / `[推断]`），并附可复现的实验代码。
+每份都标注结论来源（`[实测]` / `[查证]` / `[推断]`），附可复现的实验。
 
 | 文档 | 回答的问题 | 关键结论 |
 |---|---|---|
-| [`research/userspace-netstack.md`](research/userspace-netstack.md) | 无 TUN 权限的容器能否获得虚拟 IP？ | **不能透明 L3**（内核无接口承载路由，`CAP_NET_ADMIN` 不可绕过）。gVisor netstack 可提供用户态 TCP/IP，代价 +25% 体积、1.1 MiB/活跃流。**MTU 必须 ≤1200**，否则 TCP 卡死。 |
+| [`research/userspace-netstack.md`](research/userspace-netstack.md) | 无 TUN 权限的容器能否获得虚拟 IP？ | **不能透明 L3**（内核无接口承载路由，`CAP_NET_ADMIN` 不可绕过）。gVisor 可提供用户态 TCP/IP，代价 +25% 体积、1.1 MiB/活跃流。**MTU 必须 ≤1200**，否则 TCP 卡死。 |
 | [`research/mux-and-portforward.md`](research/mux-and-portforward.md) | 如何在一条加密连接上做多路复用与端口转发？ | 选 **yamux**（+33 KB，每流独立流控，20000 并发稳定）。**smux v1 会静默丢数据**，已否决。QUIC 原生多流吞吐低一个数量级，已否决。 |
 | [`research/reliable-transport.md`](research/reliable-transport.md) | 自研可靠 UDP 传输该照抄哪套？ | 蓝本为 **KCP ARQ + ENet 消息头 + RFC 9002 丢包判定**。根因：旧实现的重组表用分片下标作 key，没有消息身份。 |
 
-## 决策记录
+### 决策历史
 
-[`decisions.md`](decisions.md) —— 按时间顺序记录所有技术与工程决策（D1 至今），
-包含**被否决的方案及原因**。提 PR 前请先读与改动相关的条目。
+| 文档 | 内容 |
+|---|---|
+| [`decisions.md`](decisions.md) | 按时间顺序的 D1 至今，**包含被否决的方案及原因**。提 PR 前先读与改动相关的条目。 |
 
-## 打包与分发
+### 可观测性
+
+| 端点 | 内容 |
+|---|---|
+| `GET /dashboard` | 单页看板（内嵌二进制，无外部依赖，深/浅色自适应） |
+| `GET /status` | 同一份数据的 JSON |
+| `GET /healthz` | 存活探针 |
+
+看板不暴露房间号、对端地址或口令——房间号是 code 的派生值，公开它等于给出可离线攻击的校验值。
+
+---
+
+## ④ 开发纪律
+
+| 文档 | 内容 |
+|---|---|
+| [`CONVENTIONS.md`](CONVENTIONS.md) | **开发范式与条约**：三层文档纪律、提交纪律、测试纪律、代码纪律、安全纪律、每轮检查清单、事故记录 |
+
+**这是唯一的「怎么干」的判据。** 与它冲突的做法一律视为错误，即使能跑通。
+
+---
+
+## ⑤ 打包与分发
 
 [`../packaging/`](../packaging/) —— 生成可直接上传到服务器的 Demo 包：
 
@@ -31,12 +100,26 @@
 ./packaging/build-demo.sh          # 产出 dist/cmesh-demo.tar.gz
 ```
 
-包含 linux/amd64 + arm64 静态二进制、`start.sh`（自动选架构、自动挑空闲端口）、
-`stop.sh` 与一份即开即用指南。
+含 linux/amd64、linux/arm64、darwin/amd64、darwin/arm64、windows/amd64 五个平台的静态二进制，
+`start.sh`（自动选架构、自动挑空闲端口）、`stop.sh` 与即开即用指南。
+
+---
 
 ## 快速导航
 
-- **想知道某条限制为什么存在** → 先查 `decisions.md` 的 D 编号
-- **想改传输层** → 读 `research/reliable-transport.md` 与 `decisions.md` 的 D43–D46
-- **想加端口转发 / 多路复用** → 读 `architecture/ARCHITECTURE-SDWAN.md` 的阶段 1 与 `STAGE1-PORTFORWARD.md`
-- **想引入 gVisor 或 TUN** → 读 `research/userspace-netstack.md` 的约束章节
+| 你想… | 读 |
+|---|---|
+| **知道这项目是什么** | [`REQUIREMENTS.md`](REQUIREMENTS.md) §1.1（一句话）+ §1.2（与旧定义的差异） |
+| 知道这项目解决什么问题 | [`REQUIREMENTS.md`](REQUIREMENTS.md) §1–2 |
+| **理解组网的四层** | [`DESIGN.md`](DESIGN.md) §1–2 + `diagrams/mesh.png` + `diagrams/stack.png` |
+| 知道身份/发现/路由怎么设计 | [`DESIGN.md`](DESIGN.md) §2 |
+| 知道阶段 2 怎么拆 | [`DESIGN.md`](DESIGN.md) §7 |
+| 知道某功能做不做、做到什么程度 | [`REQUIREMENTS.md`](REQUIREMENTS.md) §3–5 |
+| 理解整体架构 | [`DESIGN.md`](DESIGN.md) §1 + [`diagrams/`](diagrams/) |
+| 知道某条限制为什么存在 | [`decisions.md`](decisions.md) 的 D 编号 |
+| 改传输层 | [`research/reliable-transport.md`](research/reliable-transport.md) + `decisions.md` 的 D43–D46 |
+| 加端口转发 / 多路复用 | [`DESIGN.md`](DESIGN.md) §3–4 + [`architecture/STAGE1-PORTFORWARD.md`](architecture/STAGE1-PORTFORWARD.md) |
+| 引入 gVisor 或 TUN | [`research/userspace-netstack.md`](research/userspace-netstack.md) 的约束章节 |
+| 提 PR 前自检 | [`CONVENTIONS.md`](CONVENTIONS.md) §6 检查清单 |
+| 部署一台中继 | [`../packaging/README.md`](../packaging/README.md) |
+| 理解多节点部署 | [`../deploy/MESH.md`](../deploy/MESH.md) |

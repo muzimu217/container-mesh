@@ -31,6 +31,7 @@ import (
 	"log/slog"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/muzimu217/container-mesh/internal/wsconn"
@@ -115,6 +116,16 @@ type Server struct {
 	contested map[string]contestState
 
 	limiter *ipLimiter
+
+	// Stats. These are counters rather than derived values because the room
+	// map is not a census of activity: an entry is deleted the moment two
+	// peers pair, so len(rooms) counts peers still waiting, not sessions
+	// running. A dashboard that reported it as "connections" would show zero
+	// during exactly the traffic it exists to display.
+	startedAt       time.Time
+	activeSessions  atomic.Int64
+	bytesRelayed    atomic.Int64
+	messagesRelayed atomic.Int64
 }
 
 // contestState records recent take-overs for one room label.
@@ -206,6 +217,7 @@ func New(cfg Config) *Server {
 		rooms:     make(map[string]*room),
 		contested: make(map[string]contestState),
 		limiter:   newIPLimiter(cfg.ConnectRatePerMin, cfg.MaxConnsPerIP),
+		startedAt: time.Now(),
 	}
 }
 
@@ -217,9 +229,17 @@ func (s *Server) Handler() http.Handler {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		fmt.Fprintln(w, "ok")
 	})
+	// /status is JSON for machines, /dashboard is the page for humans. Both are
+	// read-only and expose no room labels, addresses or codes.
+	mux.HandleFunc("/status", s.handleStatus)
+	mux.HandleFunc("/dashboard", s.handleDashboard)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		fmt.Fprintf(w, "container-mesh relay\nendpoint: %s?room=<code>&role=A|B\n", s.cfg.Path)
+		fmt.Fprintf(w, "container-mesh relay\nendpoint: %s?room=<code>&role=A|B\nstatus:   /status\ndashboard: /dashboard\n", s.cfg.Path)
 	})
 	return mux
 }
@@ -486,6 +506,9 @@ func (s *Server) removeWaiter(roomID, role string, w *waiter) {
 //
 // The relay is a dumb pipe: it does not parse, buffer or reorder.
 func (s *Server) splice(roomID string, a, b *wsconn.Conn) {
+	s.activeSessions.Add(1)
+	defer s.activeSessions.Add(-1)
+
 	var once sync.Once
 	shutdown := func(reason string) {
 		once.Do(func() {
@@ -524,6 +547,8 @@ func (s *Server) splice(roomID string, a, b *wsconn.Conn) {
 			forwardedMu.Lock()
 			forwarded[idx]++
 			forwardedMu.Unlock()
+			s.messagesRelayed.Add(1)
+			s.bytesRelayed.Add(int64(len(msg)))
 		}
 	}
 

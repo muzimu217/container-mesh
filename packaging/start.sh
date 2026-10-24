@@ -122,6 +122,8 @@ cat <<BANNER
 container-mesh relay
   listening   $BIND
   version     $("$bin" version | awk '{print $2}')
+  dashboard   http://<this-host>:$PORT/dashboard
+              (or, once reachable: $scheme://<host>:$PORT/dashboard)
 
   From another machine, connect with:
       --relay $relay_url

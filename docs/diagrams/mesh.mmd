@@ -1,0 +1,28 @@
+flowchart TB
+    subgraph NET["🌐 同一个身份下的网（N 台设备）"]
+        direction TB
+        L["💻 笔记本<br/>家里 NAT 后"]
+        S1["☁️ 云服务器<br/>公网 IP"]
+        S2["☁️ 云服务器<br/>公网 IP"]
+        K["📦 K8s Pod<br/>受限容器"]
+        N["🏠 NAS<br/>内网"]
+    end
+
+    L ==>|"直连 · 打洞"| S1
+    S1 ==>|"直连"| S2
+    K ==>|"直连"| S1
+    N -.->|"直连失败"| S1
+    L -.->|"直连失败"| N
+    S1 -.->|"经 S1 中转"| N
+    S2 -.->|"经 S1 中转"| K
+
+    D["🔍 发现节点<br/>任意成员可兼任<br/>只发成员信息，不碰数据"]:::disc
+    S1 <-.->|"心跳/成员广播"| D
+    L <-.->|"心跳/成员广播"| D
+    K <-.->|"心跳/成员广播"| D
+    N <-.->|"心跳/成员广播"| D
+
+    classDef disc fill:#fff2cc,stroke:#d6b656,stroke-width:2px
+    linkStyle 0,1,2 stroke:#82b366,stroke-width:3px
+    linkStyle 3,4,5,6 stroke:#b85450,stroke-width:2px,stroke-dasharray:5 5
+    linkStyle 7,8,9,10 stroke:#d6b656,stroke-width:1px

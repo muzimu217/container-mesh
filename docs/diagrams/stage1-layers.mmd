@@ -1,0 +1,26 @@
+flowchart TB
+    subgraph APP["应用层 · 用户的程序"]
+        A1["SSH / psql / curl / scp"]
+        A2["文件传输"]
+    end
+    subgraph BIZ["业务流 · yamux 多路复用"]
+        B1["转发流 kind=1"]
+        B2["控制流 kind=0"]
+    end
+    subgraph MUX["internal/mux · yamux 包装"]
+        M1["流数信号量 · CloseWrite · 日志接管"]
+    end
+    subgraph PUMP["internal/peer.Pump · 记录泵 ⭐ 顺序收敛点"]
+        P1["单读者 · 单写者 · 32 KiB 记录 · 有界阻塞队列"]
+    end
+    subgraph SEC["internal/secure · 加密"]
+        S1["SPAKE2 + HKDF + AES-256-GCM<br/>严格递增计数器"]
+    end
+    subgraph TRANS["传输层"]
+        T1["wsconn · WebSocket"]
+        T2["p2pquic · QUIC/UDP 直连"]
+    end
+    APP --> BIZ --> MUX --> PUMP --> SEC --> TRANS
+    SEC -.->|"⚠️ mux 不能放在这下面<br/>跨流乱序 → 计数器失步 → 解密必失败"| MUX
+    style PUMP fill:#ffe6cc,stroke:#d79b00,stroke-width:2px
+    style SEC fill:#d5e8d4,stroke:#82b366,stroke-width:2px

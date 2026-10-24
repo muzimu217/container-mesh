@@ -6,7 +6,6 @@ package cli
 import (
 	"flag"
 	"fmt"
-	"log/slog"
 	"os"
 
 	"github.com/muzimu217/container-mesh/internal/relay"
@@ -29,11 +28,20 @@ func runRelay(args []string) error {
 		return ExitError{Code: 2, Err: err}
 	}
 
-	level := slog.LevelInfo
-	if *verbose {
-		level = slog.LevelDebug
+	logger := setupLogging(*verbose)
+
+	// Announce the listening address unconditionally. It is the one line a
+	// user needs after starting a relay: without it there is no way to know
+	// the process came up, and the log-level filter must not swallow it.
+	scheme := "ws"
+	if *tlsCert != "" {
+		scheme = "wss"
 	}
-	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
+	fmt.Fprintf(os.Stderr, "relay listening on %s://%s%s\n", scheme, *addr, *path)
+	fmt.Fprintf(os.Stderr, "  dashboard: http://%s/dashboard\n", *addr)
+
+	// Let the dashboard report the same version string `cmesh version` prints.
+	relay.SetVersion(Version)
 
 	srv := relay.New(relay.Config{
 		Addr:        *addr,
@@ -42,7 +50,7 @@ func runRelay(args []string) error {
 		MaxRooms:    *maxRooms,
 		TLSCert:     *tlsCert,
 		TLSKey:      *tlsKey,
-		Logger:      log,
+		Logger:      logger,
 	})
 	if err := srv.ListenAndServe(); err != nil {
 		return fmt.Errorf("relay: %w", err)

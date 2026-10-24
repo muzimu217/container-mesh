@@ -1,0 +1,21 @@
+flowchart LR
+    subgraph LAP["💻 你的笔记本<br/>零入站端口"]
+        L1["cmesh send / recv<br/>cmesh forward -L"]
+    end
+    subgraph RELAY["🌐 中继服务器<br/>唯一需要入站端口的角色"]
+        R1["/ws  数据面（只转发密文）"]
+        R2["/status  状态 JSON"]
+        R3["/dashboard  看板"]
+    end
+    subgraph CTR["📦 受限容器<br/>零入站端口 · 无 root · 无 TUN"]
+        C1["cmesh recv<br/>cmesh forward --accept"]
+    end
+    subgraph TGT["目标服务"]
+        G1["127.0.0.1:5432"]
+    end
+    L1 -->|"出站 WS"| R1
+    C1 -->|"出站 WS"| R1
+    C1 -->|"本地 TCP"| G1
+    L1 -.->|"可选：P2P 打洞后直连<br/>（默认关闭）"| C1
+    style RELAY fill:#dae8fc,stroke:#6c8ebf,stroke-width:2px
+    style CTR fill:#f8cecc,stroke:#b85450,stroke-width:2px

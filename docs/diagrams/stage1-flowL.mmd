@@ -1,0 +1,17 @@
+sequenceDiagram
+    autonumber
+    participant App as 应用
+    participant A as 节点A (-L)
+    participant B as 节点B (--accept)
+    participant T as 目标服务
+    App->>A: TCP connect 127.0.0.1:8080
+    A->>A: ① pending 上限检查
+    A->>B: ② OpenStream(kind=1)
+    B->>B: ③ --accept 检查（不读 preamble）
+    A->>B: ④ Preamble{kind=direct, "db:5432"}
+    B->>B: ⑤ 令牌桶
+    B->>B: ⑥ 白名单（返回具体 IP）
+    B->>T: ⑦ 拨号（只用该 IP）
+    B-->>A: Status(OK)
+    A-->>App: 双向字节流 + 半关闭传播
+    Note over B,T: ③⑤⑥ 全部在 ⑦ 之前<br/>顺序反了 = 给对端一个端口扫描器

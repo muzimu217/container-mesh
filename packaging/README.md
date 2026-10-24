@@ -11,18 +11,33 @@
 
 ```
 cmesh-demo/
-├── cmesh-linux-amd64    # x86_64 机器用这个
-├── cmesh-linux-arm64    # ARM64（含 Apple Silicon 上的 Linux 容器）用这个
-├── start.sh             # 一键起中继
-├── stop.sh              # 停掉后台中继
-└── README.md            # 本文件
+├── cmesh-linux-amd64         # x86_64 服务器
+├── cmesh-linux-arm64         # ARM64 服务器（含云厂商的 ARM 实例）
+├── cmesh-darwin-arm64        # Apple Silicon Mac（M1/M2/M3…）
+├── cmesh-darwin-amd64        # Intel Mac
+├── cmesh-windows-amd64.exe   # Windows 64 位
+├── start.sh                  # 一键起中继（Linux）
+├── stop.sh                   # 停掉后台中继
+└── README.md                 # 本文件
 ```
 
-`start.sh` 会自己按 `uname -m` 选二进制，不用你判断。
+**同一个包同时覆盖服务端和桌面端。** 全部是静态二进制，不需要装 Go、不需要装运行库。
+
+| 你的机器 | 用哪个 | 备注 |
+|---|---|---|
+| Linux 服务器 | `cmesh-linux-amd64` / `-arm64` | `start.sh` 会自动选 |
+| Mac（Apple Silicon） | `cmesh-darwin-arm64` | 直接在终端跑 |
+| Mac（Intel） | `cmesh-darwin-amd64` | |
+| Windows | `cmesh-windows-amd64.exe` | 在 PowerShell 或 cmd 里跑 |
+
+> **macOS 首次运行**会被 Gatekeeper 拦一次（未签名）。解决办法：
+> `xattr -d com.apple.quarantine cmesh-darwin-arm64`，或在「系统设置 → 隐私与安全性」里点「仍要打开」。
+
+`start.sh` 只在 Linux 上有意义（它是给服务器一键起中继用的）；桌面端直接调二进制即可。
 
 ---
 
-## 二、三步跑起来
+## 二、四步跑起来
 
 ### 1. 上传并解压
 
@@ -56,7 +71,30 @@ container-mesh relay
 > **后台运行**：`-d` 会把中继放到后台，日志写到 `./relay.log`。
 > 想直接前台看日志就去掉 `-d`。
 
-### 3. 确认它活着
+### 3. 打开看板（可选但推荐）
+
+中继自带一个单页状态看板，浏览器直接打开：
+
+```
+http://<服务器地址>:8080/dashboard
+```
+
+它显示活跃会话数、等待中的对端、累计转发的字节/消息、进程 goroutine 数，
+每 2 秒刷新。**纯静态页面，不请求任何外部资源**（没有 CDN、没有字体外链），
+断网也能显示。
+
+同一份数据有 JSON 版，方便脚本或监控抓取：
+
+```bash
+curl -s http://127.0.0.1:8080/status
+```
+
+> 看板**不显示**房间号、对端地址或任何 code 相关信息——这是刻意的：
+> 房间号是 code 的派生值，暴露它等于给出一个可离线攻击的校验值。
+
+如果通过 nginx 反代访问，注意 `/dashboard` 和 `/status` 也要一并转发。
+
+### 4. 确认它活着
 
 ```bash
 ./cmesh-linux-amd64 version
@@ -74,12 +112,22 @@ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8080/ws
 
 ### A. 用同一个包里的二进制（推荐）
 
-把 `cmesh-linux-amd64` 或 `cmesh-linux-arm64` 拷到本地。
+包里已经包含你本地要用的那个：
 
-- **Linux x86_64 / ARM64**：直接 `chmod +x` 后使用。
-- **macOS（Intel / Apple Silicon）**：这两个是 Linux 二进制，不能直接在 macOS 上跑。
-  用 `go install github.com/muzimu217/container-mesh/cmd/cm@develop`（需要 Go 1.24+），
-  或者用 Docker：`docker run --rm -it -v $PWD:/w -w /w golang:1.24 go run github.com/muzimu217/container-mesh/cmd/cm@develop ...`
+```bash
+# macOS（Apple Silicon）
+chmod +x cmesh-darwin-arm64
+xattr -d com.apple.quarantine cmesh-darwin-arm64 2>/dev/null || true
+./cmesh-darwin-arm64 version
+
+# macOS（Intel）
+chmod +x cmesh-darwin-amd64
+
+# Windows（PowerShell）
+.\cmesh-windows-amd64.exe version
+```
+
+不需要装 Go，也不需要 Docker。
 
 ### B. 传文件
 
@@ -213,6 +261,7 @@ curl -s -o /dev/null -w '%{http_code}\n' http://你的域名/cmesh/    # 期望 
 |---|---|---|---|
 | 1 | 二进制能跑 | `./cmesh-linux-amd64 version` | 打印版本号 |
 | 2 | 中继在监听 | `curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/ws` | `400` |
+| 2b | 看板可打开 | 浏览器打开 `http://<host>:8080/dashboard` | 显示数字，状态点亮绿色 |
 | 3 | 本机自环传消息 | `./cmesh-linux-amd64 send --relay ws://127.0.0.1:8080/ws --code demo1234 --message hi`（另开终端先起 `recv`） | 收到 `hi` |
 | 4 | 本机自环传文件 | 同上但用 `--file` | SHA-256 一致 |
 | 5 | 跨机连通 | 从你本地 `send` 到云主机 `recv` | SAS 相同、文件校验通过 |
@@ -261,6 +310,12 @@ rm -rf /tmp/cmesh-demo
 **两端一直配不上对**
 99% 是 `--code` 不一致。房间号由 code 派生，code 不同就永远在两个房间。
 用 `--pair-window 8s` 让它快速失败而不是干等。
+
+**但如果你看到 `no partner appeared within 25s` 反复出现，先看是不是给接收端
+加了 `--stay=false`。** 一次性模式会把配对窗口压到 25 秒、总共 6 次尝试，
+也就是 150 秒预算；对方晚到一点就错过。**接收端去掉 `--stay=false`
+（用默认值）在单 relay 下是无限等待的**，这才是「先起接收端等发送端」该用的模式。
+确实需要一次性退出时，显式给预算：`--pair-window 4m`（6 × 4m = 24 分钟）。
 
 **端口转发报 `denied`**
 看对端日志里的 `reason`：`--accept` 是否开了、`--allow-host` / `--allow-port`
