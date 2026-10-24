@@ -75,6 +75,11 @@ print('bbox', bb, 'colors', len(im.getcolors(maxcolors=2000000) or []))
 "
 ```
 
-> 踩过的坑：模板里用 f-string 拼 JS 时，`{` 会被 Python 当作占位符，
-> 导致 `.catch(function(e){...})` 被吃掉、页面永远停在 `loading`。
-> 现在用 `tpl.replace('__SRC__', ...)` 而不是 f-string。
+> 踩过的两个坑：
+> 1. 模板里用 f-string 拼 JS 时，`{` 会被 Python 当作占位符，
+>    导致 `.catch(function(e){...})` 被吃掉、页面永远停在 `loading`。
+> 2. 即使改用 `tpl.replace('__SRC__', ...)`，当 `.mmd` 源码包含会破坏
+>    行内 `<script>` 的字符时注入仍会失败（症状：105×62 的白图）。
+>
+> 可靠做法是**把 SRC 写进独立的 `.js` 文件**、HTML 用 `<script src>` 加载，
+> 渲染完删除临时文件。上面的循环脚本已按此更新。

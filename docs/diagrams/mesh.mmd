@@ -1,28 +1,31 @@
 flowchart TB
     subgraph NET["🌐 同一个身份下的网（N 台设备）"]
         direction TB
-        L["💻 笔记本<br/>家里 NAT 后"]
-        S1["☁️ 云服务器<br/>公网 IP"]
-        S2["☁️ 云服务器<br/>公网 IP"]
-        K["📦 K8s Pod<br/>受限容器"]
-        N["🏠 NAS<br/>内网"]
+        L["💻 笔记本 laptop<br/>家里 NAT 后"]
+        S1["☁️ 云服务器 S1<br/>公网 IP"]
+        S2["☁️ 云服务器 S2<br/>公网 IP"]
+        K["📦 K8s Pod pod-1<br/>受限容器"]
+        N["🏠 NAS nas<br/>内网"]
+
+        D["🔍 发现节点（S1 兼任）<br/>任意成员可兼任<br/>只发成员信息，不碰数据"]:::disc
     end
 
+    %% 直连：任何能出站的节点都能直接连上公网 IP 的 S1/S2
     L ==>|"直连 · 打洞"| S1
     S1 ==>|"直连"| S2
-    K ==>|"直连"| S1
-    N -.->|"直连失败"| S1
-    L -.->|"直连失败"| N
-    S1 -.->|"经 S1 中转"| N
-    S2 -.->|"经 S1 中转"| K
+    K ==>|"直连（出站到公网 IP）"| S1
+    N ==>|"直连（出站到公网 IP）"| S1
 
-    D["🔍 发现节点<br/>任意成员可兼任<br/>只发成员信息，不碰数据"]:::disc
-    S1 <-.->|"心跳/成员广播"| D
-    L <-.->|"心跳/成员广播"| D
-    K <-.->|"心跳/成员广播"| D
-    N <-.->|"心跳/成员广播"| D
+    %% 中转：两个都在 NAT 后的节点互相不可达，经 S1 转发
+    L -.->|"经 S1 中转"| N
+    K -.->|"经 S1 中转"| N
+
+    %% 发现：成员心跳，D 在网内
+    L <-.->|"心跳 30s / 推送"| D
+    K <-.->|"心跳 30s / 推送"| D
+    N <-.->|"心跳 30s / 推送"| D
 
     classDef disc fill:#fff2cc,stroke:#d6b656,stroke-width:2px
-    linkStyle 0,1,2 stroke:#82b366,stroke-width:3px
-    linkStyle 3,4,5,6 stroke:#b85450,stroke-width:2px,stroke-dasharray:5 5
-    linkStyle 7,8,9,10 stroke:#d6b656,stroke-width:1px
+    linkStyle 0,1,2,3 stroke:#82b366,stroke-width:3px
+    linkStyle 4,5 stroke:#b85450,stroke-width:2px,stroke-dasharray:5 5
+    linkStyle 6,7,8 stroke:#d6b656,stroke-width:1px

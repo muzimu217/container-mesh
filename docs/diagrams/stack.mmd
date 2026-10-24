@@ -1,40 +1,42 @@
 flowchart TB
     subgraph L4["④ 应用能力"]
         direction LR
-        A1["消息"] ~~~ A2["文件传输"] ~~~ A3["端口转发"]
+        A1["消息"] ~~~ A2["文件传输（512 KiB 应用块）"] ~~~ A3["端口转发 -L/-R"]
     end
-    subgraph L3["③ 端到端加密 · X25519 + AES-GCM ⭐新增<br/>中转节点解不开这一层"]
+    subgraph L3a["③ 路由（3a）⭐新增"]
         direction LR
-        E1["deviceID_A ↔ deviceID_B"]
+        R1["距离向量"] ~~~ R2["实测 RTT"] ~~~ R3["中转配额"]
     end
-    subgraph L2["③ 路由 · 距离向量 + 实测 RTT ⭐新增<br/>直连优先 → 失败经成员中转 → 配额限制"]
-        direction LR
-        R1["选路"] ~~~ R2["路径切换"] ~~~ R3["防环"]
+    subgraph L3b["③ 端到端加密（3b）⭐新增 · SIGMA/X25519 + AES-256-GCM"]
+        E1["密钥只有通信双方持有 · 中转节点解不开"]
     end
-    subgraph L1["② 连接（复用阶段 1）"]
+    subgraph L2["② 连接（复用阶段 1）"]
         direction LR
-        C1["打洞 STUN"] ~~~ C2["QUIC 直连"] ~~~ C3["WebSocket 中转"]
+        C1["打洞 STUN"] ~~~ C2["QUIC 直连"] ~~~ C3["WS 中转"]
     end
-    subgraph L0["② 多路复用 + 会话加密（复用阶段 1）"]
-        direction LR
-        M1["记录泵 32 KiB"] ~~~ M2["yamux"] ~~~ M3["SPAKE2 每跳独立"]
+    subgraph L2m["② 干线复用 · 记录泵 32 KiB + yamux（每跳独立，承载多条隧道）"]
+        M1["干线复用"]
     end
-    subgraph LA["① 发现 ⭐新增"]
+    subgraph L1["① 发现 ⭐新增"]
         direction LR
-        D1["成员列表"] ~~~ D2["心跳 30s"] ~~~ D3["地址广播"]
+        D1["成员列表"] ~~~ D2["断连检测 ≤10s · 心跳 30s 兜底"] ~~~ D3["版本化广播"]
     end
-    subgraph LB["⓪ 身份 ⭐新增"]
+    subgraph L0["⓪ 身份 ⭐新增"]
         direction LR
-        I1["Ed25519 密钥对"] ~~~ I2["账号 → 设备证书"] ~~~ I3["撤销 = 删公钥"]
+        I1["Ed25519 设备密钥"] ~~~ I2["账号→设备证书"] ~~~ I3["撤销=删公钥+主动广播"]
     end
 
-    L4 --> L3 --> L2 --> L1 --> L0
-    L0 -.-> LA -.-> LB
+    L4 --> L3a
+    L3a --- L3b
+    L3b --> L2
+    L2 --- L2m
+    L2m -.-> L1
+    L1 -.-> L0
 
-    style L3 fill:#ffe6cc,stroke:#d79b00,stroke-width:2px
-    style L2 fill:#ffe6cc,stroke:#d79b00,stroke-width:2px
-    style LA fill:#ffe6cc,stroke:#d79b00,stroke-width:2px
-    style LB fill:#ffe6cc,stroke:#d79b00,stroke-width:2px
-    style L1 fill:#d5e8d4,stroke:#82b366
-    style L0 fill:#d5e8d4,stroke:#82b366
+    style L3a fill:#ffe6cc,stroke:#d79b00,stroke-width:2px
+    style L3b fill:#ffe6cc,stroke:#d79b00,stroke-width:2px
+    style L1 fill:#ffe6cc,stroke:#d79b00,stroke-width:2px
+    style L0 fill:#ffe6cc,stroke:#d79b00,stroke-width:2px
+    style L2 fill:#d5e8d4,stroke:#82b366
+    style L2m fill:#d5e8d4,stroke:#82b366
     style L4 fill:#dae8fc,stroke:#6c8ebf
