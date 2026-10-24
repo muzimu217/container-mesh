@@ -108,12 +108,20 @@ package identity
 type Device struct {
     priv    ed25519.PrivateKey
     pub     ed25519.PublicKey
-    // ID is base32(sha256(pub))[:16]. Short enough to read aloud, long
-    // enough that collisions are not a concern at mesh scale.
+    // ID is base32(SHA-256(pub))[:16] — that is 16 base32 CHARACTERS
+    // (= 80 bits of the digest), NOT 16 bytes and NOT hex. Written out
+    // for the implementer because "[:16]" on a byte slice versus on a
+    // hex string versus on a base32 string are three different lengths,
+    // and PR-M1 (identity) and PR-M4 (mesh) must agree byte-for-byte.
+    //
+    // Canonical form: base32.StdEncoding.WithPadding(NoPadding),
+    // lowercase. Example length: exactly 16 runes.
     ID      DeviceID
 }
 
-type DeviceID string // 16 chars, base32
+// DeviceID is exactly 16 lowercase base32 characters (80 bits).
+// Not hex, not raw bytes — see the field comment above.
+type DeviceID string
 
 // Generate creates a fresh identity. Called once per machine, by `cmesh init`.
 func Generate() (*Device, error)
@@ -160,6 +168,23 @@ func (c *DeviceCert) Verify(accountPub ed25519.PublicKey) error
 // Revocation. A mesh keeps a member list; removing a deviceID from it
 // revokes that device. Because the data plane authenticates per device,
 // no key rotation is needed -- the removed key simply stops being accepted.
+//
+// IMMEDIACY (this is the part a review caught missing): a removed key stops
+// being accepted at the next handshake, but an ALREADY-ESTABLISHED e2e
+// session holds a cached symmetric key and would keep working. So removal
+// must also broadcast: the MemberList version bumps, the discovery node
+// pushes it on the Subscribe stream (push, not poll -- that is why
+// Subscribe exists), and every node that receives a higher version with
+// deviceID X removed tears down X's active e2e.Session and drops X's
+// route-table entries. Target: a revoked device loses its live sessions
+// within one push round-trip, not within a heartbeat period.
+//
+// Partitions: a revoked node that never hears the broadcast keeps its cached
+// sessions until reconnect. Mitigation: every e2e frame carries the member-
+// list version it was sealed under; on receipt the receiver compares, and a
+// session whose version is older than a revocation it knows about is dropped.
+// The revoked side cannot forge a newer version -- it cannot sign as a member
+// it no longer is.
 type MemberList struct {
     AccountID string
     Members   map[DeviceID]Member
@@ -248,9 +273,29 @@ package e2e
 
 // Session encrypts between two deviceIDs, regardless of how many hops
 // carry the bytes. A relay in the middle sees ciphertext and nothing else.
+//
+// STREAMS INSIDE THE SESSION (a review caught this undefined): the per-hop
+// yamux cannot give A and C end-to-end streams -- B terminates it. So the
+// e2e.Session itself is a byte stream, and a SECOND yamux runs INSIDE it:
+//
+//   direct:   [app streams] -> yamux(e2e) -> E2E AEAD -> QUIC stream
+//   relayed:  [app streams] -> yamux(e2e) -> E2E AEAD -> yamux(trunk,A-B)
+//                                          -> hop conn -> yamux(trunk,B-C)
+//
+// B sees one trunk stream carrying opaque bytes; the A<->C stream structure
+// is inside the ciphertext. The cost is one extra mux header layer, which
+// we accept because it reuses the stage-1 machinery unchanged (P-3 must
+// still be measured; if the double header costs too much, the fallback is
+// an explicit StreamID+window field in FrameMeshData, documented in X-risk
+// table X8).
 type Session struct {
     // ...
 }
+
+// Streams returns the end-to-end multiplexer: many streams between the two
+// endpoints, invisible to any relay. This is what forward.Manager's
+// Provider hands out, so stage-1 -L/-R mounts on it unchanged (see PR-M5).
+func (s *Session) Streams() *mux.Session
 
 // Handshake performs an X25519 exchange, authenticated by both devices'
 // Ed25519 identity keys (the signatures prove who did the ECDH, which is
@@ -266,11 +311,24 @@ func Handshake(who *identity.Device, peer identity.DeviceID,
 // wrapped so the relay sees only opaque bytes plus the next-hop address.
 func (s *Session) Seal(f *wire.Frame) ([]byte, error)
 func (s *Session) Open(b []byte) (*wire.Frame, error)
+
+// CipherSuite is negotiated in the handshake, one byte:
+//   0x01 = AES-256-GCM        (default; hardware-accelerated with AES-NI)
+//   0x02 = ChaCha20-Poly1305  (for low-power ARM without AES-NI)
+// The byte exists so the choice is explicit on the wire rather than implied
+// by the build; unknown values fall back to refusing the handshake rather
+// than guessing, so a future suite can be added without a version bump.
+func (s *Session) CipherSuite() byte
 ```
 
 **为什么不用 SPAKE2**（阶段 1 的选择）：SPAKE2 的前提是双方共享一个口令。
 组网里双方共享的是**公钥**，正确原语是签名认证的 ECDH（SIGMA 模式）。
-SPAKE2 保留给阶段 1 的兼容路径。
+
+**组网会话从建立起只有一层用户态 AEAD（E2E），不再叠加逐跳 SPAKE2。**
+早一版图示曾把两者叠加，加上 QUIC 自带的 TLS 共三重 AEAD，用户态跑两遍
+AES-GCM，直接威胁 P-3 的 200 MiB/s。E2E 的签名认证已提供 SPAKE2 的全部
+功能，逐跳再加密一次不增加攻击者需要攻破的任何东西。SPAKE2 只保留在
+阶段 1 兼容路径上，两条路径不混用。
 
 ### 2.4 路由层（`internal/mesh`）
 
@@ -371,6 +429,12 @@ const (
     // FrameMeshRelayReq asks the peer to forward to a third deviceID.
     // Payload: encrypted {to DeviceID, ttl int}.
     FrameMeshRelayReq
+
+    // FrameMeshMembers carries a versioned MemberList push: joins, leaves,
+    // and REVOCATIONS. Every e2e frame also carries the member-list version
+    // it was sealed under, so a node that knows about a revocation drops a
+    // session still running on an older version (see identity.MemberList).
+    FrameMeshMembers
 
     // FrameMeshRelayAns answers it: ok / refused (quota) / unreachable.
     FrameMeshRelayAns
@@ -512,7 +576,8 @@ cmesh://join?acct=<accountID>&disc=<discovery-addr>&k=<account-pub-b32>
 |---|---|---|
 | M1 | 3 节点、1 发现节点，全部直连 | `status` 互相可见 ≤10 s；两两 `mesh ping` < 5 ms（同机） |
 | M2 | 阻断 A↔C 直连（iptables DROP UDP） | 10 s 内 A→C 自动经 B；仍可传文件且哈希一致 |
-| M3 | 撤销 B | B 的连接被断开且无法重连；A↔C 不受影响 |
+| M3 | 撤销 B | B 的活跃 e2e 会话在一个推送往返内被销毁；B 无法重连；A↔C 不受影响 |
+| M3b | `kill -9` 一个节点 | 其余节点 ≤10 s 内感知（传输层断连检测，非心跳等待） |
 | M4 | 中转配额 | 打满 20 条流后第 21 条被拒；B 自身吞吐不受影响 |
 | M5 | 发现节点下线 | 成员拓扑靠既有连接维持 ≥60 s；发现节点回来后收敛 |
 | M6 | 中转节点抓包 | 只有密文（`tcpdump` + 人工检查） |
@@ -583,6 +648,7 @@ cmesh://join?acct=<accountID>&disc=<discovery-addr>&k=<account-pub-b32>
 | 交付 | 内容 |
 |---|---|
 | `cmesh status` 完整输出 | 成员、RTT、路由路径、配额状态 |
+| **阶段 1 转发挂载到组网** | `e2e.Session.Streams()` 暴露为 `*mux.Session`；`forward.Manager` 的 `Provider` 在组网模式下返回它，于是 `-L`/`-R` 按设备名工作（`cmesh forward -L 8080:nas:5432`），**阶段 1 的 forward 代码零改动**——它只认 `Mux` 接口，不关心底下是直连 yamux 还是 e2e 内的 yamux |
 | README / MESH.md 更新 | 组网上手指南 |
 | e2e 脚本扩展 | M1–M7 全部进 `tests/run-tests.sh --mesh` |
 
@@ -601,6 +667,7 @@ cmesh://join?acct=<accountID>&disc=<discovery-addr>&k=<account-pub-b32>
 | X5 | 撤销广播丢失（分区时） | 中 | MemberList 带版本号，重连时比较并同步 |
 | X6 | 恶意成员谎报 RTT 抢中转流量 | 低 | 实测 RTT 自己算，不信广播值 |
 | X7 | 旧 relay 不支持 `/mesh/*` | 低 | 组网客户端探测失败即跳过该节点（caps 协商） |
+| X8 | e2e 内再跑一层 yamux 的双重复用开销超出预算 | 中 | PR-M4 验收含 MP-2/MP-3；不达标则改为 `FrameMeshData` 帧头显式 StreamID+滑动窗口（实现更少复用、更多新代码，约 +200 行） |
 
 ---
 

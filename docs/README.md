@@ -53,6 +53,7 @@
 | [`architecture/STAGE1-PORTFORWARD.md`](architecture/STAGE1-PORTFORWARD.md) | 阶段 1 详细设计：包结构、Go 接口、协议扩展、CLI、四层防御、测试计划（含 4 项混沌测试）、按 PR 拆分的实施路线 |
 | [`architecture/REVIEW-RESPONSE-STAGE1.md`](architecture/REVIEW-RESPONSE-STAGE1.md) | 对 5 项架构质疑 + 4 项混沌测试要求的逐条答复（含没照办的两处及理由） |
 | [`architecture/MESH-DESIGN.md`](architecture/MESH-DESIGN.md) | **阶段 2（组网）详细设计**：身份/发现/路由/e2e 的 Go 接口、线协议、CLI、威胁模型、5 个 PR 的拆分。可直接指导编码 |
+| [`architecture/REVIEW-RESPONSE-MESH.md`](architecture/REVIEW-RESPONSE-MESH.md) | 对组网设计首轮外部评审的逐条答复：10 项接受、2 项部分、2 项不实（附原文核对） |
 
 ### 研究报告
 
