@@ -530,12 +530,23 @@ func (s *Server) splice(roomID string, a, b *wsconn.Conn) {
 	done := make(chan struct{}, 2)
 	pump := func(src, dst *wsconn.Conn, dir string, idx int) {
 		defer func() { done <- struct{}{} }()
+		// One buffer per direction, threaded through RecvInto. The splice
+		// pattern is recv->send->recv, so the bytes are dead once Send
+		// returns and the buffer can be reused — this removes the
+		// per-message allocation of Recv's ReadMessage path (measured: 157
+		// KiB and 32 allocs per 32 KiB message before).
+		//
+		// dst.Send copies into gorilla's write buffer or writes straight
+		// through, so aliasing the read buffer across the Send call is safe;
+		// the buffer is only handed back to RecvInto after Send returns.
+		buf := make([]byte, 64<<10)
 		for {
-			msg, err := src.Recv()
+			msg, err := src.RecvInto(buf)
 			if err != nil {
 				shutdown(dir + " recv: " + err.Error())
 				return
 			}
+			buf = buf[:cap(buf)]
 			if int64(len(msg)) > s.cfg.MaxMessageBytes {
 				shutdown(dir + " message too large")
 				return
