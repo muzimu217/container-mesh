@@ -26,6 +26,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"sync"
@@ -296,3 +297,60 @@ func (c *Conn) RemoteAddr() net.Addr {
 
 // ErrClosed is returned when the peer closed the connection.
 var ErrClosed = errors.New("wsconn: connection closed")
+
+// RecvInto reads one binary message into buf, returning the buffer (grown if
+// the message needed more room).
+//
+// It exists for the relay splice loop, whose pattern is recv→send→recv: the
+// received bytes are dead once Send returns, so threading one buffer through
+// the loop removes the per-message allocation that Recv's ReadMessage path
+// pays. It reads via NextReader + io.ReadFull into the caller's buffer.
+//
+// The returned slice aliases buf; do not retain it across the next RecvInto
+// on the same connection. Callers that keep the bytes must use Recv.
+func (c *Conn) RecvInto(buf []byte) ([]byte, error) {
+	c.readMu.Lock()
+	defer c.readMu.Unlock()
+	for {
+		if c.live.PingEvery > 0 {
+			_ = c.ws.SetReadDeadline(time.Now().Add(c.live.timeout()))
+		}
+		mt, r, err := c.ws.NextReader()
+		if err != nil {
+			c.markGone()
+			return nil, err
+		}
+		if mt != websocket.BinaryMessage {
+			// Drain and ignore non-binary frames the same way Recv does.
+			_, _ = io.Copy(io.Discard, r)
+			continue
+		}
+		n := 0
+		for {
+			m, err := r.Read(buf[n:])
+			n += m
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				c.markGone()
+				return nil, err
+			}
+			if n == len(buf) {
+				// The message is larger than the buffer: grow once, doubled.
+				bigger := make([]byte, len(buf)*2)
+				copy(bigger, buf)
+				buf = bigger
+			}
+		}
+		return buf[:n], nil
+	}
+}
+
+// sendRawText writes one text frame, bypassing the binary-only Send. It
+// exists for tests that need Recv/RecvInto to see a non-binary frame.
+func (c *Conn) sendRawText(s string) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	return c.ws.WriteMessage(1, []byte(s))
+}
