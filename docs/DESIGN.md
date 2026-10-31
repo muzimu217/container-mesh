@@ -263,7 +263,7 @@ cmd/cm
 
 | 包 | 改动 | 理由 |
 |---|---|---|
-| `internal/relay` | 从「两人配对」改为「成员列表广播」 | 现在是 `roles["A"]`/`roles["B"]` 硬编码（`relay.go:318`），要改成成员集合 |
+| `internal/relay` | 从「两人配对」改为「成员列表广播」 | 现在是 role 只允许 A/B 两个值（`relay.go:318` 校验 + roles map 两槽结构），要改成成员集合 |
 | `internal/wire` | 新增身份/发现/路由帧类型 | 纯增量，不升版本号（C-4） |
 | `internal/peer` | 会话层之上插入端到端层 | 记录泵不变 |
 | `internal/cli` | 新增 `init` / `join` / `status` / `dial` / `serve-discovery` | |

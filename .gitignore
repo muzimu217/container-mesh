@@ -26,3 +26,6 @@ probe.json
 
 # 服务器迁移备份（含生产 .env 与数据库 dump，绝不入库）
 /.migration-backup/
+.mimosa/
+.codeartsdoer/
+.team/verify/

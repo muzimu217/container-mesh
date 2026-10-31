@@ -291,3 +291,141 @@ func truncate(s string, n int) string {
 	}
 	return s[:n] + "..."
 }
+
+// --- security fixes from the Round 4 external review ---
+
+// TestEndpointRejectsControlCharacters is the log-injection guard: the review
+// found "evil\nFAKE:80" passed validEndpoint, which would have put a newline
+// into every downstream log and terminal that prints an endpoint.
+func TestEndpointRejectsControlCharacters(t *testing.T) {
+	f := newFixture(t, 1)
+	key := deviceKey(t, f, f.devices[0].ID())
+	bad := [][]string{
+		{"a\nb:80"}, {"a\rb:80"}, {"a\tb:80"}, {"a\x1bb:80"},
+		{"evil\nFAKE:80"}, {"\x7f:80"},
+	}
+	for _, eps := range bad {
+		a := announceFor(f.devices[0], eps)
+		sig := a.Sign(f.devices[0])
+		if err := a.Validate(key, sig, testNow); err == nil {
+			t.Fatalf("endpoints %q accepted", eps)
+		}
+	}
+}
+
+// TestEndpointRejectsMalformedHosts closes the remaining shapes the review
+// enumerated: "@:80" and "a b:80" both pass SplitHostPort but are not
+// diallable addresses in any useful sense.
+func TestEndpointRejectsMalformedHosts(t *testing.T) {
+	f := newFixture(t, 1)
+	key := deviceKey(t, f, f.devices[0].ID())
+	for _, e := range []string{"@:80", "a b:80"} {
+		a := announceFor(f.devices[0], []string{e})
+		sig := a.Sign(f.devices[0])
+		if err := a.Validate(key, sig, testNow); err == nil {
+			t.Fatalf("endpoint %q accepted", e)
+		}
+	}
+}
+
+// TestValidateRejectsWrongLengthKey guards the panic: ed25519.Verify panics
+// on a non-32-byte public key instead of returning an error (verified
+// empirically), so a malformed member record reaching the list would turn a
+// validation call into a crash.
+func TestValidateRejectsWrongLengthKey(t *testing.T) {
+	f := newFixture(t, 1)
+	a := announceFor(f.devices[0], []string{"1.2.3.4:80"})
+	sig := a.Sign(f.devices[0])
+	// A truncated key: not nil (so the membership check passes shape-wise)
+	// but the wrong length.
+	bad := make([]byte, 5)
+	if err := a.Validate(bad, sig, testNow); err != ErrAnnounceBadSignature {
+		t.Fatalf("wrong-length key = %v, want ErrAnnounceBadSignature (not a panic)", err)
+	}
+}
+
+// TestRegisterRefusesNonMember is the structural backstop: Register must
+// refuse to record state for a device that is not in the member list, even
+// if the caller skipped Validate entirely.
+func TestRegisterRefusesNonMember(t *testing.T) {
+	f := newFixture(t, 1)
+	n := NewNode(f.members)
+
+	outsider, _ := identity.Generate()
+	changed := n.Register(announceFor(outsider, []string{"9.9.9.9:9"}), testNow)
+	if changed {
+		t.Fatal("Register recorded state for a non-member")
+	}
+	if _, ok := n.LastSeen(outsider.ID()); ok {
+		t.Fatal("non-member has liveness after Register")
+	}
+}
+
+// TestRegisterCopiesEndpoints guards against aliasing: the announce's
+// Endpoints slice belongs to the caller (a transport buffer), so storing the
+// reference would let a later message silently rewrite recorded state.
+func TestRegisterCopiesEndpoints(t *testing.T) {
+	f := newFixture(t, 1)
+	n := NewNode(f.members)
+
+	eps := []string{"1.2.3.4:80"}
+	a := announceFor(f.devices[0], eps)
+	n.Register(a, testNow)
+
+	// Mutate the caller's slice; the recorded endpoints must not change.
+	eps[0] = "evil:9999"
+	if got := n.Endpoints(f.devices[0].ID()); len(got) != 1 || got[0] != "1.2.3.4:80" {
+		t.Fatalf("recorded endpoints aliased the caller's slice: %v", got)
+	}
+}
+
+// TestSubscribeSecondClosesFirst ensures a re-Subscribe does not orphan the
+// first subscriber on a channel nobody will ever signal.
+func TestSubscribeSecondClosesFirst(t *testing.T) {
+	f := newFixture(t, 1)
+	n := NewNode(f.members)
+
+	ch1, unsub1 := n.Subscribe(f.devices[0].ID())
+	defer unsub1()
+	ch2, _ := n.Subscribe(f.devices[0].ID())
+
+	select {
+	case _, ok := <-ch1:
+		if ok {
+			t.Fatal("first channel received a value; want close")
+		}
+	default:
+		t.Fatal("first channel not closed after second Subscribe")
+	}
+	// The second channel must still be live.
+	select {
+	case <-ch2:
+		t.Fatal("second channel signalled before any change")
+	default:
+	}
+}
+
+// TestInviteRejectsTooManyDiscoveryAddrs mirrors MaxEndpoints for invites:
+// an unbounded disc append is the same memory-amplification face.
+func TestInviteRejectsTooManyDiscoveryAddrs(t *testing.T) {
+	f := newFixture(t, 1)
+	inv := Invite{
+		AccountID:  f.acc.ID(),
+		AccountPub: f.acc.PublicKey(),
+		IssuedAt:   testNow,
+	}
+	for i := 0; i < MaxEndpoints+1; i++ {
+		inv.DiscoveryAddrs = append(inv.DiscoveryAddrs, "10.0.0.1:80")
+	}
+	if _, err := EncodeInvite(inv); err != nil {
+		t.Fatal(err)
+	}
+	// Decode it back and expect rejection on the count.
+	s, err := EncodeInvite(inv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DecodeInvite(s); err == nil {
+		t.Fatal("invite with more discovery addrs than MaxEndpoints accepted")
+	}
+}

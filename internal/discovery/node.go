@@ -46,26 +46,31 @@ func NewNode(members *identity.MemberList) *Node {
 	}
 }
 
-// Register applies a validated announce. Membership and signature checks
-// happen in the caller (Validate needs the caller's clock); this method only
-// mutates state, which keeps it trivially testable.
+// Register applies an announce AFTER the caller has validated it.
+//
+// The node re-checks membership itself (the cheap check — one map lookup)
+// because an unauthenticated Register is the single worst hole in this layer:
+// any caller that forgets Validate turns the node into an injection point
+// that pushes attacker-chosen endpoints to every subscriber. The expensive
+// checks (signature, timestamp, endpoint shapes) stay in the caller's
+// Validate call; membership is duplicated here as a structural backstop.
 //
 // The boolean reports whether the endpoints changed, so the HTTP layer can
 // decide whether the update is worth pushing.
 func (n *Node) Register(a MemberAnnounce, when time.Time) bool {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	changed := !equalStrings(n.endpts[a.DeviceID], a.Endpoints)
-	n.endpts[a.DeviceID] = a.Endpoints
-	n.lastSeen[a.DeviceID] = when
-	if m, ok := n.members.Get(a.DeviceID); ok {
-		m.Endpoints = a.Endpoints
-		m.LastSeen = when
-		// Best-effort write-back; MemberList has no setter for LastSeen and
-		// adding one widens its API for a display field. The authoritative
-		// freshness stays in this map.
-		_ = m
+	// Structural backstop: refuse to record state for a non-member even if
+	// the caller skipped Validate (external security review, high finding).
+	if !n.members.Contains(a.DeviceID) {
+		return false
 	}
+	changed := !equalStrings(n.endpts[a.DeviceID], a.Endpoints)
+	// Copy: the announce's Endpoints slice belongs to the caller (it may be a
+	// buffer the transport reuses), so storing the reference would let a later
+	// message silently rewrite the recorded state.
+	n.endpts[a.DeviceID] = append([]string(nil), a.Endpoints...)
+	n.lastSeen[a.DeviceID] = when
 	if changed {
 		n.notifyAll()
 	}
@@ -94,6 +99,13 @@ func (n *Node) LastSeen(id identity.DeviceID) (time.Time, bool) {
 func (n *Node) Subscribe(id identity.DeviceID) (<-chan struct{}, func()) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	// A second Subscribe for the same device closes the first channel rather
+	// than silently orphaning it: the old subscriber's select would otherwise
+	// block forever on a channel nobody signals (external review finding).
+	if old, ok := n.subs[id]; ok {
+		close(old)
+		delete(n.subs, id)
+	}
 	// Buffered so notifyAll never blocks on a slow subscriber; a dropped
 	// signal is fine because the next one re-triggers the read.
 	ch := make(chan struct{}, 1)

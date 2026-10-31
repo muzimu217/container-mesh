@@ -108,6 +108,13 @@ func (a MemberAnnounce) Validate(memberKey ed25519.PublicKey, sig []byte, now ti
 	if memberKey == nil {
 		return ErrAnnounceNotMember
 	}
+	// ed25519.Verify panics on a wrong-length public key rather than returning
+	// an error (verified empirically), so the length check is load-bearing,
+	// not decorative. A malformed member record that reaches the list turns a
+	// validation call into a crash.
+	if len(memberKey) != ed25519.PublicKeySize {
+		return ErrAnnounceBadSignature
+	}
 	if !identity.VerifyDevice(memberKey, a.signable(), sig) {
 		return ErrAnnounceBadSignature
 	}
@@ -152,6 +159,18 @@ func validEndpoint(e string) bool {
 	// Reject anything with a scheme or path: an endpoint is not a URL, and
 	// accepting "ws://x/y" here would smuggle a second syntax in.
 	if strings.ContainsAny(e, "/?#") {
+		return false
+	}
+	// Reject control characters anywhere in the endpoint. These reach logs
+	// and terminals downstream (found by an external security review:
+	// "evil\nFAKE:80" passed, which is a log-injection vector).
+	for _, r := range e {
+		if r < 0x20 || r == 0x7f {
+			return false
+		}
+	}
+	// Reject the empty local-part forms that SplitHostPort tolerates.
+	if strings.HasPrefix(host, "@") || strings.Contains(host, " ") {
 		return false
 	}
 	return true
@@ -207,6 +226,13 @@ func DecodeInvite(s string) (Invite, error) {
 		return Invite{}, errors.New("discovery: invite account key has wrong length")
 	}
 	inv.AccountPub = ed25519.PublicKey(k)
+	// The count cap mirrors MaxEndpoints: an invite is the same class of
+	// attacker-controllable list, and an unbounded append is a memory
+	// amplification face (external review finding).
+	if len(q["disc"]) > MaxEndpoints {
+		return Invite{}, fmt.Errorf("%w: invite has %d discovery addresses, max %d",
+			ErrAnnounceBadEndpoint, len(q["disc"]), MaxEndpoints)
+	}
 	for _, a := range q["disc"] {
 		if !validEndpoint(a) {
 			return Invite{}, fmt.Errorf("%w: %q", ErrAnnounceBadEndpoint, a)
