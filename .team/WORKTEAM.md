@@ -6,18 +6,18 @@
 >
 > 所有代理 headless 启动、**零上下文**：每个提示词必须自包含（仓库路径、读什么、产出什么、格式）。
 
-**版本**：W1（2026-10-26）
-**实测可用性**（2026-10-26 冒烟）：
+**版本**：W2（2026-10-31）— 代理×模型实测清单见 [`ROSTER.md`](ROSTER.md)
+**实测可用性**（2026-10-31 复核）：
 
 | 代理 | 命令 | 状态 | 实测 |
 |---|---|---|---|
-| claude | `claude -p "…"` | ✅ | ALIVE |
-| qoder | `qoder -p "…"` | ✅ | ALIVE |
-| codebuddy | `codebuddy -p "…"` | ✅ | ALIVE |
-| codearts | `codearts run "…"` | ✅ | ALIVE（deepseek-v4.1-flash） |
-| opencode | `opencode run "…"` | ✅ | ALIVE |
-| codex | `codex exec --skip-git-repo-check "…"` | ⚠️ 网络 | 提示回显后 `Reconnecting…` 循环 |
-| agy | `agy -p "…"` | ❌ 认证超时 | 需交互式登录 |
+| claude | `claude -p "…"` | ✅ | Claude Opus 5 (1M) |
+| qoder | `qoder -p "…"` | ✅ | Qwen3.8-Flash（日志实测） |
+| codebuddy | `codebuddy -p "…"` | ✅ | Hy4 preview（腾讯） |
+| codearts | `codearts run "…"` | ✅ | DeepSeek v4.1-flash（华为云） |
+| opencode | `opencode run "…"` | ⚠️ | big-pickle — **免费额度已耗尽** |
+| codex | `codex exec --skip-git-repo-check "…"` | ⚠️ 网络 | GPT-6.1-sol（agentrouter 中转） |
+| agy | `agy -p "…"` | ❌ 认证超时 | Gemini 3.8 / Sonnet 4.6 可切 |
 
 ---
 
