@@ -17,7 +17,7 @@
 | 4 | codearts | `codearts run "…"` | **DeepSeek v4.1-flash** | 华为云 CodeArts | ✅ | **文档机械核对** |
 | 5 | opencode | `opencode run "…"` | big-pickle | OpenCode 自有 | ⚠️ **免费额度已耗尽** | 需求批判（额度恢复后复用） |
 | 6 | codex | `codex exec --skip-git-repo-check "…"` | GPT-6.1-sol（经 agentrouter.org 中转） | OpenAI（中转） | ⚠️ 网络重连循环 | 备份全岗（恢复后接入） |
-| 7 | agy | `agy -p "…"` | Gemini 3.8 Flash / Claude Sonnet 4.6 / GPT-OSS 120B（可切） | Google AI Pro | ❌ **地区封锁确认**（2026-10-31 实测：CN/HK 出口均被拒，本机与两台云服务器全部出口为 HK/CN，无可用节点；认证墙+地区墙双重阻塞） | **暂不可用**（除非接入受支持地区的出口） |
+| 7 | agy | `agy -p "…"` | Gemini 3.8 Flash（实测自报；另有 Sonnet 4.6 / GPT-OSS 可切） | Google AI Pro | ⚠️ **部分可用**（2026-10-31：用户切美国出口后地区墙解除，短提示稳定；**长提示（含读文件）约 70% 概率 EOF**——eligibility 端点 POST 被链路切断，重试不定；疑似代理对大 POST 的干扰） | **第二安全评审眼**（成功时可用，失败由 claude 兜底；不阻塞） |
 | 8 | ZCode（我） | 本会话 | GLM 套餐 | Z.ai | ✅ | **产品经理 + 首席协调 + 主写手** |
 
 ---

@@ -17,7 +17,7 @@
 | codearts | `codearts run "…"` | ✅ | DeepSeek v4.1-flash（华为云） |
 | opencode | `opencode run "…"` | ⚠️ | big-pickle — **免费额度已耗尽** |
 | codex | `codex exec --skip-git-repo-check "…"` | ⚠️ 网络 | GPT-6.1-sol（agentrouter 中转） |
-| agy | `agy -p "…"` | ❌ 地区封锁 | Gemini 3.8 / Sonnet 4.6 可切（实测 CN/HK 出口均被拒） |
+| agy | `agy -p "…"` | ⚠️ 部分可用 | Gemini 3.8 Flash — 美国出口下短提示稳定；长提示约 70% EOF，仅作第二评审眼 |
 
 ---
 
