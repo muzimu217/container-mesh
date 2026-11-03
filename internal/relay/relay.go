@@ -34,6 +34,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/muzimu217/container-mesh/internal/discovery"
+	"github.com/muzimu217/container-mesh/internal/identity"
 	"github.com/muzimu217/container-mesh/internal/wsconn"
 )
 
@@ -114,6 +116,13 @@ type Server struct {
 	// It lives on the Server because a room entry is deleted as soon as two
 	// peers pair, which is exactly when the race repeats.
 	contested map[string]contestState
+
+	// Mesh discovery (nil until EnableDiscovery). discoMembers and disco are
+	// swapped together by SetMeshMembers so authentication and enforcement
+	// always consult the same list.
+	disco        *discovery.Node
+	discoMembers *identity.MemberList
+	discoStop    chan struct{}
 
 	limiter *ipLimiter
 
@@ -233,6 +242,11 @@ func (s *Server) Handler() http.Handler {
 	// read-only and expose no room labels, addresses or codes.
 	mux.HandleFunc("/status", s.handleStatus)
 	mux.HandleFunc("/dashboard", s.handleDashboard)
+	// Mesh discovery routes exist only when discovery is enabled; when they
+	// are not, /mesh/* 404s like any unknown path.
+	if s.disco != nil {
+		s.meshSnapshotMux(mux)
+	}
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)

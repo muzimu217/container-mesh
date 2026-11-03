@@ -121,13 +121,26 @@ func (c *DeviceCert) certSignable() ([]byte, error) {
 // (and made legitimately-signed expired certs impossible to construct, which
 // is how the test caught it). Pass DefaultCertTTL explicitly.
 func (a *Account) IssueCert(dev *Device, ttl time.Duration) (*DeviceCert, error) {
+	return a.IssueCertForPub(dev.PublicKey(), ttl)
+}
+
+// IssueCertForPub signs a certificate for a device the account holder has
+// never seen: only the device's public key crossed the wire. This is the
+// remote-approval path — the joiner exports its public key, the account
+// owner signs it, the certificate travels back (or straight to the discovery
+// host). The device ID is derived from the key here, exactly as IssueCert
+// would have.
+func (a *Account) IssueCertForPub(pub ed25519.PublicKey, ttl time.Duration) (*DeviceCert, error) {
 	if ttl <= 0 {
 		return nil, fmt.Errorf("identity: cert ttl must be positive, got %v", ttl)
 	}
+	if len(pub) != ed25519.PublicKeySize {
+		return nil, fmt.Errorf("identity: public key must be %d bytes, got %d", ed25519.PublicKeySize, len(pub))
+	}
 	now := time.Now().UTC()
 	c := &DeviceCert{
-		DeviceID:  dev.ID(),
-		DevicePub: dev.PublicKey(),
+		DeviceID:  IDFromKey(pub),
+		DevicePub: pub,
 		AccountID: a.id,
 		IssuedAt:  now,
 		ExpiresAt: now.Add(ttl),

@@ -1,0 +1,312 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 muzimu217
+
+package relay
+
+// Mesh discovery endpoints, mounted on the same process and mux as the
+// stage-1 pairing relay. The discovery node is a member-run rendezvous for
+// membership, not a data plane: it holds the member list in plaintext in
+// memory (it must, to verify signatures and push views) and never carries
+// user traffic (MESH-DESIGN §2.2).
+//
+// Two endpoints, both authenticated by membership (R-2.4: a stranger who
+// learns the address can neither register a presence nor read the roster):
+//
+//	POST /mesh/register   signed announce (heartbeat)  → 200 / 4xx
+//	GET  /mesh/members    member-authenticated WS      → full-snapshot pushes
+//
+// Logging discipline (T-4.2): mesh handlers log device IDs and outcomes
+// only — never endpoints, never signatures.
+
+import (
+	"context"
+	"crypto/ed25519"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"time"
+
+	"github.com/muzimu217/container-mesh/internal/discovery"
+	"github.com/muzimu217/container-mesh/internal/identity"
+	"github.com/muzimu217/container-mesh/internal/wsconn"
+)
+
+// maxMeshRegisterBytes bounds the register body. An announce is a device ID,
+// ≤16 endpoints and a signature; anything beyond a few KiB is not an announce,
+// it is an abuse vector. Cap it before the decoder sees it.
+const maxMeshRegisterBytes = 64 << 10
+
+// reasonCode maps a rejection to a short stable token for logs. The error
+// text itself is for the CLIENT's benefit (actionable errors, O-4); logs get
+// the token because the text can carry endpoint strings or timestamps
+// (T-4.2, review F6).
+func reasonCode(err error) string {
+	switch {
+	case errors.Is(err, discovery.ErrAnnounceNotMember):
+		return "not-member"
+	case errors.Is(err, discovery.ErrAnnounceBadSignature):
+		return "bad-signature"
+	case errors.Is(err, discovery.ErrAnnounceStale):
+		return "stale-timestamp"
+	case errors.Is(err, discovery.ErrAnnounceBadEndpoint):
+		return "bad-endpoint"
+	default:
+		return "rejected"
+	}
+}
+
+// safeID sanitizes a client-supplied device ID for logging: valid IDs pass
+// as-is (16 lowercase base32 chars); anything else is truncated to 32
+// printable characters so a hostile ID cannot inject newlines or megabytes
+// into the log (review F6).
+func safeID(id identity.DeviceID) string {
+	s := id.String()
+	if id.Valid() {
+		return s
+	}
+	clean := make([]rune, 0, 32)
+	for _, r := range s {
+		if len(clean) >= 32 {
+			break
+		}
+		if r >= 0x20 && r != 0x7f {
+			clean = append(clean, r)
+		}
+	}
+	return string(clean) + "-invalid"
+}
+
+// EnableDiscovery mounts the mesh discovery endpoints on this relay and
+// starts the liveness sweep. Call it before HTTPServer()/ListenAndServe so
+// the routes land in the mux. The returned node is the caller's handle for
+// approvals (SetMembers) and direct state inspection in tests.
+//
+// The relay keeps its own reference to the member list because announce and
+// stream authentication must consult the SAME list the node enforces; they
+// are swapped together by SetMeshMembers.
+func (s *Server) EnableDiscovery(members *identity.MemberList) *discovery.Node {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.disco != nil {
+		return s.disco
+	}
+	s.disco = discovery.NewNode(members)
+	s.discoMembers = members
+	stop := make(chan struct{})
+	s.discoStop = stop
+	go func() {
+		t := time.NewTicker(discovery.SweepInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-t.C:
+				// Reachability-only expiry: a member whose laptop slept is
+				// dropped from the ONLINE view, never from membership.
+				if dropped := s.disco.Sweep(); len(dropped) > 0 {
+					s.log.Info("mesh sweep dropped offline members", "count", len(dropped))
+				}
+			case <-stop:
+				return
+			}
+		}
+	}()
+	return s.disco
+}
+
+// StopDiscovery halts the sweep loop (tests). Discovery endpoints already
+// registered in the mux keep working.
+func (s *Server) StopDiscovery() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.discoStop != nil {
+		close(s.discoStop)
+		s.discoStop = nil
+	}
+}
+
+// SetMeshMembers replaces the member list everywhere it is consulted: the
+// node's enforcement view and both endpoints' authentication lookups. This
+// is the approval path for `join` — the operator adds a cert, reloads, and
+// every subscriber is pushed the new view.
+func (s *Server) SetMeshMembers(m *identity.MemberList) {
+	s.mu.Lock()
+	s.discoMembers = m
+	s.mu.Unlock()
+	s.disco.SetMembers(m)
+}
+
+// meshSnapshot wires the mux routes. Called from Handler().
+func (s *Server) meshSnapshotMux(mux *http.ServeMux) {
+	mux.HandleFunc("/mesh/register", s.handleMeshRegister)
+	mux.HandleFunc("/mesh/members", s.handleMeshMembers)
+}
+
+// meshMemberKey returns the device key recorded for id in the CURRENT member
+// list, nil when the device is not a member. An expired certificate is
+// reported as not-a-member: membership is what the list records, but a lapsed
+// cert must not keep authenticating past its TTL even if the removal has not
+// happened yet.
+func (s *Server) meshMemberKey(id identity.DeviceID) (ed25519.PublicKey, error) {
+	s.mu.Lock()
+	m := s.discoMembers
+	s.mu.Unlock()
+	if m == nil {
+		return nil, discovery.ErrAnnounceNotMember
+	}
+	mm, ok := m.Get(id)
+	if !ok {
+		return nil, discovery.ErrAnnounceNotMember
+	}
+	if time.Now().UTC().After(mm.Cert.ExpiresAt) {
+		return nil, fmt.Errorf("%w: certificate expired at %s",
+			discovery.ErrAnnounceNotMember, mm.Cert.ExpiresAt.Format(time.RFC3339))
+	}
+	return mm.Cert.DevicePub, nil
+}
+
+func (s *Server) handleMeshRegister(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	// The relay is unauthenticated at the pairing layer, so per-IP budgets
+	// are the first thing a flood hits — same policy as /ws, one limiter.
+	ip := s.limiter.clientIP(r)
+	if !s.limiter.acquire(ip) {
+		s.log.Warn("mesh register rate limited", "ip", ip)
+		http.Error(w, "too many requests", http.StatusTooManyRequests)
+		return
+	}
+	defer s.limiter.release(ip)
+
+	var req discovery.RegisterRequest
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxMeshRegisterBytes))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		http.Error(w, "malformed register body", http.StatusBadRequest)
+		return
+	}
+
+	key, err := s.meshMemberKey(req.Announce.DeviceID)
+	if err == nil {
+		err = req.Announce.Validate(key, req.Sig, time.Now())
+	}
+	if err != nil {
+		// Log a sanitized device ID and a stable reason TOKEN — the raw
+		// error text can embed attacker-supplied endpoint strings or expiry
+		// timestamps, which T-4.2 keeps out of logs (review F6).
+		s.log.Warn("mesh register rejected", "device", safeID(req.Announce.DeviceID), "reason", reasonCode(err))
+		status := http.StatusUnauthorized
+		if !errors.Is(err, discovery.ErrAnnounceNotMember) &&
+			!errors.Is(err, discovery.ErrAnnounceBadSignature) &&
+			!errors.Is(err, discovery.ErrAnnounceStale) {
+			status = http.StatusBadRequest
+		}
+		http.Error(w, err.Error(), status)
+		return
+	}
+
+	changed := s.disco.Register(req.Announce, time.Now())
+	s.log.Info("mesh register", "device", req.Announce.DeviceID, "changed", changed)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "changed": changed})
+}
+
+// authenticateMeshMember checks the stream credentials: a member-signed
+// binding of MeshAuthContext + device ID + timestamp. Same skew window as
+// announces; a captured header set cannot outlive its timestamp, and a
+// signature made for a register body cannot satisfy this context.
+func (s *Server) authenticateMeshMember(r *http.Request) (identity.DeviceID, error) {
+	id := identity.DeviceID(r.Header.Get(discovery.HeaderMeshDevice))
+	ts := r.Header.Get(discovery.HeaderMeshTime)
+	sig, err := base64.StdEncoding.DecodeString(r.Header.Get(discovery.HeaderMeshSig))
+	if err != nil {
+		return "", fmt.Errorf("malformed signature encoding")
+	}
+	if !id.Valid() {
+		return "", fmt.Errorf("%w: malformed device id", discovery.ErrAnnounceNotMember)
+	}
+	t, err := time.Parse(time.RFC3339Nano, ts)
+	if err != nil {
+		return "", fmt.Errorf("%w: malformed timestamp", discovery.ErrAnnounceStale)
+	}
+	now := time.Now()
+	if now.Sub(t) > discovery.AnnounceClockSkew || t.Sub(now) > discovery.AnnounceClockSkew {
+		return "", fmt.Errorf("%w: timestamp outside window", discovery.ErrAnnounceStale)
+	}
+	key, err := s.meshMemberKey(id)
+	if err != nil {
+		return "", err
+	}
+	signable := discovery.MeshAuthContext + "\x00" + id.String() + "\x00" + ts
+	if !identity.VerifyDevice(key, []byte(signable), sig) {
+		return "", fmt.Errorf("%w: stream signature invalid", discovery.ErrAnnounceBadSignature)
+	}
+	return id, nil
+}
+
+func (s *Server) handleMeshMembers(w http.ResponseWriter, r *http.Request) {
+	id, err := s.authenticateMeshMember(r)
+	if err != nil {
+		// Reject BEFORE upgrade: a non-member must not hold a socket, even
+		// one that would receive nothing. Reason is logged as a token, not
+		// raw error text (T-4.2, review F6).
+		s.log.Warn("mesh members rejected", "device", safeID(id), "reason", reasonCode(err))
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+
+	conn, err := wsconn.Upgrade(w, r)
+	if err != nil {
+		s.log.Warn("mesh members upgrade failed", "err", err)
+		return
+	}
+	conn.EnableLiveness(s.liveness())
+
+	s.streamMeshMembers(r.Context(), conn, id)
+}
+
+// streamMeshMembers pushes full snapshots: one immediately, then one per
+// change signal. Every push re-reads the current member list — SetMeshMembers
+// may swap it at any moment, and a stream opened before an approval must
+// still deliver the post-approval view. Returns when the connection dies or
+// the request context is cancelled; the deferred unsub prevents a subscriber
+// leak either way.
+func (s *Server) streamMeshMembers(ctx context.Context, conn *wsconn.Conn, id identity.DeviceID) {
+	ch, unsub := s.disco.Subscribe(id)
+	defer unsub()
+
+	send := func() error {
+		s.mu.Lock()
+		members := s.discoMembers
+		s.mu.Unlock()
+		snap := discovery.BuildSnapshot(members, s.disco, time.Now())
+		b, err := json.Marshal(snap)
+		if err != nil {
+			return err
+		}
+		return conn.Send(b)
+	}
+
+	if err := send(); err != nil {
+		s.log.Info("mesh members: initial snapshot failed", "device", id, "err", err)
+		_ = conn.Close()
+		return
+	}
+	for {
+		select {
+		case <-ch:
+			if err := send(); err != nil {
+				s.log.Info("mesh members: push failed", "device", id, "err", err)
+				_ = conn.Close()
+				return
+			}
+		case <-conn.Closed():
+			return
+		case <-ctx.Done():
+			return
+		}
+	}
+}

@@ -107,7 +107,15 @@ func (d *Device) PublicKey() ed25519.PublicKey { return d.pub }
 func (d *Device) Sign(msg []byte) []byte { return ed25519.Sign(d.priv, msg) }
 
 // VerifyDevice checks a signature against a device key.
+//
+// The length check is load-bearing: ed25519.Verify PANICS on a wrong-length
+// public key instead of returning false (verified empirically), so a
+// malformed key reaching this function from any path turns verification into
+// a crash. Every caller is one unvalidated record away from that.
 func VerifyDevice(pub ed25519.PublicKey, msg, sig []byte) bool {
+	if len(pub) != ed25519.PublicKeySize {
+		return false
+	}
 	return ed25519.Verify(pub, msg, sig)
 }
 

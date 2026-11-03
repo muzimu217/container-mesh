@@ -53,6 +53,14 @@ func Run(args []string) error {
 		return runInit(args[1:])
 	case "account":
 		return runAccount(args[1:])
+	case "show-pub":
+		return runShowPub(args[1:])
+	case "invite":
+		return runInvite(args[1:])
+	case "join":
+		return runJoin(args[1:])
+	case "serve-discovery":
+		return runServeDiscovery(args[1:])
 	case "version", "-v", "--version":
 		fmt.Printf("cmesh %s\n", Version)
 		return nil
@@ -101,10 +109,31 @@ Usage:
         public half derives a 16-character device ID. The private key is
         stored encrypted with a passphrase and never leaves this machine.
 
-  cmesh account create | device-add | show
+  cmesh account create | device-add | authorize | show
         The account is the "same identity, many devices" anchor. create
         generates the account key (keep it on your most trusted machine);
-        device-add signs this machine's device ID into the account.
+        device-add signs this machine's device ID into the account;
+        authorize signs a REMOTE device's public key (the approval half of
+        "cmesh join").
+
+  cmesh show-pub
+        Print this device's public key — the value the account owner needs
+        for "cmesh account authorize".
+
+  cmesh serve-discovery [--addr :8080] [--state DIR]
+        Run this machine as a mesh discovery node (it must itself be a
+        member). Bootstraps members.json with this device when absent, and
+        hot-reloads the file so approvals apply within seconds. Also serves
+        the stage-1 pairing relay on the same port.
+
+  cmesh invite --disc host:port [--disc host2:port2]
+        Print a join string for this account. It carries no secret: using it
+        only lets a device ASK to join (R-1.5).
+
+  cmesh join <invite> [--endpoint host:port ...] [--once]
+        Join the network announced by an invite: announce on a heartbeat and
+        wait until an existing member approves this device's certificate.
+        Without --once it keeps running and prints the network view.
 
   cmesh version
 

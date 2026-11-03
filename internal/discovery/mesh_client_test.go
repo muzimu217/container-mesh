@@ -1,0 +1,522 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 muzimu217
+
+package discovery_test
+
+// Client-side and three-node integration tests. This file is an EXTERNAL
+// test package because it drives the whole stack (relay + discovery node +
+// clients) through exported APIs only, and relay imports discovery.
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/muzimu217/container-mesh/internal/discovery"
+	"github.com/muzimu217/container-mesh/internal/identity"
+	"github.com/muzimu217/container-mesh/internal/relay"
+	"github.com/muzimu217/container-mesh/internal/wsconn"
+)
+
+type meshStack struct {
+	acc     *identity.Account
+	devices []*identity.Device
+	members *identity.MemberList
+	srv     *relay.Server
+	ts      *httptest.Server
+}
+
+func newStack(t *testing.T, n int) *meshStack {
+	t.Helper()
+	acc, err := identity.GenerateAccount()
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &meshStack{acc: acc, members: identity.NewMemberList(acc.ID())}
+	for i := 0; i < n; i++ {
+		dev, err := identity.Generate()
+		if err != nil {
+			t.Fatal(err)
+		}
+		cert, err := acc.IssueCert(dev, time.Hour)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.members.Add(*cert); err != nil {
+			t.Fatal(err)
+		}
+		s.devices = append(s.devices, dev)
+	}
+	s.srv = relay.New(relay.DefaultConfig())
+	s.srv.EnableDiscovery(s.members)
+	s.ts = httptest.NewServer(s.srv.Handler())
+	t.Cleanup(s.ts.Close)
+	t.Cleanup(s.srv.StopDiscovery)
+	return s
+}
+
+func (s *meshStack) clientFor(t *testing.T, i int, eps []string) *discovery.Client {
+	t.Helper()
+	cl, err := discovery.NewClient(discovery.ClientConfig{
+		Addrs:      []string{s.ts.URL},
+		Device:     s.devices[i],
+		AccountID:  s.acc.ID(),
+		AccountPub: []byte(s.acc.PublicKey()),
+		Endpoints:  eps,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cl
+}
+
+func waitFor(t *testing.T, bound time.Duration, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(bound)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("%s not satisfied within %s", what, bound)
+}
+
+func TestClientAnnouncesAndSeesItselfOnline(t *testing.T) {
+	s := newStack(t, 1)
+	cl := s.clientFor(t, 0, []string{"203.0.113.5:7000"})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = cl.Run(ctx) }()
+
+	waitFor(t, 5*time.Second, "initial snapshot", func() bool { return cl.Snapshot() != nil })
+	waitFor(t, 5*time.Second, "self online after announce", func() bool {
+		snap := cl.Snapshot()
+		mv, ok := snap.Members[s.devices[0].ID()]
+		return ok && mv.Online && len(mv.Endpoints) == 1
+	})
+	if !cl.Joined() {
+		t.Fatal("member device must report Joined after its snapshot")
+	}
+}
+
+func TestClientRejectsForgedSnapshot(t *testing.T) {
+	// A hostile "discovery node": skips every auth check and pushes a
+	// snapshot carrying a cert the real account never signed. The client's
+	// account-key verification is what must save it (MESH-DESIGN §5.1:
+	// the node is trusted to be online, not to be honest).
+	acc, err := identity.GenerateAccount()
+	if err != nil {
+		t.Fatal(err)
+	}
+	victim, err := identity.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	forgerAcc, err := identity.GenerateAccount() // NOT the invite's account key
+	if err != nil {
+		t.Fatal(err)
+	}
+	forgerDev, err := identity.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	forgerCert, err := forgerAcc.IssueCert(forgerDev, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	push := make(chan discovery.MemberSnapshot, 4)
+	fake := fakeMembersServer(t, acc.ID(), push)
+	defer fake.Close()
+
+	cl, err := discovery.NewClient(discovery.ClientConfig{
+		Addrs:      []string{fake.URL},
+		Device:     victim,
+		AccountID:  acc.ID(),
+		AccountPub: []byte(acc.PublicKey()),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = cl.Run(ctx) }()
+
+	push <- discovery.MemberSnapshot{
+		AccountID: acc.ID(),
+		Version:   1,
+		Members: map[identity.DeviceID]discovery.MemberView{
+			forgerDev.ID(): {Cert: *forgerCert, Online: true, Endpoints: []string{"6.6.6.6:6666"}},
+		},
+	}
+	waitFor(t, 3*time.Second, "forged-only snapshot processed", func() bool { return cl.Snapshot() != nil })
+
+	// The forged member must NOT exist in the view; an empty applied
+	// snapshot is correct behaviour (drop, not reject — one forged cert must
+	// not blind the client, review F3).
+	snap := cl.Snapshot()
+	if _, present := snap.Members[forgerDev.ID()]; present {
+		t.Fatalf("forged member present in the view: %+v", snap.Members)
+	}
+	if cl.Joined() {
+		t.Fatal("client must not consider itself joined on a forged-only view")
+	}
+}
+
+// fakeMembersServer is a hostile-or-test discovery node: no auth checks,
+// snapshots pushed verbatim from a channel.
+func fakeMembersServer(t *testing.T, accountID identity.DeviceID, push <-chan discovery.MemberSnapshot) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/mesh/members" {
+			http.NotFound(w, r)
+			return
+		}
+		conn, err := wsconn.Upgrade(w, r)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		for {
+			select {
+			case snap := <-push:
+				b, err := json.Marshal(snap)
+				if err != nil {
+					return
+				}
+				if err := conn.Send(b); err != nil {
+					return
+				}
+			case <-r.Context().Done():
+				return
+			}
+		}
+	}))
+}
+
+// TestClientKeepsGoodMembersAmongForged pins the F3 fix: a snapshot with one
+// forged and one genuine member yields a view with ONLY the genuine one —
+// the forged cert is dropped, the honest view survives.
+func TestClientKeepsGoodMembersAmongForged(t *testing.T) {
+	acc, _ := identity.GenerateAccount()
+	victim, _ := identity.Generate()
+	forgerAcc, _ := identity.GenerateAccount()
+	forgerDev, _ := identity.Generate()
+	forgerCert, err := forgerAcc.IssueCert(forgerDev, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	honestDev, _ := identity.Generate()
+	honestCert, err := acc.IssueCert(honestDev, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	push := make(chan discovery.MemberSnapshot, 4)
+	fake := fakeMembersServer(t, acc.ID(), push)
+	defer fake.Close()
+
+	cl, _ := discovery.NewClient(discovery.ClientConfig{
+		Addrs:      []string{fake.URL},
+		Device:     victim,
+		AccountID:  acc.ID(),
+		AccountPub: []byte(acc.PublicKey()),
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = cl.Run(ctx) }()
+
+	push <- discovery.MemberSnapshot{
+		AccountID: acc.ID(),
+		Version:   1,
+		Members: map[identity.DeviceID]discovery.MemberView{
+			forgerDev.ID(): {Cert: *forgerCert, Online: true, Endpoints: []string{"6.6.6.6:6666"}},
+			honestDev.ID(): {Cert: *honestCert, Online: true, Endpoints: []string{"203.0.113.7:7000"}},
+		},
+	}
+	waitFor(t, 3*time.Second, "mixed snapshot applied", func() bool {
+		snap := cl.Snapshot()
+		return snap != nil && len(snap.Members) == 1
+	})
+	if _, ok := cl.Snapshot().Members[honestDev.ID()]; !ok {
+		t.Fatal("honest member dropped along with the forged one")
+	}
+}
+
+// TestAnnounceSanitizesErrorBody pins the F8 fix: a hostile node's 4xx body
+// reaches client logs as printable text — newlines and ANSI escapes become
+// spaces, so the error channel cannot forge log lines.
+func TestAnnounceSanitizesErrorBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte("evil\nFAKE LOG LINE\x1b[31minjected"))
+	}))
+	defer srv.Close()
+
+	dev, _ := identity.Generate()
+	acc, _ := identity.GenerateAccount()
+	cl, err := discovery.NewClient(discovery.ClientConfig{
+		Addrs:      []string{srv.URL},
+		Device:     dev,
+		AccountID:  acc.ID(),
+		AccountPub: []byte(acc.PublicKey()),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = cl.Announce(context.Background())
+	if err == nil {
+		t.Fatal("announce against rejecting server must fail")
+	}
+	msg := err.Error()
+	if strings.ContainsAny(msg, "\n\r\x1b") {
+		t.Fatalf("error message carries control characters (log injection): %q", msg)
+	}
+	if !strings.Contains(msg, "FAKE LOG LINE") {
+		t.Fatalf("error message lost the (sanitized) server reason: %q", msg)
+	}
+}
+
+// TestClientIgnoresVersionRegression pins the F1 fix: a replayed PRE-revocation
+// snapshot (lower version) must never overwrite the newer view — a malicious
+// node's only remaining power is to withhold updates, not to resurrect
+// revoked members.
+func TestClientIgnoresVersionRegression(t *testing.T) {
+	acc, _ := identity.GenerateAccount()
+	victim, _ := identity.Generate()
+	revoked, _ := identity.Generate()
+	revokedCert, err := acc.IssueCert(revoked, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	push := make(chan discovery.MemberSnapshot, 4)
+	fake := fakeMembersServer(t, acc.ID(), push)
+	defer fake.Close()
+
+	cl, _ := discovery.NewClient(discovery.ClientConfig{
+		Addrs:      []string{fake.URL},
+		Device:     victim,
+		AccountID:  acc.ID(),
+		AccountPub: []byte(acc.PublicKey()),
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = cl.Run(ctx) }()
+
+	// v2: post-revocation world — the revoked device is gone.
+	push <- discovery.MemberSnapshot{AccountID: acc.ID(), Version: 2, Members: map[identity.DeviceID]discovery.MemberView{}}
+	waitFor(t, 3*time.Second, "v2 applied", func() bool {
+		snap := cl.Snapshot()
+		return snap != nil && snap.Version == 2
+	})
+
+	// Replay: the node pushes the pre-revocation v1 snapshot.
+	push <- discovery.MemberSnapshot{
+		AccountID: acc.ID(),
+		Version:   1,
+		Members: map[identity.DeviceID]discovery.MemberView{
+			revoked.ID(): {Cert: *revokedCert, Online: true, Endpoints: []string{"6.6.6.6:6666"}},
+		},
+	}
+	time.Sleep(500 * time.Millisecond)
+	snap := cl.Snapshot()
+	if snap.Version != 2 {
+		t.Fatalf("replayed v1 overwrote the view (version now %d)", snap.Version)
+	}
+	if _, present := snap.Members[revoked.ID()]; present {
+		t.Fatal("revoked member resurrected by a replayed snapshot")
+	}
+}
+
+func TestClientRejectsWrongAccountSnapshot(t *testing.T) {
+	s := newStack(t, 1)
+	otherAcc, err := identity.GenerateAccount()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A node that answers for a DIFFERENT account: the client's account
+	// binding (from its invite) must reject the view outright.
+	cl, err := discovery.NewClient(discovery.ClientConfig{
+		Addrs:      []string{s.ts.URL},
+		Device:     s.devices[0],
+		AccountID:  otherAcc.ID(), // claim a different account than the node serves
+		AccountPub: []byte(otherAcc.PublicKey()),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = cl.Run(ctx) }()
+
+	time.Sleep(500 * time.Millisecond)
+	if snap := cl.Snapshot(); snap != nil {
+		t.Fatalf("foreign-account snapshot accepted: account %s", snap.AccountID)
+	}
+}
+
+func TestClientAnnounceSurfacesNotMemberReason(t *testing.T) {
+	s := newStack(t, 1)
+	// devices[0] is a member; a second device is not in the list.
+	stranger, err := identity.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, err := s.acc.IssueCert(stranger, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = cert // issued but never added: pending approval
+
+	cl, err := discovery.NewClient(discovery.ClientConfig{
+		Addrs:      []string{s.ts.URL},
+		Device:     stranger,
+		AccountID:  s.acc.ID(),
+		AccountPub: []byte(s.acc.PublicKey()),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = cl.Announce(context.Background())
+	if err == nil {
+		t.Fatal("pending-approval announce must be rejected")
+	}
+	if !strings.Contains(err.Error(), "not a member") {
+		t.Fatalf("error must carry the actionable reason (O-4): %v", err)
+	}
+}
+
+func TestClientFailsOverAcrossAddresses(t *testing.T) {
+	s := newStack(t, 1)
+	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { http.NotFound(w, r) }))
+	deadURL := dead.URL
+	dead.Close() // port now refused
+
+	cl, err := discovery.NewClient(discovery.ClientConfig{
+		// Dead first, live second: both announce and stream must land on the
+		// second without the caller caring.
+		Addrs:      []string{deadURL, s.ts.URL},
+		Device:     s.devices[0],
+		AccountID:  s.acc.ID(),
+		AccountPub: []byte(s.acc.PublicKey()),
+		Endpoints:  []string{"203.0.113.5:7000"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cl.Announce(context.Background()); err != nil {
+		t.Fatalf("announce with failover: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = cl.Run(ctx) }()
+	waitFor(t, 5*time.Second, "snapshot via second address", func() bool { return cl.Snapshot() != nil })
+}
+
+// TestThreeNodesMutualVisibility is the PR-M2 acceptance scenario: 3 nodes
+// announce; each sees all three online. The bound here is generous (in-process
+// loopback), the REQUIREMENT (R-2.2 / §5.1) stays ≤10 s in real deployments.
+func TestThreeNodesMutualVisibility(t *testing.T) {
+	s := newStack(t, 3)
+	clients := make([]*discovery.Client, 3)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	for i := range clients {
+		clients[i] = s.clientFor(t, i, []string{fmt.Sprintf("203.0.113.%d:7000", i+1)})
+		go func(cl *discovery.Client) { _ = cl.Run(ctx) }(clients[i])
+	}
+
+	for i, cl := range clients {
+		i, cl := i, cl
+		waitFor(t, 8*time.Second, fmt.Sprintf("node %d sees 3 online members", i), func() bool {
+			snap := cl.Snapshot()
+			if snap == nil || len(snap.Members) != 3 {
+				return false
+			}
+			for _, mv := range snap.Members {
+				if !mv.Online {
+					return false
+				}
+			}
+			return true
+		})
+	}
+}
+
+// TestUnapprovedDeviceStaysInvisible pins the R-1.5/R-2.4 boundary: a device
+// with no membership is blind (its stream is refused — the roster is members-
+// only) and invisible (it appears in no member's view). Approval then flips
+// both sides within one push.
+func TestUnapprovedDeviceStaysInvisible(t *testing.T) {
+	s := newStack(t, 2) // two approved members
+	// third device: cert issued, approval pending
+	stranger, err := identity.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, err := s.acc.IssueCert(stranger, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scl, err := discovery.NewClient(discovery.ClientConfig{
+		Addrs:      []string{s.ts.URL},
+		Device:     stranger,
+		AccountID:  s.acc.ID(),
+		AccountPub: []byte(s.acc.PublicKey()),
+		Endpoints:  []string{"203.0.113.200:7000"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = scl.Run(ctx) }()
+
+	// Blind: every stream attempt is 401'd before upgrade.
+	time.Sleep(800 * time.Millisecond)
+	if snap := scl.Snapshot(); snap != nil {
+		t.Fatalf("unapproved device received a snapshot: %+v", snap.Members)
+	}
+	if scl.Joined() {
+		t.Fatal("unapproved device claims joined")
+	}
+
+	memberCl := s.clientFor(t, 0, nil)
+	mctx, mcancel := context.WithCancel(context.Background())
+	defer mcancel()
+	go func() { _ = memberCl.Run(mctx) }()
+	waitFor(t, 5*time.Second, "member snapshot", func() bool { return memberCl.Snapshot() != nil })
+	time.Sleep(300 * time.Millisecond)
+	if snap := memberCl.Snapshot(); len(snap.Members) != 2 {
+		t.Fatalf("member view has %d members; the unapproved device leaked in", len(snap.Members))
+	}
+
+	// Approval lands (operator adds the cert and hot-swaps the list): the
+	// joiner's next reconnect succeeds and BOTH sides see the new state.
+	if err := s.members.Add(*cert); err != nil {
+		t.Fatal(err)
+	}
+	s.srv.SetMeshMembers(s.members)
+
+	waitFor(t, 8*time.Second, "joiner sees the roster after approval", func() bool {
+		snap := scl.Snapshot()
+		return snap != nil && len(snap.Members) == 3 && scl.Joined()
+	})
+	waitFor(t, 5*time.Second, "member sees the approved joiner", func() bool {
+		snap := memberCl.Snapshot()
+		if len(snap.Members) != 3 {
+			return false
+		}
+		_, inList := snap.Members[stranger.ID()]
+		return inList
+	})
+}

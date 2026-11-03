@@ -160,6 +160,19 @@ func (n *Node) SetClock(f func() time.Time) {
 	n.now = f
 }
 
+// SetMembers replaces the membership source. This is the approval path: an
+// operator adds a device's certificate to the list and hands the new list to
+// the node; the swap itself pushes a change to every subscriber, because a
+// membership change is exactly what they are watching for. The node does not
+// merge or diff — it swaps wholesale, and Register's own membership backstop
+// immediately starts consulting the new list.
+func (n *Node) SetMembers(m *identity.MemberList) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.members = m
+	n.notifyAll()
+}
+
 // OnlineSnapshot lists currently-online members with their endpoints.
 type OnlineMember struct {
 	DeviceID  identity.DeviceID

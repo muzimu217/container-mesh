@@ -5,6 +5,8 @@ package cli
 
 import (
 	"bufio"
+	"crypto/ed25519"
+	"encoding/base64"
 	"errors"
 	"flag"
 	"fmt"
@@ -112,11 +114,109 @@ func runAccount(args []string) error {
 		return runAccountCreate(args[1:])
 	case "device-add":
 		return runAccountDeviceAdd(args[1:])
+	case "authorize":
+		return runAccountAuthorize(args[1:])
 	case "show":
 		return runAccountShow(args[1:])
 	default:
-		return ExitError{Code: 2, Err: fmt.Errorf("unknown account subcommand %q", args[0])}
+		return ExitError{Code: 2, Err: fmt.Errorf(
+			"unknown account subcommand %q (known: create | device-add | authorize | show)", args[0])}
 	}
+}
+
+// runAccountAuthorize signs a REMOTE device's public key into this account.
+// This is the approval half of `cmesh join`: the joiner exports its key with
+// `cmesh show-pub`, the account owner authorizes it, and the resulting
+// certificate file goes to the discovery host (drop it into the certs
+// directory there — serve-discovery picks it up within seconds).
+func runAccountAuthorize(args []string) error {
+	fs := flag.NewFlagSet("account authorize", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	state := fs.String("state", "", "state directory (default ~/.cmesh)")
+	pass := fs.String("account-passphrase", "", "passphrase for the account file (for scripting)")
+	pub := fs.String("pub", "", "the joining device's public key, base64 from `cmesh show-pub`")
+	out := fs.String("out", "", "where to write the certificate (default <state>/<deviceID>.cert.json)")
+	ttl := fs.Duration("ttl", identity.DefaultCertTTL, "certificate validity")
+	if err := fs.Parse(args); err != nil {
+		return ExitError{Code: 2, Err: err}
+	}
+	if *pub == "" {
+		return ExitError{Code: 2, Err: errors.New(
+			"authorize needs the joining device's public key: --pub <base64> (the joiner prints it via cmesh show-pub)")}
+	}
+	raw, err := base64.StdEncoding.DecodeString(*pub)
+	if err != nil {
+		return ExitError{Code: 1, Err: fmt.Errorf("--pub is not base64: %w", err)}
+	}
+
+	dir, err := stateDir(*state)
+	if err != nil {
+		return ExitError{Code: 2, Err: err}
+	}
+	accPath := identity.IdentityPath(dir, identity.AccountFileName)
+	if _, err := os.Stat(accPath); err != nil {
+		return ExitError{Code: 1, Err: fmt.Errorf("%s not found; run cmesh account create first", accPath)}
+	}
+	phrase, err := readPassphrase(*pass, "account passphrase")
+	if err != nil {
+		return ExitError{Code: 1, Err: err}
+	}
+	acc, err := identity.LoadAccount(accPath, phrase)
+	if err != nil {
+		return ExitError{Code: 1, Err: err}
+	}
+
+	cert, err := acc.IssueCertForPub(ed25519.PublicKey(raw), *ttl)
+	if err != nil {
+		return ExitError{Code: 1, Err: err}
+	}
+	path := *out
+	if path == "" {
+		path = identity.IdentityPath(dir, string(cert.DeviceID)+identity.CertSuffix)
+	}
+	if err := identity.SaveCert(cert, path); err != nil {
+		return ExitError{Code: 1, Err: err}
+	}
+
+	fmt.Fprintf(os.Stderr, "device authorized into account %s\n", acc.ID())
+	fmt.Fprintf(os.Stderr, "  device   %s\n", cert.DeviceID)
+	fmt.Fprintf(os.Stderr, "  expires  %s\n", cert.ExpiresAt.Format("2006-01-02"))
+	fmt.Fprintf(os.Stderr, "  cert     %s\n", path)
+	fmt.Fprintf(os.Stderr, "\nHand %s to the discovery host: drop it into that host's certs directory\n", filepath.Base(path))
+	fmt.Fprintf(os.Stderr, "(cmesh serve-discovery adopts it and pushes the new membership within seconds).\n")
+	return nil
+}
+
+// runShowPub exports this device's public key: the value a joiner hands to
+// the account owner for `account authorize`. Public by definition — the
+// private half never leaves the device.
+func runShowPub(args []string) error {
+	fs := flag.NewFlagSet("show-pub", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	state := fs.String("state", "", "state directory (default ~/.cmesh)")
+	pass := fs.String("device-passphrase", "", "passphrase for the device file (for scripting)")
+	if err := fs.Parse(args); err != nil {
+		return ExitError{Code: 2, Err: err}
+	}
+	dir, err := stateDir(*state)
+	if err != nil {
+		return ExitError{Code: 2, Err: err}
+	}
+	devPath := identity.IdentityPath(dir, identity.DeviceFileName)
+	if _, err := os.Stat(devPath); err != nil {
+		return ExitError{Code: 1, Err: fmt.Errorf("%s not found; run cmesh init first", devPath)}
+	}
+	phrase, err := readPassphrase(*pass, "device passphrase")
+	if err != nil {
+		return ExitError{Code: 1, Err: err}
+	}
+	dev, err := identity.LoadDevice(devPath, phrase)
+	if err != nil {
+		return ExitError{Code: 1, Err: err}
+	}
+	fmt.Fprintf(os.Stderr, "device %s public key (base64; give it to the account owner):\n", dev.ID())
+	fmt.Println(base64.StdEncoding.EncodeToString(dev.PublicKey()))
+	return nil
 }
 
 func runAccountCreate(args []string) error {
