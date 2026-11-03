@@ -11,7 +11,7 @@
 
 | # | 代理 | 命令 | 模型（实测） | 提供商 | 可用性 | 团队角色 |
 |---|---|---|---|---|---|---|
-| 1 | claude | `claude -p "…"` | **Claude Opus 5**（1M 上下文） | Anthropic | ✅ | **安全评审 + 性能分析**（推理最重的两个岗） |
+| 1 | claude | `claude -p --model <模型> "…"` | ⚠️ **默认已漂移为 doubao-1.5-pro**（2026-11-03 实测）。显式覆盖可用：`auto/glm-5.3`、`auto/kimi-k3.1-pro`、`auto/deepseek-v4-pro`；`github-copilot/claude-opus-5` 已 400 无权限 | magpie 本地路由（127.0.0.1:3425） | ✅（**必须显式 `--model`**） | **安全评审 + 性能分析** → 改派 `--model auto/glm-5.3`（首个实战评审通过后转正） |
 | 2 | qoder | `qoder -p "…"` | **Qwen3.8-Flash** | 阿里通义（Qoder 托管） | ✅ | **QA 评审** |
 | 3 | codebuddy | `codebuddy -p "…"` | **Hy4 preview** | 腾讯 | ✅ | **实现评审** |
 | 4 | codearts | `codearts run "…"` | **DeepSeek v4.1-flash** | 华为云 CodeArts | ✅ | **文档机械核对** |
@@ -28,7 +28,7 @@
 
 | 代理 | 方法 | 结果来源 |
 |---|---|---|
-| claude | 直接问「What model are you?」 | 自报 "Opus 5 (1M context)" |
+| claude | 直接问 + 查 `~/.claude/settings.json` | 2026-10-31 自报 Opus 5；**2026-11-03 配置里 `/model = doubao/doubao-1.5-pro`，ANTHROPIC_DEFAULT_OPUS/SONNET/HAIKU 全部映射到 doubao**（magpie 路由改了默认，无通知） |
 | codebuddy | 问「Are you Claude/GPT/GLM/…?」 | 自报 "Hy4 preview model, not Claude/GPT/GLM/DeepSeek/hunyuan" |
 | codearts | 启动行自带模型标签 | `> build · deepseek-v4.1-flash` |
 | opencode | 查运行日志 | `~/.local/share/opencode/log/opencode.log` → `llm.model=big-pickle`；且日志显示 **free limit reached** |
@@ -44,7 +44,7 @@
 
 | 角色 | 分给了谁 | 为什么是这个模型 |
 |---|---|---|
-| **安全评审** | claude（Opus 5） | 安全推理是全团最重的岗：本轮实战中它发现了 ed25519 panic、控制字符注入、Register 无认证三项真问题，且全部附 file:line。Opus 的长上下文也能一次读完整个包 |
+| **安全评审** | claude `--model auto/glm-5.3` | 原 Opus 5 已不可用（400 无权限）；GLM-5.3 是路由上实测可用的最强档（effort 到 max）。2026-11-03 doubao 兜底跑需求审计证明「材料内嵌 + 机械核对」flash 档也够用，但推理岗仍需重模型 |
 | **性能分析** | claude（兼） | 同为推理密集：分配/锁/拷贝分析需要跨文件追踪 |
 | **QA 评审** | qoder（Qwen3.8-Flash） | 测试有效性评审的核心是「破坏方向对不对、环境真不真」，模式化程度高，flash 档够用 |
 | **实现评审** | codebuddy（Hy4） | 独立视角读结构与抽象，非推理密集 |
@@ -57,8 +57,8 @@
 ## 4. 委派命令速查（复制即用）
 
 ```bash
-# 安全评审（claude）
-timeout 300 claude -p "$(cat .team/prompts/security-review.md | sed 's|@@TARGET@@|internal/discovery/|g; s|@@ROUND@@|Round 5|g')"
+# 安全评审（claude + 显式模型；2026-11-03 起默认已漂移为 doubao，不带 --model 会拿到豆包）
+timeout 300 claude -p --model auto/glm-5.3 "$(cat .team/prompts/security-review.md | sed 's|@@TARGET@@|internal/discovery/|g; s|@@ROUND@@|Round 5|g')"
 
 # 实现评审（codebuddy）
 timeout 300 codebuddy -p "$(cat .team/prompts/impl-review.md | sed 's|@@TARGET@@|internal/identity/|g; s|@@ROUND@@|Round 5|g')"
@@ -82,6 +82,7 @@ timeout 300 codex exec --skip-git-repo-check "$(cat .team/prompts/security-revie
 
 | 问题 | 影响 | 处置 |
 |---|---|---|
+| **claude 默认模型静默漂移**（Opus 5 → doubao-1.5-pro，2026-10-31 ~ 11-03 之间发生） | 全部委派质量降级且不易察觉（本轮靠输出 banner 的 unrecognized_model 抓到） | **每次委派显式 `--model` 并在结果里核对模型自报**；抽查频率从「每 3 轮」提到「每轮」 |
 | opencode 免费额度耗尽 | 需求批判岗缺人 | claude 兼；或等额度恢复（日志显示按月重置） |
 | codex 网络重连循环 | 备份岗缺人 | agentrouter 中转不稳；监测，恢复后接入 |
 | agy 认证超时 | 无法使用 | 需美/日/新出口或交互式登录；不阻塞 |
