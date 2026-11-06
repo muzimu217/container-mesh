@@ -1,0 +1,272 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 muzimu217
+
+package cli
+
+// Mesh direct-link commands: `cmesh mesh ping` and `cmesh dial`.
+//
+// Both resolve the target's endpoints from the LIVE member view (discovery),
+// then bring up a mutually-authenticated direct QUIC link (device
+// certificates pinned to the member view). PR-M3 semantics: ping measures
+// RTT; dial is an interactive duplex channel to the peer's listener (echo),
+// the transport-validation predecessor of PR-M4's real services.
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"time"
+
+	"github.com/muzimu217/container-mesh/internal/discovery"
+	"github.com/muzimu217/container-mesh/internal/identity"
+	"github.com/muzimu217/container-mesh/internal/mesh"
+)
+
+// meshSession bundles what a one-shot mesh command needs: identity, the
+// persisted discovery config, and a live client with its resolver.
+type meshSession struct {
+	dev      *identity.Device
+	cl       *discovery.Client
+	resolver *liveViewResolver
+}
+
+// openMeshSession loads state and starts a discovery client, returning once
+// the first verified snapshot has arrived (or the context ends).
+func openMeshSession(ctx context.Context, state, pass string, eps []string) (*meshSession, error) {
+	dir, err := stateDir(state)
+	if err != nil {
+		return nil, err
+	}
+	devPath := identity.IdentityPath(dir, identity.DeviceFileName)
+	if _, err := os.Stat(devPath); err != nil {
+		return nil, fmt.Errorf("%s not found; run cmesh init and cmesh join first", devPath)
+	}
+	dev, err := identity.LoadDevice(devPath, pass)
+	if err != nil {
+		return nil, err
+	}
+	cfgPath := filepath.Join(dir, "discovery.json")
+	blob, err := os.ReadFile(cfgPath)
+	if err != nil {
+		return nil, fmt.Errorf("%s not found; this device has not joined a network yet (run cmesh join)", cfgPath)
+	}
+	var cfg discoveryConfig
+	if err := json.Unmarshal(blob, &cfg); err != nil {
+		return nil, fmt.Errorf("%s is not a valid discovery config: %w", cfgPath, err)
+	}
+	inv, err := discovery.DecodeInvite(cfg.Invite)
+	if err != nil {
+		return nil, fmt.Errorf("saved invite is malformed: %w", err)
+	}
+	cl, err := discovery.NewClient(discovery.ClientConfig{
+		Addrs:      inv.DiscoveryAddrs,
+		Device:     dev,
+		AccountID:  inv.AccountID,
+		AccountPub: []byte(inv.AccountPub),
+		Endpoints:  eps,
+	})
+	if err != nil {
+		return nil, err
+	}
+	go func() { _ = cl.Run(ctx) }()
+
+	waitCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	t := time.NewTicker(50 * time.Millisecond)
+	defer t.Stop()
+	for {
+		select {
+		case <-waitCtx.Done():
+			if cl.Snapshot() == nil {
+				return nil, fmt.Errorf("no member view within 15s (discovery node unreachable or not a member?)")
+			}
+			resolver := &liveViewResolver{accountPub: []byte(inv.AccountPub)}
+			resolver.set(cl)
+			return &meshSession{dev: dev, cl: cl, resolver: resolver}, nil
+		case <-t.C:
+			if cl.Snapshot() != nil {
+				resolver := &liveViewResolver{accountPub: []byte(inv.AccountPub)}
+				resolver.set(cl)
+				return &meshSession{dev: dev, cl: cl, resolver: resolver}, nil
+			}
+		}
+	}
+}
+
+// resolveTarget waits until the target appears in the live view with at
+// least one endpoint, or the context ends.
+func (s *meshSession) resolveTarget(ctx context.Context, target identity.DeviceID) ([]string, error) {
+	t := time.NewTicker(100 * time.Millisecond)
+	defer t.Stop()
+	for {
+		snap := s.cl.Snapshot()
+		if snap != nil {
+			if mv, ok := snap.Members[target]; ok {
+				if len(mv.Endpoints) > 0 {
+					return mv.Endpoints, nil
+				}
+				if !mv.Online {
+					// A listed member that never announces: it will not grow
+					// endpoints by waiting — say so instead of stalling to
+					// the deadline.
+					return nil, fmt.Errorf("%s is a member but has announced no endpoints (is it running with --listen?)", target)
+				}
+			} else {
+				return nil, fmt.Errorf("%s is not a member of this network", target)
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("timed out waiting for %s to appear with endpoints", target)
+		case <-t.C:
+		}
+	}
+}
+
+func snapContains(snap *discovery.MemberSnapshot, id identity.DeviceID) bool {
+	_, ok := snap.Members[id]
+	return ok
+}
+
+func runMesh(args []string) error {
+	if len(args) == 0 {
+		return ExitError{Code: 2, Err: errors.New("mesh needs a subcommand: ping")}
+	}
+	switch args[0] {
+	case "ping":
+		return runMeshPing(args[1:])
+	default:
+		return ExitError{Code: 2, Err: fmt.Errorf("unknown mesh subcommand %q (known: ping)", args[0])}
+	}
+}
+
+func runMeshPing(args []string) error {
+	fs := flag.NewFlagSet("mesh ping", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	state := fs.String("state", "", "state directory (default ~/.cmesh)")
+	pass := fs.String("device-passphrase", "", "passphrase for the device file (for scripting)")
+	count := fs.Int("count", 10, "pings to send")
+	interval := fs.Duration("interval", 200*time.Millisecond, "delay between pings")
+	timeout := fs.Duration("timeout", 20*time.Second, "overall budget including discovery")
+	if err := fs.Parse(args); err != nil {
+		return ExitError{Code: 2, Err: err}
+	}
+	if fs.NArg() != 1 {
+		return ExitError{Code: 2, Err: errors.New(
+			"usage: cmesh mesh ping [flags] <deviceID> (the device ID goes last: flag parsing stops at the first positional argument)")}
+	}
+	target := identity.DeviceID(fs.Arg(0))
+	if !target.Valid() {
+		return ExitError{Code: 2, Err: fmt.Errorf("%q is not a valid device ID", fs.Arg(0))}
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	ctx, cancel := context.WithTimeout(ctx, *timeout)
+	defer cancel()
+
+	sess, err := openMeshSession(ctx, *state, *pass, nil)
+	if err != nil {
+		return ExitError{Code: 1, Err: err}
+	}
+	eps, err := sess.resolveTarget(ctx, target)
+	if err != nil {
+		return ExitError{Code: 1, Err: err}
+	}
+
+	link, err := mesh.DialDirect(ctx, mesh.DialConfig{
+		Device:    sess.dev,
+		Resolver:  sess.resolver,
+		Target:    target,
+		Endpoints: eps,
+		Kind:      mesh.KindPing,
+	})
+	if err != nil {
+		return ExitError{Code: 1, Err: err}
+	}
+	defer link.Close()
+
+	rtts, err := mesh.PingExchange(ctx, link, *count, *interval)
+	if err != nil && len(rtts) == 0 {
+		return ExitError{Code: 1, Err: fmt.Errorf("ping exchange failed: %w", err)}
+	}
+	for i, rtt := range rtts {
+		fmt.Printf("seq=%d rtt=%.3fms\n", i+1, rtt)
+	}
+	p50 := mesh.Percentile(rtts, 50)
+	p95 := mesh.Percentile(rtts, 95)
+	fmt.Printf("--- %s: %d/%d pings, p50 %.3fms p95 %.3fms (P-1 line: <5ms)\n",
+		target, len(rtts), *count, p50, p95)
+	if p95 >= 5.0 {
+		fmt.Fprintf(os.Stderr, "note: p95 above the P-1 acceptance line (5ms) — expected across real networks, investigate only on same-machine links\n")
+	}
+	return nil
+}
+
+func runDial(args []string) error {
+	fs := flag.NewFlagSet("dial", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	state := fs.String("state", "", "state directory (default ~/.cmesh)")
+	pass := fs.String("device-passphrase", "", "passphrase for the device file (for scripting)")
+	timeout := fs.Duration("timeout", 20*time.Second, "budget for discovery and the handshake")
+	if err := fs.Parse(args); err != nil {
+		return ExitError{Code: 2, Err: err}
+	}
+	if fs.NArg() != 1 {
+		return ExitError{Code: 2, Err: errors.New(
+			"usage: cmesh dial [flags] <deviceID> (the device ID goes last)")}
+	}
+	target := identity.DeviceID(fs.Arg(0))
+	if !target.Valid() {
+		return ExitError{Code: 2, Err: fmt.Errorf("%q is not a valid device ID", fs.Arg(0))}
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	hctx, cancel := context.WithTimeout(ctx, *timeout)
+	defer cancel()
+
+	sess, err := openMeshSession(hctx, *state, *pass, nil)
+	if err != nil {
+		return ExitError{Code: 1, Err: err}
+	}
+	eps, err := sess.resolveTarget(hctx, target)
+	if err != nil {
+		return ExitError{Code: 1, Err: err}
+	}
+	link, err := mesh.DialDirect(hctx, mesh.DialConfig{
+		Device:    sess.dev,
+		Resolver:  sess.resolver,
+		Target:    target,
+		Endpoints: eps,
+		Kind:      mesh.KindDial,
+	})
+	if err != nil {
+		return ExitError{Code: 1, Err: err}
+	}
+	defer link.Close()
+	fmt.Fprintf(os.Stderr, "connected to %s (direct, mutually authenticated); type lines — they echo back; Ctrl-C to quit\n", target)
+
+	// Duplex pipe: stdin → stream, stream → stdout. Either side ending ends
+	// the session.
+	done := make(chan error, 2)
+	go func() {
+		_, err := io.Copy(link.Stream(), os.Stdin)
+		done <- err
+	}()
+	go func() {
+		_, err := io.Copy(os.Stdout, link.Reader())
+		done <- err
+	}()
+	select {
+	case <-ctx.Done():
+	case <-done:
+	}
+	return nil
+}

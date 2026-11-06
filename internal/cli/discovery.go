@@ -32,10 +32,12 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/muzimu217/container-mesh/internal/discovery"
 	"github.com/muzimu217/container-mesh/internal/identity"
+	"github.com/muzimu217/container-mesh/internal/mesh"
 	"github.com/muzimu217/container-mesh/internal/relay"
 )
 
@@ -113,6 +115,32 @@ type discoveryConfig struct {
 	SavedAt   time.Time `json:"saved_at"`
 }
 
+// liveViewResolver adapts the client's live, verified snapshot to the mesh
+// package's MemberResolver: keys come from the CURRENT view, so revocation
+// takes effect on the direct-link listener within one push (a removed
+// member's certificate no longer pins). The client pointer is atomic because
+// the listener's accept goroutines read it while the main goroutine creates
+// the client (the listener must bind BEFORE the client, so its resolved
+// ports are what join announces).
+type liveViewResolver struct {
+	ptr        atomic.Pointer[discovery.Client]
+	accountPub []byte
+}
+
+func (r *liveViewResolver) set(cl *discovery.Client) { r.ptr.Store(cl) }
+
+func (r *liveViewResolver) KeyFor(id identity.DeviceID) (ed25519.PublicKey, error) {
+	cl := r.ptr.Load()
+	if cl == nil {
+		return nil, errors.New("mesh: no verified member view yet")
+	}
+	snap := cl.Snapshot()
+	if snap == nil {
+		return nil, errors.New("mesh: no verified member view yet")
+	}
+	return mesh.SnapshotAdapter{Snap: snap, AccountPub: ed25519.PublicKey(r.accountPub)}.KeyFor(id)
+}
+
 func saveDiscoveryConfig(dir string, cfg discoveryConfig) (string, error) {
 	b, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
@@ -136,10 +164,16 @@ func runJoin(args []string) error {
 	pass := fs.String("device-passphrase", "", "passphrase for the device file (for scripting)")
 	var eps stringSlice
 	fs.Var(&eps, "endpoint", "address(es) other members can reach this device on, repeatable host:port (optional: a device with none is visible but not dialable)")
+	var listen stringSlice
+	fs.Var(&listen, "listen", "bind UDP endpoint(s) for direct links and answer them, repeatable host:port (port 0 = auto; the bound ports are what gets announced)")
 	once := fs.Bool("once", false, "exit as soon as this device is a member")
 	timeout := fs.Duration("timeout", 10*time.Minute, "how long to wait for approval before giving up (0 = forever)")
 	if err := fs.Parse(args); err != nil {
 		return ExitError{Code: 2, Err: err}
+	}
+	if *once && len(listen) > 0 {
+		return ExitError{Code: 2, Err: errors.New(
+			"--once exits after approval; --listen needs a serving process (drop --once)")}
 	}
 	if fs.NArg() != 1 {
 		return ExitError{Code: 2, Err: errors.New(
@@ -181,16 +215,43 @@ func runJoin(args []string) error {
 			"invite issue time is in the future; check this machine's clock or re-request the invite")}
 	}
 
+	// Bind the direct-link listener FIRST (when requested): its resolved
+	// ports are what join announces, so discovery never advertises a port
+	// that is not open. The listener's key resolver is pointed at the live
+	// view as soon as the client exists — until then it cleanly rejects
+	// incoming streams ("no verified member view"), which is also correct
+	// behaviour before the first snapshot.
+	resolver := &liveViewResolver{accountPub: []byte(inv.AccountPub)}
+	var listener *mesh.Listener
+	announced := []string(eps)
+	if len(listen) > 0 {
+		l, err := mesh.NewListener(context.Background(), mesh.ListenerConfig{
+			Device:  dev,
+			Members: resolver,
+			Addrs:   []string(listen),
+		})
+		if err != nil {
+			return ExitError{Code: 1, Err: err}
+		}
+		listener = l
+		defer listener.Close()
+		announced = l.BoundAddrs()
+	}
+
 	cl, err := discovery.NewClient(discovery.ClientConfig{
 		Addrs:      inv.DiscoveryAddrs,
 		Device:     dev,
 		AccountID:  inv.AccountID,
 		AccountPub: []byte(inv.AccountPub),
-		Endpoints:  []string(eps),
+		Endpoints:  announced,
 		Logger:     setupLogging(false),
 	})
 	if err != nil {
 		return ExitError{Code: 1, Err: err}
+	}
+	if listener != nil {
+		resolver.set(cl)
+		fmt.Fprintf(os.Stderr, "listening for direct links on %s\n", strings.Join(listener.BoundAddrs(), ", "))
 	}
 
 	// Persisted only after every check passed: a failed join must not leave

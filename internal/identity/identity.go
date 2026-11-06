@@ -23,11 +23,16 @@ package identity
 
 import (
 	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/base32"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
 	"os"
 	"path/filepath"
 	"strings"
@@ -117,6 +122,40 @@ func VerifyDevice(pub ed25519.PublicKey, msg, sig []byte) bool {
 		return false
 	}
 	return ed25519.Verify(pub, msg, sig)
+}
+
+// TLSCertificate builds a self-signed X.509 certificate whose public key IS
+// the device's Ed25519 identity key, signed by that same key. The Subject CN
+// carries the device ID.
+//
+// This is the identity's TLS face for direct mesh links: a dialer verifies
+// the peer's certificate public key against the member view's recorded key
+// for the target device, so the TLS handshake itself authenticates the peer
+// — no CA, no hostname, no certificate-authority infrastructure, and no
+// disabled verification. Revocation composes for free: a removed member's
+// key is no longer in the view, so its certificate no longer verifies.
+func (d *Device) TLSCertificate() (tls.Certificate, error) {
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(time.Now().UnixNano()),
+		Subject:      pkix.Name{CommonName: d.id.String()},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().AddDate(10, 0, 0),
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+		// Self-signed: the certificate is its own issuer, so it must be a
+		// (minimal) CA for x509 verification to accept it as its own root.
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, d.pub, d.priv)
+	if err != nil {
+		return tls.Certificate{}, fmt.Errorf("identity: build device certificate: %w", err)
+	}
+	return tls.Certificate{
+		Certificate: [][]byte{der},
+		PrivateKey:  d.priv,
+		Leaf:        tmpl,
+	}, nil
 }
 
 // filePayload is the plaintext structure that gets encrypted on disk.

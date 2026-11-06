@@ -61,6 +61,10 @@ func Run(args []string) error {
 		return runJoin(args[1:])
 	case "serve-discovery":
 		return runServeDiscovery(args[1:])
+	case "mesh":
+		return runMesh(args[1:])
+	case "dial":
+		return runDial(args[1:])
 	case "version", "-v", "--version":
 		fmt.Printf("cmesh %s\n", Version)
 		return nil
@@ -130,10 +134,22 @@ Usage:
         Print a join string for this account. It carries no secret: using it
         only lets a device ASK to join (R-1.5).
 
-  cmesh join <invite> [--endpoint host:port ...] [--once]
+  cmesh join <invite> [--endpoint host:port ...] [--listen host:port ...] [--once]
         Join the network announced by an invite: announce on a heartbeat and
         wait until an existing member approves this device's certificate.
         Without --once it keeps running and prints the network view.
+        --listen additionally binds direct-link (QUIC) endpoints and serves
+        them — what binds is what gets announced, so other members can
+        cmesh dial / cmesh mesh ping this device.
+
+  cmesh mesh ping <deviceID>
+        Measure direct-link RTT to a member (custom measurement, not ICMP).
+        Resolves the target's endpoints from the live member view.
+
+  cmesh dial <deviceID>
+        Open a mutually-authenticated direct channel to a member (device
+        certificates are pinned to the member view). Interactive: typed
+        lines echo back. PR-M4 adds real services on this link.
 
   cmesh version
 

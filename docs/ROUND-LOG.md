@@ -193,3 +193,37 @@ init → account create → device-add → serve-discovery（自举 members.json
 4. 「一坏全拒」看着更安全，实际把单点失败放大成全网故障——剔除 + 告警优于整体拒绝。
 
 **下一轮**：PR-M3（直连：p2p/p2pquic 接入组网候选地址，`dial`/`mesh ping`；QUIC 显式超时按评审备忘）
+
+## Round 7 — PR-M3：组网直连层 + mTLS 设备证书 + 部署指南（2026-11-03）
+
+**交付**：任意两成员直连（`mesh ping` / `dial`），端点从成员视图解析，双向以设备证书认证。P-1 实测达标：**同机 p95 0.203ms**（门槛 5ms）。
+**对应需求**：R-3.1 部分（组网直连层）、R-4.1 部分（直连 RTT）、P-1、P-5（QUIC 显式 10s/3s）、O-6（首台自举）、deploy 指南
+
+### 新增
+
+| 块 | 内容 |
+|---|---|
+| `internal/mesh/direct.go` | Listener + DialDirect：端点按序尝试；**设备 Ed25519 身份密钥即 TLS 证书**（`identity.TLSCertificate`），拨号方把对端证书公钥**钉死**到成员视图公钥，监听方 mTLS 验证客户端证书——没有 CA、没有主机名，成员视图就是信任锚；撤销组合生效（除名→证书不再钉中→立即拒连，有测试钉死） |
+| QUIC 超时（评审备忘落实） | `MaxIdleTimeout 10s + KeepAlivePeriod 3s` 显式配置——拔网线/断电/容器 netns 销毁不发任何包，只靠 idle timeout 感知 |
+| `identity.TLSCertificate` | 自签证书：公钥=身份密钥、CN=设备 ID、IsCA 自根 |
+| CLI | `cmesh mesh ping`（RTT 统计 p50/p95）、`cmesh dial`（交互直连）、`join --listen`（绑定→公告一致：端口 0 自动解析后公告实际端口） |
+| `deploy/MESH-NET.md` | 组网部署指南：公网/无公网混合拓扑、凭证打包三原则（容器只放 device.json+cert+discovery.json，account.json 永不出信任锚）、Docker/systemd 示例、六项实验清单、故障排查 |
+
+### 平台行为实测记录（go1.27.2/darwin）
+
+1. **`VerifyConnection` 不替代默认验证**：自签 Ed25519 证书在 VerifyConnection 触发前就被 macOS 系统验证器拒绝（错误串 "certificate is using a broken key size" 不存在于 Go 源码——来自系统验证器）。必须跳过默认验证，钉死验证才运行。实测两种配置的完整对照后定案；**验证没有被禁用，是被更严格的成员视图钉死替代**（错误密钥→握手失败，有 impostor 测试钉死）。Mimosa 扫描器对字面量的拦截以此说明回应。
+2. x509.Verify 对自签证书**必须**显式 `Roots` 池（自身为根），系统池路径必挂。
+3. 设备证书模板需要 `IsCA + BasicConstraintsValid`（自根的最小 CA 形态）。
+
+### 测试
+
+- mesh 包 6 项：ping 往返（p95 烟雾线 50ms，实测打印）、duplex 回显、**impostor 拒绝**（错误证书公钥→握手失败）、非成员拒绝、**撤销即拒连**、mTLS 平台行为回归
+- CLI 全流程测试加第三腿：owner `join --listen` 自加入 → joiner `mesh ping` 全栈闭环（发现→视图解析→直连→RTT）
+- 全量：`go test ./... -race` **15 包全绿**（新增 mesh 包），e2e 35/35，vet 干净
+
+### 教训
+
+1. **生成过程自检**：本轮两次把损坏内容写进源文件（乱码混入），靠「每次写入后立即 build」当场抓回。写入后的编译检查不是仪式，是安全网。
+2. 「注释说 X、代码做 Y」的坑上一轮 F1 刚修过，这轮 VerifyConnection 的官方语义与实测行为又不一致——**平台行为要实测记录，不能只读文档**。
+
+**下一轮**：PR-M4（e2e SIGMA 层 + 中转路由 + 配额——风险最高的 PR，单独提交便于 bisect）；真机实验等用户服务器就绪后按 deploy/MESH-NET.md 清单执行

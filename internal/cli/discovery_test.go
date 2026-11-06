@@ -171,6 +171,29 @@ func TestMeshBootstrapApprovalFlow(t *testing.T) {
 	if m.Count() != 2 {
 		t.Fatalf("approved network has %d members, want 2 (adopted cert must persist)", m.Count())
 	}
+
+	// --- Leg 3: direct links over the mesh. The OWNER device joins its own
+	// network with a listener (it is already a member, so approval lands on
+	// the first heartbeat); the joiner then pings it across a direct QUIC
+	// link, endpoints resolved from the member view.
+	ownerDev := loadJoinerDevice(t, ownerDir, pass)
+	go func() {
+		if err := Run([]string{"join", "--state", ownerDir, "--device-passphrase", pass,
+			"--listen", "127.0.0.1:0", "--timeout", "30s", strings.TrimSpace(invite)}); err != nil {
+			t.Errorf("owner join --listen: %v", err)
+		}
+	}()
+	time.Sleep(1500 * time.Millisecond) // owner announces; endpoints propagate
+
+	pingOut := captureStdout(t, func() {
+		if err := Run([]string{"mesh", "ping", "--state", joinerDir, "--device-passphrase", pass,
+			"--count", "5", "--timeout", "25s", ownerDev.String()}); err != nil {
+			t.Errorf("mesh ping: %v", err)
+		}
+	})
+	if !strings.Contains(pingOut, "5/5 pings") || !strings.Contains(pingOut, "p95") {
+		t.Fatalf("mesh ping output incomplete: %q", pingOut)
+	}
 }
 
 func loadJoinerDevice(t *testing.T, dir, pass string) identity.DeviceID {
