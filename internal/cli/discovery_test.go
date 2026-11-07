@@ -11,6 +11,7 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"net"
@@ -22,6 +23,7 @@ import (
 	"time"
 
 	"github.com/muzimu217/container-mesh/internal/identity"
+	"github.com/muzimu217/container-mesh/internal/relay"
 )
 
 // captureStdout swaps os.Stdout while fn runs and returns what it printed.
@@ -215,5 +217,60 @@ func TestServeDiscoveryTLSHalfConfigRejected(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "together") {
 		t.Fatalf("error must say the flags go together: %v", err)
+	}
+}
+
+// TestWatchApprovalsNoSelfTriggerLoop pins the D-3 fix (issue #8): with no
+// external edits and no certificates dropped, the watcher must leave the
+// member list alone — before the fix it reload+saved every 2 s, inflating
+// the version (v3→v208 in 6 minutes of pure idle) and re-pushing identical
+// snapshots to every member.
+func TestWatchApprovalsNoSelfTriggerLoop(t *testing.T) {
+	dir := t.TempDir()
+	acc, err := identity.GenerateAccount()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dev, err := identity.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, err := acc.IssueCert(dev, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	members := identity.NewMemberList(acc.ID())
+	if err := members.Add(*cert); err != nil {
+		t.Fatal(err)
+	}
+	membersPath := filepath.Join(dir, "members.json")
+	if err := members.SaveMembers(membersPath); err != nil {
+		t.Fatal(err)
+	}
+
+	relaySrv := relay.New(relay.DefaultConfig())
+	relaySrv.EnableDiscovery(members)
+	t.Cleanup(relaySrv.StopDiscovery)
+
+	certsDir := filepath.Join(dir, "certs")
+	if err := os.MkdirAll(certsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	go watchApprovals(ctx, membersPath, certsDir, members, relaySrv, []byte(acc.PublicKey()))
+
+	// Three watcher ticks with zero input: the file must be untouched.
+	time.Sleep(5500 * time.Millisecond)
+	cancel()
+
+	m, err := identity.LoadMembers(membersPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.CurrentVersion() != 1 {
+		t.Fatalf("idle watcher inflated the member-list version to %d (self-trigger loop, D-3)", m.CurrentVersion())
+	}
+	if m.Count() != 1 {
+		t.Fatalf("idle watcher changed the member count to %d", m.Count())
 	}
 }

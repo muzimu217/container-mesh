@@ -243,9 +243,34 @@ func NewListener(ctx context.Context, cfg ListenerConfig) (*Listener, error) {
 	return l, nil
 }
 
-// BoundAddrs reports the resolved local endpoints; join announces these so
-// discovery never advertises a port that is not actually open.
-func (l *Listener) BoundAddrs() []string { return append([]string(nil), l.bound...) }
+// BoundAddrs reports the resolved local endpoints that are safe to ANNOUNCE:
+// unspecified addresses (0.0.0.0 / ::) are filtered out because a peer given
+// "0.0.0.0:7000" would dial its own loopback and time out forever (issue #8,
+// D-1). The wildcard sockets still BIND and serve — only the advertisement
+// is suppressed; join passes an explicit --endpoint to publish a NAT-mapped
+// or public address.
+func (l *Listener) BoundAddrs() []string {
+	out := make([]string, 0, len(l.bound))
+	for _, a := range l.bound {
+		if udp, err := net.ResolveUDPAddr("udp", a); err == nil && udp.IP != nil && udp.IP.IsUnspecified() {
+			continue
+		}
+		out = append(out, a)
+	}
+	return out
+}
+
+// WildcardAddrs reports which bound endpoints were suppressed from the
+// announcement (for actionable warnings).
+func (l *Listener) WildcardAddrs() []string {
+	var out []string
+	for _, a := range l.bound {
+		if udp, err := net.ResolveUDPAddr("udp", a); err == nil && udp.IP != nil && udp.IP.IsUnspecified() {
+			out = append(out, a)
+		}
+	}
+	return out
+}
 
 // Close shuts every listener socket down; pending Accepts fail and the
 // accept loops exit.
@@ -391,6 +416,15 @@ func DialDirect(ctx context.Context, cfg DialConfig) (*Link, error) {
 	}
 	if cfg.HandshakeTimeout <= 0 {
 		cfg.HandshakeTimeout = 10 * time.Second
+	}
+	// Defense in depth for D-1: a wildcard endpoint in the member view can
+	// only come from a peer that announced 0.0.0.0 — dialing it would hit
+	// our own loopback and hang until timeout. Refuse with the actionable
+	// reason instead.
+	for _, ep := range cfg.Endpoints {
+		if udp, err := net.ResolveUDPAddr("udp", ep); err == nil && udp.IP != nil && udp.IP.IsUnspecified() {
+			return nil, fmt.Errorf("mesh: %s announced the wildcard endpoint %s; ask them to pass a concrete --endpoint (their public or NAT-mapped address)", cfg.Target, ep)
+		}
 	}
 	wantKey, err := cfg.Resolver.KeyFor(cfg.Target)
 	if err != nil {

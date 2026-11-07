@@ -29,6 +29,14 @@ type Node struct {
 	// subs are the connected members receiving pushes.
 	subs map[identity.DeviceID]chan struct{}
 
+	// streams counts live members-stream connections per device. It is the
+	// fast liveness path (R-2.2's "transport-level break detection"): when a
+	// member's process dies — kill -9, cable pull, destroyed netns — the
+	// kernel closes its socket and the node sees the stream end within
+	// seconds, an order of magnitude ahead of the heartbeat timeout, which
+	// remains only as the fallback for "connection alive, process hung".
+	streams map[identity.DeviceID]int
+
 	// now is injectable for tests.
 	now func() time.Time
 }
@@ -42,7 +50,39 @@ func NewNode(members *identity.MemberList) *Node {
 		lastSeen: make(map[identity.DeviceID]time.Time),
 		endpts:   make(map[identity.DeviceID][]string),
 		subs:     make(map[identity.DeviceID]chan struct{}),
+		streams:  make(map[identity.DeviceID]int),
 		now:      time.Now,
+	}
+}
+
+// AttachStream records that id has an open members-stream connection.
+func (n *Node) AttachStream(id identity.DeviceID) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.streams[id]++
+}
+
+// DetachStream removes one members-stream connection for id. When it was the
+// last one, the device's reachability expires IMMEDIATELY and subscribers
+// are pushed the change — this is the fast-offline path that makes P-5's
+// ≤10 s bound achievable for kill -9 style deaths (the heartbeat timeout
+// only has to catch the hung-process case it was designed for).
+//
+// Reconnect overlap is safe: a member that re-dials before its old socket's
+// death is noticed holds count 2; the old stream's detach leaves 1 and the
+// device stays online.
+func (n *Node) DetachStream(id identity.DeviceID) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.streams[id] > 1 {
+		n.streams[id]--
+		return
+	}
+	delete(n.streams, id)
+	if _, wasOnline := n.lastSeen[id]; wasOnline {
+		delete(n.lastSeen, id)
+		delete(n.endpts, id)
+		n.notifyAll()
 	}
 }
 

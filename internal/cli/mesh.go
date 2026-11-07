@@ -354,5 +354,7 @@ func runAccountShow(args []string) error {
 	fmt.Fprintf(os.Stderr, "account  %s\n", acc.ID())
 	fmt.Fprintf(os.Stderr, "  file   %s\n", accPath)
 	fmt.Fprintf(os.Stderr, "  pubkey %x\n", acc.PublicKey())
+	fmt.Fprintf(os.Stderr, "  pubkey.b64 %s  (this is the form `serve-discovery --account-pub` accepts, hex works too)\n",
+		base64.StdEncoding.EncodeToString(acc.PublicKey()))
 	return nil
 }

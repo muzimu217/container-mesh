@@ -408,6 +408,73 @@ func TestMeshMembersShortKeyMemberDoesNotPanic(t *testing.T) {
 	}
 }
 
+// TestStreamCloseExpiresMemberFast pins the #7 fix (issue #8): a member's
+// death (kill -9 closes its socket) must flip it offline in every other
+// member's view within seconds — the stream-close is the fast liveness
+// signal, NOT the 90s heartbeat timeout. Removing the AttachStream/DetachStream
+// pair in streamMeshMembers turns this test red (the snapshot only updates
+// after MemberTimeout).
+func TestStreamCloseExpiresMemberFast(t *testing.T) {
+	f := newMeshFixture(t, 2)
+	_, ts, _ := newMeshRelay(t, f.members)
+
+	// devices[1] announces and opens its members stream (what every client
+	// does in Run).
+	if resp, _ := postRegister(t, ts, signedAnnounce(f.devices[1], []string{"203.0.113.9:7000"}, time.Now())); resp.StatusCode != 200 {
+		t.Fatal("announce failed")
+	}
+	victimConn := dialMembers(t, ts, f.devices[1], membersAuthHeaders(f.devices[1]))
+	if snap := recvSnapshot(t, victimConn); !snap.Members[f.devices[1].ID()].Online {
+		t.Fatal("victim should be online in its own initial snapshot")
+	}
+
+	// devices[0] watches the network.
+	obs := dialMembers(t, ts, f.devices[0], membersAuthHeaders(f.devices[0]))
+	if snap := recvSnapshot(t, obs); !snap.Members[f.devices[1].ID()].Online {
+		t.Fatal("observer should see the victim online initially")
+	}
+
+	// Death: the socket closes (kill -9 sends no goodbye; the kernel RSTs).
+	start := time.Now()
+	_ = victimConn.Close()
+
+	// The observer is pushed the offline flip well within seconds — the
+	// bound here is a smoke ceiling (T-2.4), the P-5 line is 10 s.
+	_ = obs.SetReadDeadline(time.Now().Add(3 * time.Second))
+	snap := recvSnapshot(t, obs)
+	if snap.Members[f.devices[1].ID()].Online {
+		t.Fatalf("victim still online after stream close (%.1fs)", time.Since(start).Seconds())
+	}
+	if len(snap.Members[f.devices[1].ID()].Endpoints) != 0 {
+		t.Fatal("offline member must not carry endpoints")
+	}
+	// Membership itself survives: reachability expired, not membership.
+	if _, still := snap.Members[f.devices[1].ID()]; !still {
+		t.Fatal("fast expiry must not remove membership")
+	}
+}
+
+// TestStreamOverlapKeepsOnline covers the reconnect-overlap case: a member
+// that re-dials before its old socket's death is noticed stays online.
+func TestStreamOverlapKeepsOnline(t *testing.T) {
+	f := newMeshFixture(t, 1)
+	_, ts, node := newMeshRelay(t, f.members)
+	dev := f.devices[0]
+	if resp, _ := postRegister(t, ts, signedAnnounce(dev, []string{"203.0.113.5:7000"}, time.Now())); resp.StatusCode != 200 {
+		t.Fatal("announce failed")
+	}
+	node.AttachStream(dev.ID())
+	node.AttachStream(dev.ID()) // re-dial before the old one dies
+	node.DetachStream(dev.ID()) // old socket's death noticed
+	if snap := discovery.BuildSnapshot(f.members, node, time.Now()); !snap.Members[dev.ID()].Online {
+		t.Fatal("overlap detach must not expire a member with a live stream")
+	}
+	node.DetachStream(dev.ID())
+	if snap := discovery.BuildSnapshot(f.members, node, time.Now()); snap.Members[dev.ID()].Online {
+		t.Fatal("last detach must expire reachability")
+	}
+}
+
 func TestBuildSnapshotOmitsStaleEndpointsOnly(t *testing.T) {
 	f := newMeshFixture(t, 1)
 	_, ts, node := newMeshRelay(t, f.members)

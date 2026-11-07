@@ -21,6 +21,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/muzimu217/container-mesh/internal/discovery"
@@ -37,8 +38,11 @@ type meshSession struct {
 }
 
 // openMeshSession loads state and starts a discovery client, returning once
-// the first verified snapshot has arrived (or the context ends).
-func openMeshSession(ctx context.Context, state, pass string, eps []string) (*meshSession, error) {
+// the first verified snapshot has arrived (or the context ends). The
+// passphrase goes through readPassphrase so CMESH_PASSPHRASE works exactly
+// as it does for init/join — the container-deploy path in the guide depends
+// on it (issue #8 D-5).
+func openMeshSession(ctx context.Context, state, passFlag string, eps []string) (*meshSession, error) {
 	dir, err := stateDir(state)
 	if err != nil {
 		return nil, err
@@ -46,6 +50,10 @@ func openMeshSession(ctx context.Context, state, pass string, eps []string) (*me
 	devPath := identity.IdentityPath(dir, identity.DeviceFileName)
 	if _, err := os.Stat(devPath); err != nil {
 		return nil, fmt.Errorf("%s not found; run cmesh init and cmesh join first", devPath)
+	}
+	pass, err := readPassphrase(passFlag, "device passphrase")
+	if err != nil {
+		return nil, err
 	}
 	dev, err := identity.LoadDevice(devPath, pass)
 	if err != nil {
@@ -84,7 +92,17 @@ func openMeshSession(ctx context.Context, state, pass string, eps []string) (*me
 		select {
 		case <-waitCtx.Done():
 			if cl.Snapshot() == nil {
-				return nil, fmt.Errorf("no member view within 15s (discovery node unreachable or not a member?)")
+				// Distinguish the two failures a joiner can hit: the node is
+				// unreachable, or THIS DEVICE IS NOT A MEMBER (typically:
+				// revoked). The register response already carries the
+				// authoritative reason — a 401 "not a member" is a certainty
+				// about membership, not a network fault, and the message must
+				// say so instead of sending the user off to debug routing
+				// (issue #8, report 1 finding on the revocation UX).
+				if perr := cl.Announce(waitCtx); perr != nil && strings.Contains(perr.Error(), "not a member") {
+					return nil, fmt.Errorf("this device has been removed from this network (revoked by the account owner, or the approval never happened)")
+				}
+				return nil, fmt.Errorf("no member view within 15s (discovery node unreachable, or not approved yet?)")
 			}
 			resolver := &liveViewResolver{accountPub: []byte(inv.AccountPub)}
 			resolver.set(cl)
@@ -111,15 +129,15 @@ func (s *meshSession) resolveTarget(ctx context.Context, target identity.DeviceI
 				if len(mv.Endpoints) > 0 {
 					return mv.Endpoints, nil
 				}
-				if !mv.Online {
-					// A listed member that never announces: it will not grow
-					// endpoints by waiting — say so instead of stalling to
-					// the deadline.
-					return nil, fmt.Errorf("%s is a member but has announced no endpoints (is it running with --listen?)", target)
-				}
-			} else {
-				return nil, fmt.Errorf("%s is not a member of this network", target)
+				// A member with zero endpoints is in a STABLE state — the
+				// announce carries endpoints atomically, so waiting cannot
+				// grow them. Say the actionable thing immediately instead
+				// of stalling to the deadline (issue #8 D-4: an online
+				// restricted container used to wait the full --timeout for
+				// a hint that only fired for offline targets).
+				return nil, fmt.Errorf("%s is a member but has announced no endpoints (is it running with --listen?)", target)
 			}
+			return nil, fmt.Errorf("%s is not a member of this network", target)
 		}
 		select {
 		case <-ctx.Done():

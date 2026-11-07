@@ -7,6 +7,19 @@
 当发现锚点，没公网的节点照样可达。阶段 1 的 relay 网格文档见
 [`MESH.md`](MESH.md)（两者可同机共存，同一进程）。
 
+> **构建**（必须显式关闭 CGO 才是静态单二进制，放进 alpine/scratch 才能跑）：
+>
+> ```bash
+> CGO_ENABLED=0 go build -trimpath -o cmesh ./cmd/cm
+> ```
+>
+> **两个易踩的 CLI 约定**（首轮测试实测踩中）：
+> 1. 位置参数（invite 串、deviceID）**必须放在所有 flag 之后**——Go 的 flag
+>    解析碰到第一个位置参数就停止，`cmesh join "$INV" --state X` 会把
+>    `--state X` 吞进位置参数报错；
+> 2. `show-pub` 的人类可读行走 stderr、密钥走 stdout——脚本取值用
+>    `cmesh show-pub 2>/dev/null`。
+
 ---
 
 ## 1. 当前能力边界（诚实清单）
@@ -69,9 +82,12 @@ cmesh account device-add  # 把本设备签进账号
 ### 第 2 步：发现节点上线（有公网的机器）
 
 ```bash
-cmesh serve-discovery --addr :8080 --account-pub <base64>
-# --account-pub 从 `cmesh account show` 拿；提供它之后，certs 目录收编的
-# 每张证书都会先验签再入列表（强烈建议提供）
+cmesh serve-discovery --addr :8080 --account-pub <base64 或 hex>
+# --account-pub 从 `cmesh account show` 拿（pubkey.b64 那行；hex 也接受）。
+# 提供它之后，certs 目录收编的每张证书都会先验签再入列表（强烈建议提供）
+#
+# 可选 --announce <成员可达地址>:端口：把发现节点自己也公告进成员视图
+#（否则它恒显示 offline，易被误读为掉线）。--addr 写具体 IP 时可省略。
 ```
 
 首次运行自动自举 `~/.cmesh/members.json`（包含本设备）——这就是 O-6
@@ -80,10 +96,15 @@ cmesh serve-discovery --addr :8080 --account-pub <base64>
 ### 第 3 步：成员机器入网（每台执行）
 
 ```bash
-# 公网成员机器 B（可被直连）：
+# 公网成员机器 B（可被直连）——--listen 绑具体地址，别用 0.0.0.0：
 cmesh init
-cmesh join <invite> --listen 0.0.0.0:7000
+cmesh join <invite> --listen <B的内网或公网IP>:7000
 # 输出 PUBKEY 行；同时设备处于「等待批准」状态
+#
+# NAT 后的成员要被公网直连（做了端口映射/DNAT 的），公告映射后的公网地址：
+cmesh join <invite> --listen 192.168.1.10:7000 --endpoint <公网IP>:7000
+#   --endpoint 优先于绑定地址公告；只绑 0.0.0.0 且不给 --endpoint 时
+#   程序会大声警告「不可被直连」（通配地址发出去对端只会拨到自己）
 
 # 受限容器 C（只出站，不可被直连）：
 cmesh init
@@ -157,8 +178,12 @@ FROM alpine
 COPY cmesh /usr/local/bin/cmesh
 COPY state/ /mesh/state/          # device.json + cert + discovery.json
 # 口令由编排系统注入环境变量（docker run -e CMESH_PASSPHRASE=... / K8s Secret），
-# cmesh 会优先读 CMESH_PASSPHRASE，不进进程参数（ps 不可见）
-ENTRYPOINT ["cmesh", "join", "--state", "/mesh/state", "--listen", "0.0.0.0:7000"]
+# cmesh 会优先读 CMESH_PASSPHRASE，不进进程参数（ps 不可见）。
+# 注意：--listen 绑容器内具体地址；要被容器外直连，用 --endpoint 公告
+# 映射到宿主机的地址（-p 7000:7000 时即 <宿主机IP>:7000）
+ENTRYPOINT ["cmesh", "join", "--state", "/mesh/state",
+            "--listen", "172.17.0.2:7000",
+            "--endpoint", "{{宿主机IP}}:7000"]
 ```
 
 ### 4.4 systemd 示例（普通服务器）
@@ -187,10 +212,10 @@ WantedBy=multi-user.target
 | 实验 | 期望 | 对应需求 |
 |---|---|---|
 | 两台都无公网（同局域网） | `mesh ping` 直连通（私网端点） | R-3.1 |
-| 一台公网一台 NAT 后 | NAT 侧能 ping 公网侧（公网侧端点直连） | R-3.1 |
-| 两台不同 NAT 后、都有 `--listen` | 依赖打洞；M3 尚无自动打洞编排——预期报「无可达端点」或超时，属**已知边界**（M4 中转兜底） | N-4 |
-| 受限容器（只出站） | 入网、可见、能主动 ping 别人 | C-3 / S5 |
-| kill -9 一个成员 | 其余成员 ≤10s 内视图更新为 offline | P-5（QUIC 10s idle 显式配置） |
+| 一台公网一台 NAT 后 | NAT 侧能 ping 公网侧；**做了 DNAT 放行的 NAT 成员也能被公网侧 ping**（`--endpoint` 公告映射地址） | R-3.1 |
+| 两台不同 NAT 后、都有 `--listen` | 依赖打洞；M3 尚无自动打洞编排——预期报「无可达端点」或通配警告，属**已知边界**（M4 中转兜底） | N-4 |
+| 受限容器（只出站） | 入网、可见、能主动 ping 别人；别人 ping 它会立即提示「没开 `--listen`」 | C-3 / S5 |
+| kill -9 一个成员 | 其余成员 ≤10s 内视图更新为 offline（members 流断开即下线；10s idle 兜底硬杀场景） | P-5 |
 | 撤销一台设备 | 其直连立即失败，其余成员不受影响 | R-1.3 |
 
 ---
@@ -200,10 +225,12 @@ WantedBy=multi-user.target
 | 现象 | 原因 | 处理 |
 |---|---|---|
 | `join` 卡在等待批准 | 证书未进发现节点 | 走第 4 步；确认 certs 目录 + `--account-pub` |
-| `mesh ping` 报「has announced no endpoints」 | 目标没开 `--listen` | 目标重启带 `--listen` |
+| `mesh ping` 报「has announced no endpoints」 | 目标没开 `--listen`（在线与否都会提示） | 目标重启带 `--listen`；NAT 场景加 `--endpoint` |
+| `mesh ping` 报「announced the wildcard endpoint」 | 对端用 `--listen 0.0.0.0` 且没给 `--endpoint` | 对端补 `--endpoint <可达地址>` |
 | `serve-discovery` 起不来报 bind 错误 | 端口被占（O-7） | 换 `--addr :8081`，或停掉占用者 |
 | ping 握手失败「timestamp outside window」 | 双方时钟差 >5s | 上 NTP； skew 窗口是安全参数不要调大 |
 | join 报「invite issue time is in the future」 | 本机时钟快了 >5min | 校时 |
+| join 报「has been removed from this network」 | 本设备不在成员列表（被撤销或未批准） | 找账号所有者确认；重新走审批 |
 | 中转需求（两端都不可直连） | M3 未含中转 | 等 PR-M4；或临时让两端之一挂公网 |
 
 ---

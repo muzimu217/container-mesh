@@ -21,16 +21,22 @@ package cli
 // membership is what lets it in.
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -113,6 +119,21 @@ type discoveryConfig struct {
 	Invite    string    `json:"invite"`
 	Endpoints []string  `json:"endpoints,omitempty"`
 	SavedAt   time.Time `json:"saved_at"`
+}
+
+// parsePubKeyString accepts a 32-byte public key as either base64 (what
+// show-pub prints) or hex (what account show prints). Both encodings were
+// live in the docs with different commands expecting different ones, which
+// made the documented flow fail on contact (issue #8 D-2); accepting both
+// removes the trap without breaking either output.
+func parsePubKeyString(s string) ([]byte, error) {
+	if raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(s)); err == nil && len(raw) == ed25519.PublicKeySize {
+		return raw, nil
+	}
+	if raw, err := hex.DecodeString(strings.TrimSpace(s)); err == nil && len(raw) == ed25519.PublicKeySize {
+		return raw, nil
+	}
+	return nil, fmt.Errorf("must be base64 or hex of a %d-byte public key", ed25519.PublicKeySize)
 }
 
 // liveViewResolver adapts the client's live, verified snapshot to the mesh
@@ -223,6 +244,11 @@ func runJoin(args []string) error {
 	// behaviour before the first snapshot.
 	resolver := &liveViewResolver{accountPub: []byte(inv.AccountPub)}
 	var listener *mesh.Listener
+	// Announcement priority: explicit --endpoint wins (the operator knows
+	// their public / NAT-mapped address — a bound wildcard or private IP
+	// cannot express it, issue #8 D-1); otherwise the concrete bound
+	// addresses are announced (never wildcards — peers cannot dial
+	// 0.0.0.0).
 	announced := []string(eps)
 	if len(listen) > 0 {
 		l, err := mesh.NewListener(context.Background(), mesh.ListenerConfig{
@@ -235,7 +261,17 @@ func runJoin(args []string) error {
 		}
 		listener = l
 		defer listener.Close()
-		announced = l.BoundAddrs()
+		if len(eps) == 0 {
+			announced = l.BoundAddrs()
+			if len(announced) == 0 {
+				fmt.Fprintf(os.Stderr, "WARNING: listening on %s, but a wildcard address cannot be announced —\n", strings.Join(l.WildcardAddrs(), ", "))
+				fmt.Fprintf(os.Stderr, "  other members will NOT be able to dial this device.\n")
+				fmt.Fprintf(os.Stderr, "  pass --endpoint <your-public-or-NAT-mapped-address>:<port> to publish one.\n")
+			}
+		} else if wl := l.WildcardAddrs(); len(wl) > 0 {
+			fmt.Fprintf(os.Stderr, "note: wildcard binds %s serve incoming links but are not announced; announcing %s\n",
+				strings.Join(wl, ", "), strings.Join(announced, ", "))
+		}
 	}
 
 	cl, err := discovery.NewClient(discovery.ClientConfig{
@@ -304,6 +340,27 @@ func runJoin(args []string) error {
 	}
 
 	approvedAt := time.Time{}
+	// Print only when the VIEW actually changes: version (membership) or the
+	// online set (liveness). Same-version same-liveness snapshots arrive on
+	// every re-push, and re-rendering them produced 8800 lines/s of log spam
+	// under a churning server (issue #8, report 1 §3.2). The signature guard
+	// keeps online/offline transitions visible while killing the spam; the
+	// D-3 server-side fix removes the churn itself.
+	viewSig := func() string {
+		snap := cl.Snapshot()
+		if snap == nil {
+			return ""
+		}
+		online := make([]string, 0, len(snap.Members))
+		for id, mv := range snap.Members {
+			if mv.Online {
+				online = append(online, id.String())
+			}
+		}
+		sort.Strings(online)
+		return fmt.Sprintf("v%d|%s", snap.Version, strings.Join(online, ","))
+	}
+	lastSig := ""
 	for {
 		select {
 		case <-cl.Updates():
@@ -312,12 +369,16 @@ func runJoin(args []string) error {
 					approvedAt = time.Now()
 					fmt.Fprintf(os.Stderr, "approved: this device is now a member\n")
 					printSnapshot()
+					lastSig = viewSig()
 					if *once {
 						return nil
 					}
 					continue
 				}
-				printSnapshot()
+				if sig := viewSig(); sig != lastSig {
+					printSnapshot()
+					lastSig = sig
+				}
 			} else if !approvedAt.IsZero() {
 				// Membership was revoked (R-1.3 says what happens to
 				// sessions; here the honest CLI response is to say so).
@@ -353,7 +414,11 @@ func runServeDiscovery(args []string) error {
 	// Optional but strongly recommended: with it, adopted certificates are
 	// verified against the account key before entering the list; without it,
 	// the certs directory is trusted as operator-managed (review F2).
-	accountPub := fs.String("account-pub", "", "account public key, base64 (`cmesh account show` prints it); enables signature verification for adopted certificates")
+	accountPub := fs.String("account-pub", "", "account public key, base64 or hex (`cmesh account show` prints both); enables signature verification for adopted certificates")
+	// The discovery node is itself a member; without an announce it shows
+	// offline in every member's view forever (issue #8 D-6). A wildcard
+	// --addr has no self-describing public address, hence this flag.
+	announce := fs.String("announce", "", "address members use to reach THIS node (host:port); announces the node itself into the member view so it is visible and dialable")
 	verbose := fs.Bool("v", false, "verbose (debug) logging")
 	if err := fs.Parse(args); err != nil {
 		return ExitError{Code: 2, Err: err}
@@ -366,9 +431,9 @@ func runServeDiscovery(args []string) error {
 	}
 	var accountPubKey []byte
 	if *accountPub != "" {
-		raw, err := base64.StdEncoding.DecodeString(*accountPub)
-		if err != nil || len(raw) != ed25519.PublicKeySize {
-			return ExitError{Code: 2, Err: fmt.Errorf("--account-pub must be base64 of a %d-byte public key", ed25519.PublicKeySize)}
+		raw, err := parsePubKeyString(*accountPub)
+		if err != nil {
+			return ExitError{Code: 2, Err: fmt.Errorf("--account-pub: %w", err)}
 		}
 		accountPubKey = raw
 	}
@@ -435,10 +500,70 @@ func runServeDiscovery(args []string) error {
 	}
 	go watchApprovals(context.Background(), *membersPath, certsDir, members, srv, accountPubKey)
 
+	// D-6: announce ourselves so the node is visible (and dialable) in the
+	// member view instead of showing offline forever. The announced address
+	// is --announce when given, else the concrete --addr; a wildcard --addr
+	// alone cannot be announced — say so instead of staying silently
+	// invisible.
+	selfEPS := []string{}
+	if *announce != "" {
+		selfEPS = []string{*announce}
+	} else if host, port, err := net.SplitHostPort(*addr); err == nil && host != "" {
+		selfEPS = []string{net.JoinHostPort(host, port)}
+	}
+	if len(selfEPS) > 0 {
+		_, port, _ := net.SplitHostPort(*addr)
+		selfURL := "http://127.0.0.1:" + port
+		if host, _, err := net.SplitHostPort(*addr); err == nil && host != "" {
+			selfURL = "http://" + net.JoinHostPort(host, port)
+		}
+		go selfAnnounceLoop(context.Background(), selfURL, selfEPS, dev)
+	} else {
+		fmt.Fprintf(os.Stderr, "note: --addr is a wildcard and no --announce given: this node will show as offline\n")
+		fmt.Fprintf(os.Stderr, "  in member views; pass --announce <members-facing-address>:port to make it visible\n")
+	}
+
 	if err := srv.ListenAndServe(); err != nil {
 		return ExitError{Code: 1, Err: fmt.Errorf("serve-discovery: %w", err)}
 	}
 	return nil
+}
+
+// selfAnnounceLoop posts the discovery node's own signed announce on the
+// heartbeat interval: the node is a member, and members announce. Failures
+// are logged, never fatal — a node that cannot reach itself via its own
+// published address is a deployment problem worth one log line per attempt,
+// not a crash.
+func selfAnnounceLoop(ctx context.Context, selfURL string, eps []string, dev *identity.Device) {
+	post := func() {
+		a := discovery.MemberAnnounce{DeviceID: dev.ID(), Endpoints: eps, Timestamp: time.Now()}
+		req := discovery.RegisterRequest{Announce: a, Sig: a.Sign(dev)}
+		b, err := json.Marshal(req)
+		if err != nil {
+			return
+		}
+		resp, err := http.Post(selfURL+"/mesh/register", "application/json", bytes.NewReader(b))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "self-announce failed: %v\n", err)
+			return
+		}
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			fmt.Fprintf(os.Stderr, "self-announce rejected: HTTP %d: %s\n", resp.StatusCode, strings.TrimSpace(string(body)))
+		}
+	}
+	post()
+	t := time.NewTicker(discovery.HeartbeatInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			post()
+		}
+	}
 }
 
 // loadOrBootstrapMembers reads the member list, or creates one bound to the
@@ -490,9 +615,20 @@ func loadOrBootstrapMembers(path string, dev *identity.Device) (*identity.Member
 // whose version went backwards is bumped past the current one.
 func watchApprovals(ctx context.Context, membersPath, certsDir string, start *identity.MemberList, srv *relay.Server, accountPub []byte) {
 	cur := start
+	// lastMembers records the mtime of the file AS WE LAST LEFT IT (either
+	// read it or wrote it). Our own SaveMembers refreshes the mtime — without
+	// re-reading it here, our own save would register as an external edit and
+	// the watcher would reload+save in a 2-second loop forever, inflating the
+	// member-list version and re-pushing identical snapshots to every member
+	// (issue #8 D-3: 201 self-triggered reloads, v3→v208, zero changes).
 	var lastMembers time.Time
 	if st, err := os.Stat(membersPath); err == nil {
 		lastMembers = st.ModTime()
+	}
+	noteFileState := func() {
+		if st, err := os.Stat(membersPath); err == nil {
+			lastMembers = st.ModTime()
+		}
 	}
 	// Adopted files are tracked by mtime so a junk file logs once, not on
 	// every tick.
@@ -514,13 +650,14 @@ func watchApprovals(ctx context.Context, membersPath, certsDir string, start *id
 			// External edit wins first, so adoption on this tick lands on
 			// top of the fresh file rather than a stale list.
 			if st, err := os.Stat(membersPath); err == nil && st.ModTime().After(lastMembers) {
-				lastMembers = st.ModTime()
 				m, err := identity.LoadMembers(membersPath)
 				switch {
 				case err != nil:
 					fmt.Fprintf(os.Stderr, "members file reload failed: %v\n", err)
+					noteFileState() // don't retry a broken file every tick forever
 				case m.AccountID != cur.AccountID:
 					fmt.Fprintf(os.Stderr, "members file reload refused: file is for account %s, network is %s\n", m.AccountID, cur.AccountID)
+					noteFileState()
 				default:
 					if m.Version <= cur.CurrentVersion() {
 						m.Version = cur.CurrentVersion() + 1
@@ -580,6 +717,9 @@ func watchApprovals(ctx context.Context, membersPath, certsDir string, start *id
 				if err := cur.SaveMembers(membersPath); err != nil {
 					fmt.Fprintf(os.Stderr, "members save failed: %v\n", err)
 				}
+				// Our own save refreshed the file's mtime: record it, or the
+				// next tick would treat our write as an external edit (D-3).
+				noteFileState()
 				srv.SetMeshMembers(cur)
 			}
 		}

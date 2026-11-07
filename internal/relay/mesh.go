@@ -263,7 +263,12 @@ func (s *Server) handleMeshMembers(w http.ResponseWriter, r *http.Request) {
 		s.log.Warn("mesh members upgrade failed", "err", err)
 		return
 	}
-	conn.EnableLiveness(s.liveness())
+	// The members stream IS the member's liveness signal (issue #8 #7), so
+	// its keepalive is tighter than the pairing relay's: 3 s pings prove
+	// liveness three times inside the 10 s idle window — the P-5 acceptance
+	// numbers (same as the direct-link QUIC memo). Members are tens; the
+	// ping cost is negligible.
+	conn.EnableLiveness(wsconn.Liveness{PingEvery: 3 * time.Second, IdleTimeout: 10 * time.Second})
 
 	s.streamMeshMembers(r.Context(), conn, id)
 }
@@ -271,12 +276,34 @@ func (s *Server) handleMeshMembers(w http.ResponseWriter, r *http.Request) {
 // streamMeshMembers pushes full snapshots: one immediately, then one per
 // change signal. Every push re-reads the current member list — SetMeshMembers
 // may swap it at any moment, and a stream opened before an approval must
-// still deliver the post-approval view. Returns when the connection dies or
-// the request context is cancelled; the deferred unsub prevents a subscriber
-// leak either way.
+// still deliver the post-approval view. The stream doubles as the member's
+// fast liveness signal: when it dies (kill -9 closes the socket), the node
+// expires the device immediately instead of waiting out the heartbeat
+// timeout (P-5's ≤10 s; issue #8 finding #7). Returns when the connection
+// dies or the request context is cancelled; deferred unsub + detach prevent
+// subscriber/liveness leaks either way.
 func (s *Server) streamMeshMembers(ctx context.Context, conn *wsconn.Conn, id identity.DeviceID) {
 	ch, unsub := s.disco.Subscribe(id)
 	defer unsub()
+	s.disco.AttachStream(id)
+	defer s.disco.DetachStream(id)
+
+	// Drain the read side: the server only SENDS on this stream, so without
+	// a reader the peer's close (FIN/close-frame) sits unseen until the next
+	// ping tick fails — up to a full ping period of extra "offline" lag, or
+	// forever if nobody ever reads. Draining makes a graceful client close
+	// surface in one RTT; a hard kill surfaces via the ping/idle deadline
+	// above. Discarding whatever arrives is correct: members never send
+	// data on this stream (red check: removing this goroutine makes
+	// TestStreamCloseExpiresMemberFast red — the push only fires after the
+	// ping period instead of immediately).
+	go func() {
+		for {
+			if _, err := conn.Recv(); err != nil {
+				return
+			}
+		}
+	}()
 
 	send := func() error {
 		s.mu.Lock()

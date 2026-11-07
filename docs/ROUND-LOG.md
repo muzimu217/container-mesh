@@ -227,3 +227,44 @@ init → account create → device-add → serve-discovery（自举 members.json
 2. 「注释说 X、代码做 Y」的坑上一轮 F1 刚修过，这轮 VerifyConnection 的官方语义与实测行为又不一致——**平台行为要实测记录，不能只读文档**。
 
 **下一轮**：PR-M4（e2e SIGMA 层 + 中转路由 + 配额——风险最高的 PR，单独提交便于 bisect）；真机实验等用户服务器就绪后按 deploy/MESH-NET.md 清单执行
+
+## Round 8 — 外部测试回报处置：1 高危功能阻断 + P-5 失败根修（2026-11-07）
+
+**输入**：issue #8 两份独立外部测试报告（单沙箱三进程版；netns+iptables 真实 NAT 拓扑版）。质量极高：jsDelivr sha256 逐文件锁定 commit、真实内核转发路径搭 NAT、每条缺陷带代码定位+复现命令、未验证项如实单列。**全部接受**，处置回复已发 issue。
+
+### 测试结论（develop @ f0124e9）
+
+8 项：6 通过 / **#7 kill -9 收敛失败（69–83s vs ≤10s）** / #5 一半被 D-1 阻断。另 6 个非已知边界缺陷（D-1~D-6）+ 4 个文档/易用性问题。
+
+### 根修（本 Round 交付）
+
+| 发现 | 根因 | 修复 |
+|---|---|---|
+| **#7 P-5 失败**（两报告一致） | 成员视图 online 只看心跳（90s+15s）；R-2.2 说的「传输层断连检测」**从未实现**——发现节点对成员只有 POST，没有可断的连接。issue 文案把 QUIC 链路 idle 和成员存活混为一谈（认账） | **快路径**：节点按设备计数 members 流（AttachStream/DetachStream），流断开→立即清在线+推送。**排水读取器**：server 原本不读该流，客户端 FIN 要等 ping 周期才发现（红检抓出：20s→0.01s）；liveness 收紧 3s ping/10s idle（对齐备忘数字，硬杀场景 ≤10s）。心跳超时降级为「连接活着但进程僵死」的兜底 |
+| **D-1 高危阻断** | `--listen 0.0.0.0:7000` 把通配地址当端点广播→对端拨自己的回环；`--endpoint` 被 BoundAddrs 覆盖 | BoundAddrs 滤未指定地址；`--endpoint` 显式优先（NAT 映射场景的正解）；通配-only 绑定大声警告；DialDirect 拒绝通配端点（纵深） |
+| **D-3 watcher 死循环** | 外部编辑检测用 mtime，自己 SaveMembers 刷 mtime→自触发（原始日志实锤 201 次，v3→v208） | 自身保存后重读 mtime 记账；坏文件/拒收也记账防重试风暴 |
+| 3.2 日志热循环（164MB/10min） | D-3 版本灌水 + join 对同版本快照反复渲染 | D-3 修复 + join 打印加「版本+在线集合」签名守卫（在线翻转仍可见） |
+| D-2 hex/base64 陷阱 | account show 输出 hex、--account-pub 只收 base64 | 双编码接受 + account show 加 pubkey.b64 行 |
+| D-4 提示不可达 | 「在线但无端点」等满 20s 才报通用超时 | 该状态是稳态，立即给可操作提示 |
+| D-5 口令不一致 | mesh ping/dial 没走 readPassphrase | 统一走（CMESH_PASSPHRASE 恢复可用） |
+| D-6 发现节点恒 offline | 节点不 announce | `--announce` 参数 + 具体 --addr 自动公告 + 通配时如实说明 |
+| 报告一 #8 文案 | 撤销后报「网络不可达」误导排障 | openMeshSession 失败时补 announce 探测，401 not-member→明确报「已被移出网络」 |
+| 3.1 构建非静态 | issue 命令缺 CGO_ENABLED=0 | 指南修正（Makefile 本来就对） |
+| 3.3 间歇 dial 超时 | 未复现 | 主嫌疑 D-3 风暴；修复后请测试者复测（已在 issue 回复注明） |
+
+### 红绿验证
+
+- **TestStreamCloseExpiresMemberFast**：先红后修——第一版只挂 Attach/Detach 时测试红了（推送要等 ping 周期），暴露「server 不读流」的真问题，排水读取器是红检逼出来的
+- TestStreamOverlapKeepsOnline（重连重叠不误杀）、TestDialRejectsWildcardEndpoint、TestBoundAddrsFiltersWildcard、**TestWatchApprovalsNoSelfTriggerLoop**（空闲 5.5s 版本不变，D-3 修复前必红）
+
+### 全量验证
+
+`go test ./... -race` 15 包全绿，e2e 35/35，vet 干净。
+
+### 教训
+
+1. **「服务端只写不读」的流必须排水**：不读就发现不了对端关闭——这次是红检把 20s→0.01s 的差距暴露出来的，不是推演。
+2. issue 邀请文案里每个技术断言都会被当验收标准执行——「QUIC 10s idle」被写成 #7 的保障，测试者按它判了失败。**文案=契约**。
+3. 外部测试者搭 netns+NAT 真实拓扑的严谨度超过我们自己的验收测试——真机实验清单应该吸收他们的复现脚本（§7 最短路径已可复用）。
+
+**下一轮**：等 #8 复测回报（重点：#7 收敛、D-1 修复后公网→NAT 方向、3.3 是否随 D-3 消失）→ PR-M4（e2e + 中转路由）

@@ -187,6 +187,44 @@ func TestDialFailsForNonMember(t *testing.T) {
 	}
 }
 
+// TestDialRejectsWildcardEndpoint pins the D-1 defense (issue #8): a peer
+// that announced 0.0.0.0 must produce the actionable error, not a 10s dial
+// into our own loopback.
+func TestDialRejectsWildcardEndpoint(t *testing.T) {
+	f := newDirectFixture(t)
+	_, err := DialDirect(context.Background(), DialConfig{
+		Device:    f.bob,
+		Resolver:  MemberListAdapter{List: f.members},
+		Target:    f.aline.ID(),
+		Endpoints: []string{"0.0.0.0:7000"},
+		Kind:      KindPing,
+	})
+	if err == nil || !strings.Contains(err.Error(), "--endpoint") {
+		t.Fatalf("wildcard endpoint must fail with the actionable reason, got: %v", err)
+	}
+}
+
+// TestBoundAddrsFiltersWildcard pins the listener half of D-1: wildcard
+// binds serve but are never announced.
+func TestBoundAddrsFiltersWildcard(t *testing.T) {
+	f := newDirectFixture(t)
+	l, err := NewListener(context.Background(), ListenerConfig{
+		Device:  f.aline,
+		Members: MemberListAdapter{List: f.members},
+		Addrs:   []string{"0.0.0.0:0"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(l.Close)
+	if got := l.BoundAddrs(); len(got) != 0 {
+		t.Fatalf("wildcard bind must not be announced, got %v", got)
+	}
+	if got := l.WildcardAddrs(); len(got) != 1 {
+		t.Fatalf("wildcard bind should be reported for the warning, got %v", got)
+	}
+}
+
 // TestRevokedMemberCannotConnect pins revocation on the listener side: once
 // the device is out of the member list, its certificate no longer pins and
 // the TLS handshake fails.
