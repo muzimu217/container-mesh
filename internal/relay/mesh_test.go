@@ -475,6 +475,62 @@ func TestStreamOverlapKeepsOnline(t *testing.T) {
 	}
 }
 
+// TestSlowConsumerKicked pins the push-path hardening from the issue #8
+// retest: a member stream whose client stops reading must be KICKED by the
+// write deadline instead of jamming forever (unbounded Send fills kernel
+// + gorilla buffers, blocks every keepalive write behind it, and freezes the
+// member's view mid-stream). The kick is safe by design: the client's
+// reconnect loop redials and receives a fresh snapshot. Removing the
+// SetWriteDeadline in streamMeshMembers turns this test red (the conn stays
+// open while megabytes queue).
+func TestSlowConsumerKicked(t *testing.T) {
+	f := newMeshFixture(t, 3)
+	_, ts, node := newMeshRelay(t, f.members)
+
+	// The observer connects and then STOPS READING (its process is wedged).
+	obs := dialMembers(t, ts, f.devices[0], membersAuthHeaders(f.devices[0]))
+	recvSnapshot(t, obs) // initial push lands in the socket buffer
+
+	// A churn storm: tens of thousands of endpoint changes, each one a
+	// legitimate notifyAll → a full-snapshot push toward the wedged reader.
+	// ~48 MB total: comfortably past every auto-tuned loopback kernel buffer,
+	// so without the write deadline the queue grows for minutes instead of
+	// the kick firing in seconds.
+	go func() {
+		for i := 0; i < 60000; i++ {
+			ep := fmt.Sprintf("203.0.113.%d:%d", 1+i%250, 7000+i%1000)
+			node.Register(discovery.MemberAnnounce{
+				DeviceID:  f.devices[2].ID(),
+				Endpoints: []string{ep},
+				Timestamp: time.Now(),
+			}, time.Now())
+		}
+	}()
+
+	// The observable for "kicked" is the server-side close surfacing on the
+	// client's read: the client here deliberately has no liveness and never
+	// reads (that IS the wedge), so its own Closed() cannot fire. The close
+	// surfaces only AFTER the client drains whatever is already buffered,
+	// so poll: buffered snapshots read clean (nil error) until the kick's
+	// close arrives, then Recv errors. Polling also tolerates the race
+	// between our wait and the deadline trip (kick observed anywhere from
+	// ~5 s in). Without the write deadline the server never closes and this
+	// loop runs to the fatal bound.
+	kickSeen := false
+	deadline := time.Now().Add(25 * time.Second)
+	for time.Now().Before(deadline) {
+		_ = obs.SetReadDeadline(time.Now().Add(2 * time.Second))
+		_, err := obs.Recv()
+		if err != nil {
+			kickSeen = true
+			break
+		}
+	}
+	if !kickSeen {
+		t.Fatal("server never kicked the wedged stream — the push path can still jam forever")
+	}
+}
+
 func TestBuildSnapshotOmitsStaleEndpointsOnly(t *testing.T) {
 	f := newMeshFixture(t, 1)
 	_, ts, node := newMeshRelay(t, f.members)

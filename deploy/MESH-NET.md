@@ -83,8 +83,11 @@ cmesh account device-add  # 把本设备签进账号
 
 ```bash
 cmesh serve-discovery --addr :8080 --account-pub <base64 或 hex>
-# --account-pub 从 `cmesh account show` 拿（pubkey.b64 那行；hex 也接受）。
-# 提供它之后，certs 目录收编的每张证书都会先验签再入列表（强烈建议提供）
+# --account-pub 从 `cmesh account show` 拿（pubkey.b64 行，打在 stdout；hex 也接受）。
+# 脚本取值示例（公钥在 stdout，叙述在 stderr）：
+#   ACC=$(cmesh account show --state A --passphrase p2 2>/dev/null | awk '/^pubkey.b64 /{print $2}')
+# 提供它之后，certs 目录收编的每张证书都会先验签再入列表（强烈建议提供；
+# flag 传空时启动会打 NOTE 提示验证未开启——见到 NOTE 就是取值链路出了问题）
 #
 # 可选 --announce <成员可达地址>:端口：把发现节点自己也公告进成员视图
 #（否则它恒显示 offline，易被误读为掉线）。--addr 写具体 IP 时可省略。

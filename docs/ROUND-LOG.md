@@ -268,3 +268,35 @@ init → account create → device-add → serve-discovery（自举 members.json
 3. 外部测试者搭 netns+NAT 真实拓扑的严谨度超过我们自己的验收测试——真机实验清单应该吸收他们的复现脚本（§7 最短路径已可复用）。
 
 **下一轮**：等 #8 复测回报（重点：#7 收敛、D-1 修复后公网→NAT 方向、3.3 是否随 D-3 消失）→ PR-M4（e2e + 中转路由）
+
+## Round 9 — 复测处置：两项指控反驳 + 慢消费者踢除加固（2026-11-07）
+
+**输入**：复测报告（develop @ `ba1619f`）——声称 #7 kill -9 回归为流堵死冻结、N-1 新发现端点污染、D-2 NOTE 误报；随包日志 tar.gz。
+
+### 核实结果（第一方复现 + 随包日志交叉）
+
+| 指控 | 结论 |
+|---|---|
+| N-1 拨发现地址 20s 假拨号 | **反驳**：同拓扑复现 131ms 即时提示（`resolveTarget` 对空端点稳态立即短路，无回退路径） |
+| #7 kill -9 冻结 110s | **反驳**：同拓扑复现 **0.56s** 翻 offline，kill 后新成员变更正常推送；随包日志（netns 复测）独立佐证 **1.1s** |
+| D-2 NOTE 误报 | **部分成立**：NOTE 是诚实告警（flag 到达时为空），但 `account show` 公钥打 stderr 是真缺陷 → 修为 stdout 输出（`pubkey.b64`/`pubkey.hex`），与 show-pub 约定一致；我方复现脚本同样踩中（`2>/dev/null` 拿空） |
+
+**关键疑点**：随包日志是 **netns 拓扑**（`ws://8080`、pub2/memB 角色名、t7b kill-9=1.1s），与报告文本所述单机 A/B/C `:18080` 拓扑不符——现场日志（`/tmp/cmtest2`）未随包，已请报告作者补交四件证据。`logs/accountpub.txt` 的「公钥」解码开头是 ASCII `#tes`（非均匀随机形态）+ `PUBB64=` 变量赋值行，指向 harness 取值链路拿到错误对象。
+
+### 采纳的加固（报告建议正确的部分）
+
+`streamMeshMembers` 每次 push 带 **5s 写超时**，超时踢除慢消费者（无界 Send 会灌满内核缓冲、卡死 keepalive、冻结视图——失败形态真实存在，即使本轮未能复现）。踢除安全：客户端重连即拿新快照。
+
+**红检插曲**：踢除测试第一版 20s 红——不是机制没生效（日志实锤 i/o timeout + conn 关闭），而是**断言选错**：楔死的客户端自己永不读、无 liveness，`Closed()` 不会自触发；改为轮询「服务端关闭在客户端读侧浮出」，2s 绿。
+
+### 交付
+
+`account show` stdout 修正、wsconn `SetWriteDeadline`（增量方法）、push 写超时踢除、`TestSlowConsumerKicked`、指南取值示例。issue #8 三条评论（代发复测报告 / 本处置）。全量 `-race` 15 包 + e2e 35/35 绿。
+
+### 教训
+
+1. **随包证据要先自洽再定结论**：tar.gz 里的日志与 md 报告描述的是两个不同环境的运行——若只读 md 就动手改代码，会把两个真 bug（Round 8 已修）再「修」一遍。
+2. 断言可观测量的选择和机制本身一样重要：楔死客户端的 `Closed()` 在结构上不可能触发，轮询读侧才是「踢除」的正确观测量。
+3. 脚本取值面（stdout）与人类叙述面（stderr）的约定必须全 CLI 一致——一处不一致（account show）就让外部 harness 与我自己的复现脚本同时翻车。
+
+**下一轮**：等报告一作者补证据 / netns 测试者确认 → develop→main 合并 PR → PR-M4

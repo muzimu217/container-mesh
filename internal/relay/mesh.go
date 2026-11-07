@@ -305,6 +305,16 @@ func (s *Server) streamMeshMembers(ctx context.Context, conn *wsconn.Conn, id id
 		}
 	}()
 
+	// pushWriteDeadline bounds each snapshot write. A consumer that cannot
+	// keep up must be KICKED, not buffered forever: an unbounded Send jams
+	// the stream (kernel buffer, then gorilla's buffer, then every keepalive
+	// write behind it), which both hides the peer's death from liveness and
+	// freezes this member's view mid-stream — the exact failure shape the
+	// issue #8 retest reported (megabytes stuck in kernel queues). Kicking
+	// is safe: the client's reconnect loop redials, authenticates, and
+	// receives a fresh snapshot on arrival.
+	const pushWriteDeadline = 5 * time.Second
+
 	send := func() error {
 		s.mu.Lock()
 		members := s.discoMembers
@@ -314,6 +324,8 @@ func (s *Server) streamMeshMembers(ctx context.Context, conn *wsconn.Conn, id id
 		if err != nil {
 			return err
 		}
+		_ = conn.SetWriteDeadline(time.Now().Add(pushWriteDeadline))
+		defer func() { _ = conn.SetWriteDeadline(time.Time{}) }()
 		return conn.Send(b)
 	}
 

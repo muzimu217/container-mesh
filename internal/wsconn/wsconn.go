@@ -268,6 +268,19 @@ func (c *Conn) SetReadDeadline(t time.Time) error {
 	return c.ws.SetReadDeadline(t)
 }
 
+// SetWriteDeadline sets the deadline for subsequent Send calls. Without one,
+// a Send to a stalled consumer blocks forever — the kernel buffer, then
+// gorilla's write buffer, grow without bound — which jams the whole stream,
+// keepalive writes included, and hides a dead peer behind a full pipe
+// (issue #8 retest: a members stream with megabytes stuck in kernel queues
+// and a view frozen mid-stream). Additive method: callers that never set a
+// deadline keep today's behavior.
+func (c *Conn) SetWriteDeadline(t time.Time) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	return c.ws.SetWriteDeadline(t)
+}
+
 // Close closes the underlying socket and stops the liveness ticker. Safe to
 // call more than once. It never waits on a blocked Recv — the gorilla read
 // is unblocked by the socket close itself.

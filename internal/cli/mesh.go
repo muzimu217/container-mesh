@@ -353,8 +353,14 @@ func runAccountShow(args []string) error {
 	}
 	fmt.Fprintf(os.Stderr, "account  %s\n", acc.ID())
 	fmt.Fprintf(os.Stderr, "  file   %s\n", accPath)
-	fmt.Fprintf(os.Stderr, "  pubkey %x\n", acc.PublicKey())
-	fmt.Fprintf(os.Stderr, "  pubkey.b64 %s  (this is the form `serve-discovery --account-pub` accepts, hex works too)\n",
+	// The key lines go to STDOUT: scripts capture stdout (and routinely
+	// discard stderr with 2>/dev/null — the retest round's harness did
+	// exactly that and passed an empty --account-pub, silently disabling
+	// cert verification). Same convention as show-pub: stdout is the
+	// copy-paste surface, stderr is the human narration.
+	fmt.Printf("pubkey.b64 %s\n", base64.StdEncoding.EncodeToString(acc.PublicKey()))
+	fmt.Printf("pubkey.hex %x\n", acc.PublicKey())
+	fmt.Fprintf(os.Stderr, "  pubkey.b64 %s (printed on stdout for scripting; both forms are accepted by --account-pub)\n",
 		base64.StdEncoding.EncodeToString(acc.PublicKey()))
 	return nil
 }
