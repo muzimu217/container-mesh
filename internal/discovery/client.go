@@ -65,6 +65,13 @@ type ClientConfig struct {
 	// valid: a device with no inbound path (C-3) is visible and can dial out,
 	// it just cannot be dialed yet.
 	Endpoints []string
+	// NoAnnounce turns the client into a view-only participant: it streams
+	// snapshots but never registers presence or endpoints. One-shot commands
+	// (mesh ping / dial) must use it: the machine's real announcer is its
+	// long-running join process, and a second announcer with no endpoint
+	// knowledge would overwrite the announced set with an empty one (issue #8
+	// D-7 — the server-side guard in Node.Register is the second layer).
+	NoAnnounce bool
 	// Heartbeat is the announce period (0 = HeartbeatInterval).
 	Heartbeat time.Duration
 	// DialTimeout bounds both the HTTP register and the stream dial
@@ -201,12 +208,19 @@ func (c *Client) Announce(ctx context.Context) error {
 // Run blocks until ctx is cancelled: heartbeat loop plus snapshot stream,
 // each retrying with failover until the context ends. The first announce
 // fires immediately so a joiner is visible without waiting one period.
-// Run returns ctx.Err() on cancellation.
+// View-only clients (NoAnnounce) run the stream alone — their machine's
+// announcer is the long-running join process. Run returns ctx.Err() on
+// cancellation.
 func (c *Client) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	errc := make(chan error, 1)
 	go func() { errc <- c.streamLoop(ctx) }()
+
+	if c.cfg.NoAnnounce {
+		<-ctx.Done()
+		return ctx.Err()
+	}
 
 	if err := c.Announce(ctx); err != nil {
 		// Non-fatal: the heartbeat loop keeps trying, and the actionable

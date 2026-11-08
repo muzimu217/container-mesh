@@ -196,6 +196,29 @@ func TestMeshBootstrapApprovalFlow(t *testing.T) {
 	if !strings.Contains(pingOut, "5/5 pings") || !strings.Contains(pingOut, "p95") {
 		t.Fatalf("mesh ping output incomplete: %q", pingOut)
 	}
+
+	// --- Leg 4 (D-7 regression): the OWNER now runs a one-shot ping at the
+	// joiner (which has no listener → an immediate hint, exit 1). In the
+	// buggy version the owner's one-shot client announced empty endpoints on
+	// its way through, blanking the owner's own advertised endpoints for up
+	// to a heartbeat — so the JOINER's NEXT ping at the owner failed with
+	// "has announced no endpoints". With the fix (view-only one-shot clients
+	// + server-side empty-announce guard) the repeat ping must succeed.
+	pingErr := Run([]string{"mesh", "ping", "--state", ownerDir, "--device-passphrase", pass,
+		"--count", "1", "--timeout", "25s", loadJoinerDevice(t, joinerDir, pass).String()})
+	var hintExit ExitError
+	if !errors.As(pingErr, &hintExit) || hintExit.Code != 1 {
+		t.Fatalf("ping at listener-less joiner: got %v, want exit-1 hint", pingErr)
+	}
+	ping2 := captureStdout(t, func() {
+		if err := Run([]string{"mesh", "ping", "--state", joinerDir, "--device-passphrase", pass,
+			"--count", "3", "--timeout", "25s", ownerDev.String()}); err != nil {
+			t.Errorf("repeat mesh ping after owner's one-shot: %v", err)
+		}
+	})
+	if !strings.Contains(ping2, "3/3 pings") {
+		t.Fatalf("owner's one-shot ping wiped its own advertised endpoints (D-7): %q", ping2)
+	}
 }
 
 func loadJoinerDevice(t *testing.T, dir, pass string) identity.DeviceID {

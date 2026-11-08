@@ -72,12 +72,25 @@ func openMeshSession(ctx context.Context, state, passFlag string, eps []string) 
 	if err != nil {
 		return nil, fmt.Errorf("saved invite is malformed: %w", err)
 	}
+	// Announce only what we KNOW: endpoints from --endpoint flags, else the
+	// set saved by the join that created this config. With neither, the
+	// one-shot client runs view-only (NoAnnounce) — this machine's real
+	// announcer is its long-running join process, and an empty announce from
+	// here would blank its advertised endpoints for up to a heartbeat,
+	// making the machine undialable while we merely wanted to LOOK (issue #8
+	// D-7: a mesh ping used to knock the pinging machine itself offline in
+	// every other member's view).
+	known := append([]string(nil), eps...)
+	if len(known) == 0 {
+		known = append([]string(nil), cfg.Endpoints...)
+	}
 	cl, err := discovery.NewClient(discovery.ClientConfig{
 		Addrs:      inv.DiscoveryAddrs,
 		Device:     dev,
 		AccountID:  inv.AccountID,
 		AccountPub: []byte(inv.AccountPub),
-		Endpoints:  eps,
+		Endpoints:  known,
+		NoAnnounce: len(known) == 0,
 	})
 	if err != nil {
 		return nil, err

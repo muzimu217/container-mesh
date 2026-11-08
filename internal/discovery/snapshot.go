@@ -84,10 +84,17 @@ func BuildSnapshot(members *identity.MemberList, n *Node, now time.Time) *Member
 			continue
 		}
 		view := MemberView{Cert: mm.Cert}
+		// Endpoints are announcement state and are shown regardless of
+		// liveness: a members-stream gap does not mean the member's UDP
+		// listener is gone, and a dial attempt against the last advertised
+		// address beats a blind "no endpoints" hint (issue #8 — endpoint
+		// oscillation fix). Online remains the pure liveness signal (P-5).
+		if eps := n.Endpoints(id); len(eps) > 0 {
+			view.Endpoints = eps
+		}
 		if t, seen := n.LastSeen(id); seen && now.Sub(t) <= MemberTimeout {
 			view.Online = true
 			view.LastSeen = t
-			view.Endpoints = n.Endpoints(id)
 		}
 		snap.Members[id] = view
 	}

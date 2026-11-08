@@ -162,6 +162,15 @@ func (r *liveViewResolver) KeyFor(id identity.DeviceID) (ed25519.PublicKey, erro
 	return mesh.SnapshotAdapter{Snap: snap, AccountPub: ed25519.PublicKey(r.accountPub)}.KeyFor(id)
 }
 
+// relayMembersResolver pins direct-link certificates against the relay's
+// LIVE member list — the serve-discovery listener must follow hot reloads,
+// or an approved device could not connect until process restart.
+type relayMembersResolver struct{ srv *relay.Server }
+
+func (r relayMembersResolver) KeyFor(id identity.DeviceID) (ed25519.PublicKey, error) {
+	return mesh.MemberListAdapter{List: r.srv.MeshMembers()}.KeyFor(id)
+}
+
 func saveDiscoveryConfig(dir string, cfg discoveryConfig) (string, error) {
 	b, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
@@ -287,7 +296,16 @@ func runJoin(args []string) error {
 	}
 	if listener != nil {
 		resolver.set(cl)
-		fmt.Fprintf(os.Stderr, "listening for direct links on %s\n", strings.Join(listener.BoundAddrs(), ", "))
+		// D-1b: wildcard-only binds print as "bound, not announced" instead
+		// of an empty list that reads like nothing is listening.
+		parts := make([]string, 0, 2)
+		if bound := listener.BoundAddrs(); len(bound) > 0 {
+			parts = append(parts, strings.Join(bound, ", "))
+		}
+		if wild := listener.WildcardAddrs(); len(wild) > 0 {
+			parts = append(parts, "wildcard "+strings.Join(wild, ", ")+" (bound, not announced — pass --endpoint to publish)")
+		}
+		fmt.Fprintf(os.Stderr, "listening for direct links on %s\n", strings.Join(parts, "; "))
 	}
 
 	// Persisted only after every check passed: a failed join must not leave
@@ -512,13 +530,32 @@ func runServeDiscovery(args []string) error {
 		selfEPS = []string{net.JoinHostPort(host, port)}
 	}
 	if len(selfEPS) > 0 {
+		// D-6r: the announced address must actually carry a QUIC listener,
+		// or members dial an undialable endpoint. HTTP is TCP on this port;
+		// the direct link is UDP on the SAME number, so both coexist. If the
+		// bind fails (address not local, port taken), drop the self-announce
+		// entirely — announcing something unreachable is exactly the bug.
+		if ml, lerr := mesh.NewListener(context.Background(), mesh.ListenerConfig{
+			Device:  dev,
+			Members: relayMembersResolver{srv: srv},
+			Addrs:   selfEPS,
+		}); lerr != nil {
+			fmt.Fprintf(os.Stderr, "note: cannot bind direct-link listener on %s (%v)\n", strings.Join(selfEPS, ", "), lerr)
+			fmt.Fprintf(os.Stderr, "  self-announce dropped: announcing an unreachable address would mislead dialers\n")
+			selfEPS = nil
+		} else {
+			defer ml.Close()
+			fmt.Fprintf(os.Stderr, "  mesh direct-link listener: UDP %s\n", strings.Join(ml.BoundAddrs(), ", "))
+		}
+	}
+	if len(selfEPS) > 0 {
 		_, port, _ := net.SplitHostPort(*addr)
 		selfURL := "http://127.0.0.1:" + port
 		if host, _, err := net.SplitHostPort(*addr); err == nil && host != "" {
 			selfURL = "http://" + net.JoinHostPort(host, port)
 		}
 		go selfAnnounceLoop(context.Background(), selfURL, selfEPS, dev)
-	} else {
+	} else if *announce == "" {
 		fmt.Fprintf(os.Stderr, "note: --addr is a wildcard and no --announce given: this node will show as offline\n")
 		fmt.Fprintf(os.Stderr, "  in member views; pass --announce <members-facing-address>:port to make it visible\n")
 	}

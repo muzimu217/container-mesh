@@ -300,3 +300,37 @@ init → account create → device-add → serve-discovery（自举 members.json
 3. 脚本取值面（stdout）与人类叙述面（stderr）的约定必须全 CLI 一致——一处不一致（account show）就让外部 harness 与我自己的复现脚本同时翻车。
 
 **下一轮**：等报告一作者补证据 / netns 测试者确认 → develop→main 合并 PR → PR-M4
+
+## Round 10 — 三方复测收敛：D-7 根修 + 端点语义纠正（公告态 ≠ 存活态）（2026-11-07）
+
+**输入**：三份复测（3e1397d 沙盒版全过无阻塞；ba1619f 版定位端点振荡根因；netns 版确认两项反驳 + 抓出 **D-7 新阻断**）。
+
+### 本轮核心：端点语义纠正
+
+三方证据合流指向同一个设计错误——**把「公告态」（endpoints）当成了「存活态」（liveness）**，而我们自己的 Sweep 注释早就写着 "membership and liveness are different things"。两个表现：
+
+| 症状 | 机制 | 修复 |
+|---|---|---|
+| **D-7（高，阻断）**：跑一次 `mesh ping` 后本机 30s 不可被直连 | 一次性客户端 `Client.Run` 立即以空端点 announce，覆盖 join 进程公告的端点 | 双层：① `NoAnnounce` 视图模式——mesh ping/dial 只取视图不当第二公告者；② 服务端 `Register` 空端点=纯在场，**不覆盖**已公告端点（防未来同类 bug） |
+| **端点振荡（~30s 有/无，报告二定位）** | WS 空闲超时重连存在空窗，`DetachStream` 把端点跟 lastSeen 一起删，恢复要等下一次心跳 | `DetachStream` 只删存活不删端点；`BuildSnapshot` 端点**离线也可见**（流断了不等于 UDP 监听没了——可拨穿）；Sweep 仍在 90s 地平线清端点 |
+
+同源修复：D-6r（发现节点公告的地址挂上真正的 QUIC 监听，UDP/TCP 同端口号共存；绑不上就丢弃自公告）、D-1b（通配-only 打印「bound, not announced」而非空串）。
+
+### 测试
+
+- `TestEmptyAnnounceKeepsEndpoints`（D-7 服务端护栏：空 announce 刷新存活但不覆盖端点）
+- `TestDetachStreamKeepsEndpoints`（detach 后端点保留、可拨穿）
+- `TestStreamCloseExpiresMemberFast` 断言翻转：offline 后端点**保留**（原断言端点清空——语义修正的体现）
+- CLI 全流程加腿 4：owner ping 提示后 joiner 再 ping owner **必须成功**（D-7 回归）
+- 全量 `-race` 15 包 + e2e 35/35 绿
+
+### O-1（Send-Q MB 级积压）：挂 PR-M4
+
+慢消费者踢除已生效（本轮未堵死），但全量快照推送粒度对慢消费者仍会积到 MB 级。根治是增量推送，属于 M4 路由层工作；本轮不改阈值（5s 写超时是「防失控」线，不是「防积压」线——防积压需要协议层改动）。
+
+### 教训
+
+1. **「谁在公告」要唯一**：一台机器两个 announce 来源（join 进程 + 一次性命令）天然竞态。一次性命令应该是纯读者。这个错误是我写 `openMeshSession` 时引入的——三个测试者从三个角度（振荡、假拨号、不可直连）合力才定位到。
+2. 状态分类学：membership（谁属于）/ liveness（谁可达）/ announcement（谁说自己在哪）是三种生命周期不同的状态——前两条我们分清了，第三条这次才分清。
+
+**下一轮**：等三方在修复 commit 上确认 D-7/振荡/3.3 闭环 → develop→main 合并 PR → PR-M4（e2e + 中转路由 + 增量推送一并考虑 O-1）

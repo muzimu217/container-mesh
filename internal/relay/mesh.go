@@ -137,6 +137,16 @@ func (s *Server) SetMeshMembers(m *identity.MemberList) {
 	s.disco.SetMembers(m)
 }
 
+// MeshMembers returns the member list the mesh endpoints currently enforce.
+// Exposed so CLI-side adapters (the serve-discovery direct-link listener's
+// certificate pinning) resolve against the LIVE list across hot reloads,
+// not against a snapshot captured at startup.
+func (s *Server) MeshMembers() *identity.MemberList {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.discoMembers
+}
+
 // meshSnapshot wires the mux routes. Called from Handler().
 func (s *Server) meshSnapshotMux(mux *http.ServeMux) {
 	mux.HandleFunc("/mesh/register", s.handleMeshRegister)

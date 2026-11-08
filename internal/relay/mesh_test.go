@@ -445,8 +445,11 @@ func TestStreamCloseExpiresMemberFast(t *testing.T) {
 	if snap.Members[f.devices[1].ID()].Online {
 		t.Fatalf("victim still online after stream close (%.1fs)", time.Since(start).Seconds())
 	}
-	if len(snap.Members[f.devices[1].ID()].Endpoints) != 0 {
-		t.Fatal("offline member must not carry endpoints")
+	// Endpoints PERSIST the stream close (announcement state ≠ liveness,
+	// issue #8 endpoint-oscillation fix): the member's UDP listener is
+	// probably still alive, so its advertised address stays a dial candidate.
+	if len(snap.Members[f.devices[1].ID()].Endpoints) == 0 {
+		t.Fatal("stream close must not blank announced endpoints")
 	}
 	// Membership itself survives: reachability expired, not membership.
 	if _, still := snap.Members[f.devices[1].ID()]; !still {

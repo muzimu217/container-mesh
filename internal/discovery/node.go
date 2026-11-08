@@ -68,6 +68,14 @@ func (n *Node) AttachStream(id identity.DeviceID) {
 // ≤10 s bound achievable for kill -9 style deaths (the heartbeat timeout
 // only has to catch the hung-process case it was designed for).
 //
+// Reachability expires, but the ANNOUNCED ENDPOINTS PERSIST: they are what
+// the member's listener last advertised and remain valid dial candidates
+// while that UDP listener is alive. A stream reconnect gap or an idle
+// -timeout cycle must not blank them — deleting endpoints here produced a
+// ~30 s online/no-endpoints oscillation on every quiet network (issue #8,
+// report 2 §4). Sweep still clears endpoints at the heartbeat-timeout
+// horizon if the member stays gone.
+//
 // Reconnect overlap is safe: a member that re-dials before its old socket's
 // death is noticed holds count 2; the old stream's detach leaves 1 and the
 // device stays online.
@@ -81,7 +89,6 @@ func (n *Node) DetachStream(id identity.DeviceID) {
 	delete(n.streams, id)
 	if _, wasOnline := n.lastSeen[id]; wasOnline {
 		delete(n.lastSeen, id)
-		delete(n.endpts, id)
 		n.notifyAll()
 	}
 }
@@ -103,6 +110,17 @@ func (n *Node) Register(a MemberAnnounce, when time.Time) bool {
 	// Structural backstop: refuse to record state for a non-member even if
 	// the caller skipped Validate (external security review, high finding).
 	if !n.members.Contains(a.DeviceID) {
+		return false
+	}
+	// An EMPTY announce is presence-only. Endpoints are announcement state —
+	// the last thing the member's real listener advertised — and a
+	// zero-length list must not wipe them: a second announcer with no
+	// endpoint knowledge (one-shot view clients, issue #8 D-7) would
+	// otherwise blank the endpoints a running join process announced, making
+	// the machine undialable for up to a heartbeat. A device that genuinely
+	// has no endpoints never HAD any, so this is a no-op for the C-3 case.
+	if len(a.Endpoints) == 0 {
+		n.lastSeen[a.DeviceID] = when
 		return false
 	}
 	changed := !equalStrings(n.endpts[a.DeviceID], a.Endpoints)
