@@ -223,23 +223,38 @@ func (c *Client) Run(ctx context.Context) error {
 	}
 
 	if err := c.Announce(ctx); err != nil {
-		// Non-fatal: the heartbeat loop keeps trying, and the actionable
-		// reason (e.g. "not a member") has already been logged by Announce's
-		// caller-visible error path on the next tick.
+		// Non-fatal: the loop keeps trying, and a "not a member" failure is
+		// the expected pre-approval state — polled on a fast cadence so the
+		// member becomes visible within seconds of approval (issue #8:
+		// approval used to wait out a full heartbeat).
 		c.log.Warn("first announce failed; retrying on heartbeat", "err", err)
 	}
-	t := time.NewTicker(c.cfg.Heartbeat)
+	t := time.NewTicker(announceRetryDelay(nil, c.cfg.Heartbeat))
 	defer t.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-t.C:
-			if err := c.Announce(ctx); err != nil {
+			err := c.Announce(ctx)
+			if err != nil {
 				c.log.Warn("announce failed", "err", err)
 			}
+			// Approval-pending failures retry fast; everything else keeps
+			// the heartbeat cadence.
+			t.Reset(announceRetryDelay(err, c.cfg.Heartbeat))
 		}
 	}
+}
+
+// announceRetryDelay picks the next announce delay: a not-member rejection
+// means the approval may land any moment, so poll on a short cadence
+// instead of waiting out a full heartbeat.
+func announceRetryDelay(err error, heartbeat time.Duration) time.Duration {
+	if err != nil && strings.Contains(err.Error(), "not a member") {
+		return 3 * time.Second
+	}
+	return heartbeat
 }
 
 // streamLoop dials the members stream, applies pushes, and reconnects with

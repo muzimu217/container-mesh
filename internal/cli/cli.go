@@ -65,6 +65,12 @@ func Run(args []string) error {
 		return runMesh(args[1:])
 	case "dial":
 		return runDial(args[1:])
+	case "msg":
+		return runMsg(args[1:])
+	case "send-to":
+		return runSendTo(args[1:])
+	case "run":
+		return runRun(args[1:])
 	case "version", "-v", "--version":
 		fmt.Printf("cmesh %s\n", Version)
 		return nil
@@ -150,6 +156,19 @@ Usage:
         Open a mutually-authenticated direct channel to a member (device
         certificates are pinned to the member view). Interactive: typed
         lines echo back. PR-M4 adds real services on this link.
+
+  cmesh msg <deviceID> --text "…"
+        Deliver a message to a member. The receiver's join --listen
+        process prints it live (📩).
+
+  cmesh send-to <deviceID> --file PATH
+        Stream a file to a member over a direct link, sha256-verified.
+        The receiver saves it into its inbox (📬).
+
+  cmesh run <deviceID> @info | @disk [PATH] | @mem | @cat FILE | @ls [DIR]
+        Run a built-in read-only verb on a member and print the result.
+        Remote exit code propagates. (Arbitrary command execution is a
+        separate, operator-gated feature.)
 
   cmesh version
 

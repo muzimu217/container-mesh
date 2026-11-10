@@ -12,6 +12,7 @@ package cli
 // the transport-validation predecessor of PR-M4's real services.
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -175,6 +176,166 @@ func runMesh(args []string) error {
 	default:
 		return ExitError{Code: 2, Err: fmt.Errorf("unknown mesh subcommand %q (known: ping)", args[0])}
 	}
+}
+
+// runRun implements `cmesh run <deviceID> <verb> [args…]`: invoke a built-in
+// read-only verb on a member (@info @disk @mem @cat @ls). No process
+// execution — verbs are implemented natively on the receiver.
+func runRun(args []string) error {
+	fs := flag.NewFlagSet("run", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	state := fs.String("state", "", "state directory (default ~/.cmesh)")
+	pass := fs.String("device-passphrase", "", "passphrase for the device file (for scripting)")
+	timeout := fs.Duration("timeout", 30*time.Second, "budget for discovery and the verb")
+	if err := fs.Parse(args); err != nil {
+		return ExitError{Code: 2, Err: err}
+	}
+	if fs.NArg() < 2 {
+		return ExitError{Code: 2, Err: errors.New(
+			"usage: cmesh run [flags] <deviceID> <@verb> [args…]  (built-ins: @info @disk @mem @cat @ls)")}
+	}
+	target := identity.DeviceID(fs.Arg(0))
+	if !target.Valid() {
+		return ExitError{Code: 2, Err: fmt.Errorf("%q is not a valid device ID", fs.Arg(0))}
+	}
+	verb := fs.Arg(1)
+	verbArgs := fs.Args()[2:]
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	hctx, cancel := context.WithTimeout(ctx, *timeout)
+	defer cancel()
+
+	sess, err := openMeshSession(hctx, *state, *pass, nil)
+	if err != nil {
+		return ExitError{Code: 1, Err: err}
+	}
+	eps, err := sess.resolveTarget(hctx, target)
+	if err != nil {
+		return ExitError{Code: 1, Err: err}
+	}
+	code, err := mesh.SendRun(hctx, mesh.DialConfig{
+		Device:    sess.dev,
+		Resolver:  sess.resolver,
+		Target:    target,
+		Endpoints: eps,
+	}, verb, verbArgs)
+	if err != nil {
+		return ExitError{Code: 1, Err: err}
+	}
+	// Propagate the remote exit code, ssh-style.
+	return ExitError{Code: code}
+}
+
+// runMsg implements `cmesh msg <deviceID> --text "…"`: deliver a message to
+// a member over a direct link. The receiver's join --listen process prints
+// it live.
+func runMsg(args []string) error {
+	fs := flag.NewFlagSet("msg", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	state := fs.String("state", "", "state directory (default ~/.cmesh)")
+	pass := fs.String("device-passphrase", "", "passphrase for the device file (for scripting)")
+	text := fs.String("text", "", "message text; without it, one message per stdin line")
+	timeout := fs.Duration("timeout", 20*time.Second, "budget for discovery and delivery")
+	if err := fs.Parse(args); err != nil {
+		return ExitError{Code: 2, Err: err}
+	}
+	if fs.NArg() != 1 {
+		return ExitError{Code: 2, Err: errors.New("usage: cmesh msg [flags] <deviceID> (device ID goes last)")}
+	}
+	target := identity.DeviceID(fs.Arg(0))
+	if !target.Valid() {
+		return ExitError{Code: 2, Err: fmt.Errorf("%q is not a valid device ID", fs.Arg(0))}
+	}
+	var texts []string
+	if *text != "" {
+		texts = append(texts, *text)
+	} else {
+		sc := bufio.NewScanner(os.Stdin)
+		for sc.Scan() {
+			if line := sc.Text(); line != "" {
+				texts = append(texts, line)
+			}
+		}
+	}
+	if len(texts) == 0 {
+		return ExitError{Code: 2, Err: errors.New("nothing to send: pass --text or pipe lines on stdin")}
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	hctx, cancel := context.WithTimeout(ctx, *timeout)
+	defer cancel()
+
+	sess, err := openMeshSession(hctx, *state, *pass, nil)
+	if err != nil {
+		return ExitError{Code: 1, Err: err}
+	}
+	eps, err := sess.resolveTarget(hctx, target)
+	if err != nil {
+		return ExitError{Code: 1, Err: err}
+	}
+	if err := mesh.SendMsg(hctx, mesh.DialConfig{
+		Device:    sess.dev,
+		Resolver:  sess.resolver,
+		Target:    target,
+		Endpoints: eps,
+	}, texts); err != nil {
+		return ExitError{Code: 1, Err: err}
+	}
+	fmt.Fprintf(os.Stderr, "delivered %d message(s) to %s\n", len(texts), target)
+	return nil
+}
+
+// runSendTo implements `cmesh send-to <deviceID> --file PATH`: stream a file
+// to a member over a direct link with sha256 verification (R-4.2). The
+// receiver saves it into its inbox.
+func runSendTo(args []string) error {
+	fs := flag.NewFlagSet("send-to", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	state := fs.String("state", "", "state directory (default ~/.cmesh)")
+	pass := fs.String("device-passphrase", "", "passphrase for the device file (for scripting)")
+	file := fs.String("file", "", "file to send (required)")
+	timeout := fs.Duration("timeout", 10*time.Minute, "overall budget; large files need real time")
+	if err := fs.Parse(args); err != nil {
+		return ExitError{Code: 2, Err: err}
+	}
+	if fs.NArg() != 1 {
+		return ExitError{Code: 2, Err: errors.New("usage: cmesh send-to [flags] --file PATH <deviceID> (device ID goes last)")}
+	}
+	if *file == "" {
+		return ExitError{Code: 2, Err: errors.New("send-to needs --file PATH")}
+	}
+	target := identity.DeviceID(fs.Arg(0))
+	if !target.Valid() {
+		return ExitError{Code: 2, Err: fmt.Errorf("%q is not a valid device ID", fs.Arg(0))}
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	hctx, cancel := context.WithTimeout(ctx, *timeout)
+	defer cancel()
+
+	sess, err := openMeshSession(hctx, *state, *pass, nil)
+	if err != nil {
+		return ExitError{Code: 1, Err: err}
+	}
+	eps, err := sess.resolveTarget(hctx, target)
+	if err != nil {
+		return ExitError{Code: 1, Err: err}
+	}
+	h, err := mesh.SendFile(hctx, mesh.DialConfig{
+		Device:    sess.dev,
+		Resolver:  sess.resolver,
+		Target:    target,
+		Endpoints: eps,
+	}, *file)
+	if err != nil {
+		return ExitError{Code: 1, Err: err}
+	}
+	fmt.Fprintf(os.Stderr, "sent %s (%d bytes) to %s\n  sha256 %s — receiver verified\n",
+		h.Name, h.Size, target, h.SHA256)
+	return nil
 }
 
 func runMeshPing(args []string) error {

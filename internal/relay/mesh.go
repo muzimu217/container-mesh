@@ -324,6 +324,15 @@ func (s *Server) streamMeshMembers(ctx context.Context, conn *wsconn.Conn, id id
 	// is safe: the client's reconnect loop redials, authenticates, and
 	// receives a fresh snapshot on arrival.
 	const pushWriteDeadline = 5 * time.Second
+	// slowPushKick: a write that SUCCEEDS but takes this long means deep
+	// queueing (the peer's app stalled while kernel auto-tuning absorbs).
+	// Every snapshot is a FULL view, so everything queued ahead of it is
+	// already stale — delivering megabytes of history delays the newest
+	// state by the drain time, which is exactly how a kill event sat 90s+
+	// behind a 3.7MB backlog before the member's view updated (issue #8,
+	// oh-no-agent). Kick on slow success: the reconnect gets the fresh view
+	// immediately instead of draining stale bytes.
+	const slowPushKick = 750 * time.Millisecond
 
 	send := func() error {
 		s.mu.Lock()
@@ -335,8 +344,14 @@ func (s *Server) streamMeshMembers(ctx context.Context, conn *wsconn.Conn, id id
 			return err
 		}
 		_ = conn.SetWriteDeadline(time.Now().Add(pushWriteDeadline))
-		defer func() { _ = conn.SetWriteDeadline(time.Time{}) }()
-		return conn.Send(b)
+		started := time.Now()
+		err = conn.Send(b)
+		if err == nil {
+			if d := time.Since(started); d > slowPushKick {
+				err = fmt.Errorf("push slow (%s): kicking slow consumer", d.Round(time.Millisecond))
+			}
+		}
+		return err
 	}
 
 	if err := send(); err != nil {

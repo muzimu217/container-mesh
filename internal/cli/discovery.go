@@ -259,11 +259,22 @@ func runJoin(args []string) error {
 	// addresses are announced (never wildcards — peers cannot dial
 	// 0.0.0.0).
 	announced := []string(eps)
+	inboxDir := filepath.Join(dir, "inbox")
 	if len(listen) > 0 {
 		l, err := mesh.NewListener(context.Background(), mesh.ListenerConfig{
 			Device:  dev,
 			Members: resolver,
 			Addrs:   []string(listen),
+			// R-4.1: member-to-member messages print live.
+			OnMessage: func(from identity.DeviceID, text string) {
+				fmt.Fprintf(os.Stderr, "📩 from %s: %s\n", from, text)
+			},
+			// R-4.2: inbound files land in the state dir's inbox/.
+			InboxDir: inboxDir,
+			OnFile: func(from identity.DeviceID, savedPath string, h mesh.FileHeader) {
+				fmt.Fprintf(os.Stderr, "📬 from %s: %s → %s (sha256 %s…, %d bytes)\n",
+					from, h.Name, savedPath, h.SHA256[:12], h.Size)
+			},
 		})
 		if err != nil {
 			return ExitError{Code: 1, Err: err}
@@ -281,6 +292,7 @@ func runJoin(args []string) error {
 			fmt.Fprintf(os.Stderr, "note: wildcard binds %s serve incoming links but are not announced; announcing %s\n",
 				strings.Join(wl, ", "), strings.Join(announced, ", "))
 		}
+		fmt.Fprintf(os.Stderr, "  inbox: %s (inbound files land here)\n", inboxDir)
 	}
 
 	cl, err := discovery.NewClient(discovery.ClientConfig{
@@ -353,7 +365,11 @@ func runJoin(args []string) error {
 			if mv.Online {
 				state = "online"
 			}
-			fmt.Fprintf(os.Stderr, "  %-16s %s%s\n", id, state, mark)
+			eps := ""
+			if len(mv.Endpoints) > 0 {
+				eps = "  " + strings.Join(mv.Endpoints, ",")
+			}
+			fmt.Fprintf(os.Stderr, "  %-16s %s%s%s\n", id, state, eps, mark)
 		}
 	}
 
@@ -369,14 +385,23 @@ func runJoin(args []string) error {
 		if snap == nil {
 			return ""
 		}
-		online := make([]string, 0, len(snap.Members))
+		// Signature covers membership version AND each member's endpoint
+		// set: endpoints arrive via same-version pushes (announce updates
+		// don't bump the member-list version), and a member gaining its
+		// first dialable endpoint is exactly when the user needs the
+		// reprint (issue #8: endpoint arrival used to wait for the next
+		// version bump to become visible).
+		ids := make([]string, 0, len(snap.Members))
 		for id, mv := range snap.Members {
+			state := "0"
 			if mv.Online {
-				online = append(online, id.String())
+				state = "1"
 			}
+			sort.Strings(mv.Endpoints)
+			ids = append(ids, fmt.Sprintf("%s:%s:%v", id, state, mv.Endpoints))
 		}
-		sort.Strings(online)
-		return fmt.Sprintf("v%d|%s", snap.Version, strings.Join(online, ","))
+		sort.Strings(ids)
+		return fmt.Sprintf("v%d|%s", snap.Version, strings.Join(ids, ","))
 	}
 	lastSig := ""
 	for {

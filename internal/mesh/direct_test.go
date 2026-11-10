@@ -5,7 +5,13 @@ package mesh
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	crand "crypto/rand"
+	"crypto/sha256"
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -184,6 +190,147 @@ func TestDialFailsForNonMember(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "not a member") {
 		t.Fatalf("non-member target must fail with membership reason, got: %v", err)
+	}
+}
+
+// TestMsgRoundTrip: member-to-member message (R-4.1) — the listener's
+// OnMessage fires with the sender's verified identity and the exact text.
+func TestMsgRoundTrip(t *testing.T) {
+	f := newDirectFixture(t)
+	got := make(chan struct {
+		from identity.DeviceID
+		text string
+	}, 4)
+	l, err := NewListener(context.Background(), ListenerConfig{
+		Device:  f.aline,
+		Members: MemberListAdapter{List: f.members},
+		Addrs:   []string{"127.0.0.1:0"},
+		OnMessage: func(from identity.DeviceID, text string) {
+			got <- struct {
+				from identity.DeviceID
+				text string
+			}{from, text}
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(l.Close)
+
+	texts := []string{"first line", "第二行中文", ""}
+	_ = texts[2]
+	if err := SendMsg(context.Background(), DialConfig{
+		Device:           f.bob,
+		Resolver:         MemberListAdapter{List: f.members},
+		Target:           f.aline.ID(),
+		Endpoints:        l.BoundAddrs(),
+		HandshakeTimeout: 5 * time.Second,
+	}, texts[:2]); err != nil {
+		t.Fatalf("SendMsg: %v", err)
+	}
+	for _, want := range texts[:2] {
+		select {
+		case m := <-got:
+			if m.from != f.bob.ID() {
+				t.Fatalf("message attributed to %s, want %s", m.from, f.bob.ID())
+			}
+			if m.text != want {
+				t.Fatalf("text mismatch: %q ≠ %q", m.text, want)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("message not delivered within 5s")
+		}
+	}
+}
+
+// TestFileRoundTrip: member-to-member file transfer (R-4.2) — 8 MB of
+// random bytes, sha256 verified on both ends, saved into the receiver's
+// inbox under its own name.
+func TestFileRoundTrip(t *testing.T) {
+	f := newDirectFixture(t)
+	inbox := t.TempDir()
+	savedCh := make(chan string, 1)
+	l, err := NewListener(context.Background(), ListenerConfig{
+		Device:   f.aline,
+		Members:  MemberListAdapter{List: f.members},
+		Addrs:    []string{"127.0.0.1:0"},
+		InboxDir: inbox,
+		OnFile: func(from identity.DeviceID, savedPath string, h FileHeader) {
+			savedCh <- savedPath
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(l.Close)
+
+	src := make([]byte, 8<<20)
+	if _, err := crand.Read(src); err != nil {
+		t.Fatal(err)
+	}
+	srcPath := filepath.Join(t.TempDir(), "payload-大文件.bin")
+	if err := os.WriteFile(srcPath, src, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	h, err := SendFile(context.Background(), DialConfig{
+		Device:           f.bob,
+		Resolver:         MemberListAdapter{List: f.members},
+		Target:           f.aline.ID(),
+		Endpoints:        l.BoundAddrs(),
+		HandshakeTimeout: 5 * time.Second,
+	}, srcPath)
+	if err != nil {
+		t.Fatalf("SendFile: %v", err)
+	}
+	if h.SHA256 != fmt.Sprintf("%x", sha256.Sum256(src)) {
+		t.Fatal("sender-side sha mismatch")
+	}
+	select {
+	case saved := <-savedCh:
+		got, err := os.ReadFile(saved)
+		if err != nil {
+			t.Fatalf("saved file unreadable: %v", err)
+		}
+		if len(got) != len(src) || !bytes.Equal(got, src) {
+			t.Fatalf("saved file differs: %d bytes vs %d", len(got), len(src))
+		}
+		if filepath.Base(saved) != filepath.Base(srcPath) {
+			t.Fatalf("saved name changed: %s", saved)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("OnFile never fired")
+	}
+}
+
+// TestFileRefusedWithoutInbox: a listener with no inbox configured refuses
+// the transfer with an actionable error BEFORE the bytes move.
+func TestFileRefusedWithoutInbox(t *testing.T) {
+	f := newDirectFixture(t)
+	l, err := NewListener(context.Background(), ListenerConfig{
+		Device:  f.aline,
+		Members: MemberListAdapter{List: f.members},
+		Addrs:   []string{"127.0.0.1:0"},
+		// no InboxDir
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(l.Close)
+
+	src := filepath.Join(t.TempDir(), "x.bin")
+	if err := os.WriteFile(src, []byte("payload"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err = SendFile(context.Background(), DialConfig{
+		Device:           f.bob,
+		Resolver:         MemberListAdapter{List: f.members},
+		Target:           f.aline.ID(),
+		Endpoints:        l.BoundAddrs(),
+		HandshakeTimeout: 5 * time.Second,
+	}, src)
+	if err == nil || !strings.Contains(err.Error(), "refused") {
+		t.Fatalf("no-inbox receiver must refuse before transfer, got: %v", err)
 	}
 }
 

@@ -211,6 +211,16 @@ func (n *Node) Sweep() []identity.DeviceID {
 	return dropped
 }
 
+// StreamCount reports how many members-stream connections are attached for
+// id. Diagnostics/tests: a kicked slow consumer's detach shows up as the
+// count dropping to zero, without waiting for the client to drain its own
+// buffered bytes before noticing the close.
+func (n *Node) StreamCount(id identity.DeviceID) int {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.streams[id]
+}
+
 // SetClock replaces the time source (tests).
 func (n *Node) SetClock(f func() time.Time) {
 	n.mu.Lock()

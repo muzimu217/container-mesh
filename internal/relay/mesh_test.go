@@ -478,6 +478,72 @@ func TestStreamOverlapKeepsOnline(t *testing.T) {
 	}
 }
 
+// TestThrottledConsumerKicked pins the slow-success kick (issue #8,
+// oh-no-agent's #7 failure shape): a consumer that reads SLOWLY (app alive
+// but starved — e.g. its stderr pipe backed up) lets writes succeed while
+// megabytes queue; the queue delays every later push, so a kill event's
+// full snapshot sat 90s+ behind 3.7MB of stale history. A push that takes
+// longer than slowPushKick must kick EVEN WHEN IT EVENTUALLY SUCCEEDS:
+// full snapshots make queued history obsolete, so reconnect-and-refetch
+// converges strictly faster than draining.
+func TestThrottledConsumerKicked(t *testing.T) {
+	f := newMeshFixture(t, 3)
+	_, ts, node := newMeshRelay(t, f.members)
+
+	obs := dialMembers(t, ts, f.devices[0], membersAuthHeaders(f.devices[0]))
+	recvSnapshot(t, obs) // initial push lands
+
+	// Starved reader: 512 bytes every 200 ms (~2.5 KB/s) — orders of
+	// magnitude slower than pushes arrive.
+	stopReading := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-stopReading:
+				return
+			default:
+			}
+			_ = obs.SetReadDeadline(time.Now().Add(10 * time.Second))
+			if _, err := obs.Recv(); err != nil {
+				return // server kicked us — reader's job is done
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+	}()
+
+	go func() {
+		for i := 0; i < 60000; i++ {
+			ep := fmt.Sprintf("203.0.113.%d:%d", 1+i%250, 7000+i%1000)
+			node.Register(discovery.MemberAnnounce{
+				DeviceID:  f.devices[2].ID(),
+				Endpoints: []string{ep},
+				Timestamp: time.Now(),
+			}, time.Now())
+		}
+	}()
+
+	// The server must close the starved stream within a bounded window once
+	// a push runs past slowPushKick (750 ms). Observable from the SERVER
+	// side (stream count drops to zero) — the client's own view of the close
+	// would be delayed by minutes: it drains its buffered bytes at its
+	// throttled pace before ever seeing the FIN, which is exactly why the
+	// backlog was so damaging in the first place.
+	kicked := false
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		if node.StreamCount(f.devices[0].ID()) == 0 {
+			kicked = true
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	close(stopReading)
+	if !kicked {
+		t.Fatalf("throttled consumer never kicked (stream count %d) — slow-success pushes can still queue forever",
+			node.StreamCount(f.devices[0].ID()))
+	}
+}
+
 // TestSlowConsumerKicked pins the push-path hardening from the issue #8
 // retest: a member stream whose client stops reading must be KICKED by the
 // write deadline instead of jamming forever (unbounded Send fills kernel

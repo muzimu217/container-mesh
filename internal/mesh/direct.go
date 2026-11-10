@@ -25,6 +25,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/binary"
 	"encoding/json"
@@ -32,6 +33,9 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/muzimu217/container-mesh/internal/discovery"
@@ -56,7 +60,109 @@ const (
 const (
 	KindPing = "ping"
 	KindDial = "dial"
+	// KindMsg: the sender pushes short text messages; the receiver's
+	// listener prints them live (R-4.1 — member-to-member messaging).
+	KindMsg = "msg"
+	// KindFile: the sender streams one file with a size/sha256 header; the
+	// receiver verifies and saves it (R-4.2 — large-file transfer by device
+	// name).
+	KindFile = "file"
+	// KindExec: the sender asks the receiver to run a command and stream
+	// back stdout/stderr/exit-code — the mesh's ssh shape (design §4.1
+	// dial [--cmd]). Authenticated by the same membership mTLS: only
+	// approved members can exec, and the listener can refuse entirely.
+	KindExec = "exec"
 )
+
+// ExecRequest is the header line of an exec session: the argv to run.
+type ExecRequest struct {
+	Command []string `json:"command"`
+}
+
+// Exec frame envelope tags (first byte of each frame body).
+const (
+	ExecTagOut  = 'O' // stdout chunk
+	ExecTagErr  = 'E' // stderr chunk
+	ExecTagExit = 'X' // exit code (4-byte BE after tag)
+)
+
+// Exec frames: tag byte + payload, length-prefixed by writeFrame.
+func writeExecFrame(w io.Writer, tag byte, payload []byte) error {
+	return writeFrame(w, append([]byte{tag}, payload...))
+}
+
+func writeExecExit(w io.Writer, code int) error {
+	var payload [5]byte
+	payload[0] = ExecTagExit
+	binary.BigEndian.PutUint32(payload[1:], uint32(code))
+	return writeFrame(w, payload[:])
+}
+
+// readExecFrame returns (tag, payload).
+func readExecFrame(br *bufio.Reader) (byte, []byte, error) {
+	frame, err := readFrame(br, maxExecFrameBytes)
+	if err != nil {
+		return 0, nil, err
+	}
+	if len(frame) == 0 {
+		return 0, nil, errors.New("mesh: empty exec frame")
+	}
+	return frame[0], frame[1:], nil
+}
+
+// maxExecFrameBytes bounds one stdout/stderr chunk.
+const maxExecFrameBytes = 256 << 10
+
+// Exec limits: argv length, and a kill grace period for abort handling.
+const (
+	maxExecArgvBytes = 64 << 10
+	execKillGrace    = 10 * time.Second
+)
+
+// FileHeader is the metadata line a file sender writes before the bytes.
+// SHA256 is computed by the sender over the whole file; the receiver
+// re-computes while writing and refuses a mismatch — integrity without
+// trusting the transport's compression or a truncated send.
+type FileHeader struct {
+	Name   string `json:"name"`
+	Size   int64  `json:"size"`
+	SHA256 string `json:"sha256"`
+}
+
+// MaxFileBytes caps one inbound file (default 8 GiB). Large is the point —
+// S3's 10 GB target — but a cap still bounds a hostile or broken sender.
+const MaxFileBytes = int64(8) << 30
+
+// MaxMsgBytes caps one message.
+const MaxMsgBytes = 64 << 10
+
+// writeFrame writes one length-prefixed message (4-byte BE length + body).
+func writeFrame(w io.Writer, body []byte) error {
+	var l [4]byte
+	binary.BigEndian.PutUint32(l[:], uint32(len(body)))
+	if _, err := w.Write(l[:]); err != nil {
+		return err
+	}
+	_, err := w.Write(body)
+	return err
+}
+
+// readFrame reads one length-prefixed message with a hard cap.
+func readFrame(br *bufio.Reader, capBytes int64) ([]byte, error) {
+	var l [4]byte
+	if _, err := io.ReadFull(br, l[:]); err != nil {
+		return nil, err
+	}
+	n := binary.BigEndian.Uint32(l[:])
+	if int64(n) > capBytes {
+		return nil, fmt.Errorf("frame %d bytes exceeds cap %d", n, capBytes)
+	}
+	body := make([]byte, n)
+	if _, err := io.ReadFull(br, body); err != nil {
+		return nil, err
+	}
+	return body, nil
+}
 
 // Hello is the first line on a direct-link stream. Identity comes from the
 // TLS handshake (device certificate), so the hello carries no identity of
@@ -177,6 +283,21 @@ type ListenerConfig struct {
 	Members MemberResolver
 	// Addrs are UDP endpoints to bind (host:port, port 0 = auto).
 	Addrs []string
+	// OnMessage receives text messages addressed to this member (KindMsg).
+	// Nil = messages are accepted and discarded.
+	OnMessage func(from identity.DeviceID, text string)
+	// InboxDir is where inbound files (KindFile) are saved. Empty = file
+	// sessions are refused with an actionable error.
+	InboxDir string
+	// MaxFileBytes caps one inbound file (0 = MaxFileBytes default).
+	MaxFileBytes int64
+	// OnFile is called after a file is verified and saved. Nil = silent.
+	OnFile func(from identity.DeviceID, savedPath string, h FileHeader)
+	// ExecDisabled refuses exec sessions (KindExec). Default is to allow
+	// them for approved members — joining the mesh grants exec rights, the
+	// same trust shape as Tailscale SSH. Operators who want file/message
+	// but not command execution set this.
+	ExecDisabled bool
 }
 
 // Listener accepts direct links from fellow members.
@@ -307,14 +428,21 @@ func (l *Listener) acceptLoop(ln *quic.Listener) {
 // then the session body. Stream-level failures do not kill the connection.
 func (l *Listener) handle(conn *quic.Conn) {
 	defer conn.CloseWithError(0, "bye")
+	// The peer's identity comes from its pinned device certificate (mTLS);
+	// receive handlers stamp it onto every message and file they accept.
+	peerID := identity.DeviceID(conn.ConnectionState().TLS.PeerCertificates[0].Subject.CommonName)
 	for {
 		st, err := conn.AcceptStream(context.Background())
 		if err != nil {
 			return
 		}
-		if err := l.serveStream(st); err != nil {
+		if err := l.serveStream(peerID, st); err != nil {
+			// Close only the STREAM (graceful: pending error lines flush to
+			// the peer) and keep accepting — tearing the connection here
+			// would discard an error verdict the dialer is still waiting to
+			// read (observed: "refused" verdicts lost to the close race).
 			_ = st.Close()
-			return
+			continue
 		}
 	}
 }
@@ -322,9 +450,13 @@ func (l *Listener) handle(conn *quic.Conn) {
 // serveStream reads the hello, checks freshness and intent, answers ok, and
 // dispatches. The TLS handshake has already authenticated the peer (device
 // certificate pinned to the member view); the hello only carries intent.
-func (l *Listener) serveStream(st *quic.Stream) error {
+func (l *Listener) serveStream(peerID identity.DeviceID, st *quic.Stream) error {
+	// One buffered reader for hello AND session body. The hello's length
+	// bound comes from readLine's cap — NOT from a LimitReader here: a cap
+	// on the reader would truncate every session body (an 8 MB file died
+	// after exactly MaxHelloBytes+1 bytes, with the sender wedged mid-write).
+	br := bufio.NewReader(st)
 	_ = st.SetReadDeadline(time.Now().Add(helloTimeout))
-	br := bufio.NewReader(io.LimitReader(st, MaxHelloBytes+1))
 	line, err := readLine(br, MaxHelloBytes)
 	if err != nil {
 		return fmt.Errorf("mesh: hello read: %w", err)
@@ -333,7 +465,9 @@ func (l *Listener) serveStream(st *quic.Stream) error {
 	if err := json.Unmarshal(line, &h); err != nil || h.Proto != ProtoID {
 		return errors.New("mesh: bad hello")
 	}
-	if h.Kind != KindPing && h.Kind != KindDial {
+	switch h.Kind {
+	case KindPing, KindDial, KindMsg, KindFile, KindRun, KindExec:
+	default:
 		return fmt.Errorf("mesh: unknown hello kind %q", h.Kind)
 	}
 	if now := time.Now(); now.Sub(h.Time) > Skew || h.Time.Sub(now) > Skew {
@@ -347,9 +481,105 @@ func (l *Listener) serveStream(st *quic.Stream) error {
 	switch h.Kind {
 	case KindPing:
 		return echoPings(br, st)
-	default:
+	case KindDial:
 		return echoDuplex(br, st)
+	case KindMsg:
+		return receiveMsgs(peerID, br, st, l.cfg.OnMessage)
+	case KindFile:
+		return receiveFile(peerID, br, st, l.cfg)
+	case KindRun:
+		return receiveRun(br, st, l.cfg)
+	// KindExec (arbitrary remote commands) is pending: the implementation
+	// is gated on the operator adjusting the code-scanner rule that blocks
+	// os/exec writes. Built-in verbs above cover remote diagnosis today.
+	default:
+		return fmt.Errorf("mesh: unknown hello kind %q", h.Kind)
 	}
+}
+
+// receiveMsgs prints incoming messages until the sender half-closes the
+// stream, then ACKs. The ack is load-bearing: the sender must not tear the
+// connection until every frame has been CONSUMED (not just delivered to the
+// kernel) — a connection close races the receiver's reads and can discard
+// the tail (observed in tests as silently dropped messages).
+func receiveMsgs(from identity.DeviceID, br *bufio.Reader, st *quic.Stream, onMsg func(identity.DeviceID, string)) error {
+	for {
+		frame, err := readFrame(br, MaxMsgBytes)
+		if err != nil {
+			break // sender half-close is a normal end
+		}
+		if onMsg != nil {
+			onMsg(from, string(frame))
+		}
+	}
+	if _, err := fmt.Fprintln(st, "done"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// receiveFile reads one FileHeader line, streams the body to InboxDir,
+// verifies sha256, and answers "ok\n" (or an error line the sender shows).
+func receiveFile(from identity.DeviceID, br *bufio.Reader, st *quic.Stream, cfg ListenerConfig) error {
+	line, err := readLine(br, MaxHelloBytes)
+	if err != nil {
+		return err
+	}
+	var h FileHeader
+	if err := json.Unmarshal(line, &h); err != nil || h.Name == "" || h.Size < 0 {
+		return errors.New("mesh: bad file header")
+	}
+	if cfg.InboxDir == "" {
+		fmt.Fprintln(st, "err: receiver has no inbox configured")
+		return errors.New("mesh: no inbox configured")
+	}
+	cap := cfg.MaxFileBytes
+	if cap <= 0 {
+		cap = MaxFileBytes
+	}
+	if h.Size > cap {
+		fmt.Fprintf(st, "err: file exceeds receiver cap (%d > %d)\n", h.Size, cap)
+		return fmt.Errorf("mesh: file %d bytes exceeds cap %d", h.Size, cap)
+	}
+	base := filepath.Base(h.Name)
+	if base == "." || base == "/" || strings.Contains(base, "..") {
+		fmt.Fprintln(st, "err: bad file name")
+		return errors.New("mesh: bad file name")
+	}
+	_ = st.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	if _, err := fmt.Fprintln(st, "ok"); err != nil {
+		return err
+	}
+	_ = st.SetWriteDeadline(time.Time{})
+
+	if err := os.MkdirAll(cfg.InboxDir, 0o700); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(cfg.InboxDir, ".incoming-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	hash := sha256.New()
+	_, copyErr := io.CopyN(io.MultiWriter(tmp, hash), br, h.Size)
+	closeErr := tmp.Close()
+	if copyErr != nil || closeErr != nil || fmt.Sprintf("%x", hash.Sum(nil)) != h.SHA256 {
+		_ = os.Remove(tmpPath)
+		fmt.Fprintln(st, "err: sha256 mismatch or short read")
+		return errors.New("mesh: file integrity check failed")
+	}
+	saved := filepath.Join(cfg.InboxDir, base)
+	if err := os.Rename(tmpPath, saved); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if _, err := fmt.Fprintln(st, "done "+h.SHA256); err != nil {
+		return err
+	}
+	if cfg.OnFile != nil {
+		cfg.OnFile(from, saved, h)
+	}
+	return nil
 }
 
 // echoPings answers ping records verbatim until the dialer hangs up.
@@ -510,6 +740,147 @@ type Link struct {
 	qc *quic.Conn
 	st *quic.Stream
 	br *bufio.Reader
+}
+
+// SendMsg delivers short text messages to a member. Frames are
+// length-prefixed, so multi-line text travels intact; the stream close is
+// the end-of-messages marker the receiver's read loop waits on.
+func SendMsg(ctx context.Context, cfg DialConfig, texts []string) error {
+	if len(texts) == 0 {
+		return errors.New("mesh: no message text")
+	}
+	for i, t := range texts {
+		if t == "" {
+			return fmt.Errorf("mesh: message %d is empty", i)
+		}
+		if int64(len(t)) > MaxMsgBytes {
+			return fmt.Errorf("mesh: message %d exceeds %d bytes", i, MaxMsgBytes)
+		}
+	}
+	cfg.Kind = KindMsg
+	link, err := DialDirect(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	defer link.Close()
+	for _, t := range texts {
+		if err := writeFrame(link.Stream(), []byte(t)); err != nil {
+			return fmt.Errorf("mesh: send message: %w", err)
+		}
+	}
+	// Half-close (FIN after the frames), then wait for the receiver's done
+	// ack — only then is tearing the connection safe.
+	if err := link.Stream().Close(); err != nil {
+		return fmt.Errorf("mesh: close send side: %w", err)
+	}
+	_ = link.Stream().SetReadDeadline(time.Now().Add(10 * time.Second))
+	ack, err := readLine(link.br, 16)
+	if err != nil {
+		return fmt.Errorf("mesh: await delivery ack: %w", err)
+	}
+	if !bytes.HasPrefix(ack, []byte("done")) {
+		return fmt.Errorf("mesh: receiver error: %s", ack)
+	}
+	return nil
+}
+
+// SendFile streams one file to a member. The sender hashes the file first
+// (the receiver verifies the hash it was promised, not one computed after
+// the fact), streams the bytes, and waits for the receiver's final verdict.
+// Returns the header the receiver was given.
+func SendFile(ctx context.Context, cfg DialConfig, path string) (FileHeader, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return FileHeader{}, fmt.Errorf("mesh: open %s: %w", path, err)
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return FileHeader{}, err
+	}
+	if !st.Mode().IsRegular() {
+		return FileHeader{}, fmt.Errorf("mesh: %s is not a regular file", path)
+	}
+	hash := sha256.New()
+	if _, err := io.Copy(hash, f); err != nil {
+		return FileHeader{}, err
+	}
+	h := FileHeader{
+		Name:   filepath.Base(path),
+		Size:   st.Size(),
+		SHA256: fmt.Sprintf("%x", hash.Sum(nil)),
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return FileHeader{}, err
+	}
+
+	cfg.Kind = KindFile
+	link, err := DialDirect(ctx, cfg)
+	if err != nil {
+		return h, err
+	}
+	defer link.Close()
+
+	hdr, err := json.Marshal(h)
+	if err != nil {
+		return h, err
+	}
+	if _, err := fmt.Fprintf(link.Stream(), "%s\n", hdr); err != nil {
+		return h, fmt.Errorf("mesh: send header: %w", err)
+	}
+	// Receiver answers ok before taking bytes (its inbox may be unset or
+	// the file over its cap — cheaper to learn now than after 8 GB).
+	_ = link.Stream().SetReadDeadline(time.Now().Add(15 * time.Second))
+	if ack, err := readLine(link.br, MaxHelloBytes); err != nil {
+		return h, fmt.Errorf("mesh: read file ack: %w", err)
+	} else if !bytes.HasPrefix(ack, []byte("ok")) {
+		return h, fmt.Errorf("mesh: receiver refused: %s", ack)
+	}
+	_ = link.Stream().SetReadDeadline(time.Time{})
+
+	if err := sendFileBody(ctx, link.Stream(), f, h.Size); err != nil {
+		return h, fmt.Errorf("mesh: send body: %w", err)
+	}
+	_ = link.Stream().SetReadDeadline(time.Now().Add(30 * time.Second))
+	verdict, err := readLine(link.br, MaxHelloBytes)
+	if err != nil {
+		return h, fmt.Errorf("mesh: read verdict: %w", err)
+	}
+	if !bytes.HasPrefix(verdict, []byte("done")) {
+		return h, fmt.Errorf("mesh: receiver rejected the file: %s", verdict)
+	}
+	return h, nil
+}
+
+// fileChunkSize bounds each body write so a rolling write deadline can
+// detect a dead receiver mid-transfer instead of blocking on one giant
+// write for the whole file.
+const fileChunkSize = 1 << 20
+
+func sendFileBody(ctx context.Context, st *quic.Stream, f *os.File, size int64) error {
+	buf := make([]byte, fileChunkSize)
+	remaining := size
+	for remaining > 0 {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		n := int64(len(buf))
+		if remaining < n {
+			n = remaining
+		}
+		if _, err := io.ReadFull(f, buf[:n]); err != nil {
+			return err
+		}
+		// Rolling deadline: 60 s per chunk — long enough for any honest
+		// link short of total congestion, short enough that a dead
+		// receiver surfaces within a minute of the last progress.
+		_ = st.SetWriteDeadline(time.Now().Add(60 * time.Second))
+		if _, err := st.Write(buf[:n]); err != nil {
+			return err
+		}
+		remaining -= n
+	}
+	return nil
 }
 
 // Stream exposes the raw duplex stream (one pipe, positioned after the
