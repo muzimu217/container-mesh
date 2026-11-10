@@ -557,15 +557,41 @@ func runServeDiscovery(args []string) error {
 	if len(selfEPS) > 0 {
 		// D-6r: the announced address must actually carry a QUIC listener,
 		// or members dial an undialable endpoint. HTTP is TCP on this port;
-		// the direct link is UDP on the SAME number, so both coexist. If the
-		// bind fails (address not local, port taken), drop the self-announce
-		// entirely — announcing something unreachable is exactly the bug.
+		// the direct link is UDP on the SAME number, so both coexist.
+		//
+		// The BIND address and the ANNOUNCED address are not always the
+		// same: on a cloud server the public IP is a NAT mapping, not an
+		// address on any local interface, so binding it fails with
+		// "cannot assign requested address". Bind the wildcard on the same
+		// port instead and announce the public address — the packet
+		// arrives at the same socket either way.
+		bindAddrs := selfEPS
+		if host, port, err := net.SplitHostPort(selfEPS[0]); err == nil && host != "" {
+			if !localAddr(host) {
+				bindAddrs = []string{net.JoinHostPort("0.0.0.0", port)}
+				fmt.Fprintf(os.Stderr, "  note: %s is a NAT-mapped address, not a local interface; binding UDP 0.0.0.0:%s for the direct link\n", host, port)
+			}
+		}
 		if ml, lerr := mesh.NewListener(context.Background(), mesh.ListenerConfig{
 			Device:  dev,
 			Members: relayMembersResolver{srv: srv},
-			Addrs:   selfEPS,
+			Addrs:   bindAddrs,
+			// The discovery node is a full member: it receives messages and
+			// files like any other node (a real deployment has the anchor
+			// receiving the reports and artifacts of the network it
+			// serves). Without these the node would silently discard
+			// everything sent to it — the symptom seen in the first real
+			// cross-internet test.
+			OnMessage: func(from identity.DeviceID, text string) {
+				fmt.Fprintf(os.Stderr, "📩 from %s: %s\n", from, text)
+			},
+			InboxDir: filepath.Join(dir, "inbox"),
+			OnFile: func(from identity.DeviceID, savedPath string, h mesh.FileHeader) {
+				fmt.Fprintf(os.Stderr, "📬 from %s: %s → %s (sha256 %s…, %d bytes)\n",
+					from, h.Name, savedPath, h.SHA256[:12], h.Size)
+			},
 		}); lerr != nil {
-			fmt.Fprintf(os.Stderr, "note: cannot bind direct-link listener on %s (%v)\n", strings.Join(selfEPS, ", "), lerr)
+			fmt.Fprintf(os.Stderr, "note: cannot bind direct-link listener on %s (%v)\n", strings.Join(bindAddrs, ", "), lerr)
 			fmt.Fprintf(os.Stderr, "  self-announce dropped: announcing an unreachable address would mislead dialers\n")
 			selfEPS = nil
 		} else {
@@ -589,6 +615,30 @@ func runServeDiscovery(args []string) error {
 		return ExitError{Code: 1, Err: fmt.Errorf("serve-discovery: %w", err)}
 	}
 	return nil
+}
+
+// localAddr reports whether host is an address of this machine's own
+// interfaces. A cloud server's public IP is a NAT mapping and never appears
+// on an interface, so binding it directly fails — the wildcard on the same
+// port is the correct bind target.
+func localAddr(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || ip.IsLoopback() {
+		return false
+	}
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return false
+	}
+	for _, a := range addrs {
+		if ipnet, ok := a.(*net.IPNet); ok && ipnet.IP.Equal(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 // selfAnnounceLoop posts the discovery node's own signed announce on the
