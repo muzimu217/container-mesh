@@ -610,8 +610,7 @@ func runServeDiscovery(args []string) error {
 		// the normal startup flow reads like a fault (netns-probe round 9,
 		// low-severity observation). The loop retries anyway, so this only
 		// affects log noise.
-		time.Sleep(800 * time.Millisecond)
-		go selfAnnounceLoop(context.Background(), selfURL, selfEPS, dev)
+		go selfAnnounceLoop(context.Background(), selfURL, selfEPS, dev, srv.Ready())
 	} else if *announce == "" {
 		fmt.Fprintf(os.Stderr, "note: --addr is a wildcard and no --announce given: this node will show as offline\n")
 		fmt.Fprintf(os.Stderr, "  in member views; pass --announce <members-facing-address>:port to make it visible\n")
@@ -652,7 +651,19 @@ func localAddr(host string) bool {
 // are logged, never fatal — a node that cannot reach itself via its own
 // published address is a deployment problem worth one log line per attempt,
 // not a crash.
-func selfAnnounceLoop(ctx context.Context, selfURL string, eps []string, dev *identity.Device) {
+func selfAnnounceLoop(ctx context.Context, selfURL string, eps []string, dev *identity.Device, ready <-chan struct{}) {
+	// Gate the first announce on the listener actually accepting (issue #8
+	// rounds 10/11: announcing before the socket accepts races the bind and
+	// loses — measured refusal rates 6%→86% across two commits). A 15s
+	// fallback covers the listen-failed case without hanging forever.
+	select {
+	case <-ready:
+	case <-ctx.Done():
+		return
+	case <-time.After(15 * time.Second):
+		fmt.Fprintf(os.Stderr, "note: listener not ready within 15s; self-announce deferred\n")
+		return
+	}
 	post := func() {
 		a := discovery.MemberAnnounce{DeviceID: dev.ID(), Endpoints: eps, Timestamp: time.Now()}
 		req := discovery.RegisterRequest{Announce: a, Sig: a.Sign(dev)}

@@ -29,6 +29,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -126,6 +127,13 @@ type Server struct {
 	// streams tracks live members-stream connections per device, so an
 	// operator (or a test) can force a member to reconnect.
 	streams map[identity.DeviceID]map[*wsconn.Conn]struct{}
+	// ready is closed once the HTTP listener is bound and accepting.
+	// Announce-goroutines gate their first fire on it: announcing before
+	// the socket accepts races the listener and loses (connection
+	// refused) — netns-probe rounds 10/11 measured that race at 6–86%
+	// refusal rates across two commits.
+	ready     chan struct{}
+	readyOnce sync.Once
 
 	limiter *ipLimiter
 
@@ -230,6 +238,7 @@ func New(cfg Config) *Server {
 		contested: make(map[string]contestState),
 		limiter:   newIPLimiter(cfg.ConnectRatePerMin, cfg.MaxConnsPerIP),
 		startedAt: time.Now(),
+		ready:     make(chan struct{}),
 		streams:   make(map[identity.DeviceID]map[*wsconn.Conn]struct{}),
 	}
 }
@@ -277,14 +286,34 @@ func (s *Server) HTTPServer() *http.Server {
 // can use wss://host/ws with no reverse proxy in between.
 func (s *Server) ListenAndServe() error {
 	s.StartMaintenance()
+	ln, err := net.Listen("tcp", s.cfg.Addr)
+	if err != nil {
+		return err
+	}
+	// The socket is bound and accepting: announce-goroutines gated on
+	// Ready() may start firing (the first self-announce used to race this
+	// moment and lose, logging a spurious connection-refused on every
+	// clean start — netns-probe rounds 10/11 measured 6%→86% refusal rates
+	// across two commits for exactly this race).
+	s.markReady()
 	hs := s.HTTPServer()
 	if s.cfg.TLSCert != "" && s.cfg.TLSKey != "" {
 		s.log.Info("relay listening (TLS)", "addr", s.cfg.Addr, "path", s.cfg.Path)
-		return hs.ListenAndServeTLS(s.cfg.TLSCert, s.cfg.TLSKey)
+		return hs.ServeTLS(ln, s.cfg.TLSCert, s.cfg.TLSKey)
 	}
 	s.log.Info("relay listening", "addr", s.cfg.Addr, "path", s.cfg.Path)
-	return hs.ListenAndServe()
+	return hs.Serve(ln)
 }
+
+// markReady closes the readiness signal exactly once (called from
+// ListenAndServe after a successful bind).
+func (s *Server) markReady() {
+	s.readyOnce.Do(func() { close(s.ready) })
+}
+
+// Ready reports when the HTTP listener is bound and accepting. Announce
+// goroutines gate their first fire on this signal.
+func (s *Server) Ready() <-chan struct{} { return s.ready }
 
 // StartMaintenance begins periodic cleanup of limiter and contest state.
 //
