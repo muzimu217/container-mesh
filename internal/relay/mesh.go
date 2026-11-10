@@ -347,6 +347,11 @@ func (s *Server) streamMeshMembers(ctx context.Context, conn *wsconn.Conn, id id
 	// data on this stream (red check: removing this goroutine makes
 	// TestStreamCloseExpiresMemberFast red — the push only fires after the
 	// ping period instead of immediately).
+
+	// Shared between the monitor goroutine and the send closure: the last
+	// snapshot size drives the queue-depth cap's dynamic scaling.
+	var lastPushLen int64
+
 	go func() {
 		for {
 			if _, err := conn.Recv(); err != nil {
@@ -378,7 +383,6 @@ func (s *Server) streamMeshMembers(ctx context.Context, conn *wsconn.Conn, id id
 			outqChecks     = 2         // consecutive breaches before the kick
 			outqCheckEvery = 2 * time.Second
 		)
-		var lastPushLen int64
 		breaches := 0
 		t := time.NewTicker(outqCheckEvery)
 		defer t.Stop()
@@ -468,6 +472,10 @@ func (s *Server) streamMeshMembers(ctx context.Context, conn *wsconn.Conn, id id
 		_ = conn.SetWriteDeadline(time.Now().Add(pushWriteDeadline))
 		started := time.Now()
 		err = conn.Send(b)
+		// Record the snapshot size for the queue-depth monitor: the cap
+		// scales with the last snapshot so a large membership list gets a
+		// proportionally larger buffer before a kick fires.
+		atomic.StoreInt64(&lastPushLen, int64(len(b)))
 		if err == nil {
 			if d := time.Since(started); d > slowPushKick {
 				err = fmt.Errorf("push slow (%s): kicking slow consumer", d.Round(time.Millisecond))
