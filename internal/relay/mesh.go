@@ -315,6 +315,50 @@ func (s *Server) streamMeshMembers(ctx context.Context, conn *wsconn.Conn, id id
 		}
 	}()
 
+	// Send-queue monitor (issue #8, netns-probe root-cause): the kernel
+	// sndbuf absorbs megabytes of backlog, so app-layer write duration
+	// stays in microseconds and neither the slow-push kick nor the write
+	// deadline can ever fire. Measure the KERNEL queue directly (SIOCOUTQ):
+	// two consecutive checks above the cap means the consumer is not
+	// draining — kick so it reconnects onto a fresh pipe instead of
+	// draining stale snapshots for a minute.
+	go func() {
+		sys := conn.SysConn()
+		if sys == nil {
+			return
+		}
+		const (
+			outqCap        = 256 << 10 // 256 KiB
+			outqChecks     = 2         // consecutive breaches before the kick
+			outqCheckEvery = 2 * time.Second
+		)
+		breaches := 0
+		t := time.NewTicker(outqCheckEvery)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+			}
+			n, err := socketOutq(sys)
+			if err != nil {
+				return // platform without introspection: monitor dormant
+			}
+			if n > outqCap {
+				breaches++
+				if breaches >= outqChecks {
+					s.log.Warn("mesh members: send queue over cap; kicking slow consumer",
+						"device", id, "outq", n)
+					_ = conn.Close()
+					return
+				}
+				continue
+			}
+			breaches = 0
+		}
+	}()
+
 	// pushWriteDeadline bounds each snapshot write. A consumer that cannot
 	// keep up must be KICKED, not buffered forever: an unbounded Send jams
 	// the stream (kernel buffer, then gorilla's buffer, then every keepalive

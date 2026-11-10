@@ -264,6 +264,14 @@ func (c *Conn) Ping() error {
 // because Close was called or because the read side failed. It lets a caller
 // observe liveness without consuming data from the socket.
 func (c *Conn) Closed() <-chan struct{} { return c.gone }
+
+// SysConn exposes the underlying network connection, for callers that need
+// socket-level introspection (e.g. SIOCOUTQ send-queue depth to detect a
+// stalled consumer whose kernel buffer — not the application write — is
+// where the backlog lives). Additive accessor; nil for upgraded conns whose
+// underlying transport is not a net.Conn.
+func (c *Conn) SysConn() net.Conn { return c.ws.UnderlyingConn() }
+
 func (c *Conn) SetReadDeadline(t time.Time) error {
 	return c.ws.SetReadDeadline(t)
 }
