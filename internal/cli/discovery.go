@@ -605,6 +605,12 @@ func runServeDiscovery(args []string) error {
 		if host, _, err := net.SplitHostPort(*addr); err == nil && host != "" {
 			selfURL = "http://" + net.JoinHostPort(host, port)
 		}
+		// Small delay before the first announce: the HTTP listener needs a
+		// moment to start accepting, and a first-announce failure logged in
+		// the normal startup flow reads like a fault (netns-probe round 9,
+		// low-severity observation). The loop retries anyway, so this only
+		// affects log noise.
+		time.Sleep(800 * time.Millisecond)
 		go selfAnnounceLoop(context.Background(), selfURL, selfEPS, dev)
 	} else if *announce == "" {
 		fmt.Fprintf(os.Stderr, "note: --addr is a wildcard and no --announce given: this node will show as offline\n")
