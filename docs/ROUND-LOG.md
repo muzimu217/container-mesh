@@ -334,3 +334,33 @@ init → account create → device-add → serve-discovery（自举 members.json
 2. 状态分类学：membership（谁属于）/ liveness（谁可达）/ announcement（谁说自己在哪）是三种生命周期不同的状态——前两条我们分清了，第三条这次才分清。
 
 **下一轮**：等三方在修复 commit 上确认 D-7/振荡/3.3 闭环 → develop→main 合并 PR → PR-M4（e2e + 中转路由 + 增量推送一并考虑 O-1）
+
+## Round 11 — 基础通信补齐：按名消息 + 按名大文件 + 远端诊断动词（2026-11-09）
+
+**输入**：用户指令「最基础的传输通信和命令行接入调用都要实现」+ Hub 值守轮次（三方 2891872 复测：D-7/振荡/D-6r 全部确认；oh-no 报告 #7 积压场景失效）。
+
+### 交付（全部实测，三进程真机演示）
+
+| 能力 | 命令 | 实测 |
+|---|---|---|
+| **按名消息**（R-4.1） | `cmesh msg <deviceID> --text "…"` | 实时投递 ✓，多行/中文 ✓，双向 ✓（无 listen 侧也能主动发） |
+| **按名大文件**（R-4.2） | `cmesh send-to <deviceID> --file PATH` | **100MB @ 72.3 MB/s**，SHA-256 双端一致 ✓；头部承诺 hash→流式传输→接收端复验→verdict |
+| **远端诊断动词** | `cmesh run <deviceID> @info/@disk/@mem/@cat/@ls` | 全部 ✓（Go 原生实现，无 os/exec——任意外名命令执行被 Mimosa 规则拦 5 次，含其白名单建议版；改为内置动词，任意外命令作为独立特性待规则调整） |
+| **#7 积压场景 slow-kick** | 写入成功 >750ms 即踢除 | `TestThrottledConsumerKicked`：限速读取者 + 6 万风暴，修复前永久排队 → 修复后 1.31s 踢除 |
+| **批准收敛加速** | 401 not-member announce 改 3s 快轮询 | 批准→端点可见不再等满 30s 心跳 |
+| **端点可见性** | join 视图打印含端点列 | 排障不再盲 |
+
+### 过程抓出的真缺陷（均为演示/红检暴露，非推测）
+
+1. **serveStream dispatch 缺 KindRun/KindExec case**——白名单放行、dispatch 落 default，拨号方读 EOF。教训：**新增枚举值时 grep 所有 switch**。
+2. **监听端 bufio 挂 LimitReader(4097)**——会话体被截断，8MB 文件 4KB 即 EOF、发送端永久阻塞。修：bufio 裸挂 + readLine 自身 cap 限制 hello；发送端文件体分块写 + 60s 滚动写超时。
+3. **msg 半关闭竞态**——发送端写完立刻关连接会丢弃尾部帧；修复：接收方处理完回 `done` ack，发送方等到 ack 再拆连接（连接关闭竞态导致的静默丢消息，测试抓出）。
+4. 演示脚本两次设备 ID 映射搞反——「错误提示恰好正确」的案例：发给无 inbox 节点被正确拒收、发给无监听节点收到可操作提示。
+
+### 已知边界（如实）
+
+- 任意外名命令执行（ssh 形态 exec）暂缺：Mimosa 扫描器拦 5 次（含白名单版），待规则调整后实现（exec.go 头部已留设计文档）
+- 消息/文件暂无断点续传（阶段 1 两人模式有）；增量推送（O-1）挂 PR-M4
+- 消息发往未配置 OnMessage 的监听方会静默丢弃（应回错误帧，挂 M5）
+
+**下一轮**：三方将 msg/send-to/run 纳入回归 → develop→main 合并 PR（待放行）→ PR-M4（e2e + 中转路由 + 增量推送）
