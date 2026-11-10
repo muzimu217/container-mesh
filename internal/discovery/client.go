@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -405,11 +406,24 @@ func (c *Client) applySnapshot(snap *MemberSnapshot) {
 // http and requiring that nothing beyond the origin is present.
 func normalizeBaseURL(a string) (*url.URL, error) {
 	if !strings.Contains(a, "://") {
-		a = "http://" + a
+		// Bare "host:port" defaults to https on the TLS port: a discovery
+		// node published on 443 (the one port most restricted egress
+		// allows) must be usable without spelling out the scheme. Anything
+		// else stays plain http until a deployment opts into TLS.
+		if _, port, err := net.SplitHostPort(a); err == nil && port == "443" {
+			a = "https://" + a
+		} else {
+			a = "http://" + a
+		}
 	}
 	u, err := url.Parse(a)
 	if err != nil {
 		return nil, err
+	}
+	switch u.Scheme {
+	case "http", "https":
+	default:
+		return nil, fmt.Errorf("unsupported scheme %q (http or https)", u.Scheme)
 	}
 	if u.Host == "" {
 		return nil, fmt.Errorf("no host")

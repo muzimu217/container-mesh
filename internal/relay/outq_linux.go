@@ -9,18 +9,23 @@ import (
 	"fmt"
 	"net"
 	"syscall"
+	"unsafe"
 )
 
-// siocoutq is SIOCOUTQ (0x5411): bytes not yet transmitted in the socket
-// send queue. Defined locally — the constant is missing from some syscall
-// packages/architecture combos Go ships.
-const siocoutq = 0x5411
+// tiocoutq is TIOCOUTQ (0x5411): an **ioctl** command that returns the bytes
+// queued in the socket send queue but not yet acknowledged.
+//
+// Load-bearing correctness note (netns-probe round 7, kernel 5.10): the same
+// numeric value passed to getsockopt returns ENOPROTOOPT — it is an ioctl
+// request, not a socket option. The first implementation made that mistake,
+// so the monitor died on its first tick and never kicked anything.
+const tiocoutq = 0x5411
 
 // socketOutq returns the bytes queued for transmission but not yet
-// acknowledged by the peer (SIOCOUTQ) — the kernel-level view of "how far
-// behind is this consumer". This is where the issue #8 backlog lived
-// (1.5–3.7 MB in sndbuf): the application-layer write had already returned,
-// so write-duration based kicks could never see it.
+// acknowledged by the peer — the kernel-level view of "how far behind is
+// this consumer". This is where the issue #8 backlog lived (1.5–4.1 MB in
+// sndbuf): the application-layer write had already returned, so
+// write-duration based kicks could never see it.
 func socketOutq(c net.Conn) (int, error) {
 	tc, ok := c.(*net.TCPConn)
 	if !ok {
@@ -30,18 +35,21 @@ func socketOutq(c net.Conn) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	var outq int
+	var outq int32
 	var ctlErr error
 	err = raw.Control(func(fd uintptr) {
-		n, e := syscall.GetsockoptInt(int(fd), syscall.SOL_SOCKET, siocoutq)
-		if e != nil {
-			ctlErr = e
-			return
+		// ioctl(fd, TIOCOUTQ, &outq) — argument must be a pointer to int.
+		_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, fd, tiocoutq,
+			uintptr(unsafe.Pointer(&outq)))
+		if errno != 0 {
+			ctlErr = errno
 		}
-		outq = n
 	})
 	if err != nil {
 		return 0, err
 	}
-	return outq, ctlErr
+	if ctlErr != nil {
+		return 0, ctlErr
+	}
+	return int(outq), nil
 }

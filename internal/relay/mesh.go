@@ -343,13 +343,19 @@ func (s *Server) streamMeshMembers(ctx context.Context, conn *wsconn.Conn, id id
 			}
 			n, err := socketOutq(sys)
 			if err != nil {
-				return // platform without introspection: monitor dormant
+				// Log once, loudly: a dormant monitor is exactly how the
+				// first implementation failed silently for a whole round
+				// (wrong syscall => ENOPROTOOPT => return on first tick,
+				// netns-probe round 7).
+				s.log.Warn("mesh members: send-queue monitor unavailable; queue-depth kick disabled",
+					"device", id, "err", err)
+				return
 			}
 			if n > outqCap {
 				breaches++
 				if breaches >= outqChecks {
 					s.log.Warn("mesh members: send queue over cap; kicking slow consumer",
-						"device", id, "outq", n)
+						"device", id, "outq", n, "cap", outqCap, "consecutive", breaches)
 					_ = conn.Close()
 					return
 				}
