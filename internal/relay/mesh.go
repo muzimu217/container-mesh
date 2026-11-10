@@ -26,6 +26,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"github.com/muzimu217/container-mesh/internal/discovery"
@@ -361,16 +362,23 @@ func (s *Server) streamMeshMembers(ctx context.Context, conn *wsconn.Conn, id id
 	// two consecutive checks above the cap means the consumer is not
 	// draining — kick so it reconnects onto a fresh pipe instead of
 	// draining stale snapshots for a minute.
+	//
+	// The cap is DYNAMIC: max(256 KiB, 2× the last snapshot size). A 44 KB
+	// snapshot kicks at 256 KiB (genuinely stuck), but a 1 MB snapshot
+	// legitimately needs more kernel buffer — a fixed cap would live-lock
+	// on large memberships because the reconnect gets the same snapshot
+	// and immediately hits the cap again (netns-probe round 16).
 	go func() {
 		sys := conn.SysConn()
 		if sys == nil {
 			return
 		}
 		const (
-			outqCap        = 256 << 10 // 256 KiB
+			outqBase       = 256 << 10 // 256 KiB floor
 			outqChecks     = 2         // consecutive breaches before the kick
 			outqCheckEvery = 2 * time.Second
 		)
+		var lastPushLen int64
 		breaches := 0
 		t := time.NewTicker(outqCheckEvery)
 		defer t.Stop()
@@ -390,11 +398,15 @@ func (s *Server) streamMeshMembers(ctx context.Context, conn *wsconn.Conn, id id
 					"device", id, "err", err)
 				return
 			}
-			if n > outqCap {
+			cap := int64(outqBase)
+			if l := atomic.LoadInt64(&lastPushLen); l > 0 {
+				cap = outqBase + 2*l
+			}
+			if int64(n) > cap {
 				breaches++
 				if breaches >= outqChecks {
 					s.log.Warn("mesh members: send queue over cap; kicking slow consumer",
-						"device", id, "outq", n, "cap", outqCap, "consecutive", breaches)
+						"device", id, "outq", n, "cap", cap, "consecutive", breaches)
 					_ = conn.Close()
 					return
 				}
