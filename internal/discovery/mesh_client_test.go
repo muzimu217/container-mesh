@@ -87,6 +87,60 @@ func waitFor(t *testing.T, bound time.Duration, what string, cond func() bool) {
 	t.Fatalf("%s not satisfied within %s", what, bound)
 }
 
+// TestClientReconnectBackoffResetsAfterHealthyStream pins the fix for the
+// root cause netns-probe found in round 7: the reconnect penalty doubled on
+// EVERY stream end and was never reset, so a client that the server kicked
+// as a slow consumer ended up in a 30-second reconnect gap — and any state
+// change landing in that gap arrived 30s late (issue #8 #7).
+//
+// A healthy stream (one that delivered a verified snapshot) must reset the
+// penalty, so repeated kicks cost one backoff step each, not a ladder.
+func TestClientReconnectBackoffResetsAfterHealthyStream(t *testing.T) {
+	s := newStack(t, 2)
+	node := s.srv.DiscoNode()
+	if node == nil {
+		t.Fatal("discovery node not enabled on the stack relay")
+	}
+
+	// Observe the client's reconnect behaviour through the server: each
+	// stream attach/detach pair is visible as the stream count changing.
+	cl := s.clientFor(t, 0, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = cl.Run(ctx) }()
+
+	waitFor(t, 5*time.Second, "first snapshot", func() bool { return cl.Snapshot() != nil })
+
+	// The server kicks this client repeatedly (as it would a slow
+	// consumer). Each kick must be followed by a prompt reconnect — a
+	// laddering penalty would show up as a growing gap.
+	gaps := make([]time.Duration, 0, 3)
+	for i := 0; i < 3; i++ {
+		time.Sleep(200 * time.Millisecond)
+		// Force the server to drop this member's stream — the same thing
+		// the queue-depth cleanup does to a slow consumer.
+		if n := s.srv.KickStream(s.devices[0].ID()); n == 0 {
+			t.Fatal("no stream to kick — the client is not connected")
+		}
+		before := node.StreamCount(s.devices[0].ID())
+		start := time.Now()
+		waitFor(t, 8*time.Second, "client reconnects promptly", func() bool {
+			return node.StreamCount(s.devices[0].ID()) > before
+		})
+		gaps = append(gaps, time.Since(start))
+	}
+	t.Logf("reconnect gaps after repeated kicks: %v", gaps)
+	// With a resetting penalty every gap is ~1s (the initial backoff). A
+	// laddering penalty would make the third gap ≥4s. Use a generous
+	// bound (T-2.4: no absolute thresholds in tests) but well below the
+	// ladder's 8s+.
+	for i, g := range gaps {
+		if g > 5*time.Second {
+			t.Fatalf("reconnect gap %d was %s — the penalty is laddering instead of resetting", i+1, g)
+		}
+	}
+}
+
 func TestClientAnnouncesAndSeesItselfOnline(t *testing.T) {
 	s := newStack(t, 1)
 	cl := s.clientFor(t, 0, []string{"203.0.113.5:7000"})

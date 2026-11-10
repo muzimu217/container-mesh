@@ -123,6 +123,9 @@ type Server struct {
 	disco        *discovery.Node
 	discoMembers *identity.MemberList
 	discoStop    chan struct{}
+	// streams tracks live members-stream connections per device, so an
+	// operator (or a test) can force a member to reconnect.
+	streams map[identity.DeviceID]map[*wsconn.Conn]struct{}
 
 	limiter *ipLimiter
 
@@ -227,6 +230,7 @@ func New(cfg Config) *Server {
 		contested: make(map[string]contestState),
 		limiter:   newIPLimiter(cfg.ConnectRatePerMin, cfg.MaxConnsPerIP),
 		startedAt: time.Now(),
+		streams:   make(map[identity.DeviceID]map[*wsconn.Conn]struct{}),
 	}
 }
 

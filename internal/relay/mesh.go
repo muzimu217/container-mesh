@@ -147,6 +147,32 @@ func (s *Server) MeshMembers() *identity.MemberList {
 	return s.discoMembers
 }
 
+// DiscoNode returns the discovery node behind the /mesh/* endpoints (nil
+// when discovery is not enabled). Diagnostics and tests use it to observe
+// liveness bookkeeping (stream counts, reachability) directly.
+func (s *Server) DiscoNode() *discovery.Node {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.disco
+}
+
+// KickStream closes every members-stream connection of a device, forcing it
+// to reconnect and re-authenticate. Operations use it to refresh a member's
+// view on demand (its endpoints may have changed); tests use it to simulate
+// the server-side cleanup of a slow consumer.
+func (s *Server) KickStream(id identity.DeviceID) int {
+	s.mu.Lock()
+	conns := make([]*wsconn.Conn, 0, len(s.streams[id]))
+	for c := range s.streams[id] {
+		conns = append(conns, c)
+	}
+	s.mu.Unlock()
+	for _, c := range conns {
+		_ = c.Close()
+	}
+	return len(conns)
+}
+
 // meshSnapshot wires the mux routes. Called from Handler().
 func (s *Server) meshSnapshotMux(mux *http.ServeMux) {
 	mux.HandleFunc("/mesh/register", s.handleMeshRegister)
@@ -298,6 +324,19 @@ func (s *Server) streamMeshMembers(ctx context.Context, conn *wsconn.Conn, id id
 	s.disco.AttachStream(id)
 	defer s.disco.DetachStream(id)
 
+	// Track the connection per device so KickStream can force a reconnect.
+	s.mu.Lock()
+	if s.streams[id] == nil {
+		s.streams[id] = make(map[*wsconn.Conn]struct{})
+	}
+	s.streams[id][conn] = struct{}{}
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		delete(s.streams[id], conn)
+		s.mu.Unlock()
+	}()
+
 	// Drain the read side: the server only SENDS on this stream, so without
 	// a reader the peer's close (FIN/close-frame) sits unseen until the next
 	// ping tick fails — up to a full ping period of extra "offline" lag, or
@@ -384,6 +423,20 @@ func (s *Server) streamMeshMembers(ctx context.Context, conn *wsconn.Conn, id id
 	// immediately instead of draining stale bytes.
 	const slowPushKick = 750 * time.Millisecond
 
+	// pushCoalesceBytes is the queue depth above which a new push is NOT
+	// queued. Snapshots are FULL views, so a newer one supersedes every
+	// older one — queuing both only delays the fresh state behind stale
+	// bytes. When the kernel queue already holds more than a snapshot's
+	// worth, the push is deferred and retried shortly; the retry carries
+	// the CURRENT state, so nothing is lost but latency (issue #8,
+	// netns-probe round 7: a kill event queued behind 4 MB of history
+	// arrived 13.6s late).
+	const pushCoalesceBytes = 32 << 10
+	const pushCoalesceRetry = 500 * time.Millisecond
+
+	// errPushCoalesced means "the queue is deep; try again shortly".
+	var errPushCoalesced = errors.New("mesh: push coalesced")
+
 	send := func() error {
 		s.mu.Lock()
 		members := s.discoMembers
@@ -392,6 +445,13 @@ func (s *Server) streamMeshMembers(ctx context.Context, conn *wsconn.Conn, id id
 		b, err := json.Marshal(snap)
 		if err != nil {
 			return err
+		}
+		// Queue-depth check before writing: if the socket already holds
+		// pending bytes, this snapshot would sit behind them. Defer instead.
+		if sys := conn.SysConn(); sys != nil {
+			if q, qerr := socketOutq(sys); qerr == nil && q > pushCoalesceBytes {
+				return errPushCoalesced
+			}
 		}
 		_ = conn.SetWriteDeadline(time.Now().Add(pushWriteDeadline))
 		started := time.Now()
@@ -412,10 +472,30 @@ func (s *Server) streamMeshMembers(ctx context.Context, conn *wsconn.Conn, id id
 	for {
 		select {
 		case <-ch:
-			if err := send(); err != nil {
-				s.log.Info("mesh members: push failed", "device", id, "err", err)
-				_ = conn.Close()
-				return
+			// Push with coalescing: a deep queue defers this push and
+			// retries shortly, so the fresh state lands promptly instead of
+			// behind stale snapshots.
+			for {
+				err := send()
+				if err == errPushCoalesced {
+					timer := time.NewTimer(pushCoalesceRetry)
+					select {
+					case <-ctx.Done():
+						timer.Stop()
+						return
+					case <-conn.Closed():
+						timer.Stop()
+						return
+					case <-timer.C:
+					}
+					continue
+				}
+				if err != nil {
+					s.log.Info("mesh members: push failed", "device", id, "err", err)
+					_ = conn.Close()
+					return
+				}
+				break
 			}
 		case <-conn.Closed():
 			return

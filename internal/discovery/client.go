@@ -261,27 +261,52 @@ func announceRetryDelay(err error, heartbeat time.Duration) time.Duration {
 // streamLoop dials the members stream, applies pushes, and reconnects with
 // capped backoff — advancing to the next address each time a dial or stream
 // dies — until the context ends.
+//
+// The backoff is RESET whenever a snapshot was received and verified: the
+// server kicks a slow consumer as a cleanup measure, and for the kicked
+// client that is not a failure but a reconnect opportunity. Without the
+// reset the penalty doubled on every kick (1s→2s→…→30s), so a client under
+// a snapshot storm ended up in a 30s reconnect gap — and any state change
+// landing in that gap was delivered 30s late (issue #8, netns-probe round
+// 7 root cause).
 func (c *Client) streamLoop(ctx context.Context) error {
 	backoff := streamInitialBackoff
 	for {
 		if ctx.Err() != nil {
 			return nil
 		}
-		err := c.streamOnce(ctx)
+		healthy, err := c.streamOnce(ctx)
 		if ctx.Err() != nil {
 			return nil
 		}
-		c.log.Warn("members stream ended; reconnecting", "err", err, "next_retry", backoff)
-		timer := time.NewTimer(backoff)
+		// A stream that produced a verified snapshot was healthy: reconnect
+		// promptly AND reset the penalty ladder. A stream that failed gets
+		// the current backoff and pushes the ladder one step further (the
+		// original behaviour for real failures).
+		//
+		// The reset is what keeps a server-side cleanup kick (the server
+		// dropping a slow consumer) from being charged to the client as a
+		// failure: without it, repeated kicks walked the delay 1s→2s→4s→…
+		//→30s and any state change landing in that gap arrived 30s late
+		// (issue #8 #7, netns-probe round 7).
+		if healthy {
+			backoff = streamInitialBackoff
+		}
+		delay := backoff
+		if !healthy {
+			backoff *= 2
+			if backoff > maxStreamBackoff {
+				backoff = maxStreamBackoff
+			}
+		}
+		c.log.Warn("members stream ended; reconnecting", "err", err,
+			"healthy", healthy, "next_retry", delay)
+		timer := time.NewTimer(delay)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
 			return nil
 		case <-timer.C:
-		}
-		backoff *= 2
-		if backoff > maxStreamBackoff {
-			backoff = maxStreamBackoff
 		}
 		// Each failed attempt lands on the next address, so a dead node is
 		// skipped on the reconnect instead of re-timeouting forever.
@@ -291,13 +316,13 @@ func (c *Client) streamLoop(ctx context.Context) error {
 	}
 }
 
-func (c *Client) streamOnce(ctx context.Context) error {
+func (c *Client) streamOnce(ctx context.Context) (bool, error) {
 	c.mu.Lock()
 	idx := c.addrIdx
 	c.mu.Unlock()
 	u, err := membersWSURL(c.addrs[idx])
 	if err != nil {
-		return err
+		return false, err
 	}
 	conn, err := wsconn.Dial(ctx, wsconn.DialOptions{
 		URL:         u,
@@ -314,14 +339,19 @@ func (c *Client) streamOnce(ctx context.Context) error {
 		Liveness: func() *wsconn.Liveness { l := wsconn.DefaultLiveness(); return &l }(),
 	})
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer conn.Close()
 
+	// healthy records whether this stream produced a verified snapshot: the
+	// caller resets its reconnect penalty on that signal. The stream itself
+	// keeps running until it breaks — returning early here would turn the
+	// client into a 1-second reconnect loop.
+	healthy := false
 	for {
 		msg, err := conn.Recv()
 		if err != nil {
-			return err
+			return healthy, err
 		}
 		var snap MemberSnapshot
 		if err := json.Unmarshal(msg, &snap); err != nil {
@@ -336,6 +366,7 @@ func (c *Client) streamOnce(ctx context.Context) error {
 			continue
 		}
 		c.applySnapshot(&snap)
+		healthy = true
 	}
 }
 
