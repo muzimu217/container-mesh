@@ -122,12 +122,20 @@ func TestClientReconnectBackoffResetsAfterHealthyStream(t *testing.T) {
 		if n := s.srv.KickStream(s.devices[0].ID()); n == 0 {
 			t.Fatal("no stream to kick — the client is not connected")
 		}
-		before := node.StreamCount(s.devices[0].ID())
-		start := time.Now()
-		waitFor(t, 8*time.Second, "client reconnects promptly", func() bool {
-			return node.StreamCount(s.devices[0].ID()) > before
+		// The detach is asynchronous (the old handler's deferred
+		// DetachStream fires when it sees the close), so `before` sampled
+		// immediately after KickStream can still show the old count —
+		// `> before` then never becomes true (doubao-cloud-vm-01 round 8
+		// diagnosed this exact race). Instead: wait for the detach to land
+		// (count drops to 0), then wait for the reconnect (count ≥ 1).
+		kickAt := time.Now()
+		waitFor(t, 5*time.Second, "detach lands after kick", func() bool {
+			return node.StreamCount(s.devices[0].ID()) == 0
 		})
-		gaps = append(gaps, time.Since(start))
+		waitFor(t, 8*time.Second, "client reconnects promptly", func() bool {
+			return node.StreamCount(s.devices[0].ID()) >= 1
+		})
+		gaps = append(gaps, time.Since(kickAt))
 	}
 	t.Logf("reconnect gaps after repeated kicks: %v", gaps)
 	// With a resetting penalty every gap is ~1s (the initial backoff). A

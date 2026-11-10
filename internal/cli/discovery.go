@@ -605,11 +605,10 @@ func runServeDiscovery(args []string) error {
 		if host, _, err := net.SplitHostPort(*addr); err == nil && host != "" {
 			selfURL = "http://" + net.JoinHostPort(host, port)
 		}
-		// Small delay before the first announce: the HTTP listener needs a
-		// moment to start accepting, and a first-announce failure logged in
-		// the normal startup flow reads like a fault (netns-probe round 9,
-		// low-severity observation). The loop retries anyway, so this only
-		// affects log noise.
+		// The first announce fires once the relay signals Ready (its
+		// listener is bound and accepting) — the loop retries at heartbeat
+		// cadence after that, so a transient register failure just waits
+		// for the next tick rather than reading like a fault.
 		go selfAnnounceLoop(context.Background(), selfURL, selfEPS, dev, srv.Ready())
 	} else if *announce == "" {
 		fmt.Fprintf(os.Stderr, "note: --addr is a wildcard and no --announce given: this node will show as offline\n")
