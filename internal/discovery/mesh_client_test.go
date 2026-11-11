@@ -11,9 +11,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -649,4 +652,138 @@ func TestFirstAnnounceRejectionArmsFastApprovalPoll(t *testing.T) {
 		mv, ok := snap.Members[stranger.ID()]
 		return ok && len(mv.Endpoints) > 0
 	})
+}
+
+// TestTransportFailureStillPollsFastBeforeJoin pins the boundary netns-probe
+// quantified in round 25: a TRANSPORT-level announce failure (node down, or
+// the joiner racing the node's socket) must not cost a full heartbeat while
+// the device is unjoined. The old error-text rule fast-polled only
+// "not a member" rejections, so a 503/refused left approvals waiting
+// 27.1 s — 25× the not-member path. The cadence now keys on joined state:
+// ANY pre-join failure retries fast; post-join failures keep the heartbeat
+// (a node outage must not turn the whole membership into a 3 s storm).
+//
+// A 503-ing register endpoint is the transport bucket: the response never
+// carries membership semantics, so the pre-fix client armed its next ticker
+// at the heartbeat — one attempt in the window. The fixed client must be
+// back within ~3 s, and not hammer: bounded above to catch cadence bugs.
+func TestTransportFailureStillPollsFastBeforeJoin(t *testing.T) {
+	var attempts int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/mesh/register" {
+			atomic.AddInt64(&attempts, 1)
+			http.Error(w, "transport bucket: service unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		http.NotFound(w, r) // stream dials fail too; irrelevant to this cadence
+	}))
+	defer srv.Close()
+
+	stranger, err := identity.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	acc, err := identity.GenerateAccount()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cl, err := discovery.NewClient(discovery.ClientConfig{
+		Addrs:      []string{srv.URL},
+		Device:     stranger,
+		AccountID:  acc.ID(),
+		AccountPub: []byte(acc.PublicKey()),
+		Endpoints:  []string{"203.0.113.202:7000"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = cl.Run(ctx) }()
+
+	// First announce fires immediately and fails (503). The retry ticker
+	// must re-arm at the fast cadence, not the heartbeat: a second attempt
+	// within the 6 s bound proves it (the pre-fix code would need 30 s).
+	waitFor(t, 6*time.Second, "second announce attempt after transport failure", func() bool {
+		return atomic.LoadInt64(&attempts) >= 2
+	})
+	if n := atomic.LoadInt64(&attempts); n > 4 {
+		t.Fatalf("pre-join retries ran at %d attempts in 6s; expected ~3s cadence", n)
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// TestJoinedAnnounceFailuresKeepHeartbeat pins the OTHER half of the D-9b
+// cadence, the anti-storm side netns-probe round 27 baselined on the merge
+// candidate (gaps 30.001–30.005 s under 503): once JOINED, announce
+// failures must keep the heartbeat cadence — a node outage must not turn
+// the whole membership into a 3 s request storm (2084 members would go
+// from ~70 to ~695 req/s). The heartbeat here is shrunk to 5 s so the same
+// property asserts in seconds: post-flip gaps must stay ≈5 s. An inverted
+// joined-check (fast when joined) collapses them to ~3 s and fails — the
+// symptom would otherwise be silent 10× request volume, not an error.
+func TestJoinedAnnounceFailuresKeepHeartbeat(t *testing.T) {
+	s := newStack(t, 1)
+
+	var mu sync.Mutex
+	failMode := false
+	var stamps []time.Time
+	hc := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/mesh/register" {
+			mu.Lock()
+			stamps = append(stamps, time.Now())
+			mu.Unlock()
+			if failMode {
+				return &http.Response{
+					StatusCode: http.StatusServiceUnavailable,
+					Body:       io.NopCloser(strings.NewReader("stub: upstream unavailable")),
+					Header:     http.Header{},
+				}, nil
+			}
+		}
+		return http.DefaultTransport.RoundTrip(r)
+	})}
+
+	cl, err := discovery.NewClient(discovery.ClientConfig{
+		Addrs:      []string{s.ts.URL},
+		Device:     s.devices[0],
+		AccountID:  s.acc.ID(),
+		AccountPub: []byte(s.acc.PublicKey()),
+		Endpoints:  []string{"203.0.113.5:7000"},
+		Heartbeat:  5 * time.Second,
+		HTTPClient: hc,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = cl.Run(ctx) }()
+
+	// Join for real: announce succeeds, the stream delivers the member view.
+	waitFor(t, 8*time.Second, "member joins", func() bool { return cl.Joined() })
+
+	mu.Lock()
+	failMode = true
+	flipAt := len(stamps)
+	mu.Unlock()
+
+	// Collect three post-failure announces (~15 s at the 5 s heartbeat).
+	waitFor(t, 25*time.Second, "three announces after failures begin", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(stamps)-flipAt >= 3
+	})
+
+	mu.Lock()
+	defer mu.Unlock()
+	for i := flipAt + 1; i < len(stamps); i++ {
+		gap := stamps[i].Sub(stamps[i-1])
+		if gap < 4500*time.Millisecond || gap > 7500*time.Millisecond {
+			t.Fatalf("post-join announce gap %s (want ≈5s heartbeat, not ~3s fast poll)", gap)
+		}
+	}
 }
