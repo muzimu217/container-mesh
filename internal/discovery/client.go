@@ -78,6 +78,10 @@ type ClientConfig struct {
 	// DialTimeout bounds both the HTTP register and the stream dial
 	// (0 = DefaultDialTimeout).
 	DialTimeout time.Duration
+	// HTTPClient overrides the client used for register requests (nil = built
+	// from DialTimeout). Tests inject fault-injecting transports; callers
+	// behind proxies can pin their own dial behavior.
+	HTTPClient *http.Client
 	// Logger receives heartbeat and stream outcomes.
 	Logger *slog.Logger
 }
@@ -137,7 +141,11 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		addrs:   addrs,
 		updates: make(chan struct{}, 1),
 	}
-	c.httpc = &http.Client{Timeout: cfg.DialTimeout}
+	if cfg.HTTPClient != nil {
+		c.httpc = cfg.HTTPClient
+	} else {
+		c.httpc = &http.Client{Timeout: cfg.DialTimeout}
+	}
 	return c, nil
 }
 
@@ -240,7 +248,7 @@ func (c *Client) Run(ctx context.Context) error {
 		// ~30 s to become dialable).
 		c.log.Warn("first announce failed; retrying", "err", firstErr)
 	}
-	t := time.NewTicker(announceRetryDelay(firstErr, c.cfg.Heartbeat))
+	t := time.NewTicker(announceRetryDelay(c.Joined(), c.cfg.Heartbeat))
 	defer t.Stop()
 	for {
 		select {
@@ -251,19 +259,25 @@ func (c *Client) Run(ctx context.Context) error {
 			if err != nil {
 				c.log.Warn("announce failed", "err", err)
 			}
-			// Approval-pending failures retry fast; everything else keeps
-			// the heartbeat cadence.
-			t.Reset(announceRetryDelay(err, c.cfg.Heartbeat))
+			// While unjoined, ANY failure polls fast (approval may land any
+			// moment); once joined, the heartbeat cadence carries endpoint
+			// freshness and transient failures do not accelerate it.
+			t.Reset(announceRetryDelay(c.Joined(), c.cfg.Heartbeat))
 		}
 	}
 }
 
-// announceRetryDelay picks the next announce delay: a not-member rejection
-// means the approval may land any moment, so poll on a short cadence
-// instead of waiting out a full heartbeat.
-func announceRetryDelay(err error, heartbeat time.Duration) time.Duration {
-	if err != nil && strings.Contains(err.Error(), "not a member") {
-		return 3 * time.Second
+// announceRetryDelay picks the next announce delay. Before the first
+// verified membership view, poll fast no matter WHY the announce failed:
+// not-member is the normal pre-approval state, but a transport failure
+// (joiner racing a restarting node) used to fall back to a full heartbeat —
+// an approval landing in that window waited ~27 s instead of ~3 s
+// (netns-probe round 25, 25× the not-member path). Once joined, failures
+// keep the heartbeat cadence: a node outage must not turn the whole
+// membership into a 3 s request storm.
+func announceRetryDelay(joined bool, heartbeat time.Duration) time.Duration {
+	if !joined {
+		return announceFastRetry
 	}
 	return heartbeat
 }
@@ -520,6 +534,7 @@ func printableBody(b []byte) string {
 }
 
 const (
-	registerPath = "/mesh/register"
-	membersPath  = "/mesh/members"
+	registerPath      = "/mesh/register"
+	membersPath       = "/mesh/members"
+	announceFastRetry = 3 * time.Second
 )
