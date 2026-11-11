@@ -368,7 +368,8 @@ func (s *Server) streamMeshMembers(ctx context.Context, conn *wsconn.Conn, id id
 	// draining — kick so it reconnects onto a fresh pipe instead of
 	// draining stale snapshots for a minute.
 	//
-	// The cap is DYNAMIC: max(256 KiB, 2× the last snapshot size). A 44 KB
+	// The cap is DYNAMIC: 256 KiB + 2× the last snapshot size — always
+	// more than one full snapshot in flight. A 44 KB
 	// snapshot kicks at 256 KiB (genuinely stuck), but a 1 MB snapshot
 	// legitimately needs more kernel buffer — a fixed cap would live-lock
 	// on large memberships because the reconnect gets the same snapshot
