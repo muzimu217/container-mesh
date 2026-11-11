@@ -582,3 +582,71 @@ func TestUnapprovedDeviceStaysInvisible(t *testing.T) {
 		return inList
 	})
 }
+
+// TestFirstAnnounceRejectionArmsFastApprovalPoll pins the approval-path
+// latency netns-probe quantified in round 20: when the FIRST announce is
+// rejected ("not a member" — the normal pre-approval state), the retry
+// ticker must arm at the fast cadence immediately, so the joiner's
+// endpoints surface within seconds of approval. Run used to pass nil to
+// announceRetryDelay, arming the first ticker at a full heartbeat: an
+// approval landing in the first window left the new member undialable
+// for ~30 s while "is it running with --listen?" pointed troubleshooters
+// the wrong way.
+//
+// The observable is an APPROVED member's pushed snapshot — the stranger
+// appears there with endpoints only once its announce has landed, which
+// isolates the announce cadence from the joiner's own stream backoff.
+func TestFirstAnnounceRejectionArmsFastApprovalPoll(t *testing.T) {
+	s := newStack(t, 1)
+
+	// Observer: approved member, stream up before the joiner exists.
+	obsCl := s.clientFor(t, 0, []string{"203.0.113.5:7000"})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = obsCl.Run(ctx) }()
+	waitFor(t, 5*time.Second, "observer snapshot", func() bool { return obsCl.Snapshot() != nil })
+
+	// Joiner: cert issued, approval pending.
+	stranger, err := identity.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, err := s.acc.IssueCert(stranger, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	joinCl, err := discovery.NewClient(discovery.ClientConfig{
+		Addrs:      []string{s.ts.URL},
+		Device:     stranger,
+		AccountID:  s.acc.ID(),
+		AccountPub: []byte(s.acc.PublicKey()),
+		Endpoints:  []string{"203.0.113.201:7000"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	jctx, jcancel := context.WithCancel(context.Background())
+	defer jcancel()
+	go func() { _ = joinCl.Run(jctx) }()
+
+	// Let the first announce fire and be rejected — the state whose retry
+	// delay this test pins.
+	time.Sleep(500 * time.Millisecond)
+
+	if err := s.members.Add(*cert); err != nil {
+		t.Fatal(err)
+	}
+	s.srv.SetMeshMembers(s.members)
+
+	// Endpoints must surface on the fast cadence (~3 s), not a heartbeat
+	// (30 s). The 8 s bound keeps this red if the first ticker is armed at
+	// the heartbeat, and green with margin under -race.
+	waitFor(t, 8*time.Second, "joiner endpoints visible after approval (fast poll)", func() bool {
+		snap := obsCl.Snapshot()
+		if snap == nil {
+			return false
+		}
+		mv, ok := snap.Members[stranger.ID()]
+		return ok && len(mv.Endpoints) > 0
+	})
+}

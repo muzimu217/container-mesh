@@ -176,9 +176,15 @@ func (c *Client) Announce(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// addrIdx is also written by the stream reconnect loop; read it under
+	// the same lock (race detector: Announce's unlocked read raced
+	// streamLoop's locked rotate on shared-list runs).
+	c.mu.Lock()
+	base := c.addrIdx
+	c.mu.Unlock()
 	var lastErr error
 	for i := 0; i < len(c.addrs); i++ {
-		idx := (c.addrIdx + i) % len(c.addrs)
+		idx := (base + i) % len(c.addrs)
 		u := c.addrs[idx] + registerPath
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(body))
 		if err != nil {
@@ -223,14 +229,18 @@ func (c *Client) Run(ctx context.Context) error {
 		return ctx.Err()
 	}
 
-	if err := c.Announce(ctx); err != nil {
+	firstErr := c.Announce(ctx)
+	if firstErr != nil {
 		// Non-fatal: the loop keeps trying, and a "not a member" failure is
-		// the expected pre-approval state — polled on a fast cadence so the
-		// member becomes visible within seconds of approval (issue #8:
-		// approval used to wait out a full heartbeat).
-		c.log.Warn("first announce failed; retrying on heartbeat", "err", err)
+		// the expected pre-approval state — the FIRST retry must already be
+		// on the fast cadence so the member becomes visible within seconds
+		// of approval (issue #8: approval used to wait out a full heartbeat;
+		// netns-probe round 20: passing nil armed the first ticker at the
+		// full heartbeat, so approvals landing in the first window waited
+		// ~30 s to become dialable).
+		c.log.Warn("first announce failed; retrying", "err", firstErr)
 	}
-	t := time.NewTicker(announceRetryDelay(nil, c.cfg.Heartbeat))
+	t := time.NewTicker(announceRetryDelay(firstErr, c.cfg.Heartbeat))
 	defer t.Stop()
 	for {
 		select {
