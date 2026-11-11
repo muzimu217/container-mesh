@@ -179,12 +179,20 @@ func TestMeshBootstrapApprovalFlow(t *testing.T) {
 	// the first heartbeat); the joiner then pings it across a direct QUIC
 	// link, endpoints resolved from the member view.
 	ownerDev := loadJoinerDevice(t, ownerDir, pass)
+	ownerJoined := make(chan struct{})
 	go func() {
+		defer close(ownerJoined)
 		if err := Run([]string{"join", "--state", ownerDir, "--device-passphrase", pass,
-			"--listen", "127.0.0.1:0", "--timeout", "30s", strings.TrimSpace(invite)}); err != nil {
+			"--listen", "127.0.0.1:0", "--timeout", "15s", strings.TrimSpace(invite)}); err != nil {
 			t.Errorf("owner join --listen: %v", err)
 		}
 	}()
+	// Reap the join goroutine before the test ends: it prints view blocks
+	// via fmt.Fprintf(os.Stderr, …), which races with the NEXT test's
+	// stderr capture if still running (netns-probe round 21, O-B1 — the
+	// failure surfaced under TestCLIAccountWorkflow's name). 15 s bounds
+	// the goroutine while leaving 3-4× margin over legs 3-4.
+	t.Cleanup(func() { <-ownerJoined })
 	time.Sleep(1500 * time.Millisecond) // owner announces; endpoints propagate
 
 	pingOut := captureStdout(t, func() {

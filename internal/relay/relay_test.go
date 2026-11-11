@@ -363,6 +363,13 @@ func TestRoomTimesOut(t *testing.T) {
 // TestParkedDeadPeerFreesRoom checks that a peer dying while parked (process
 // killed, proxy dropped the flow) does not block recovery: when the same
 // code+role reconnects, the newcomer evicts the zombie and pairs normally.
+//
+// KNOWN FLAKE (~1/5 under -race, netns-probe rounds 14 & 21): B can observe
+// "websocket: close 1000 (normal)" instead of the expected frame — the
+// parked relay not reading its socket lets a dead-peer corpse pairing race
+// the newcomer's first frame (R14-M1). Only test-hardening was shipped;
+// the production park/pair fix is queued for PR-M4. A red on THIS test
+// alone is not a merge blocker — rerun to confirm.
 func TestParkedDeadPeerFreesRoom(t *testing.T) {
 	base, stop := startTestRelay(t)
 	defer stop()
