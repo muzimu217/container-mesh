@@ -787,3 +787,61 @@ func TestJoinedAnnounceFailuresKeepHeartbeat(t *testing.T) {
 		}
 	}
 }
+
+// TestRateLimitedAnnounceBacksOffBeforeJoin pins the round-34 finding: when
+// the register limiter answers 429, the budget is shared per EGRESS address
+// (120 tokens/min + 2/s refill, pairing /ws included), so keeping the 3 s
+// cadence wastes the whole site's allowance — round 34 measured D-9b's
+// steady demand multiplying rejected requests 8× with zero improvement in
+// worst-case approval latency. A 429 must back off (8-12 s here) while
+// other failure classes keep the fast poll; jitter spreads same-site
+// joiners off shared ticks.
+func TestRateLimitedAnnounceBacksOffBeforeJoin(t *testing.T) {
+	var attempts int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/mesh/register" {
+			atomic.AddInt64(&attempts, 1)
+			http.Error(w, "too many requests", http.StatusTooManyRequests)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	stranger, err := identity.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	acc, err := identity.GenerateAccount()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cl, err := discovery.NewClient(discovery.ClientConfig{
+		Addrs:      []string{srv.URL},
+		Device:     stranger,
+		AccountID:  acc.ID(),
+		AccountPub: []byte(acc.PublicKey()),
+		Endpoints:  []string{"203.0.113.203:7000"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = cl.Run(ctx) }()
+
+	// First announce fires immediately and gets 429. The retry must NOT be
+	// on the fast cadence: within 5 s there must still be exactly one
+	// attempt (pre-fix code retries at ~3 s — red), and the backoff must
+	// actually come back within 20 s (8-12 s band).
+	time.Sleep(5 * time.Second)
+	if n := atomic.LoadInt64(&attempts); n != 1 {
+		t.Fatalf("429 retries ran %d attempts in 5s; want exactly 1 (backoff, not fast poll)", n)
+	}
+	waitFor(t, 20*time.Second, "second attempt after rate-limit backoff", func() bool {
+		return atomic.LoadInt64(&attempts) >= 2
+	})
+	if n := atomic.LoadInt64(&attempts); n > 3 {
+		t.Fatalf("rate-limited retries ran %d attempts in ~20s; want ≈8-12s cadence", n)
+	}
+}

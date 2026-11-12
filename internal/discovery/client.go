@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/url"
@@ -248,7 +249,7 @@ func (c *Client) Run(ctx context.Context) error {
 		// ~30 s to become dialable).
 		c.log.Warn("first announce failed; retrying", "err", firstErr)
 	}
-	t := time.NewTicker(announceRetryDelay(c.Joined(), c.cfg.Heartbeat))
+	t := time.NewTicker(announceRetryDelay(c.Joined(), firstErr, c.cfg.Heartbeat))
 	defer t.Stop()
 	for {
 		select {
@@ -260,9 +261,11 @@ func (c *Client) Run(ctx context.Context) error {
 				c.log.Warn("announce failed", "err", err)
 			}
 			// While unjoined, ANY failure polls fast (approval may land any
-			// moment); once joined, the heartbeat cadence carries endpoint
-			// freshness and transient failures do not accelerate it.
-			t.Reset(announceRetryDelay(c.Joined(), c.cfg.Heartbeat))
+			// moment) except a rate-limit rejection, which backs off — the
+			// budget is shared per egress address. Once joined, the
+			// heartbeat cadence carries endpoint freshness and transient
+			// failures do not accelerate it.
+			t.Reset(announceRetryDelay(c.Joined(), err, c.cfg.Heartbeat))
 		}
 	}
 }
@@ -275,11 +278,36 @@ func (c *Client) Run(ctx context.Context) error {
 // (netns-probe round 25, 25× the not-member path). Once joined, failures
 // keep the heartbeat cadence: a node outage must not turn the whole
 // membership into a 3 s request storm.
-func announceRetryDelay(joined bool, heartbeat time.Duration) time.Duration {
-	if !joined {
-		return announceFastRetry
+//
+// The one pre-join exception is a rate-limit rejection: the register budget
+// is shared per EGRESS address (rounds 33-35 — 120 tokens/min + 2/s refill,
+// pairing /ws included), so when the bucket is empty, keeping a 3 s cadence
+// wastes the whole site's allowance: round 34 measured D-9b's steady demand
+// multiplying rejected requests 8× with zero improvement in worst-case
+// approval latency. Back off past the refill window, and jitter BOTH
+// pre-join delays so same-site joiners de-synchronize instead of phasing
+// onto the same ticks.
+func announceRetryDelay(joined bool, err error, heartbeat time.Duration) time.Duration {
+	if joined {
+		return heartbeat
 	}
-	return heartbeat
+	if isRateLimited(err) {
+		return announceRateBackoff + time.Duration(rand.Int64N(int64(announceRateJitter)))
+	}
+	return announceFastRetry + time.Duration(rand.Int64N(int64(announceFastJitter)))
+}
+
+// isRateLimited reports whether err is the limiter's rejection. The relay
+// answers 429 with body "too many requests" (rate bucket) or "too many
+// connections" (in-flight cap) — both mean this egress site's shared
+// allowance is exhausted and retrying fast only burns other devices' share.
+func isRateLimited(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "429") || strings.Contains(s, "too many request") ||
+		strings.Contains(s, "too many connection")
 }
 
 // streamLoop dials the members stream, applies pushes, and reconnects with
@@ -534,7 +562,16 @@ func printableBody(b []byte) string {
 }
 
 const (
-	registerPath      = "/mesh/register"
-	membersPath       = "/mesh/members"
-	announceFastRetry = 3 * time.Second
+	registerPath = "/mesh/register"
+	membersPath  = "/mesh/members"
+	// Pre-join announce cadence: fast, with jitter so same-egress joiners
+	// de-synchronize (rounds 33-35: the register budget is shared per
+	// egress address, and phased tickers waste it together).
+	announceFastRetry  = 3 * time.Second
+	announceFastJitter = 600 * time.Millisecond
+	// Rate-limit rejections back off past the 2/s refill window — retrying
+	// fast only burns other devices' share (round 34: 8× rejected requests,
+	// zero faster joins).
+	announceRateBackoff = 8 * time.Second
+	announceRateJitter  = 4 * time.Second
 )
