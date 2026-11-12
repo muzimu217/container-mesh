@@ -234,7 +234,16 @@ func DecodeInvite(s string) (Invite, error) {
 			ErrAnnounceBadEndpoint, len(q["disc"]), MaxEndpoints)
 	}
 	for _, a := range q["disc"] {
-		if !validEndpoint(a) {
+		// An optional scheme prefix is allowed so TLS deployments can point
+		// at non-443 https ports; the client's normalizeBaseURL keeps the
+		// explicit scheme. Validation applies to the host:port part —
+		// invite used to emit scheme-ed addrs that join then rejected
+		// (netns-probe round 31, defect F2).
+		bare := a
+		if i := strings.Index(a, "://"); i >= 0 {
+			bare = a[i+3:]
+		}
+		if !validEndpoint(bare) {
 			return Invite{}, fmt.Errorf("%w: %q", ErrAnnounceBadEndpoint, a)
 		}
 		inv.DiscoveryAddrs = append(inv.DiscoveryAddrs, a)

@@ -512,12 +512,14 @@ func runServeDiscovery(args []string) error {
 
 	relay.SetVersion(Version)
 	scheme := "ws"
+	httpScheme := "http"
 	if *tlsCert != "" {
 		scheme = "wss"
+		httpScheme = "https"
 	}
 	fmt.Fprintf(os.Stderr, "discovery node listening on %s://%s\n", scheme, strings.TrimPrefix(*addr, ":"))
-	fmt.Fprintf(os.Stderr, "  register: POST   http://%s/mesh/register\n", *addr)
-	fmt.Fprintf(os.Stderr, "  members:  WS     http://%s/mesh/members\n", *addr)
+	fmt.Fprintf(os.Stderr, "  register: POST   %s://%s/mesh/register\n", httpScheme, *addr)
+	fmt.Fprintf(os.Stderr, "  members:  WS     %s://%s/mesh/members\n", httpScheme, *addr)
 	fmt.Fprintf(os.Stderr, "  members file: %s (edited externally; hot-reloaded)\n", *membersPath)
 	fmt.Fprintf(os.Stderr, "  pairing relay and dashboard unchanged: %s%s, /dashboard\n", scheme, *addr)
 
@@ -601,9 +603,14 @@ func runServeDiscovery(args []string) error {
 	}
 	if len(selfEPS) > 0 {
 		_, port, _ := net.SplitHostPort(*addr)
-		selfURL := "http://127.0.0.1:" + port
+		// The self-announce must speak the same scheme the node serves:
+		// under --tls-* a hardcoded http URL hits the TLS listener and dies
+		// with "Client sent an HTTP request to an HTTPS server" every
+		// heartbeat, leaving the anchor permanently offline with no
+		// endpoints (netns-probe round 31, defect F1).
+		selfURL := httpScheme + "://127.0.0.1:" + port
 		if host, _, err := net.SplitHostPort(*addr); err == nil && host != "" {
-			selfURL = "http://" + net.JoinHostPort(host, port)
+			selfURL = httpScheme + "://" + net.JoinHostPort(host, port)
 		}
 		// The first announce fires once the relay signals Ready (its
 		// listener is bound and accepting) — the loop retries at heartbeat

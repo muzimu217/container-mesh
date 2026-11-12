@@ -285,6 +285,48 @@ func TestInviteRejectsMalformed(t *testing.T) {
 	}
 }
 
+// TestInviteAcceptsSchemeDiscoveryAddrs pins the F2 fix (netns-probe round
+// 31): invite emits scheme-ed discovery addrs for TLS deployments (e.g.
+// --disc https://10.0.0.1:18443), and join used to reject exactly what
+// invite produced — validEndpoint saw "https://host:port" and failed
+// SplitHostPort, leaving 443 as the only usable TLS port with a misleading
+// "malformed endpoint" error. The scheme prefix must survive the round
+// trip (the client's normalizeBaseURL keeps it), while a scheme with a
+// bogus host:port is still rejected.
+func TestInviteAcceptsSchemeDiscoveryAddrs(t *testing.T) {
+	f := newFixture(t, 1)
+	inv := Invite{
+		AccountID:      f.acc.ID(),
+		AccountPub:     f.acc.PublicKey(),
+		DiscoveryAddrs: []string{"https://10.55.0.1:18443", "203.0.113.10:8080"},
+		IssuedAt:       testNow,
+	}
+	s, err := EncodeInvite(inv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := DecodeInvite(s)
+	if err != nil {
+		t.Fatalf("scheme-ed discovery addr rejected: %v", err)
+	}
+	if len(got.DiscoveryAddrs) != 2 || got.DiscoveryAddrs[0] != "https://10.55.0.1:18443" {
+		t.Fatalf("discovery addrs = %v; scheme must be preserved verbatim", got.DiscoveryAddrs)
+	}
+
+	bad, err := EncodeInvite(Invite{
+		AccountID:      f.acc.ID(),
+		AccountPub:     f.acc.PublicKey(),
+		DiscoveryAddrs: []string{"https://no-port-here"},
+		IssuedAt:       testNow,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DecodeInvite(bad); err == nil {
+		t.Fatal("scheme-ed addr with malformed host:port must still be rejected")
+	}
+}
+
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s

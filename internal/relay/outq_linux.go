@@ -6,6 +6,7 @@
 package relay
 
 import (
+	"crypto/tls"
 	"fmt"
 	"net"
 	"syscall"
@@ -26,11 +27,26 @@ const tiocoutq = 0x5411
 // this consumer". This is where the issue #8 backlog lived (1.5–4.1 MB in
 // sndbuf): the application-layer write had already returned, so
 // write-duration based kicks could never see it.
+//
+// A *tls.Conn is unwrapped via NetConn: under --tls-* the members stream is
+// TLS over TCP, and the type assert alone silently disabled the queue-depth
+// kick for every TLS deployment (netns-probe round 31, defect F3).
 func socketOutq(c net.Conn) (int, error) {
-	tc, ok := c.(*net.TCPConn)
-	if !ok {
-		return 0, fmt.Errorf("relay: not a TCP conn")
+	for depth := 0; depth < 4; depth++ {
+		switch t := c.(type) {
+		case *net.TCPConn:
+			return tcpOutq(t)
+		case *tls.Conn:
+			c = t.NetConn()
+			continue
+		default:
+			return 0, fmt.Errorf("relay: unsupported conn type %T", c)
+		}
 	}
+	return 0, fmt.Errorf("relay: conn nesting too deep for queue introspection")
+}
+
+func tcpOutq(tc *net.TCPConn) (int, error) {
 	raw, err := tc.SyscallConn()
 	if err != nil {
 		return 0, err
