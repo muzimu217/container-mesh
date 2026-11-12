@@ -104,6 +104,20 @@ type Client struct {
 
 	// updates is signalled (buffered, coalescing) whenever the view changes.
 	updates chan struct{}
+
+	// streamKick wakes the stream reconnect loop out of its backoff wait
+	// when an announce succeeded while this device was still unjoined (see
+	// kickStreamIfPending). announceNow asks the heartbeat loop for an
+	// out-of-band announce when a stream RECONNECT verifies a snapshot (see
+	// signalRecoveryAnnounce). Both are buffered 1: a signal nobody is
+	// waiting for right now must not block the sender, and a coalesced
+	// repeat is harmless — each is "do it now", not a count.
+	streamKick  chan struct{}
+	announceNow chan struct{}
+
+	// connSeq numbers members-stream connections; only the stream goroutine
+	// reads and writes it.
+	connSeq int
 }
 
 // NewClient validates the configuration and normalizes addresses. Bad
@@ -137,10 +151,12 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		addrs = append(addrs, strings.TrimRight(normalizedAddr(a), "/"))
 	}
 	c := &Client{
-		cfg:     cfg,
-		log:     cfg.Logger,
-		addrs:   addrs,
-		updates: make(chan struct{}, 1),
+		cfg:         cfg,
+		log:         cfg.Logger,
+		addrs:       addrs,
+		updates:     make(chan struct{}, 1),
+		streamKick:  make(chan struct{}, 1),
+		announceNow: make(chan struct{}, 1),
 	}
 	if cfg.HTTPClient != nil {
 		c.httpc = cfg.HTTPClient
@@ -255,10 +271,29 @@ func (c *Client) Run(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-c.announceNow:
+			// A stream recovery asked for an out-of-band announce: the
+			// server expired this device's presence when the old stream
+			// detached, and until the next announce every subscriber's
+			// view shows it offline — waiting for the heartbeat left
+			// 0–30 s of stale "offline" after the transport was already
+			// back (R40-1, the recovery-visibility batch with C-4).
+			err := c.Announce(ctx)
+			if err != nil {
+				c.log.Warn("recovery announce failed", "err", err)
+			}
+			t.Reset(announceRetryDelay(c.Joined(), err, c.cfg.Heartbeat))
 		case <-t.C:
 			err := c.Announce(ctx)
 			if err != nil {
 				c.log.Warn("announce failed", "err", err)
+			} else {
+				// Registered fine but still no verified view of our own
+				// membership: the approval that let this announce through
+				// has not reached the stream yet — wake it instead of
+				// letting it wait out its backoff ladder (doubao round 51:
+				// 26.7 s approval→dialable after a long pending wait).
+				c.kickStreamIfPending()
 			}
 			// While unjoined, ANY failure polls fast (approval may land any
 			// moment) except a rate-limit rejection, which backs off — the
@@ -358,6 +393,12 @@ func (c *Client) streamLoop(ctx context.Context) error {
 		case <-ctx.Done():
 			timer.Stop()
 			return nil
+		case <-c.streamKick:
+			// An announce succeeded while this device was still unjoined:
+			// approval just landed, and the remaining backoff wait — built
+			// up from pre-approval rejections — is the only thing between
+			// us and the snapshot that makes the device dialable. Skip it.
+			timer.Stop()
 		case <-timer.C:
 		}
 		// Each failed attempt lands on the next address, so a dead node is
@@ -369,6 +410,8 @@ func (c *Client) streamLoop(ctx context.Context) error {
 }
 
 func (c *Client) streamOnce(ctx context.Context) (bool, error) {
+	c.connSeq++
+	connNo := c.connSeq
 	c.mu.Lock()
 	idx := c.addrIdx
 	c.mu.Unlock()
@@ -400,6 +443,10 @@ func (c *Client) streamOnce(ctx context.Context) (bool, error) {
 	// keeps running until it breaks — returning early here would turn the
 	// client into a 1-second reconnect loop.
 	healthy := false
+	// announced pins the recovery signal to the FIRST verified snapshot of
+	// this connection — one out-of-band announce per reconnect, not one per
+	// push.
+	announced := false
 	for {
 		msg, err := conn.Recv()
 		if err != nil {
@@ -419,6 +466,48 @@ func (c *Client) streamOnce(ctx context.Context) (bool, error) {
 		}
 		c.applySnapshot(&snap)
 		healthy = true
+		if !announced {
+			announced = true
+			c.signalRecoveryAnnounce(connNo)
+		}
+	}
+}
+
+// signalRecoveryAnnounce asks the heartbeat loop for an out-of-band announce
+// when a RECONNECTED stream verifies its first snapshot. The old stream's
+// detach expired this device's presence server-side (the fast-offline path),
+// so until the next announce every subscriber's view shows it offline no
+// matter how fresh its own view already is (R40-1: recovery visibility used
+// to be bound by the heartbeat, 0–30 s after the transport was back). The
+// first connection ever is exempt: Run's immediate first announce covers it,
+// and one extra register per client start would double the join burst on the
+// shared egress budget.
+func (c *Client) signalRecoveryAnnounce(connNo int) {
+	if connNo <= 1 || c.cfg.NoAnnounce {
+		return
+	}
+	select {
+	case c.announceNow <- struct{}{}:
+	default:
+	}
+}
+
+// kickStreamIfPending wakes the members-stream loop when an announce
+// succeeded while no verified view contains this device. The register gate
+// and the stream gate consult the same member list, so the success means an
+// approval just landed — and the stream, still backing off from its
+// pre-approval rejections, is the only thing delaying the snapshot that
+// makes the device dialable (doubao round 51: 26.7 s approval→dialable after
+// a 35 s pending wait; the ladder had climbed to its cap). No-op once
+// joined; a signal sent in the race window before Joined flips at worst
+// skips one backoff step on a later reconnect.
+func (c *Client) kickStreamIfPending() {
+	if c.Joined() {
+		return
+	}
+	select {
+	case c.streamKick <- struct{}{}:
+	default:
 	}
 }
 

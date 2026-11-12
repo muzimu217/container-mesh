@@ -845,3 +845,203 @@ func TestRateLimitedAnnounceBacksOffBeforeJoin(t *testing.T) {
 		t.Fatalf("rate-limited retries ran %d attempts in ~20s; want ≈8-12s cadence", n)
 	}
 }
+
+// TestAnnounceSuccessKicksStreamOutOfBackoff pins the round-51 defect
+// doubao quantified: a device pending approval has its members-stream
+// reconnect ladder climb toward the 30 s cap while the /mesh/members gate
+// keeps rejecting it, so when approval finally lands the SNAPSHOT — the
+// thing that makes the device dialable — waits out the ladder's remainder
+// (26.1–26.7 s measured after a 35 s pending wait). D-9b's fast announce
+// poll already notices the approval within ~3 s; a successful announce
+// while still unjoined must WAKE the stream instead of leaving it asleep.
+//
+// Observable: the timing of the next /mesh/members attempt after approval.
+// The ladder is climbed honestly (attempts at ~0,1,3,7,15 s) so the 6th
+// attempt without the kick lands ~16 s after approval; with it, within ~4 s.
+func TestAnnounceSuccessKicksStreamOutOfBackoff(t *testing.T) {
+	var members, registers int64
+	var approved int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/mesh/members":
+			// Reject every attempt: this test observes reconnect TIMING,
+			// not snapshot delivery — 401 is the pre-approval gate.
+			atomic.AddInt64(&members, 1)
+			http.Error(w, "not a member", http.StatusUnauthorized)
+		case "/mesh/register":
+			atomic.AddInt64(&registers, 1)
+			if atomic.LoadInt32(&approved) == 0 {
+				http.Error(w, "not a member", http.StatusUnauthorized)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	acc, err := identity.GenerateAccount()
+	if err != nil {
+		t.Fatal(err)
+	}
+	joiner, err := identity.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cl, err := discovery.NewClient(discovery.ClientConfig{
+		Addrs:      []string{srv.URL},
+		Device:     joiner,
+		AccountID:  acc.ID(),
+		AccountPub: []byte(acc.PublicKey()),
+		Endpoints:  []string{"203.0.113.203:7000"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = cl.Run(ctx) }()
+
+	// Let the ladder climb past its 8 s step: the 5th attempt lands at
+	// ~15 s, and the wait that follows is 16 s — comfortably beyond the
+	// 8 s bound below, which keeps the red side unambiguous.
+	waitFor(t, 25*time.Second, "five stream attempts (ladder climbed)", func() bool {
+		return atomic.LoadInt64(&members) >= 5
+	})
+
+	atomic.StoreInt32(&approved, 1)
+	approveAt := time.Now()
+
+	waitFor(t, 8*time.Second, "stream re-attempt after approval (kicked, not backed off)", func() bool {
+		return atomic.LoadInt64(&members) >= 6
+	})
+	t.Logf("approval → next stream attempt: %s (registers=%d)", time.Since(approveAt), atomic.LoadInt64(&registers))
+}
+
+// recoveryMembersServer is a discovery-node stand-in that hands every
+// members-stream connection one valid snapshot, then holds the connection
+// open until it dies. The test keeps a registry of live connections so it
+// can kill them on demand, producing a stream GAP with the server healthy.
+func recoveryMembersServer(t *testing.T, snap discovery.MemberSnapshot, registers *int64) (kill func(), url string) {
+	t.Helper()
+	body, err := json.Marshal(snap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	live := make(map[*wsconn.Conn]struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/mesh/register":
+			atomic.AddInt64(registers, 1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		case "/mesh/members":
+			conn, err := wsconn.Upgrade(w, r)
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			live[conn] = struct{}{}
+			mu.Unlock()
+			defer func() {
+				mu.Lock()
+				delete(live, conn)
+				mu.Unlock()
+				conn.Close()
+			}()
+			if err := conn.Send(body); err != nil {
+				return
+			}
+			<-r.Context().Done()
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return func() {
+		mu.Lock()
+		defer mu.Unlock()
+		for conn := range live {
+			conn.Close()
+		}
+	}, srv.URL
+}
+
+// TestStreamRecoveryFiresImmediateAnnounce pins R40-1 (recovery visibility):
+// when a member's stream dies, the server expires its presence via the
+// fast-offline path — and until the member's NEXT announce, every other
+// subscriber's view shows it offline. That announce used to wait for the
+// heartbeat ticker (0–30 s of stale "offline" after the transport was
+// already back). A stream connection that verifies a snapshot after a gap
+// must trigger an out-of-band announce; only the very first connection is
+// exempt (Run's immediate first announce already covers it).
+func TestStreamRecoveryFiresImmediateAnnounce(t *testing.T) {
+	acc, err := identity.GenerateAccount()
+	if err != nil {
+		t.Fatal(err)
+	}
+	self, err := identity.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, err := acc.IssueCert(self, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap := discovery.MemberSnapshot{
+		AccountID: acc.ID(),
+		Version:   1,
+		Members: map[identity.DeviceID]discovery.MemberView{
+			self.ID(): {Cert: *cert, Online: true, Endpoints: []string{"203.0.113.204:7000"}},
+		},
+	}
+
+	var registers int64
+	kill, url := recoveryMembersServer(t, snap, &registers)
+
+	cl, err := discovery.NewClient(discovery.ClientConfig{
+		Addrs:      []string{url},
+		Device:     self,
+		AccountID:  acc.ID(),
+		AccountPub: []byte(acc.PublicKey()),
+		Endpoints:  []string{"203.0.113.204:7000"},
+		// One heartbeat per minute: within this test's window the ticker
+		// CANNOT be what produces the second announce — only the recovery
+		// signal can.
+		Heartbeat: time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = cl.Run(ctx) }()
+
+	waitFor(t, 5*time.Second, "first announce", func() bool { return atomic.LoadInt64(&registers) >= 1 })
+	waitFor(t, 5*time.Second, "stream healthy", func() bool { return cl.Snapshot() != nil })
+
+	// The pre-join fast poll leaves one stale ~3 s tick armed from before
+	// the snapshot flipped us to joined — drain it BEFORE the kill, so the
+	// only announce that can follow the gap is the recovery signal (the
+	// 60 s ticker cannot fire inside a 6 s window). Otherwise the stale
+	// tick masquerades as the recovery announce and the test stays green
+	// unfixed.
+	waitFor(t, 6*time.Second, "pre-join fast tick drained", func() bool {
+		return atomic.LoadInt64(&registers) >= 2
+	})
+	time.Sleep(300 * time.Millisecond)
+
+	kill() // stream gap; the server itself stays up
+
+	// The reconnect (initial backoff ~1 s) verifies a snapshot on its
+	// connection, which must announce out of band — not at the 60 s ticker.
+	waitFor(t, 6*time.Second, "recovery announce fired", func() bool {
+		return atomic.LoadInt64(&registers) >= 3
+	})
+	if n := atomic.LoadInt64(&registers); n > 4 {
+		t.Fatalf("recovery fired %d announces; want one out-of-band announce, not a storm", n)
+	}
+}

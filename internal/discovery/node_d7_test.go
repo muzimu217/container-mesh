@@ -87,3 +87,59 @@ func TestDetachStreamKeepsEndpoints(t *testing.T) {
 		t.Fatalf("detach must keep announced endpoints for dial-through: %v", got)
 	}
 }
+
+// drainSignal waits for one subscriber push.
+func drainSignal(t *testing.T, ch <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("expected a subscriber push: %s", what)
+	}
+}
+
+// assertNoSignal verifies silence for a settling window.
+func assertNoSignal(t *testing.T, ch <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-ch:
+		t.Fatalf("unexpected subscriber push: %s", what)
+	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+// TestRegisterPushesOfflineToOnlineTransition pins C-4/R39-1: DetachStream
+// pushes the offline transition, but the returning device's announce used to
+// push NOTHING when its endpoints were unchanged — Register only notified on
+// endpoint change, so every other member kept showing the device offline
+// until some unrelated change happened to push (measured 147.7 s stale, R39).
+// Presence is a transition, not a diff of endpoints.
+func TestRegisterPushesOfflineToOnlineTransition(t *testing.T) {
+	_, dev, _, node := d7Fixture(t)
+	ch, unsub := node.Subscribe(dev.ID())
+	defer unsub()
+
+	now := time.Now()
+	ep := []string{"10.0.0.5:7000"}
+	node.Register(MemberAnnounce{DeviceID: dev.ID(), Endpoints: ep, Timestamp: now}, now)
+	drainSignal(t, ch, "first announce (endpoints appear)")
+
+	// The device's stream dies: fast-offline push.
+	node.AttachStream(dev.ID())
+	node.DetachStream(dev.ID())
+	drainSignal(t, ch, "detach (offline transition)")
+	if _, online := node.LastSeen(dev.ID()); online {
+		t.Fatal("detach must have expired presence — recovery register would not count as a transition")
+	}
+
+	// It comes back with the SAME endpoints. The announce must still push:
+	// subscribers' views say offline until told otherwise.
+	if changed := node.Register(MemberAnnounce{DeviceID: dev.ID(), Endpoints: ep, Timestamp: now}, now); changed {
+		t.Fatal("same-endpoints announce must not report endpoint change")
+	}
+	drainSignal(t, ch, "recovery announce (online transition)")
+
+	// Steady state: online, endpoints unchanged — no push (no chatter).
+	node.Register(MemberAnnounce{DeviceID: dev.ID(), Endpoints: ep, Timestamp: now}, now)
+	assertNoSignal(t, ch, "steady-state announce must not re-push")
+}

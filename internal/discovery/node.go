@@ -112,6 +112,14 @@ func (n *Node) Register(a MemberAnnounce, when time.Time) bool {
 	if !n.members.Contains(a.DeviceID) {
 		return false
 	}
+	// An announce from a device with no recorded presence is an
+	// offline→online TRANSITION (C-4/R39-1): DetachStream pushed the
+	// offline side, and if this register only refreshed state, subscribers
+	// kept showing the device offline until some unrelated change pushed —
+	// measured 147.7 s stale. The presence flip is worth a push even when
+	// the endpoints are identical; the boolean stays endpoint-changed so
+	// the HTTP layer's "changed" logging keeps its meaning.
+	_, wasOnline := n.lastSeen[a.DeviceID]
 	// An EMPTY announce is presence-only. Endpoints are announcement state —
 	// the last thing the member's real listener advertised — and a
 	// zero-length list must not wipe them: a second announcer with no
@@ -121,6 +129,9 @@ func (n *Node) Register(a MemberAnnounce, when time.Time) bool {
 	// has no endpoints never HAD any, so this is a no-op for the C-3 case.
 	if len(a.Endpoints) == 0 {
 		n.lastSeen[a.DeviceID] = when
+		if !wasOnline {
+			n.notifyAll()
+		}
 		return false
 	}
 	changed := !equalStrings(n.endpts[a.DeviceID], a.Endpoints)
@@ -129,7 +140,7 @@ func (n *Node) Register(a MemberAnnounce, when time.Time) bool {
 	// message silently rewrite the recorded state.
 	n.endpts[a.DeviceID] = append([]string(nil), a.Endpoints...)
 	n.lastSeen[a.DeviceID] = when
-	if changed {
+	if changed || !wasOnline {
 		n.notifyAll()
 	}
 	return changed
