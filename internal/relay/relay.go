@@ -370,12 +370,18 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	s.sweepContested()
 
 	ip := s.limiter.clientIP(r)
-	if !s.limiter.acquire(ip) {
+	if ok, why := s.limiter.acquireWhy(ip); !ok {
 		// The relay is unauthenticated by design (the room label is not a
 		// credential), so per-IP budgets are the only thing standing between a
-		// single host and a room-exhaustion or squatting flood.
-		s.log.Warn("rate limited", "ip", ip, "room", redactRoom(roomID))
-		http.Error(w, "too many connections", http.StatusTooManyRequests)
+		// single host and a room-exhaustion or squatting flood. The body
+		// distinguishes the budget (C-6): "too many connections" is the
+		// in-flight cap, "too many requests" the token bucket.
+		body, logWhy := "too many requests", whyRate
+		if why == whyConcurrency {
+			body, logWhy = "too many connections", whyConcurrency
+		}
+		s.log.Warn("rate limited", "ip", ip, "room", redactRoom(roomID), "why", logWhy)
+		http.Error(w, body, http.StatusTooManyRequests)
 		return
 	}
 	defer s.limiter.release(ip)

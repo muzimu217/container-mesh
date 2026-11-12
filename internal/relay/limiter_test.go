@@ -200,6 +200,37 @@ func TestRedactRoomHidesFullLabel(t *testing.T) {
 	}
 	// Short labels pass through unchanged (they cannot be truncated usefully).
 	if short := "abc"; redactRoom(short) != short {
-		t.Errorf("short room was altered: %q", redactRoom(short))
+		t.Errorf("short room was altered: %q", short)
+	}
+}
+
+// TestAcquireWhyDistinguishesReasons pins C-6: a 429 must say WHICH budget
+// refused — the in-flight cap and the token bucket need different operator
+// actions, and the saturation test rounds could not tell them apart while
+// both endpoints printed the same text.
+func TestAcquireWhyDistinguishesReasons(t *testing.T) {
+	// Concurrency: two slots, ample tokens.
+	l := newIPLimiter(1000, 2)
+	if ok, why := l.acquireWhy("1.1.1.1"); !ok || why != "" {
+		t.Fatalf("first acquire = %v, %q; want ok with no reason", ok, why)
+	}
+	if ok, _ := l.acquireWhy("1.1.1.1"); !ok {
+		t.Fatal("second acquire should fill the cap, not fail")
+	}
+	if ok, why := l.acquireWhy("1.1.1.1"); ok || why != whyConcurrency {
+		t.Fatalf("over-cap acquire = %v, %q; want concurrency", ok, why)
+	}
+	l.release("1.1.1.1")
+	if ok, why := l.acquireWhy("1.1.1.1"); !ok || why != "" {
+		t.Fatalf("acquire after release = %v, %q; want ok with no reason", ok, why)
+	}
+
+	// Rate: one token, ample concurrency.
+	r := newIPLimiter(1, 16)
+	if ok, why := r.acquireWhy("2.2.2.2"); !ok || why != "" {
+		t.Fatalf("first acquire = %v, %q; want ok with no reason", ok, why)
+	}
+	if ok, why := r.acquireWhy("2.2.2.2"); ok || why != whyRate {
+		t.Fatalf("dry-bucket acquire = %v, %q; want rate", ok, why)
 	}
 }

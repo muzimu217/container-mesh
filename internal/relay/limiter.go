@@ -48,9 +48,20 @@ func newIPLimiter(perMin, maxCon int) *ipLimiter {
 	return &ipLimiter{perMin: perMin, maxCon: maxCon, state: make(map[string]*ipState), now: time.Now}
 }
 
-// acquire reserves one connection slot for ip. It returns false when the IP is
-// over its rate or concurrency budget.
-func (l *ipLimiter) acquire(ip string) bool {
+// Rejection reasons reported by acquireWhy (C-6): the two budgets need
+// different operator actions (wait for token refill vs. close connections)
+// and different tester verdicts — one shared 429 text made the saturation
+// rounds indistinguishable. The strings stay internal; the HTTP layer maps
+// them to the body texts the client matches on.
+const (
+	whyRate        = "rate"
+	whyConcurrency = "concurrency"
+)
+
+// acquireWhy reserves one connection slot for ip, reporting WHY on refusal:
+// the in-flight cap ("concurrency") or the token bucket ("rate"). It returns
+// false with the reason when the IP is over either budget.
+func (l *ipLimiter) acquireWhy(ip string) (bool, string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -73,14 +84,21 @@ func (l *ipLimiter) acquire(ip string) bool {
 	st.seen = now
 
 	if st.inflight >= l.maxCon {
-		return false
+		return false, whyConcurrency
 	}
 	if st.tokens < 1 {
-		return false
+		return false, whyRate
 	}
 	st.tokens--
 	st.inflight++
-	return true
+	return true, ""
+}
+
+// acquire reserves one connection slot for ip. It returns false when the IP is
+// over its rate or concurrency budget.
+func (l *ipLimiter) acquire(ip string) bool {
+	ok, _ := l.acquireWhy(ip)
+	return ok
 }
 
 // release frees a slot taken by acquire.

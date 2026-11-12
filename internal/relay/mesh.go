@@ -211,9 +211,17 @@ func (s *Server) handleMeshRegister(w http.ResponseWriter, r *http.Request) {
 	// The relay is unauthenticated at the pairing layer, so per-IP budgets
 	// are the first thing a flood hits — same policy as /ws, one limiter.
 	ip := s.limiter.clientIP(r)
-	if !s.limiter.acquire(ip) {
-		s.log.Warn("mesh register rate limited", "ip", ip)
-		http.Error(w, "too many requests", http.StatusTooManyRequests)
+	if ok, why := s.limiter.acquireWhy(ip); !ok {
+		// C-6: the two budgets need different bodies — the client's
+		// backoff matcher treats both as rate limits, while testers and
+		// operators need to tell "shared bucket exhausted" (wait ~8–12 s)
+		// from "in-flight cap" (a stuck connection holds the slot).
+		body, logWhy := "too many requests", whyRate
+		if why == whyConcurrency {
+			body, logWhy = "too many connections", whyConcurrency
+		}
+		s.log.Warn("mesh register rate limited", "ip", ip, "why", logWhy)
+		http.Error(w, body, http.StatusTooManyRequests)
 		return
 	}
 	defer s.limiter.release(ip)
