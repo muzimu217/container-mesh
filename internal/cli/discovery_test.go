@@ -302,6 +302,20 @@ func TestWatchApprovalsNoSelfTriggerLoop(t *testing.T) {
 		t.Fatalf("idle watcher inflated the member-list version to %d (self-trigger loop, D-3)", m.CurrentVersion())
 	}
 	if m.Count() != 1 {
-		t.Fatalf("idle watcher changed the member count to %d", m.Count())
+		t.Fatalf("idle watcher changed the member count to %d (self-trigger loop, D-3)", m.Count())
+	}
+}
+
+// TestLocalAddrTreatsLoopbackAsLocal pins the kuku round-51 finding: an
+// operator who runs `serve-discovery --addr 127.0.0.1:port` said "loopback
+// only", but localAddr classified the loopback IP as non-local and the
+// caller widened the UDP direct-link listener to 0.0.0.0 — a binding-scope
+// defect visible in /proc/net/udp. Loopback is local by definition; only
+// the NAT-mapped public address takes the wildcard branch.
+func TestLocalAddrTreatsLoopbackAsLocal(t *testing.T) {
+	for _, host := range []string{"localhost", "127.0.0.1", "::1"} {
+		if !localAddr(host) {
+			t.Fatalf("localAddr(%q) = false; loopback is a local address — the NAT wildcard branch must not capture it", host)
+		}
 	}
 }

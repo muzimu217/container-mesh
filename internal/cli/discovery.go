@@ -637,8 +637,16 @@ func localAddr(host string) bool {
 		return true
 	}
 	ip := net.ParseIP(host)
-	if ip == nil || ip.IsLoopback() {
+	if ip == nil {
 		return false
+	}
+	// Loopback is local BY DEFINITION: an operator who binds
+	// --addr 127.0.0.1 said "loopback only", and the NAT branch below used
+	// to widen the UDP direct-link listener to 0.0.0.0 behind their back
+	// (kuku round 51 saw the wildcard in /proc/net/udp). The hostname form
+	// above already made the same decision for "localhost".
+	if ip.IsLoopback() {
+		return true
 	}
 	addrs, err := net.InterfaceAddrs()
 	if err != nil {
