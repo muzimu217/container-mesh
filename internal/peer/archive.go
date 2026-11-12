@@ -171,7 +171,7 @@ func UnpackArchive(archive string, dir string, overwrite bool) error {
 			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 				return err
 			}
-			out, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(hdr.Mode)&0o644)
+			out, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, archiveFileMode(os.FileMode(hdr.Mode)))
 			if err != nil {
 				return fmt.Errorf("peer: create %s: %w", target, err)
 			}
@@ -229,4 +229,17 @@ func packDirToTemp(dir string) (string, error) {
 		return "", err
 	}
 	return name, nil
+}
+
+// archiveFileMode picks the on-disk mode for an unpacked entry. Regular
+// files keep their executable bit — scripts and binaries sent as a
+// directory must stay runnable (netns-probe round 37, R37-1: the old
+// blanket &0o644 silently stripped +x). Nothing else survives the trip:
+// no setuid/setgid/sticky, no group/world write — the header is attacker
+// controllable and the receiver runs as an ordinary user.
+func archiveFileMode(m os.FileMode) os.FileMode {
+	if m&0o100 != 0 { // owner-exec in the tar header
+		return 0o755
+	}
+	return 0o644
 }

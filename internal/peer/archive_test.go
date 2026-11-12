@@ -33,6 +33,13 @@ func TestDirectoryRoundTrip(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// A script with the executable bit must stay executable on the other
+	// side — directory transfers carry the exec bit (netns-probe round 37,
+	// R37-1: the old blanket 0644 strip made sent scripts unrunnable).
+	script := filepath.Join(src, "run.sh")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\necho ok\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 
 	res, err := a.SendFile(src, nil)
 	if err != nil {
@@ -55,6 +62,17 @@ func TestDirectoryRoundTrip(t *testing.T) {
 		if string(got) != want {
 			t.Errorf("%s content = %q, want %q", rel, got, want)
 		}
+	}
+
+	gotScript, err := os.Stat(filepath.Join(hb.dir, "project", "run.sh"))
+	if err != nil {
+		t.Fatalf("missing run.sh: %v", err)
+	}
+	if gotScript.Mode()&0o100 == 0 {
+		t.Fatalf("script mode %v lost the executable bit; want owner-exec preserved", gotScript.Mode())
+	}
+	if gotScript.Mode().Perm() != 0o755 {
+		t.Fatalf("script mode = %v; want exactly 0755 (no setuid/group-write survival)", gotScript.Mode().Perm())
 	}
 
 	// The archive itself must not be left behind.
