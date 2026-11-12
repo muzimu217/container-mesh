@@ -1,0 +1,6 @@
+{
+  "summary":  "container-mesh (cmesh) 交互式设计系统规范文档与 3D 网络驾驶舱高保真原型完整实施规划。涵盖哑光白实验室与玻璃金属 3D 视觉风格、12 项完整设计规范、四维正交状态模型（Membership / Liveness / Announcement / Discovery）、五种网络态势快照切换以及与真实 /api/mesh 接口的双模式架构。",
+  "updatedAt":  "2026-11-11T16:15:29.768741556Z",
+  "requestFeedback":  true,
+  "userFacing":  true
+}

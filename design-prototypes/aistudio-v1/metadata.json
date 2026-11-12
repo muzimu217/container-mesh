@@ -1,0 +1,6 @@
+{
+  "name": "cmesh — 容器与设备私有组网客户端",
+  "description": "面向容器与分散设备的用户态私有组网桌面客户端（Windows / macOS）与 3D 嵌套空间拓扑控制台，支持机房/集群/容器三级下钻检视与五种网络态势验证。",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

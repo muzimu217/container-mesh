@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cmesh Network Cockpit Prototype</title>
+<style>
+:root {
+  color-scheme: dark;
+  --bg: #070b11;
+  --surface: #0d141d;
+  --surface-2: #111c27;
+  --line: rgba(153, 191, 215, .18);
+  --line-strong: rgba(153, 191, 215, .36);
+  --text: #eef7fb;
+  --muted: #91a9b8;
+  --soft: #6f8796;
+  --accent: #73d8ff;
+  --accent-2: #24b6e9;
+  --good: #4ce2ae;
+  --warn: #f3c56b;
+  --bad: #ef8585;
+  --node-size: 116px;
+  font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "PingFang SC", "Segoe UI", sans-serif;
+}
+[data-theme="light"] {
+  color-scheme: light;
+  --bg: #eef4f2;
+  --surface: #ffffff;
+  --surface-2: #f6faf8;
+  --line: rgba(31, 76, 68, .16);
+  --line-strong: rgba(31, 76, 68, .34);
+  --text: #17342e;
+  --muted: #637c76;
+  --soft: #849b95;
+  --accent: #197d6a;
+  --accent-2: #30a88f;
+  --good: #168363;
+  --warn: #a96818;
+  --bad: #bb5757;
+}
+[data-theme="graphite"] {
+  --bg: #202426;
+  --surface: #292e31;
+  --surface-2: #303639;
+  --line: rgba(215, 231, 233, .18);
+  --line-strong: rgba(215, 231, 233, .36);
+  --text: #f0f5f5;
+  --muted: #a5b2b4;
+  --soft: #7d8c90;
+  --accent: #d6e8ea;
+  --accent-2: #9bb7ba;
+  --good: #8bd9b8;
+  --warn: #e7bd78;
+  --bad: #ed9898;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); min-width: 320px; }
+button { font: inherit; }
+button:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.app { min-height: 100vh; overflow: hidden; background: radial-gradient(circle at 42% 42%, color-mix(in srgb, var(--accent-2) 12%, transparent), transparent 34%), var(--bg); }
+.topbar { min-height: 64px; display:flex; align-items:center; gap:14px; padding: 14px 24px; border-bottom: 1px solid var(--line); position: relative; z-index: 5; }
+.brand { display:flex; align-items:center; gap:10px; font-weight: 600; letter-spacing: .02em; }
+.brandmark { width: 17px; height: 17px; border: 2px solid var(--accent); transform: rotate(45deg); position:relative; box-shadow: 0 0 18px color-mix(in srgb, var(--accent) 42%, transparent); }
+.brandmark::after { content:""; position:absolute; inset:4px; border:1px solid var(--accent); opacity:.62; }
+.topmeta { color: var(--muted); font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
+.push { flex:1; }
+.live { display:flex; align-items:center; gap:7px; color:var(--good); font-size:12px; }
+.live-dot { width:7px; height:7px; border-radius:50%; background:currentColor; box-shadow:0 0 12px currentColor; }
+.app.cached .live { color:var(--warn); }
+.app.cached .live-dot { box-shadow:none; }
+.theme-switch { display:flex; gap:4px; }
+.theme-switch button, .mode-button { color:var(--muted); background:transparent; border:1px solid var(--line); border-radius:6px; padding:6px 9px; font-size:11px; cursor:pointer; }
+.theme-switch button[aria-pressed="true"], .mode-button[aria-pressed="true"] { color:var(--text); border-color:var(--accent); background:color-mix(in srgb, var(--accent) 11%, transparent); }
+.main { display:grid; grid-template-columns:minmax(0, 1fr) 310px; min-height:calc(100vh - 64px); }
+.scene { min-height: 700px; position:relative; overflow:hidden; border-right:1px solid var(--line); }
+.scene-header { position:absolute; left:28px; top:26px; z-index:3; }
+.eyebrow { color:var(--soft); font: 10px ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing:.16em; text-transform:uppercase; }
+.scene-title { margin-top:9px; font-size:22px; font-weight:500; }
+.scene-sub { margin-top:6px; color:var(--muted); font-size:12px; }
+.scene-canvas { position:absolute; inset:0; perspective: 900px; }
+.floor { position:absolute; left:5%; right:4%; bottom:-16%; height:58%; transform:perspective(700px) rotateX(62deg); transform-origin:center bottom; background-image:linear-gradient(var(--line) 1px, transparent 1px), linear-gradient(90deg, var(--line) 1px, transparent 1px); background-size:46px 46px; opacity:.62; }
+.halo { position:absolute; left:50%; top:54%; width:500px; height:340px; transform:translate(-50%, -50%) rotateX(63deg) rotateZ(-12deg); border:1px solid color-mix(in srgb, var(--accent) 62%, transparent); border-radius:50%; box-shadow:0 0 60px color-mix(in srgb, var(--accent) 18%, transparent); }
+.halo.two { width:380px; height:250px; transform:translate(-50%, -50%) rotateX(63deg) rotateZ(43deg); opacity:.54; }
+.halo.three { width:620px; height:410px; transform:translate(-50%, -50%) rotateX(63deg) rotateZ(12deg); opacity:.22; }
+.core { position:absolute; left:50%; top:54%; width:126px; height:126px; transform:translate(-50%, -50%) rotateX(55deg) rotateZ(45deg); background:linear-gradient(135deg, color-mix(in srgb, var(--accent) 35%, var(--surface-2)), var(--surface-2)); border:1px solid var(--accent); box-shadow:0 0 45px color-mix(in srgb, var(--accent) 24%, transparent), inset 0 0 28px color-mix(in srgb, var(--accent) 20%, transparent); z-index:2; }
+.core::before, .core::after { content:""; position:absolute; border:1px solid color-mix(in srgb, var(--accent) 75%, transparent); inset:14px; }
+.core::after { inset:30px; opacity:.56; }
+.core-label { position:absolute; left:50%; top:54%; transform:translate(-50%, -50%); z-index:3; text-align:center; font-size:11px; color:var(--muted); white-space:nowrap; }
+.core-label strong { display:block; color:var(--text); font-size:25px; font-weight:500; letter-spacing:-.04em; }
+.core-label small { display:block; margin-top:3px; color:var(--accent); }
+.connection { position:absolute; left:50%; top:54%; width:220px; height:1px; transform-origin: left center; background:linear-gradient(90deg, color-mix(in srgb, var(--accent) 84%, transparent), transparent); z-index:1; }
+.connection::after { content:""; position:absolute; left:42%; top:-2px; width:5px; height:5px; border-radius:50%; background:var(--accent); box-shadow:0 0 12px var(--accent); animation:flow 3s linear infinite; }
+@keyframes flow { from { transform:translateX(0); opacity:.1; } 25% { opacity:1; } to { transform:translateX(150px); opacity:0; } }
+.no-motion .connection::after, .no-motion .halo { animation:none; }
+.c1 { transform:rotate(205deg); } .c2 { transform:rotate(333deg); } .c3 { transform:rotate(145deg); } .c4 { transform:rotate(37deg); }
+.node { position:absolute; z-index:4; width:var(--node-size); min-height:58px; padding:10px 11px; text-align:left; color:var(--text); background:color-mix(in srgb, var(--surface) 82%, transparent); border:1px solid var(--line-strong); border-radius:8px; cursor:pointer; backdrop-filter: blur(12px); transition: transform .2s ease, border-color .2s ease, background .2s ease; }
+.node:hover, .node.selected { transform:translateY(-5px); border-color:var(--accent); background:color-mix(in srgb, var(--accent) 10%, var(--surface)); }
+.node-head { display:flex; gap:6px; align-items:center; font-size:11px; font-weight:500; }
+.node small { display:block; margin-top:5px; color:var(--muted); font:10px ui-monospace, SFMono-Regular, Menlo, monospace; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.node-dot { width:7px; height:7px; border-radius:50%; background:var(--good); box-shadow:0 0 8px var(--good); flex:none; }
+.node.offline .node-dot { background:var(--soft); box-shadow:none; }
+.node.pending .node-dot { background:var(--warn); box-shadow:none; }
+.node-a { left:15%; top:32%; } .node-b { right:11%; top:27%; } .node-c { left:20%; bottom:21%; } .node-d { right:16%; bottom:20%; }
+.scene-readout { position:absolute; left:28px; bottom:28px; z-index:3; display:flex; gap:24px; flex-wrap:wrap; }
+.readout-item { color:var(--muted); font-size:11px; }
+.readout-item strong { display:block; margin-top:3px; color:var(--text); font:500 14px ui-monospace, SFMono-Regular, Menlo, monospace; }
+.side { padding:24px 20px; background:var(--surface); }
+.side h2 { margin:0 0 4px; font-size:15px; font-weight:500; }
+.side-sub { color:var(--muted); font-size:11px; margin-bottom:20px; }
+.kpi { padding:16px 0; border-bottom:1px solid var(--line); }
+.kpi-label { color:var(--muted); font-size:11px; }
+.kpi-value { margin-top:4px; font-size:31px; font-weight:500; letter-spacing:-.04em; }
+.kpi-value span { color:var(--muted); font-size:14px; letter-spacing:0; }
+.detail { margin-top:20px; padding:13px; border:1px solid var(--line); border-radius:8px; background:var(--surface-2); font-size:11px; line-height:1.7; }
+.detail-title { color:var(--text); font-size:13px; font-weight:500; margin-bottom:4px; }
+.detail-muted { color:var(--muted); }
+.detail-good { color:var(--good); }
+.detail-warn { color:var(--warn); }
+.notice { margin-top:15px; padding:10px 12px; border-left:2px solid var(--warn); color:var(--warn); background:color-mix(in srgb, var(--warn) 8%, transparent); font-size:11px; line-height:1.6; }
+.controls { margin-top:18px; display:grid; gap:8px; }
+.control-label { color:var(--muted); font-size:10px; letter-spacing:.1em; text-transform:uppercase; }
+.control-row { display:flex; gap:7px; flex-wrap:wrap; }
+.control-row button { flex:1; min-width:92px; }
+.footer { position:absolute; bottom:0; left:0; right:0; padding:9px 24px; border-top:1px solid var(--line); color:var(--muted); font-size:10px; display:flex; gap:16px; }
+.footer .push { flex:1; }
+.demo-label { position:absolute; right:24px; bottom:28px; color:var(--soft); font:10px ui-monospace, SFMono-Regular, Menlo, monospace; z-index:3; }
+@media (max-width: 840px) { .main { grid-template-columns:1fr; } .scene { min-height:580px; border-right:0; } .side { border-top:1px solid var(--line); } .footer { position:relative; } .app { min-height:100vh; } }
+@media (max-width: 560px) { .topbar { padding:12px 16px; flex-wrap:wrap; } .topmeta { display:none; } .scene { min-height:520px; } .scene-title { left:18px; } .scene-sub { left:18px; font-size:18px; } .scene-readout { left:18px; bottom:20px; gap:12px; } .halo { width:330px; height:230px; } .halo.two { width:260px; height:170px; } .halo.three { width:410px; height:280px; } .node { --node-size:92px; padding:8px; } .node-a { left:5%; top:31%; } .node-b { right:4%; top:27%; } .node-c { left:8%; bottom:21%; } .node-d { right:7%; bottom:19%; } .core { width:92px; height:92px; } .core-label strong { font-size:21px; } .demo-label { right:18px; bottom:20px; } }
+</style>
+</head>
+<body>
+<div class="app" id="app">
+  <header class="topbar">
+    <div class="brand"><span class="brandmark" aria-hidden="true"></span>cmesh</div>
+    <div class="topmeta">私有网络 / 研究驾驶舱</div>
+    <div class="push"></div>
+    <div class="live"><span class="live-dot"></span><span id="connectionText">实时连接</span></div>
+    <div class="theme-switch" aria-label="切换原型风格">
+      <button type="button" data-theme="dark" aria-pressed="true">深空</button>
+      <button type="button" data-theme="light" aria-pressed="false">白昼</button>
+      <button type="button" data-theme="graphite" aria-pressed="false">石墨</button>
+    </div>
+  </header>
+  <main class="main">
+    <section class="scene" aria-label="三维网络拓扑原型">
+      <div class="scene-header"><div class="eyebrow">network topology / live</div><div class="scene-title">设备关系与实时状态</div><div class="scene-sub">点击节点查看连接详情 · 当前为演示数据</div></div>
+      <div class="scene-canvas" id="sceneCanvas">
+        <div class="floor"></div><div class="halo"></div><div class="halo two"></div><div class="halo three"></div>
+        <div class="connection c1"></div><div class="connection c2"></div><div class="connection c3"></div><div class="connection c4"></div>
+        <div class="core"></div><div class="core-label"><strong id="onlineValue">4/5</strong>在线设备<small>网络版本 v42</small></div>
+        <button class="node node-a" type="button" data-node="anchor"><span class="node-head"><span class="node-dot"></span>发现节点</span><small>175.24.139.148</small></button>
+        <button class="node node-b" type="button" data-node="runner"><span class="node-head"><span class="node-dot"></span>runner-02</span><small>10.0.0.2:7000</small></button>
+        <button class="node node-c" type="button" data-node="agent"><span class="node-head"><span class="node-dot"></span>agent-03</span><small>203.0.113.4</small></button>
+        <button class="node node-d offline" type="button" data-node="storage"><span class="node-head"><span class="node-dot"></span>storage-01</span><small>offline · 19h</small></button>
+      </div>
+      <div class="scene-readout"><div class="readout-item">最近延迟<strong>0.34 ms</strong></div><div class="readout-item">成员版本<strong>v42</strong></div><div class="readout-item">数据更新<strong id="dataAge">2 秒前</strong></div></div>
+      <div class="demo-label">prototype / mock data</div>
+    </section>
+    <aside class="side">
+      <h2>网络摘要</h2><div class="side-sub">当前网络 · 只读驾驶舱</div>
+      <div class="kpi"><div class="kpi-label">网络成员</div><div class="kpi-value">5 <span>台设备</span></div></div>
+      <div class="kpi"><div class="kpi-label">当前在线</div><div class="kpi-value" id="sideOnline">4 <span>/ 5</span></div></div>
+      <div class="kpi"><div class="kpi-label">连接方式</div><div class="kpi-value">QUIC <span>direct</span></div></div>
+      <div class="detail" id="detail"><div class="detail-title">runner-02</div><div class="detail-muted">在线 · 2 个公告端点</div><div class="detail-muted">最近心跳：3 秒前</div><div class="detail-good">可用：查看详情、延迟测试</div></div>
+      <div class="notice" id="notice">原型状态：所有数字来自本地演示数据，正式版将绑定 /api/mesh。</div>
+      <div class="controls"><div class="control-label">原型状态演示</div><div class="control-row"><button class="mode-button" id="dropButton" type="button" aria-pressed="false">模拟成员掉线</button><button class="mode-button" id="disconnectButton" type="button" aria-pressed="false">模拟节点失联</button></div><div class="control-row"><button class="mode-button" id="motionButton" type="button" aria-pressed="false">关闭动效</button></div></div>
+    </aside>
+  </main>
+  <footer class="footer"><span>私有 · 自主 · 随时在线</span><span>数据来自真实成员视图（正式版）</span><span class="push"></span><span>设计探索稿 · v0.1</span></footer>
+</div>
+<script>
+(function(){
+  const app=document.getElementById('app');
+  const detail=document.getElementById('detail');
+  const notice=document.getElementById('notice');
+  const onlineValue=document.getElementById('onlineValue');
+  const sideOnline=document.getElementById('sideOnline');
+  const connectionText=document.getElementById('connectionText');
+  let dropped=false, disconnected=false;
+  const details={
+    anchor:['发现节点','在线 · 发现与成员视图服务','175.24.139.148:18090','角色：网络锚点'],
+    runner:['runner-02','在线 · 2 个公告端点','10.0.0.2:7000','可用：查看详情、延迟测试'],
+    agent:['agent-03','在线 · 1 个公告端点','203.0.113.4:7000','可用：查看详情、延迟测试'],
+    storage:['storage-01','离线 · 保留在名册','无可用端点 · 最近在线 19 小时前','建议：等待设备恢复连接']
+  };
+  document.querySelectorAll('.node').forEach(node=>node.addEventListener('click',()=>{
+    document.querySelectorAll('.node').forEach(n=>n.classList.remove('selected'));
+    node.classList.add('selected');
+    const item=details[node.dataset.node];
+    detail.innerHTML='<div class="detail-title">'+item[0]+'</div><div class="detail-muted">'+item[1]+'</div><div class="detail-muted">'+item[2]+'</div><div class="detail-'+(node.dataset.node==='storage'?'warn':'good')+'">'+item[3]+'</div>';
+  }));
+  document.querySelectorAll('[data-theme]').forEach(button=>button.addEventListener('click',()=>{
+    const theme=button.dataset.theme;
+    app.dataset.theme=theme==='dark'?'':theme;
+    document.querySelectorAll('[data-theme]').forEach(b=>b.setAttribute('aria-pressed',String(b===button)));
+  }));
+  document.getElementById('dropButton').addEventListener('click',()=>{
+    dropped=!dropped;
+    const node=document.querySelector('[data-node="agent"]'); node.classList.toggle('offline',dropped);
+    node.querySelector('.node-dot').style.background=dropped?'var(--soft)':'';
+    node.querySelector('small').textContent=dropped?'offline · 刚刚':'203.0.113.4';
+    onlineValue.textContent=dropped?'3/5':'4/5'; sideOnline.innerHTML=dropped?'3 <span>/ 5</span>':'4 <span>/ 5</span>';
+    document.getElementById('dropButton').textContent=dropped?'恢复成员':'模拟成员掉线'; document.getElementById('dropButton').setAttribute('aria-pressed',String(dropped));
+    notice.textContent=dropped?'演示状态：agent-03 已离线，但仍保留在网络名册中。':'原型状态：所有数字来自本地演示数据，正式版将绑定 /api/mesh。';
+  });
+  document.getElementById('disconnectButton').addEventListener('click',()=>{
+    disconnected=!disconnected; app.classList.toggle('cached',disconnected); connectionText.textContent=disconnected?'连接发现节点失败 · 缓存中':'实时连接';
+    document.getElementById('disconnectButton').textContent=disconnected?'恢复节点连接':'模拟节点失联'; document.getElementById('disconnectButton').setAttribute('aria-pressed',String(disconnected));
+    notice.textContent=disconnected?'演示状态：发现节点暂时不可达，页面保留最后一次有效快照，数据可能已过期。':'原型状态：所有数字来自本地演示数据，正式版将绑定 /api/mesh。';
+  });
+  document.getElementById('motionButton').addEventListener('click',()=>{const off=!app.classList.contains('no-motion');app.classList.toggle('no-motion',off);document.getElementById('motionButton').textContent=off?'开启动效':'关闭动效';document.getElementById('motionButton').setAttribute('aria-pressed',String(off));});
+})();
+</script>
+</body>
+</html>
