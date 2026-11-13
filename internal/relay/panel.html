@@ -5,155 +5,269 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>cmesh · 网络驾驶舱</title>
 <style>
+  /* 设计语言取自已验收的原型（design-prototypes/aistudio-v1）：
+     浅色为默认、青色强调、玻璃拟态 + 流体光斑、等宽数字。
+     唯一偏离：原型用 Google Fonts，这里必须零外部依赖，
+     因此字体一律用系统栈（Plus Jakarta Sans / Public Sans / JetBrains Mono 的等价回退）。 */
   :root {
-    --bg: #f6f7f9;
-    --surface: #ffffff;
-    --surface-2: #f0f2f5;
-    --line: #e2e6ec;
-    --text: #16191d;
-    --text-dim: #5d6672;
-    --text-faint: #8b95a1;
-    --accent: #0f6d8f;
-    --accent-soft: #e2f0f5;
-    --ok: #1d7a4c;
-    --warn: #9a6a08;
-    --err: #b3261e;
-    --radius: 10px;
-    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
-    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB",
-            "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+    --font-display: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    --font-body: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+
+    --bg-canvas: #F8FAFC;
+    --bg-surface: #FFFFFF;
+    --bg-subtle: #F1F5F9;
+    --border-hairline: #E2E8F0;
+    --text-primary: #0F172A;
+    --text-secondary: #475669;
+    --text-muted: #64748B;
+    --accent-cyan: #0284C7;
+    --accent-cyan-soft: #E0F2FE;
+    --status-online: #059669;
+    --status-offline: #64748B;
+    --status-amber: #D97706;
+    --status-error: #DC2626;
+
+    --orb-intensity: 0.75;
+    --orb-speed: 1;
+    --radius: 16px;
   }
   @media (prefers-color-scheme: dark) {
     :root {
-      --bg: #14171b;
-      --surface: #1b1f24;
-      --surface-2: #22272e;
-      --line: #2c333b;
-      --text: #e6eaef;
-      --text-dim: #a3adb9;
-      --text-faint: #7b8794;
-      --accent: #4fb3d6;
-      --accent-soft: #16303a;
-      --ok: #52b98a;
-      --warn: #d9a441;
-      --err: #ef6a60;
+      --bg-canvas: #0B1220;
+      --bg-surface: #0F172A;
+      --bg-subtle: #1E293B;
+      --border-hairline: #1E293B;
+      --text-primary: #E2E8F0;
+      --text-secondary: #94A3B8;
+      --text-muted: #64748B;
+      --accent-cyan: #38BDF8;
+      --accent-cyan-soft: #0C4A6E;
+      --status-online: #34D399;
+      --status-offline: #64748B;
+      --status-amber: #FBBF24;
+      --status-error: #F87171;
     }
   }
+
   * { box-sizing: border-box; }
   html, body { margin: 0; padding: 0; }
   body {
-    background: var(--bg);
-    color: var(--text);
-    font-family: var(--sans);
-    font-size: 14px;
-    line-height: 1.5;
+    font-family: var(--font-body);
+    background-color: var(--bg-canvas);
+    color: var(--text-primary);
     -webkit-font-smoothing: antialiased;
+    min-height: 100vh;
+    overflow-x: hidden;
   }
-  .wrap { max-width: 1080px; margin: 0 auto; padding: 24px 20px 48px; }
 
-  /* ── 顶栏 ───────────────────────────────────────────── */
-  header.bar {
-    display: flex; flex-wrap: wrap; gap: 12px 20px;
+  /* 流体光斑背景：原型的签名视觉 */
+  @keyframes cmeshFluidDriftA {
+    0%, 100% { transform: translate3d(0,0,0) scale(1) rotate(0deg); }
+    33% { transform: translate3d(68px,-44px,0) scale(1.12) rotate(12deg); }
+    66% { transform: translate3d(-48px,52px,0) scale(0.92) rotate(-8deg); }
+  }
+  @keyframes cmeshFluidDriftB {
+    0%, 100% { transform: translate3d(0,0,0) scale(1) rotate(0deg); }
+    40% { transform: translate3d(-76px,46px,0) scale(1.15) rotate(-15deg); }
+    75% { transform: translate3d(54px,-36px,0) scale(0.9) rotate(10deg); }
+  }
+  @keyframes cmeshStreamFlow {
+    0% { background-position: 0% 50%; }
+    50% { background-position: 100% 50%; }
+  }
+  .fluid {
+    position: fixed;
+    inset: 0;
+    z-index: -2;
+    background: linear-gradient(-45deg,
+      rgba(230,239,248,0.88), rgba(224,242,254,0.72), rgba(209,250,229,0.55),
+      rgba(224,231,255,0.68), rgba(237,244,251,0.88));
+    background-size: 320% 320%;
+    animation: cmeshStreamFlow calc(24s / var(--orb-speed)) ease infinite;
+    will-change: background-position;
+  }
+  @media (prefers-color-scheme: dark) {
+    .fluid {
+      background: linear-gradient(-45deg,
+        rgba(6,10,18,0.85), rgba(12,24,48,0.68), rgba(8,47,73,0.52),
+        rgba(15,23,42,0.78), rgba(17,24,39,0.85));
+    }
+  }
+  .orb {
+    position: fixed;
+    z-index: -1;
+    border-radius: 50%;
+    filter: blur(70px);
+    opacity: var(--orb-intensity);
+    pointer-events: none;
+    /* Compositor hint: without it the blur is re-rasterised every frame,
+       which on a software renderer starves the main thread badly enough
+       that automated clicks time out on the element under the animation. */
+    will-change: transform;
+  }
+  .orb-a {
+    width: 420px; height: 420px; top: -140px; left: -120px;
+    background: radial-gradient(circle at 30% 30%, rgba(2,132,199,0.55), rgba(2,132,199,0) 70%);
+    animation: cmeshFluidDriftA calc(21s / var(--orb-speed)) ease-in-out infinite;
+  }
+  .orb-b {
+    width: 380px; height: 380px; bottom: -130px; right: -100px;
+    background: radial-gradient(circle at 60% 40%, rgba(5,150,105,0.42), rgba(5,150,105,0) 70%);
+    animation: cmeshFluidDriftB calc(26s / var(--orb-speed)) ease-in-out infinite;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .fluid, .orb { animation: none !important; }
+  }
+
+  /* 玻璃拟态卡片 */
+  .glass {
+    background: linear-gradient(135deg, rgba(255,255,255,0.78) 0%, rgba(255,255,255,0.54) 100%);
+    backdrop-filter: blur(20px) saturate(165%);
+    -webkit-backdrop-filter: blur(20px) saturate(165%);
+    border: 1px solid rgba(255,255,255,0.82);
+    box-shadow: inset 0 1px 0 0 rgba(255,255,255,0.96),
+                inset 1px 0 0 0 rgba(255,255,255,0.7),
+                0 10px 30px -6px rgba(15,23,42,0.06),
+                0 2px 6px -1px rgba(15,23,42,0.03);
+  }
+  .glass-sub {
+    background: linear-gradient(135deg, rgba(255,255,255,0.62) 0%, rgba(241,245,249,0.45) 100%);
+    border: 1px solid rgba(255,255,255,0.75);
+    box-shadow: inset 0 1px 0 0 rgba(255,255,255,0.85);
+  }
+  @media (prefers-color-scheme: dark) {
+    .glass {
+      background: linear-gradient(135deg, rgba(15,23,42,0.68) 0%, rgba(15,23,42,0.44) 100%);
+      border: 1px solid rgba(255,255,255,0.12);
+      box-shadow: inset 0 1px 0 0 rgba(255,255,255,0.2),
+                  inset 1px 0 0 0 rgba(255,255,255,0.08),
+                  0 14px 36px -8px rgba(2,6,23,0.55),
+                  0 4px 12px -2px rgba(2,6,23,0.35);
+    }
+    .glass-sub {
+      background: linear-gradient(135deg, rgba(30,41,59,0.48) 0%, rgba(15,23,42,0.38) 100%);
+      border: 1px solid rgba(255,255,255,0.09);
+      box-shadow: inset 0 1px 0 0 rgba(255,255,255,0.12);
+    }
+  }
+
+  .wrap { max-width: 1120px; margin: 0 auto; padding: 28px 22px 56px; position: relative; }
+
+  /* 顶栏 */
+  .bar {
+    display: flex; flex-wrap: wrap; gap: 14px 24px;
     align-items: baseline; justify-content: space-between;
-    padding-bottom: 14px; border-bottom: 1px solid var(--line);
+    padding: 16px 20px; border-radius: var(--radius);
   }
   .brand { display: flex; align-items: baseline; gap: 10px; }
-  .brand h1 { font-size: 17px; font-weight: 600; margin: 0; letter-spacing: .2px; }
-  .brand .net { font-family: var(--mono); font-size: 12px; color: var(--text-dim); }
-  .meta { display: flex; flex-wrap: wrap; gap: 4px 18px; font-size: 12px; color: var(--text-dim); }
-  .meta b { font-weight: 500; color: var(--text-faint); font-family: var(--mono); }
-  .meta .up { color: var(--ok); }
-  .meta .down { color: var(--err); }
-  .meta .stale { color: var(--warn); }
+  .brand h1 {
+    font-family: var(--font-display); font-size: 19px; font-weight: 700;
+    margin: 0; letter-spacing: -0.01em;
+  }
+  .brand .net { font-family: var(--font-mono); font-size: 12px; color: var(--text-muted); }
+  .meta { display: flex; flex-wrap: wrap; gap: 4px 20px; font-size: 12px; color: var(--text-secondary); }
+  .meta b { font-weight: 500; color: var(--text-muted); font-family: var(--font-mono); }
+  .meta .up { color: var(--status-online); }
+  .meta .down { color: var(--status-error); }
 
-  /* ── 状态条 ─────────────────────────────────────────── */
+  /* 状态条 */
   .status {
-    margin: 18px 0 0; padding: 10px 14px; border-radius: var(--radius);
-    display: flex; align-items: center; gap: 10px;
-    background: var(--surface); border: 1px solid var(--line); font-size: 13px;
+    margin-top: 16px; padding: 13px 18px; border-radius: var(--radius);
+    display: flex; align-items: center; gap: 11px; font-size: 13.5px;
   }
-  .status .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); flex: none; }
-  .status.warn { border-color: color-mix(in srgb, var(--warn) 45%, var(--line)); }
-  .status.warn .dot { background: var(--warn); }
-  .status.err { border-color: color-mix(in srgb, var(--err) 45%, var(--line)); }
-  .status.err .dot { background: var(--err); }
-  .status .txt { color: var(--text-dim); }
-  .status .txt b { color: var(--text); font-weight: 600; }
+  .status .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--status-online); flex: none; }
+  .status.warn .dot { background: var(--status-amber); }
+  .status.err .dot { background: var(--status-error); }
+  .status .txt { color: var(--text-secondary); }
+  .status .txt b { color: var(--text-primary); font-weight: 600; }
 
-  /* ── 大数字 ─────────────────────────────────────────── */
-  .hero {
-    display: flex; flex-wrap: wrap; gap: 28px 48px; align-items: flex-end;
-    margin: 26px 0 8px;
+  /* 核心数字 */
+  .hero { display: flex; flex-wrap: wrap; gap: 20px; align-items: stretch; margin-top: 18px; }
+  .big-card { flex: 1 1 320px; padding: 26px 24px; border-radius: var(--radius); }
+  .big {
+    display: flex; align-items: baseline; gap: 10px;
+    font-family: var(--font-display);
   }
-  .big { display: flex; align-items: baseline; gap: 10px; }
   .big .n {
-    font-family: var(--mono); font-size: 64px; line-height: 1; font-weight: 600;
-    letter-spacing: -1px; font-variant-numeric: tabular-nums;
+    font-family: var(--font-mono); font-size: 68px; line-height: 1; font-weight: 700;
+    letter-spacing: -0.03em; font-variant-numeric: tabular-nums;
+    background: linear-gradient(135deg, var(--text-primary) 30%, var(--accent-cyan));
+    -webkit-background-clip: text; background-clip: text; color: transparent;
   }
-  .big .of { font-family: var(--mono); font-size: 26px; color: var(--text-faint); }
-  .big .cap { font-size: 12px; color: var(--text-dim); margin-top: 8px; }
-  .figures { display: flex; gap: 34px; }
-  .fig .v { font-family: var(--mono); font-size: 19px; font-variant-numeric: tabular-nums; }
-  .fig .k { font-size: 12px; color: var(--text-faint); }
+  .big .of { font-family: var(--font-mono); font-size: 28px; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+  .cap { font-size: 12px; color: var(--text-muted); margin-top: 12px; letter-spacing: 0.02em; }
+  .figs { flex: 1 1 320px; display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+  .fig { padding: 18px 16px; border-radius: var(--radius); display: flex; flex-direction: column; justify-content: center; }
+  .fig .v {
+    font-family: var(--font-mono); font-size: 22px; font-weight: 600;
+    font-variant-numeric: tabular-nums; color: var(--text-primary);
+  }
+  .fig .k { font-size: 11.5px; color: var(--text-muted); margin-top: 6px; }
 
-  /* ── 表格 ───────────────────────────────────────────── */
-  .tablewrap {
-    margin-top: 22px; background: var(--surface); border: 1px solid var(--line);
-    border-radius: var(--radius); overflow: hidden;
-  }
+  /* 设备表 */
+  .tablewrap { margin-top: 20px; border-radius: var(--radius); overflow: hidden; }
   .tablewrap h2 {
-    font-size: 13px; font-weight: 600; margin: 0; padding: 12px 16px;
-    border-bottom: 1px solid var(--line); color: var(--text-dim);
+    font-family: var(--font-display); font-size: 13px; font-weight: 600;
+    margin: 0; padding: 14px 18px; border-bottom: 1px solid var(--border-hairline);
+    color: var(--text-secondary);
   }
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  th, td { text-align: left; padding: 10px 16px; border-bottom: 1px solid var(--line); }
-  th { font-weight: 500; font-size: 11px; color: var(--text-faint); text-transform: uppercase; letter-spacing: .6px; }
+  th, td { text-align: left; padding: 11px 18px; border-bottom: 1px solid var(--border-hairline); }
+  th { font-weight: 500; font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.06em; }
   tr:last-child td { border-bottom: none; }
-  td.id { font-family: var(--mono); font-size: 12.5px; cursor: pointer; }
-  td.id:hover { color: var(--accent); }
-  td.ep { font-family: var(--mono); font-size: 12px; color: var(--text-dim); }
-  td.when { font-family: var(--mono); font-size: 12px; color: var(--text-dim); white-space: nowrap; }
+  td.id { font-family: var(--font-mono); font-size: 12.5px; cursor: pointer; }
+  td.id:hover { color: var(--accent-cyan); }
+  td.ep { font-family: var(--font-mono); font-size: 12px; color: var(--text-secondary); }
+  td.when { font-family: var(--font-mono); font-size: 12px; color: var(--text-secondary); white-space: nowrap; }
   .pill {
-    display: inline-flex; align-items: center; gap: 6px; font-size: 12px;
-    padding: 2px 9px 2px 7px; border-radius: 999px;
-    background: var(--surface-2); color: var(--text-dim); white-space: nowrap;
+    display: inline-flex; align-items: center; gap: 7px; font-size: 12px;
+    padding: 3px 10px 3px 8px; border-radius: 999px;
+    background: var(--bg-subtle); color: var(--text-muted); white-space: nowrap;
   }
-  .pill i { width: 7px; height: 7px; border-radius: 50%; background: var(--text-faint); font-style: normal; }
-  .pill.on { color: var(--ok); background: color-mix(in srgb, var(--ok) 12%, transparent); }
-  .pill.on i { background: var(--ok); }
+  .pill i { width: 7px; height: 7px; border-radius: 50%; background: var(--status-offline); font-style: normal; }
+  .pill.on { color: var(--status-online); background: rgba(5,150,105,0.12); }
+  .pill.on i { background: var(--status-online); }
   .badge {
-    font-size: 11px; padding: 1px 7px; border-radius: 4px; margin-left: 6px;
-    background: var(--accent-soft); color: var(--accent); white-space: nowrap;
+    font-size: 11px; padding: 2px 8px; border-radius: 6px; margin-left: 8px;
+    background: var(--accent-cyan-soft); color: var(--accent-cyan); white-space: nowrap;
   }
-  .empty { padding: 34px 16px; text-align: center; color: var(--text-faint); font-size: 13px; }
+  .empty { padding: 40px 18px; text-align: center; color: var(--text-muted); font-size: 13px; }
 
-  /* ── 令牌输入 ───────────────────────────────────────── */
-  .gate { margin-top: 26px; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 20px; }
-  .gate h2 { font-size: 14px; margin: 0 0 6px; }
-  .gate p { margin: 0 0 14px; color: var(--text-dim); font-size: 13px; }
-  .gate .row { display: flex; gap: 8px; flex-wrap: wrap; }
+  /* 令牌门 */
+  .gate { margin-top: 22px; padding: 26px 24px; border-radius: var(--radius); }
+  .gate h2 { font-family: var(--font-display); font-size: 16px; margin: 0 0 8px; }
+  .gate p { margin: 0 0 16px; color: var(--text-secondary); font-size: 13.5px; }
+  .gate .row { display: flex; gap: 10px; flex-wrap: wrap; }
   input[type=password], input[type=text] {
-    flex: 1 1 260px; min-width: 0; padding: 9px 12px; font-family: var(--mono); font-size: 13px;
-    border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--text);
+    flex: 1 1 280px; min-width: 0; padding: 10px 13px; font-family: var(--font-mono); font-size: 13px;
+    border: 1px solid var(--border-hairline); border-radius: 10px;
+    background: var(--bg-surface); color: var(--text-primary);
   }
   button {
-    padding: 9px 18px; font-size: 13px; font-family: inherit; cursor: pointer;
-    border: 1px solid var(--accent); border-radius: 8px; background: var(--accent); color: #fff;
+    padding: 10px 20px; font-size: 13px; font-family: var(--font-body); font-weight: 500; cursor: pointer;
+    border: 1px solid var(--accent-cyan); border-radius: 10px;
+    background: var(--accent-cyan); color: #fff;
   }
-  button.ghost { background: transparent; color: var(--accent); }
-  .hint { margin-top: 10px; font-size: 12px; color: var(--text-faint); }
-  code { font-family: var(--mono); background: var(--surface-2); padding: 1px 5px; border-radius: 4px; }
-  .foot { margin-top: 26px; font-size: 12px; color: var(--text-faint); }
-  @media (max-width: 640px) {
-    .wrap { padding: 16px 14px 36px; }
-    .big .n { font-size: 46px; }
+  .hint { margin-top: 12px; font-size: 12px; color: var(--text-muted); }
+  code { font-family: var(--font-mono); background: var(--bg-subtle); padding: 1px 6px; border-radius: 5px; }
+  .foot { margin-top: 24px; font-size: 12px; color: var(--text-muted); }
+
+  @media (max-width: 720px) {
+    .wrap { padding: 16px 14px 40px; }
+    .big .n { font-size: 48px; }
+    .figs { grid-template-columns: repeat(3, 1fr); }
     th.hide, td.hide { display: none; }
   }
 </style>
 </head>
 <body>
+<div class="fluid"></div>
+<div class="orb orb-a"></div>
+<div class="orb orb-b"></div>
+
 <div class="wrap">
-  <header class="bar">
+  <header class="bar glass">
     <div class="brand">
       <h1>cmesh</h1>
       <span class="net" id="acct">—</span>
@@ -165,33 +279,33 @@
     </div>
   </header>
 
-  <div class="status" id="status"><span class="dot"></span><span class="txt">正在连接发现节点…</span></div>
+  <div class="status glass" id="status"><span class="dot"></span><span class="txt">正在连接发现节点…</span></div>
 
   <div id="view" hidden>
     <section class="hero">
-      <div>
+      <div class="big-card glass">
         <div class="big">
           <span class="n" id="online">—</span>
           <span class="of">/ <span id="total">—</span></span>
         </div>
         <div class="cap">在线设备 / 名册设备</div>
       </div>
-      <div class="figures">
-        <div class="fig"><div class="v" id="f-off">—</div><div class="k">离线设备</div></div>
-        <div class="fig"><div class="v" id="f-anchor">—</div><div class="k">发现节点</div></div>
-        <div class="fig"><div class="v" id="f-end">—</div><div class="k">已公告端点</div></div>
+      <div class="figs">
+        <div class="fig glass-sub"><div class="v" id="f-off">—</div><div class="k">离线设备</div></div>
+        <div class="fig glass-sub"><div class="v" id="f-anchor">—</div><div class="k">发现节点</div></div>
+        <div class="fig glass-sub"><div class="v" id="f-end">—</div><div class="k">已公告端点</div></div>
       </div>
     </section>
 
-    <section class="tablewrap">
+    <section class="tablewrap glass">
       <h2>设备名册</h2>
       <table>
         <thead>
           <tr>
-            <th style="width:96px">状态</th>
+            <th style="width:104px">状态</th>
             <th>设备 ID</th>
             <th class="hide">端点</th>
-            <th style="width:130px">最后在线</th>
+            <th style="width:140px">最后在线</th>
           </tr>
         </thead>
         <tbody id="rows"></tbody>
@@ -202,7 +316,7 @@
     <p class="foot">离线设备仍属于名册，只是当前不可达——掉线不会除名。</p>
   </div>
 
-  <section class="gate" id="gate" hidden>
+  <section class="gate glass" id="gate" hidden>
     <h2>需要面板令牌</h2>
     <p>该令牌在启动发现节点的终端里打印（<code>panel token</code>）。它只用于读取本网络的状态，请勿外传。</p>
     <div class="row">
@@ -225,8 +339,9 @@
   var inflight = false;
 
   function token() {
-    var url = new URLSearchParams(location.search).get("token");
-    if (url) { try { localStorage.setItem(TOKEN_KEY, url); } catch (e) {} return url; }
+    // The token is never read from the URL: a query string lands in the
+    // browser history and in the node's access log. The operator pastes it
+    // into the field below; it stays in this browser's localStorage.
     try { return localStorage.getItem(TOKEN_KEY) || ""; } catch (e) { return ""; }
   }
   function saveToken(v) {
@@ -246,7 +361,7 @@
   }
 
   function setStatus(kind, text) {
-    statusEl.className = "status" + (kind ? " " + kind : "");
+    statusEl.className = "status glass" + (kind ? " " + kind : "");
     statusEl.querySelector(".txt").innerHTML = text;
   }
 

@@ -21,6 +21,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/muzimu217/container-mesh/internal/discovery"
 	"github.com/muzimu217/container-mesh/internal/identity"
 )
 
@@ -144,6 +145,91 @@ func TestPanelPayloadMatchesRoster(t *testing.T) {
 		t.Fatalf("payload marks %d rows as the anchor, want 1", anchors)
 	}
 	_ = members
+}
+
+// TestPanelRejectsTokenInQueryString pins the round-56 security note: a
+// token in the query string lands in the node's access log and in any
+// Referer, so the data endpoint accepts the header form only.
+func TestPanelRejectsTokenInQueryString(t *testing.T) {
+	ts, _, _, _ := panelStack(t, "tok")
+
+	resp, err := http.Get(ts.URL + "/api/mesh?token=tok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("a query-string token was accepted (HTTP %d); it must be refused", resp.StatusCode)
+	}
+}
+
+// TestPanelShowsLastSeenForOfflineMember pins the round-56 observation: an
+// offline member must still say when it was last around. The node forgets a
+// device's presence when its stream detaches, so the timestamp has to
+// survive that — in a map that is NOT the presence map.
+func TestPanelShowsLastSeenForOfflineMember(t *testing.T) {
+	acc, err := identity.GenerateAccount()
+	if err != nil {
+		t.Fatal(err)
+	}
+	members := identity.NewMemberList(acc.ID())
+	dev, err := identity.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, err := acc.IssueCert(dev, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := members.Add(*cert); err != nil {
+		t.Fatal(err)
+	}
+	srv := New(Config{PanelToken: "tok", AnchorDeviceID: dev.ID()})
+	dnode := srv.EnableDiscovery(members)
+	live := httptest.NewServer(srv.Handler())
+	defer live.Close()
+	defer srv.StopDiscovery()
+
+	// The member announces, then its stream dies: offline, but the panel
+	// must still report when it was last seen.
+	now := time.Now().UTC()
+	dnode.Register(discovery.MemberAnnounce{
+		DeviceID:  dev.ID(),
+		Endpoints: []string{"203.0.113.9:7000"},
+		Timestamp: now,
+	}, now)
+	dnode.AttachStream(dev.ID())
+	dnode.DetachStream(dev.ID())
+
+	req, err := http.NewRequest(http.MethodGet, live.URL+"/api/mesh", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-Panel-Token", "tok")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var data PanelData
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		t.Fatal(err)
+	}
+	var row *PanelMember
+	for i := range data.Members {
+		if data.Members[i].DeviceID == dev.ID() {
+			row = &data.Members[i]
+		}
+	}
+	if row == nil {
+		t.Fatalf("the offline member is missing from the panel: %+v", data.Members)
+	}
+	if row.Online {
+		t.Fatal("the detached member is reported as online")
+	}
+	if row.LastSeen == "" {
+		t.Fatal("the offline member has no last_seen; the panel must say when it was last around")
+	}
 }
 
 // TestPanelWithoutTokenMountsNothing: a node that was not given a token

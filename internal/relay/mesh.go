@@ -25,6 +25,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"sync/atomic"
 	"time"
@@ -178,6 +179,75 @@ func (s *Server) KickStream(id identity.DeviceID) int {
 func (s *Server) meshSnapshotMux(mux *http.ServeMux) {
 	mux.HandleFunc("/mesh/register", s.handleMeshRegister)
 	mux.HandleFunc("/mesh/members", s.handleMeshMembers)
+	mux.HandleFunc("/mesh/enroll", s.handleMeshEnroll)
+}
+
+// SetEnrollHandler installs the credential enrollment handler.
+//
+// The node does not make the admission decision itself: it verifies the
+// credential and the delegated certificate, enforces the quota, and writes
+// the member into the roster. That decision needs the ACCOUNT public key and
+// the roster file, both of which the process running the discovery node
+// owns — so the trust decision lives there and the node provides the
+// transport.
+//
+// The route is always mounted, but it refuses to enrol anyone until a
+// handler is installed: a node that cannot verify a credential must not
+// admit devices. Mounting it unconditionally (rather than only when the
+// handler exists) keeps the route from silently disappearing if the
+// handler is installed after the mux was built.
+func (s *Server) SetEnrollHandler(h func(discovery.EnrollRequest) discovery.EnrollResponse) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.enrollHook = h
+}
+
+// handleMeshEnroll admits a device that presents a team credential.
+//
+// The request is bounded and rate limited like every other mesh endpoint:
+// the register budget is shared per egress address, and a team coming
+// online at once would otherwise spend the whole site's allowance (round
+// 34 measured exactly that saturation).
+func (s *Server) handleMeshEnroll(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	ip := s.limiter.clientIP(r)
+	if ok, why := s.limiter.acquireWhy(ip); !ok {
+		body, logWhy := "too many requests", whyRate
+		if why == whyConcurrency {
+			body, logWhy = "too many connections", whyConcurrency
+		}
+		s.log.Warn("mesh enroll rate limited", "ip", ip, "why", logWhy)
+		http.Error(w, body, http.StatusTooManyRequests)
+		return
+	}
+	defer s.limiter.release(ip)
+
+	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, discovery.EnrollRequestSizeLimit))
+	if err != nil {
+		http.Error(w, "enrollment body too large or unreadable", http.StatusBadRequest)
+		return
+	}
+	req, err := discovery.DecodeEnrollRequest(raw)
+	if err != nil {
+		http.Error(w, "malformed enrollment body", http.StatusBadRequest)
+		return
+	}
+	s.mu.Lock()
+	hook := s.enrollHook
+	s.mu.Unlock()
+	if hook == nil {
+		http.Error(w, "enrollment is not enabled on this node", http.StatusNotFound)
+		return
+	}
+	res := hook(*req)
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	if !res.OK {
+		w.WriteHeader(http.StatusForbidden)
+	}
+	_ = json.NewEncoder(w).Encode(res)
 }
 
 // meshMemberKey returns the device key recorded for id in the CURRENT member

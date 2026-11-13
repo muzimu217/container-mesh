@@ -126,11 +126,9 @@ func (s *Server) handleAPIMesh(w http.ResponseWriter, r *http.Request) {
 	}
 	online := map[identity.DeviceID]bool{}
 	endpoints := map[identity.DeviceID][]string{}
-	lastSeen := map[identity.DeviceID]time.Time{}
 	for _, m := range disco.Snapshot() {
 		online[m.DeviceID] = true
 		endpoints[m.DeviceID] = m.Endpoints
-		lastSeen[m.DeviceID] = m.LastSeen
 	}
 	ids := members.IDs()
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
@@ -147,7 +145,10 @@ func (s *Server) handleAPIMesh(w http.ResponseWriter, r *http.Request) {
 		if row.Endpoints == nil {
 			row.Endpoints = []string{}
 		}
-		if t, ok := lastSeen[id]; ok && !t.IsZero() {
+		// LastSeenAt survives the device going offline, so an offline row
+		// still says when it was last around (doubao-cloud-vm-01 round 56
+		// noted the field was missing for offline members).
+		if t, ok := disco.LastSeenAt(id); ok && !t.IsZero() {
 			row.LastSeen = t.UTC().Format(time.RFC3339)
 		}
 		data.Members = append(data.Members, row)
@@ -163,6 +164,12 @@ func (s *Server) handleAPIMesh(w http.ResponseWriter, r *http.Request) {
 }
 
 // panelAuthorized reports whether the request carries the panel token.
+//
+// The token is accepted in the HEADER only. A query parameter would put it
+// into the node's access log and into any Referer the browser sends — and
+// the panel's own page keeps it in localStorage and sends the header, so
+// nothing legitimate needs the query form (oh-no-agent round 56 flagged the
+// mismatch with the documented "the token never travels in a URL").
 func (s *Server) panelAuthorized(r *http.Request) bool {
 	s.mu.Lock()
 	want := s.panelToken
@@ -174,8 +181,5 @@ func (s *Server) panelAuthorized(r *http.Request) bool {
 		return false
 	}
 	got := r.Header.Get("X-Panel-Token")
-	if got == "" {
-		got = r.URL.Query().Get("token")
-	}
 	return subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
 }

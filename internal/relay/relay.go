@@ -138,6 +138,10 @@ type Server struct {
 	panelToken string
 	// anchorDeviceID marks the discovery node's own row in the panel.
 	anchorDeviceID identity.DeviceID
+	// enrollHook is the credential enrollment handler. Nil means the node
+	// does not admit devices under a team credential, and the route is not
+	// even mounted.
+	enrollHook func(discovery.EnrollRequest) discovery.EnrollResponse
 	// streams tracks live members-stream connections per device, so an
 	// operator (or a test) can force a member to reconnect.
 	streams map[identity.DeviceID]map[*wsconn.Conn]struct{}
