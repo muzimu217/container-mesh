@@ -55,10 +55,18 @@ type MemberView struct {
 // protocol would need its own ordering rules, and a client that missed a
 // push just waits for the next full one. The version travels so a client can
 // ignore stale out-of-order copies.
+//
+// Delegations travel with it for one reason: a member that joined under a
+// team credential holds a certificate signed by a DELEGATOR, and the
+// client's trust model only knows the account key. Without the delegation
+// record that proves the delegator was authorised, such a member would
+// verify as a forgery and be dropped from every view — the device would be
+// in the network and invisible to it (M4-CREDENTIAL.md).
 type MemberSnapshot struct {
-	AccountID identity.DeviceID                `json:"account_id"`
-	Version   uint64                           `json:"version"`
-	Members   map[identity.DeviceID]MemberView `json:"members"`
+	AccountID   identity.DeviceID                `json:"account_id"`
+	Version     uint64                           `json:"version"`
+	Members     map[identity.DeviceID]MemberView `json:"members"`
+	Delegations []identity.Delegation            `json:"delegations,omitempty"`
 }
 
 // BuildSnapshot combines the member list (who belongs) with the node's
@@ -67,9 +75,10 @@ type MemberSnapshot struct {
 // they may receive approval-based services — but are not dialable now.
 func BuildSnapshot(members *identity.MemberList, n *Node, now time.Time) *MemberSnapshot {
 	snap := &MemberSnapshot{
-		AccountID: members.AccountID,
-		Version:   members.CurrentVersion(),
-		Members:   make(map[identity.DeviceID]MemberView, members.Count()),
+		AccountID:   members.AccountID,
+		Version:     members.CurrentVersion(),
+		Members:     make(map[identity.DeviceID]MemberView, members.Count()),
+		Delegations: members.DelegationList(),
 	}
 	for _, id := range members.IDs() {
 		mm, ok := members.Get(id)

@@ -172,10 +172,7 @@ func TestDelegationRecordCarriesPolicy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	d, err := c.Delegation(acc)
-	if err != nil {
-		t.Fatal(err)
-	}
+	d := c.Delegation()
 	if d.MaxDevices != 7 {
 		t.Fatalf("delegation quota = %d, want 7", d.MaxDevices)
 	}

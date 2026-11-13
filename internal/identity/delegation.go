@@ -4,19 +4,25 @@
 package identity
 
 // Delegation is the account's authorisation for a DELEGATOR key to sign
-// device certificates on the account's behalf.
+// device certificates.
 //
-// Why it exists: the account owner wants ONE string that lets a team member's
-// device join without a per-device human approval (M4 (a)). The account key
-// itself must NOT travel with the team — that would make every holder a
-// permanent certificate authority for the whole account. A delegation is the
-// narrow, bounded form of that authority: one key, a device quota, an
-// expiry, revocable by deleting the record.
+// Why it exists: the account owner wants ONE string a member's device can
+// join with, instead of signing a certificate per device and handing it
+// over. The account key must not travel with the team — a credential
+// carrying it would make every holder a permanent certificate authority for
+// the whole account. So the credential carries a delegator key instead.
 //
-// The anchor never holds the delegator's private key, so the "a discovery
-// node cannot forge a member" boundary still holds (MESH-DESIGN §5.1): the
-// node can only admit certificates the delegator signed, and only while the
-// delegation record exists.
+// It is deliberately the SAME object as the credential's public half: the
+// account signs it once, the discovery node stores it in the roster, and
+// every member verifies the delegated certificate against it with the same
+// account signature. A separate record with its own signature could not be
+// produced by the node (it holds no account key), and a delegated device
+// whose authorisation cannot be verified would be dropped from every view —
+// in the network and invisible to it.
+//
+// The bounds are structural, not advisory: a delegation without a device
+// quota or without an expiry is refused, so a leaked credential is a
+// bounded leak rather than a permanent key.
 
 import (
 	"crypto/ed25519"
@@ -36,24 +42,29 @@ var (
 
 // Delegation authorises a delegator key to sign device certificates for an
 // account, bounded by a device quota and an expiry.
+//
+// The JSON shape is the credential's public half, and the signature covers
+// exactly these fields — one canonical form, one signature, one rule for
+// everyone who has to check it.
 type Delegation struct {
-	// ID identifies the delegation for quota accounting. It is random, not
-	// derived from the key: two delegations must not share a bucket.
+	// Version is the format version.
+	Version int `json:"version"`
+	// ID identifies this delegation; it is also the quota bucket.
 	ID string `json:"id"`
-	// Pub is the delegator's public key — the only key allowed to sign
-	// certificates under this delegation.
-	Pub ed25519.PublicKey `json:"pub"`
-	// AccountID is the account this delegation speaks for.
-	AccountID DeviceID `json:"account_id"`
-	// MaxDevices is how many devices may be enrolled under this delegation.
-	// Zero or negative means "no devices" — there is no implicit unlimited
-	// mode: an unbounded delegation is a permanent credential authority.
-	MaxDevices int `json:"max_devices"`
-	// IssuedAt and ExpiresAt bound the delegation in time.
-	IssuedAt  time.Time `json:"issued_at"`
-	ExpiresAt time.Time `json:"expires_at"`
+	// AccountID and AccountPub say which account the delegation speaks for.
+	AccountID  DeviceID          `json:"account_id"`
+	AccountPub ed25519.PublicKey `json:"account_pub"`
+	// DelegatorPub is the ONLY key allowed to sign certificates under this
+	// delegation.
+	DelegatorPub ed25519.PublicKey `json:"delegator_pub"`
+	// DiscoveryAddrs are the seed discovery endpoints a joiner should use.
+	DiscoveryAddrs []string `json:"disc"`
+	// IssuedAt, ExpiresAt and MaxDevices are the bounds.
+	IssuedAt   time.Time `json:"issued_at"`
+	ExpiresAt  time.Time `json:"expires_at"`
+	MaxDevices int       `json:"max_devices"`
 	// Sig is the ACCOUNT's signature over the canonical form of the fields
-	// above. Canonical form = the JSON of the struct with Sig omitted.
+	// above (the struct without Sig).
 	Sig []byte `json:"sig"`
 }
 
@@ -64,10 +75,18 @@ func (d *Delegation) delegable() ([]byte, error) {
 	return json.Marshal(d2)
 }
 
+// Signable returns the exact bytes the account signature covers.
+//
+// It is exported because the credential package signs the SAME struct: the
+// credential's public half and the roster's delegation record are one
+// object, and a second implementation of the canonical form would be a
+// second way to get the bytes wrong.
+func (d *Delegation) Signable() ([]byte, error) { return d.delegable() }
+
 // SignDelegation records the account's signature over the delegation.
 func (a *Account) SignDelegation(d *Delegation) error {
-	if len(d.Pub) != ed25519.PublicKeySize {
-		return fmt.Errorf("identity: delegation public key must be %d bytes, got %d", ed25519.PublicKeySize, len(d.Pub))
+	if len(d.DelegatorPub) != ed25519.PublicKeySize {
+		return fmt.Errorf("identity: delegation public key must be %d bytes, got %d", ed25519.PublicKeySize, len(d.DelegatorPub))
 	}
 	if d.MaxDevices <= 0 {
 		return fmt.Errorf("identity: delegation must allow at least one device, got %d", d.MaxDevices)
@@ -89,8 +108,8 @@ func (a *Account) SignDelegation(d *Delegation) error {
 // signature, the expiry, and that it speaks for the account whose key is
 // being used.
 func (d *Delegation) Verify(accountPub ed25519.PublicKey, now time.Time) error {
-	if len(d.Pub) != ed25519.PublicKeySize {
-		return fmt.Errorf("%w: delegation public key is %d bytes", ErrDelegationBadSignature, len(d.Pub))
+	if len(d.DelegatorPub) != ed25519.PublicKeySize {
+		return fmt.Errorf("%w: delegation public key is %d bytes", ErrDelegationBadSignature, len(d.DelegatorPub))
 	}
 	if AccountID(accountPub) != d.AccountID {
 		return fmt.Errorf("%w: delegation is for account %s, not %s",

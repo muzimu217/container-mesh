@@ -26,6 +26,14 @@ type Node struct {
 	lastSeen map[identity.DeviceID]time.Time
 	endpts   map[identity.DeviceID][]string
 
+	// lastSeenAt remembers WHEN a device was last present, and it survives
+	// the device going offline. It is deliberately NOT the same map as
+	// lastSeen: presence (is it reachable right now) and freshness (when
+	// was it last around) are different facts, and merging them would make
+	// an offline device look online. The panel needs the second fact — a
+	// member that dropped out must still say when it was last there.
+	lastSeenAt map[identity.DeviceID]time.Time
+
 	// subs are the connected members receiving pushes.
 	subs map[identity.DeviceID]chan struct{}
 
@@ -46,12 +54,13 @@ type Node struct {
 // addresses on top.
 func NewNode(members *identity.MemberList) *Node {
 	return &Node{
-		members:  members,
-		lastSeen: make(map[identity.DeviceID]time.Time),
-		endpts:   make(map[identity.DeviceID][]string),
-		subs:     make(map[identity.DeviceID]chan struct{}),
-		streams:  make(map[identity.DeviceID]int),
-		now:      time.Now,
+		members:    members,
+		lastSeen:   make(map[identity.DeviceID]time.Time),
+		lastSeenAt: make(map[identity.DeviceID]time.Time),
+		endpts:     make(map[identity.DeviceID][]string),
+		subs:       make(map[identity.DeviceID]chan struct{}),
+		streams:    make(map[identity.DeviceID]int),
+		now:        time.Now,
 	}
 }
 
@@ -89,6 +98,9 @@ func (n *Node) DetachStream(id identity.DeviceID) {
 	delete(n.streams, id)
 	if _, wasOnline := n.lastSeen[id]; wasOnline {
 		delete(n.lastSeen, id)
+		// Remember when the device was last around: it is offline now, but
+		// "when did it go" is still worth showing.
+		n.lastSeenAt[id] = n.now()
 		n.notifyAll()
 	}
 }
@@ -129,6 +141,7 @@ func (n *Node) Register(a MemberAnnounce, when time.Time) bool {
 	// has no endpoints never HAD any, so this is a no-op for the C-3 case.
 	if len(a.Endpoints) == 0 {
 		n.lastSeen[a.DeviceID] = when
+		n.lastSeenAt[a.DeviceID] = when
 		if !wasOnline {
 			n.notifyAll()
 		}
@@ -140,10 +153,21 @@ func (n *Node) Register(a MemberAnnounce, when time.Time) bool {
 	// message silently rewrite the recorded state.
 	n.endpts[a.DeviceID] = append([]string(nil), a.Endpoints...)
 	n.lastSeen[a.DeviceID] = when
+	n.lastSeenAt[a.DeviceID] = when
 	if changed || !wasOnline {
 		n.notifyAll()
 	}
 	return changed
+}
+
+// LastSeenAt reports when the device was last present — online now or not.
+// Unlike LastSeen (which answers "is it reachable right now"), this survives
+// the device going offline, so an operator can see when a member dropped.
+func (n *Node) LastSeenAt(id identity.DeviceID) (time.Time, bool) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	t, ok := n.lastSeenAt[id]
+	return t, ok
 }
 
 // Endpoints returns a copy of a device's current candidate addresses.
@@ -213,6 +237,10 @@ func (n *Node) Sweep() []identity.DeviceID {
 		if now.Sub(t) > MemberTimeout {
 			delete(n.lastSeen, id)
 			delete(n.endpts, id)
+			// The heartbeat horizon is the last word on when this device was
+			// around; the endpoints go with it (the listener is presumed
+			// gone), but the timestamp stays for the operator's view.
+			n.lastSeenAt[id] = t
 			dropped = append(dropped, id)
 		}
 	}

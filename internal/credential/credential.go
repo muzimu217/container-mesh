@@ -74,26 +74,15 @@ var (
 
 // Public is the account-signed, shareable half of a credential: everything
 // a verifier needs, and nothing that grants power on its own.
-type Public struct {
-	Version int `json:"version"`
-	// ID identifies this credential for quota accounting.
-	ID string `json:"id"`
-	// AccountID and AccountPub say which account the credential speaks for.
-	AccountID  identity.DeviceID `json:"account_id"`
-	AccountPub ed25519.PublicKey `json:"account_pub"`
-	// DelegatorPub is the ONLY key allowed to sign device certificates
-	// under this credential.
-	DelegatorPub ed25519.PublicKey `json:"delegator_pub"`
-	// DiscoveryAddrs are the seed discovery endpoints a joiner should use.
-	DiscoveryAddrs []string `json:"disc"`
-	// IssuedAt, ExpiresAt and MaxDevices are the credential's bounds.
-	IssuedAt   time.Time `json:"issued_at"`
-	ExpiresAt  time.Time `json:"expires_at"`
-	MaxDevices int       `json:"max_devices"`
-	// Sig is the ACCOUNT's signature over the canonical form of the fields
-	// above (the struct without Sig).
-	Sig []byte `json:"sig"`
-}
+//
+// It IS the identity layer's Delegation — one struct, one canonical form,
+// one signature. The discovery node stores the credential's public half in
+// the roster as the delegation record, and every member verifies it with
+// the same account signature. Two shapes would mean two signatures, and the
+// node — which holds no account key — could only produce the second one by
+// never signing it at all: the delegation would arrive unverified, and the
+// delegated device would be dropped from every view.
+type Public = identity.Delegation
 
 // Secret is the holder-only half: the delegator's private key. It is
 // transported inside the same string but is NOT part of the signed body —
@@ -157,21 +146,18 @@ func Create(account *identity.Account, disc []string, ttl time.Duration, maxDevi
 }
 
 // signPublic replaces the public half's signature with the account's.
+//
+// The signature is the identity layer's: the public half IS a Delegation,
+// so one canonical form and one signature cover both the credential and the
+// roster record the discovery node stores.
 func signPublic(account *identity.Account, p *Public) error {
 	p.Sig = nil
-	b, err := p.signable()
+	b, err := p.Signable()
 	if err != nil {
 		return err
 	}
 	p.Sig = account.SignBytes(b)
 	return nil
-}
-
-// signable returns the exact bytes the signature covers.
-func (p *Public) signable() ([]byte, error) {
-	p2 := *p
-	p2.Sig = nil
-	return json.Marshal(p2)
 }
 
 // Encode renders the credential as the single string that is handed over.
@@ -217,34 +203,67 @@ func Decode(s string) (*Credential, error) {
 	return &c, nil
 }
 
-// Verify checks the public half against the account public key: version,
+// PublicPart renders the shareable half on its own, WITHOUT the secret.
+//
+// This is what a discovery node receives: the delegator's private key must
+// never leave the credential holder, or the node could mint members itself
+// and the "a node cannot forge a member" boundary would be gone.
+func (c *Credential) PublicPart() (string, error) {
+	if c == nil {
+		return "", ErrMalformed
+	}
+	pub, err := json.Marshal(c.Public)
+	if err != nil {
+		return "", fmt.Errorf("credential: encode public half: %w", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(pub), nil
+}
+
+// DecodePublic parses a public half as produced by PublicPart.
+func DecodePublic(s string) (*Public, error) {
+	s = strings.TrimSpace(s)
+	raw, err := base64.RawURLEncoding.DecodeString(s)
+	if err != nil {
+		return nil, fmt.Errorf("%w: public half is not base64url: %v", ErrMalformed, err)
+	}
+	var p Public
+	if err := json.Unmarshal(raw, &p); err != nil {
+		return nil, fmt.Errorf("%w: public half is not JSON: %v", ErrMalformed, err)
+	}
+	return &p, nil
+}
+
+// Verify checks the credential against the account public key: version,
 // signature, account binding and expiry.
 //
 // A joiner can call this for a friendlier error, but it is NOT the
 // authoritative check — a joiner holds the account public key from the
 // credential itself, so it proves nothing to itself. The discovery node
 // verifies against the account key it trusts.
+//
+// The signature check itself lives in the identity layer (a Public IS a
+// Delegation): one canonical form, one implementation, so the credential and
+// the roster record can never drift apart.
 func (c *Credential) Verify(accountPub ed25519.PublicKey, now time.Time) error {
 	if c == nil {
 		return ErrMalformed
 	}
-	p := c.Public
-	if p.Version != Version {
-		return fmt.Errorf("%w: unsupported version %d", ErrMalformed, p.Version)
+	if c.Public.Version != Version {
+		return fmt.Errorf("%w: unsupported version %d", ErrMalformed, c.Public.Version)
 	}
-	if identity.AccountID(accountPub) != p.AccountID {
+	if identity.AccountID(accountPub) != c.Public.AccountID {
 		return fmt.Errorf("%w: credential is for account %s, not %s",
-			ErrAccountMismatch, p.AccountID, identity.AccountID(accountPub))
+			ErrAccountMismatch, c.Public.AccountID, identity.AccountID(accountPub))
 	}
-	b, err := p.signable()
-	if err != nil {
-		return err
-	}
-	if !ed25519.Verify(accountPub, b, p.Sig) {
-		return ErrBadSignature
-	}
-	if now.After(p.ExpiresAt) {
-		return fmt.Errorf("%w: expired at %s", ErrExpired, p.ExpiresAt.UTC().Format(time.RFC3339))
+	if err := c.Public.Verify(accountPub, now); err != nil {
+		// Translate the identity layer's error into this package's
+		// vocabulary: callers here already switch on these.
+		switch {
+		case errors.Is(err, identity.ErrDelegationExpired):
+			return fmt.Errorf("%w: %v", ErrExpired, err)
+		default:
+			return fmt.Errorf("%w: %v", ErrBadSignature, err)
+		}
 	}
 	return nil
 }
@@ -265,25 +284,18 @@ func (c *Credential) MintCert(devPub ed25519.PublicKey, ttl time.Duration, now t
 		c.Public.AccountID, devPub, ttl, now)
 }
 
-// Delegation converts the credential into the record the discovery node
-// keeps: the delegator's authority, bounded by the credential's quota and
-// expiry, and signed by the account.
-func (c *Credential) Delegation(account *identity.Account) (*identity.Delegation, error) {
+// Delegation returns the record the discovery node keeps.
+//
+// It is the credential's public half itself — already account-signed, with
+// the same canonical form every member verifies. There is nothing to convert:
+// the node holds no account key, so it could not produce a second signature
+// even if a second shape existed.
+func (c *Credential) Delegation() *identity.Delegation {
 	if c == nil {
-		return nil, ErrMalformed
+		return nil
 	}
-	d := &identity.Delegation{
-		ID:         c.Public.ID,
-		Pub:        c.Public.DelegatorPub,
-		AccountID:  c.Public.AccountID,
-		MaxDevices: c.Public.MaxDevices,
-		IssuedAt:   c.Public.IssuedAt,
-		ExpiresAt:  c.Public.ExpiresAt,
-	}
-	if err := account.SignDelegation(d); err != nil {
-		return nil, err
-	}
-	return d, nil
+	d := c.Public
+	return &d
 }
 
 // randomID returns an identifier for quota accounting.

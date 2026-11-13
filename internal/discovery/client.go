@@ -523,18 +523,41 @@ func (c *Client) kickStreamIfPending() {
 // review F3). Endpoint strings are re-validated here because the node is
 // trusted to be online, not honest: what it says about addresses is
 // filtered by the same rules announces obey (review F5).
+//
+// A certificate signed by a DELEGATOR (a member that joined under a team
+// credential) is NOT verifiable with the account key — the account never
+// signed it. It is accepted only when the snapshot carries a delegation
+// record authorising that exact signing key: the delegation is checked
+// against the account key, and the certificate against the delegator. A
+// delegated certificate with no matching delegation is still a forgery.
 func (c *Client) verifySnapshot(snap *MemberSnapshot) error {
 	if snap.AccountID != c.cfg.AccountID {
 		return fmt.Errorf("snapshot is for account %s, expected %s", snap.AccountID, c.cfg.AccountID)
 	}
 	accountPub := ed25519.PublicKey(c.cfg.AccountPub)
+	delegations := make(map[string]identity.Delegation, len(snap.Delegations))
+	for _, d := range snap.Delegations {
+		if err := d.Verify(accountPub, time.Now().UTC()); err != nil {
+			c.log.Warn("snapshot delegation rejected", "id", d.ID, "reason", err)
+			continue
+		}
+		delegations[string(d.DelegatorPub)] = d
+	}
 	for id, mv := range snap.Members {
 		drop := ""
-		if err := mv.Cert.Verify(accountPub); err != nil {
-			drop = err.Error()
-		} else if id != mv.Cert.DeviceID {
+		switch {
+		case len(mv.Cert.SignerPub) > 0:
+			d, ok := delegations[string(mv.Cert.SignerPub)]
+			if !ok {
+				drop = "signed by a delegator that no member of this network is authorised to use"
+			} else if err := mv.Cert.VerifySigner(d.DelegatorPub); err != nil {
+				drop = "delegated certificate rejected: " + err.Error()
+			}
+		case mv.Cert.Verify(accountPub) != nil:
+			drop = mv.Cert.Verify(accountPub).Error()
+		case id != mv.Cert.DeviceID:
 			drop = "cert belongs to " + mv.Cert.DeviceID.String()
-		} else {
+		default:
 			kept := make([]string, 0, len(mv.Endpoints))
 			for _, e := range mv.Endpoints {
 				if validEndpoint(e) {
@@ -576,6 +599,19 @@ func (c *Client) applySnapshot(snap *MemberSnapshot) {
 
 // normalizeBaseURL parses a configured address, defaulting the scheme to
 // http and requiring that nothing beyond the origin is present.
+// NormalizeDiscoveryURL turns a configured discovery address into the base
+// URL a request should use. It is the same rule the client applies
+// internally (bare host:port, https on port 443, http otherwise), exposed
+// so other packages — the credential enrollment path — address the same
+// node the same way.
+func NormalizeDiscoveryURL(a string) (string, error) {
+	u, err := normalizeBaseURL(a)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimRight(u.String(), "/"), nil
+}
+
 func normalizeBaseURL(a string) (*url.URL, error) {
 	if !strings.Contains(a, "://") {
 		// Bare "host:port" defaults to https on the TLS port: a discovery
