@@ -24,6 +24,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -46,6 +47,27 @@ import (
 	"github.com/muzimu217/container-mesh/internal/mesh"
 	"github.com/muzimu217/container-mesh/internal/relay"
 )
+
+// randomToken returns a fresh panel token.
+//
+// A token is a bearer secret for the roster, so it is generated from the
+// system CSPRNG and never derived from anything guessable.
+func randomToken() string {
+	b := make([]byte, 24)
+	if _, err := rand.Read(b); err != nil {
+		// The process cannot proceed with a predictable roster token.
+		panic(fmt.Sprintf("cmesh: cannot read randomness for the panel token: %v", err))
+	}
+	return hex.EncodeToString(b)
+}
+
+// portOf returns the port part of a listen address (":8080" → "8080").
+func portOf(addr string) string {
+	if _, p, err := net.SplitHostPort(addr); err == nil {
+		return p
+	}
+	return "8080"
+}
 
 // stringSlice is a repeatable string flag (--disc a --disc b).
 type stringSlice []string
@@ -462,6 +484,11 @@ func runServeDiscovery(args []string) error {
 	// offline in every member's view forever (issue #8 D-6). A wildcard
 	// --addr has no self-describing public address, hence this flag.
 	announce := fs.String("announce", "", "address members use to reach THIS node (host:port); announces the node itself into the member view so it is visible and dialable")
+	// The panel is the product's face: "how many of my devices are online".
+	// It is OFF unless asked for, and its data endpoint is protected by a
+	// token — the page itself is a static shell that carries no state.
+	panel := fs.Bool("panel", false, "serve the visualization panel at /panel (its data endpoint /api/mesh needs the panel token)")
+	panelToken := fs.String("panel-token", "", "token for the panel's data endpoint; generated and printed when --panel is set and this is empty")
 	verbose := fs.Bool("v", false, "verbose (debug) logging")
 	if err := fs.Parse(args); err != nil {
 		return ExitError{Code: 2, Err: err}
@@ -530,6 +557,25 @@ func runServeDiscovery(args []string) error {
 		TLSKey:  *tlsKey,
 		Logger:  setupLogging(*verbose),
 	})
+	if *panel {
+		tok := *panelToken
+		if tok == "" {
+			// Generated, not defaulted: a fixed or guessable token would
+			// make the roster readable by anyone who finds the port.
+			tok = randomToken()
+		}
+		srv.SetPanelToken(tok)
+		srv.SetAnchorDeviceID(dev.ID())
+		// The token is NOT put in the URL: a query string lands in the
+		// browser history and in referrer headers. The page has a field
+		// for it.
+		panelHost := "127.0.0.1"
+		if h, _, err := net.SplitHostPort(*addr); err == nil && h != "" && h != "0.0.0.0" && h != "::" {
+			panelHost = h
+		}
+		fmt.Fprintf(os.Stderr, "  panel: %s://%s/panel   (paste the token below into the page)\n", httpScheme, net.JoinHostPort(panelHost, portOf(*addr)))
+		fmt.Fprintf(os.Stderr, "  panel token: %s  (keep it private; the data endpoint rejects anything else)\n", tok)
+	}
 	srv.EnableDiscovery(members)
 
 	// Approval flow: certificates dropped into <state>/certs/ are adopted

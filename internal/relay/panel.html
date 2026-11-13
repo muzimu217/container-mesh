@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cmesh · 网络驾驶舱</title>
+<style>
+  :root {
+    --bg: #f6f7f9;
+    --surface: #ffffff;
+    --surface-2: #f0f2f5;
+    --line: #e2e6ec;
+    --text: #16191d;
+    --text-dim: #5d6672;
+    --text-faint: #8b95a1;
+    --accent: #0f6d8f;
+    --accent-soft: #e2f0f5;
+    --ok: #1d7a4c;
+    --warn: #9a6a08;
+    --err: #b3261e;
+    --radius: 10px;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB",
+            "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14171b;
+      --surface: #1b1f24;
+      --surface-2: #22272e;
+      --line: #2c333b;
+      --text: #e6eaef;
+      --text-dim: #a3adb9;
+      --text-faint: #7b8794;
+      --accent: #4fb3d6;
+      --accent-soft: #16303a;
+      --ok: #52b98a;
+      --warn: #d9a441;
+      --err: #ef6a60;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 14px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 24px 20px 48px; }
+
+  /* ── 顶栏 ───────────────────────────────────────────── */
+  header.bar {
+    display: flex; flex-wrap: wrap; gap: 12px 20px;
+    align-items: baseline; justify-content: space-between;
+    padding-bottom: 14px; border-bottom: 1px solid var(--line);
+  }
+  .brand { display: flex; align-items: baseline; gap: 10px; }
+  .brand h1 { font-size: 17px; font-weight: 600; margin: 0; letter-spacing: .2px; }
+  .brand .net { font-family: var(--mono); font-size: 12px; color: var(--text-dim); }
+  .meta { display: flex; flex-wrap: wrap; gap: 4px 18px; font-size: 12px; color: var(--text-dim); }
+  .meta b { font-weight: 500; color: var(--text-faint); font-family: var(--mono); }
+  .meta .up { color: var(--ok); }
+  .meta .down { color: var(--err); }
+  .meta .stale { color: var(--warn); }
+
+  /* ── 状态条 ─────────────────────────────────────────── */
+  .status {
+    margin: 18px 0 0; padding: 10px 14px; border-radius: var(--radius);
+    display: flex; align-items: center; gap: 10px;
+    background: var(--surface); border: 1px solid var(--line); font-size: 13px;
+  }
+  .status .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); flex: none; }
+  .status.warn { border-color: color-mix(in srgb, var(--warn) 45%, var(--line)); }
+  .status.warn .dot { background: var(--warn); }
+  .status.err { border-color: color-mix(in srgb, var(--err) 45%, var(--line)); }
+  .status.err .dot { background: var(--err); }
+  .status .txt { color: var(--text-dim); }
+  .status .txt b { color: var(--text); font-weight: 600; }
+
+  /* ── 大数字 ─────────────────────────────────────────── */
+  .hero {
+    display: flex; flex-wrap: wrap; gap: 28px 48px; align-items: flex-end;
+    margin: 26px 0 8px;
+  }
+  .big { display: flex; align-items: baseline; gap: 10px; }
+  .big .n {
+    font-family: var(--mono); font-size: 64px; line-height: 1; font-weight: 600;
+    letter-spacing: -1px; font-variant-numeric: tabular-nums;
+  }
+  .big .of { font-family: var(--mono); font-size: 26px; color: var(--text-faint); }
+  .big .cap { font-size: 12px; color: var(--text-dim); margin-top: 8px; }
+  .figures { display: flex; gap: 34px; }
+  .fig .v { font-family: var(--mono); font-size: 19px; font-variant-numeric: tabular-nums; }
+  .fig .k { font-size: 12px; color: var(--text-faint); }
+
+  /* ── 表格 ───────────────────────────────────────────── */
+  .tablewrap {
+    margin-top: 22px; background: var(--surface); border: 1px solid var(--line);
+    border-radius: var(--radius); overflow: hidden;
+  }
+  .tablewrap h2 {
+    font-size: 13px; font-weight: 600; margin: 0; padding: 12px 16px;
+    border-bottom: 1px solid var(--line); color: var(--text-dim);
+  }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 10px 16px; border-bottom: 1px solid var(--line); }
+  th { font-weight: 500; font-size: 11px; color: var(--text-faint); text-transform: uppercase; letter-spacing: .6px; }
+  tr:last-child td { border-bottom: none; }
+  td.id { font-family: var(--mono); font-size: 12.5px; cursor: pointer; }
+  td.id:hover { color: var(--accent); }
+  td.ep { font-family: var(--mono); font-size: 12px; color: var(--text-dim); }
+  td.when { font-family: var(--mono); font-size: 12px; color: var(--text-dim); white-space: nowrap; }
+  .pill {
+    display: inline-flex; align-items: center; gap: 6px; font-size: 12px;
+    padding: 2px 9px 2px 7px; border-radius: 999px;
+    background: var(--surface-2); color: var(--text-dim); white-space: nowrap;
+  }
+  .pill i { width: 7px; height: 7px; border-radius: 50%; background: var(--text-faint); font-style: normal; }
+  .pill.on { color: var(--ok); background: color-mix(in srgb, var(--ok) 12%, transparent); }
+  .pill.on i { background: var(--ok); }
+  .badge {
+    font-size: 11px; padding: 1px 7px; border-radius: 4px; margin-left: 6px;
+    background: var(--accent-soft); color: var(--accent); white-space: nowrap;
+  }
+  .empty { padding: 34px 16px; text-align: center; color: var(--text-faint); font-size: 13px; }
+
+  /* ── 令牌输入 ───────────────────────────────────────── */
+  .gate { margin-top: 26px; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 20px; }
+  .gate h2 { font-size: 14px; margin: 0 0 6px; }
+  .gate p { margin: 0 0 14px; color: var(--text-dim); font-size: 13px; }
+  .gate .row { display: flex; gap: 8px; flex-wrap: wrap; }
+  input[type=password], input[type=text] {
+    flex: 1 1 260px; min-width: 0; padding: 9px 12px; font-family: var(--mono); font-size: 13px;
+    border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--text);
+  }
+  button {
+    padding: 9px 18px; font-size: 13px; font-family: inherit; cursor: pointer;
+    border: 1px solid var(--accent); border-radius: 8px; background: var(--accent); color: #fff;
+  }
+  button.ghost { background: transparent; color: var(--accent); }
+  .hint { margin-top: 10px; font-size: 12px; color: var(--text-faint); }
+  code { font-family: var(--mono); background: var(--surface-2); padding: 1px 5px; border-radius: 4px; }
+  .foot { margin-top: 26px; font-size: 12px; color: var(--text-faint); }
+  @media (max-width: 640px) {
+    .wrap { padding: 16px 14px 36px; }
+    .big .n { font-size: 46px; }
+    th.hide, td.hide { display: none; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="bar">
+    <div class="brand">
+      <h1>cmesh</h1>
+      <span class="net" id="acct">—</span>
+    </div>
+    <div class="meta">
+      <span>名册版本 <b id="ver">—</b></span>
+      <span>数据时间 <b id="gen">—</b></span>
+      <span id="conn">连接中…</span>
+    </div>
+  </header>
+
+  <div class="status" id="status"><span class="dot"></span><span class="txt">正在连接发现节点…</span></div>
+
+  <div id="view" hidden>
+    <section class="hero">
+      <div>
+        <div class="big">
+          <span class="n" id="online">—</span>
+          <span class="of">/ <span id="total">—</span></span>
+        </div>
+        <div class="cap">在线设备 / 名册设备</div>
+      </div>
+      <div class="figures">
+        <div class="fig"><div class="v" id="f-off">—</div><div class="k">离线设备</div></div>
+        <div class="fig"><div class="v" id="f-anchor">—</div><div class="k">发现节点</div></div>
+        <div class="fig"><div class="v" id="f-end">—</div><div class="k">已公告端点</div></div>
+      </div>
+    </section>
+
+    <section class="tablewrap">
+      <h2>设备名册</h2>
+      <table>
+        <thead>
+          <tr>
+            <th style="width:96px">状态</th>
+            <th>设备 ID</th>
+            <th class="hide">端点</th>
+            <th style="width:130px">最后在线</th>
+          </tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+      <div class="empty" id="empty" hidden>名册里还没有设备。</div>
+    </section>
+
+    <p class="foot">离线设备仍属于名册，只是当前不可达——掉线不会除名。</p>
+  </div>
+
+  <section class="gate" id="gate" hidden>
+    <h2>需要面板令牌</h2>
+    <p>该令牌在启动发现节点的终端里打印（<code>panel token</code>）。它只用于读取本网络的状态，请勿外传。</p>
+    <div class="row">
+      <input type="password" id="tok" placeholder="粘贴面板令牌" autocomplete="off">
+      <button id="go">连接</button>
+    </div>
+    <div class="hint" id="gatehint"></div>
+  </section>
+</div>
+
+<script>
+(function () {
+  "use strict";
+  var POLL_MS = 5000;
+  var TOKEN_KEY = "cmesh.panel.token";
+  var view = document.getElementById("view");
+  var gate = document.getElementById("gate");
+  var statusEl = document.getElementById("status");
+  var lastGood = null;          // last valid payload — kept so a drop does not blank the page
+  var inflight = false;
+
+  function token() {
+    var url = new URLSearchParams(location.search).get("token");
+    if (url) { try { localStorage.setItem(TOKEN_KEY, url); } catch (e) {} return url; }
+    try { return localStorage.getItem(TOKEN_KEY) || ""; } catch (e) { return ""; }
+  }
+  function saveToken(v) {
+    try { localStorage.setItem(TOKEN_KEY, v); } catch (e) {}
+  }
+
+  function relTime(iso) {
+    if (!iso) return "—";
+    var t = Date.parse(iso);
+    if (isNaN(t)) return "—";
+    var s = Math.max(0, (Date.now() - t) / 1000);
+    if (s < 10) return "刚刚";
+    if (s < 60) return Math.floor(s) + " 秒前";
+    if (s < 3600) return Math.floor(s / 60) + " 分钟前";
+    if (s < 86400) return Math.floor(s / 3600) + " 小时前";
+    return Math.floor(s / 86400) + " 天前";
+  }
+
+  function setStatus(kind, text) {
+    statusEl.className = "status" + (kind ? " " + kind : "");
+    statusEl.querySelector(".txt").innerHTML = text;
+  }
+
+  function render(d) {
+    lastGood = d;
+    document.getElementById("acct").textContent = d.account_id || "—";
+    document.getElementById("ver").textContent = d.version;
+    document.getElementById("gen").textContent = relTime(d.generated_at);
+    document.getElementById("online").textContent = d.summary.online;
+    document.getElementById("total").textContent = d.summary.members;
+    document.getElementById("f-off").textContent = d.summary.members - d.summary.online;
+    var anchors = 0, eps = 0;
+    d.members.forEach(function (m) {
+      if (m.is_anchor) anchors++;
+      eps += (m.endpoints || []).length;
+    });
+    document.getElementById("f-anchor").textContent = anchors;
+    document.getElementById("f-end").textContent = eps;
+
+    var rows = document.getElementById("rows");
+    rows.textContent = "";
+    d.members.forEach(function (m) {
+      var tr = document.createElement("tr");
+      var st = document.createElement("td");
+      var pill = document.createElement("span");
+      pill.className = "pill" + (m.online ? " on" : "");
+      var dot = document.createElement("i");
+      pill.appendChild(dot);
+      pill.appendChild(document.createTextNode(m.online ? "在线" : "离线"));
+      st.appendChild(pill);
+      if (m.is_anchor) {
+        var b = document.createElement("span");
+        b.className = "badge";
+        b.textContent = "发现节点";
+        st.appendChild(b);
+      }
+      var id = document.createElement("td");
+      id.className = "id";
+      id.textContent = m.device_id;
+      id.title = "点击复制";
+      id.addEventListener("click", function () {
+        if (navigator.clipboard) { navigator.clipboard.writeText(m.device_id); }
+      });
+      var ep = document.createElement("td");
+      ep.className = "ep hide";
+      ep.textContent = (m.endpoints && m.endpoints.length) ? m.endpoints.join(", ") : "—";
+      var when = document.createElement("td");
+      when.className = "when";
+      when.textContent = relTime(m.last_seen);
+      tr.appendChild(st); tr.appendChild(id); tr.appendChild(ep); tr.appendChild(when);
+      rows.appendChild(tr);
+    });
+    document.getElementById("empty").hidden = d.members.length > 0;
+
+    view.hidden = false;
+    gate.hidden = true;
+    var conn = document.getElementById("conn");
+    conn.className = "up";
+    conn.textContent = "已连接";
+    setStatus("", "网络正常，<b>" + d.summary.online + "/" + d.summary.members + "</b> 台设备在线。");
+  }
+
+  function renderStale(msg) {
+    var conn = document.getElementById("conn");
+    conn.className = "down";
+    conn.textContent = "连接失败";
+    setStatus("err", msg + " <b>当前显示的是最后一次有效快照，不代表实时状态。</b>");
+    if (!lastGood) { view.hidden = true; gate.hidden = false; }
+  }
+
+  function poll() {
+    if (inflight) return;
+    inflight = true;
+    var t = token();
+    fetch("/api/mesh", { headers: t ? { "X-Panel-Token": t } : {}, cache: "no-store" })
+      .then(function (r) {
+        if (r.status === 401) {
+          document.getElementById("gatehint").textContent = "令牌不正确或已更换。";
+          gate.hidden = false; view.hidden = true;
+          setStatus("warn", "面板令牌未被接受。");
+          return;
+        }
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        return r.json();
+      })
+      .then(function (d) { if (d) render(d); })
+      .catch(function (e) { renderStale("无法连接发现节点（" + e.message + "），正在重试…"); })
+      .then(function () { inflight = false; });
+  }
+
+  document.getElementById("go").addEventListener("click", function () {
+    var v = document.getElementById("tok").value.trim();
+    if (v) { saveToken(v); poll(); }
+  });
+  document.getElementById("tok").addEventListener("keydown", function (e) {
+    if (e.key === "Enter") document.getElementById("go").click();
+  });
+
+  var t = token();
+  if (t) { document.getElementById("tok").value = t; poll(); }
+  else { gate.hidden = false; setStatus("", "等待面板令牌。"); }
+  setInterval(poll, POLL_MS);
+})();
+</script>
+</body>
+</html>

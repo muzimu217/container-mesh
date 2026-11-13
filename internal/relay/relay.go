@@ -85,6 +85,14 @@ type Config struct {
 	// so terminating TLS here removes both a port requirement and a hop.
 	TLSCert string
 	TLSKey  string
+	// PanelToken enables the visualization panel's data surface when set.
+	// Empty means the panel is off: /panel and /api/mesh are not even
+	// mounted, so an operator who did not ask for a panel cannot leak the
+	// roster by running a discovery node on a public port.
+	PanelToken string
+	// AnchorDeviceID is the discovery node's own device ID, so the panel
+	// can mark the anchor's row.
+	AnchorDeviceID identity.DeviceID
 	// Logger receives structured events.
 	Logger *slog.Logger
 }
@@ -124,6 +132,12 @@ type Server struct {
 	disco        *discovery.Node
 	discoMembers *identity.MemberList
 	discoStop    chan struct{}
+	// panelToken protects the panel's data surface (GET /api/mesh). Empty
+	// means the panel data stays closed: a node that was not explicitly
+	// given a token must not leak its roster to whoever finds the port.
+	panelToken string
+	// anchorDeviceID marks the discovery node's own row in the panel.
+	anchorDeviceID identity.DeviceID
 	// streams tracks live members-stream connections per device, so an
 	// operator (or a test) can force a member to reconnect.
 	streams map[identity.DeviceID]map[*wsconn.Conn]struct{}
@@ -232,14 +246,16 @@ func New(cfg Config) *Server {
 		cfg.Logger = slog.Default()
 	}
 	return &Server{
-		cfg:       cfg,
-		log:       cfg.Logger,
-		rooms:     make(map[string]*room),
-		contested: make(map[string]contestState),
-		limiter:   newIPLimiter(cfg.ConnectRatePerMin, cfg.MaxConnsPerIP),
-		startedAt: time.Now(),
-		ready:     make(chan struct{}),
-		streams:   make(map[identity.DeviceID]map[*wsconn.Conn]struct{}),
+		cfg:            cfg,
+		log:            cfg.Logger,
+		panelToken:     cfg.PanelToken,
+		anchorDeviceID: cfg.AnchorDeviceID,
+		rooms:          make(map[string]*room),
+		contested:      make(map[string]contestState),
+		limiter:        newIPLimiter(cfg.ConnectRatePerMin, cfg.MaxConnsPerIP),
+		startedAt:      time.Now(),
+		ready:          make(chan struct{}),
+		streams:        make(map[identity.DeviceID]map[*wsconn.Conn]struct{}),
 	}
 }
 
@@ -259,6 +275,11 @@ func (s *Server) Handler() http.Handler {
 	// are not, /mesh/* 404s like any unknown path.
 	if s.disco != nil {
 		s.meshSnapshotMux(mux)
+		// The panel: a static shell plus a token-protected data endpoint.
+		if s.panelToken != "" {
+			mux.HandleFunc("/panel", s.handlePanel)
+			mux.HandleFunc("/api/mesh", s.handleAPIMesh)
+		}
 	}
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
