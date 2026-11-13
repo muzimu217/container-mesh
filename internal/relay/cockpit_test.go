@@ -344,6 +344,17 @@ func TestCockpitHasNoDemoControls(t *testing.T) {
 			"SimToggle",
 			"_savedEndpoints",
 			"getMeshDataByScenario",
+			// The prototype also shipped a DEFAULT-ON toggle that appended
+			// two synthetic Hong Kong devices to the live roster, so every
+			// operator opening the panel saw two machines that do not exist.
+			// Blacklisting button ids alone missed it (doubao-cloud-vm-01,
+			// round 58, second pass): the fabricated DEVICES are the defect.
+			"simulateHkMultiNodes",
+			"EXTRA_HK_CLUSTER_NODES",
+			"dev_06_hk_infer",
+			"dev_07_hk_sandbox",
+			"hk-infer-blade-02",
+			"香港3机智能聚合",
 		} {
 			if strings.Contains(text, bad) {
 				t.Errorf("the shipped cockpit bundle still contains prototype-only machinery (%q) in %s", bad, a.Name())
@@ -352,5 +363,32 @@ func TestCockpitHasNoDemoControls(t *testing.T) {
 	}
 	if scanned == 0 {
 		t.Fatal("no JavaScript bundle was found to scan — the cockpit build is missing")
+	}
+}
+
+// TestCockpitExposesItsCanvasLabelsAsText: the 3D view draws ANCHOR CORE and
+// the offline dock with canvas fillText, so those statements exist only as
+// pixels — a screen reader and a headless check both see an empty element.
+// The mirror carries the same facts as text (doubao-cloud-vm-01).
+func TestCockpitExposesItsCanvasLabelsAsText(t *testing.T) {
+	assets, err := fs.ReadDir(cockpitFS, "assets")
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, a := range assets {
+		if !strings.HasSuffix(a.Name(), ".js") {
+			continue
+		}
+		bundle, err := fs.ReadFile(cockpitFS, "assets/"+a.Name())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(bundle), "cockpit-canvas-mirror") {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("the cockpit has no text mirror for what the canvas draws — the panel cannot be verified without a screenshot")
 	}
 }

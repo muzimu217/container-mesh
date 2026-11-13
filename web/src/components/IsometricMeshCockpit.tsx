@@ -19,7 +19,6 @@ import {
   Compass,
   MapPin,
   Crosshair,
-  CopyPlus,
 } from 'lucide-react';
 
 interface IsometricMeshCockpitProps {
@@ -465,87 +464,6 @@ function computeGlobeCameraPose(
   latLngToVector3(lat, lng, lookAtRadius, outLookAt);
 }
 
-// Simulated additional Hong Kong co-located nodes to demonstrate zero-occlusion multi-server clustering in the same city
-const EXTRA_HK_CLUSTER_NODES: MeshMember[] = [
-  {
-    device_id: 'dev_06_hk_infer',
-    display_name: 'hk-infer-blade-02',
-    alias: '香港同城推理容器 B (直连)',
-    zone_id: 'zone_anchor_hub',
-    zone_name: '自托管锚点机房 · 中国香港',
-    geo_lat: 22.32,
-    geo_lng: 114.17,
-    geo_city: '中国香港 (HKG)',
-    geo_coord_label: '22.32°N, 114.17°E',
-    role: 'member',
-    is_anchor: false,
-    container_archetype: 'public_direct_compute',
-    has_public_inbound: true,
-    nat_type_label: '同城公网直连刀片 (无玻璃罩 · 自动微环散开防遮挡)',
-    in_roster: true,
-    online: true,
-    endpoints: ['203.0.113.18:41820'],
-    last_seen: '2026-11-11T16:11:24Z',
-    transport: 'direct',
-    peers_connected: ['dev_01_anchor_hk', 'dev_02_local_ws'],
-    active_comm_summary: '香港同城节点 2 · 与 anchor-hk-01 环形微阵列防遮挡排布',
-    diagnostic_reason: '处于同一城市经纬度 (香港 22.32°N, 114.17°E)，系统自动按切平面微星环分布，避免遮挡。',
-    diagnostic_suggestion: '点击香港区域可放大查看同城微阵列，点击具体节点可单独聚焦。',
-    container_config: {
-      runtime: 'oci-runc (Docker 26.1)',
-      image: 'ghcr.io/cmesh-net/worker:v0.9.4',
-      privileges: 'uid=1000 (非 root)',
-      cap_net_admin: false,
-      tun_device: false,
-      inbound_ports: 'UDP/41820',
-      userspace_socket: 'Userspace Direct P2P',
-      OS_arch: 'linux/amd64',
-      cpu_limit: '4.0 vCPU',
-      memory_limit: '8192 MB',
-      workdir: '/workspace',
-      whitelist_cmds: ['cmesh status --json', 'uname -a'],
-    },
-  },
-  {
-    device_id: 'dev_07_hk_sandbox',
-    display_name: 'hk-sandbox-worker-03',
-    alias: '香港同城受限沙箱 C (仅出站)',
-    zone_id: 'zone_anchor_hub',
-    zone_name: '自托管锚点机房 · 中国香港',
-    geo_lat: 22.32,
-    geo_lng: 114.17,
-    geo_city: '中国香港 (HKG)',
-    geo_coord_label: '22.32°N, 114.17°E',
-    role: 'member',
-    is_anchor: false,
-    container_archetype: 'nat_restricted_sandbox',
-    has_public_inbound: false,
-    nat_type_label: '同城受限 NAT 沙箱 (全封闭玻璃舱 · 自动微环散开防遮挡)',
-    in_roster: true,
-    online: true,
-    endpoints: [],
-    last_seen: '2026-11-11T16:11:23Z',
-    transport: 'relay',
-    peers_connected: ['dev_01_anchor_hk'],
-    active_comm_summary: '香港同城节点 3 · 经同城锚点受控中继',
-    diagnostic_reason: '处于同一城市经纬度 (香港 22.32°N, 114.17°E)，通过球面切线环形分布与标签防重叠算法实现零遮挡。',
-    diagnostic_suggestion: '支持同城多容器并存展示。',
-    container_config: {
-      runtime: 'gVisor runsc',
-      image: 'ghcr.io/cmesh-net/sandbox:v0.9.4',
-      privileges: 'uid=65534 (nobody)',
-      cap_net_admin: false,
-      tun_device: false,
-      inbound_ports: '无入站 (仅出站)',
-      userspace_socket: 'Userspace Relay Stream',
-      OS_arch: 'linux/amd64',
-      cpu_limit: '2.0 vCPU',
-      memory_limit: '2048 MB',
-      workdir: '/workspace',
-      whitelist_cmds: ['cmesh status --json', 'uname -a'],
-    },
-  },
-];
 
 export const IsometricMeshCockpit: React.FC<IsometricMeshCockpitProps> = ({
   zones,
@@ -562,8 +480,6 @@ export const IsometricMeshCockpit: React.FC<IsometricMeshCockpitProps> = ({
 }) => {
   const canvasMountRef = useRef<HTMLDivElement | null>(null);
   const [viewMode, setViewMode] = useState<'globe' | 'isometric_lab'>('globe');
-  // Enabled by default so Hong Kong has 3 co-located devices ready to demonstrate Smart Regional Cluster Ring aggregation & scatter
-  const [simulateHkMultiNodes, setSimulateHkMultiNodes] = useState<boolean>(true);
   // Tracks whether the globe camera is currently zoomed out beyond CLUSTER_ZOOM_DISTANCE_THRESHOLD
   const [isZoomedOutClusterView, setIsZoomedOutClusterView] = useState<boolean>(true);
   const [nodeScaleMultiplier, setNodeScaleMultiplier] = useState<number>(1.0);
@@ -578,11 +494,12 @@ export const IsometricMeshCockpit: React.FC<IsometricMeshCockpitProps> = ({
   const [hoveredEntityId, setHoveredEntityId] = useState<string | null>(null);
   const [projectedLabels, setProjectedLabels] = useState<Record<string, ProjectedLabel>>({});
 
-  // Effective member list (includes the 2 extra Hong Kong nodes when multi-node demo is active)
-  const effectiveMembers = useMemo(() => {
-    if (!simulateHkMultiNodes) return members;
-    return [...members, ...EXTRA_HK_CLUSTER_NODES];
-  }, [members, simulateHkMultiNodes]);
+  // There is exactly one source of members: the roster the anchor pushed.
+  // The prototype injected two synthetic Hong Kong nodes here behind a
+  // default-ON toggle, which meant every operator opening the panel saw two
+  // devices that do not exist — the dashboard painted a network instead of
+  // reporting one (doubao-cloud-vm-01, round 58).
+  const effectiveMembers = members;
 
   const cameraAnimatingRef = useRef<boolean>(false);
   const prevSelectionRef = useRef<{
@@ -607,7 +524,6 @@ export const IsometricMeshCockpit: React.FC<IsometricMeshCockpitProps> = ({
     selectedDeviceId,
     activeCommEvent,
     viewMode,
-    simulateHkMultiNodes,
     nodeScaleMultiplier,
     explodeFactor,
     showCommPulses,
@@ -626,8 +542,7 @@ export const IsometricMeshCockpit: React.FC<IsometricMeshCockpitProps> = ({
       selectedDeviceId,
       activeCommEvent,
       viewMode,
-      simulateHkMultiNodes,
-      nodeScaleMultiplier,
+        nodeScaleMultiplier,
       explodeFactor,
       showCommPulses,
       autoRotateGlobe,
@@ -643,7 +558,6 @@ export const IsometricMeshCockpit: React.FC<IsometricMeshCockpitProps> = ({
     selectedDeviceId,
     activeCommEvent,
     viewMode,
-    simulateHkMultiNodes,
     nodeScaleMultiplier,
     explodeFactor,
     showCommPulses,
@@ -1092,8 +1006,8 @@ export const IsometricMeshCockpit: React.FC<IsometricMeshCockpitProps> = ({
       };
     });
 
-    // 7. Build All Possible Container Server Nodes (Base 5 + 2 Extra Hong Kong Co-Located Demo Nodes)
-    const allPossibleMembers = [...members, ...EXTRA_HK_CLUSTER_NODES];
+    // 7. Build the container server nodes: exactly the members the anchor reported.
+    const allPossibleMembers = members;
 
     const deviceNodes: Record<
       string,
@@ -1443,23 +1357,6 @@ export const IsometricMeshCockpit: React.FC<IsometricMeshCockpitProps> = ({
         labArch: 1.95,
         flowDirection: 1,
         baseIntensity: 1.35,
-      },
-      // Extra Hong Kong Same-City Multi-Server Cluster Links (visible when HK 3-node demo is active)
-      {
-        fromId: 'dev_06_hk_infer',
-        toId: 'dev_03_gpu_fra',
-        peakAltitude: 1.32,
-        labArch: 1.5,
-        flowDirection: 1,
-        baseIntensity: 1.45,
-      },
-      {
-        fromId: 'dev_07_hk_sandbox',
-        toId: 'dev_01_anchor_hk',
-        peakAltitude: 0.36,
-        labArch: 0.9,
-        flowDirection: 1,
-        baseIntensity: 0.8,
       },
     ];
 
@@ -1875,7 +1772,7 @@ export const IsometricMeshCockpit: React.FC<IsometricMeshCockpitProps> = ({
         }
       });
 
-      // Hide any extra demo nodes when simulateHkMultiNodes is off
+      // Hide nodes that are no longer in the roster (a member left the view).
       const activeIds = new Set(current.members.map((m) => m.device_id));
       Object.entries(deviceNodes).forEach(([id, node]) => {
         if (!activeIds.has(id)) {
@@ -2377,7 +2274,30 @@ export const IsometricMeshCockpit: React.FC<IsometricMeshCockpitProps> = ({
       <div
         ref={canvasMountRef}
         className="relative z-10 w-full h-full cursor-grab active:cursor-grabbing"
+        role="img"
+        aria-label={`三维名册视图：${members.length} 台设备（${members.filter((m) => m.online).length} 台在线），其中锚点 ${members.filter((m) => m.is_anchor).length} 台`}
       />
+
+      {/* The canvas draws its labels with fillText, so they are pixels, not
+          DOM nodes: a screen reader (or a headless check) sees nothing. This
+          mirror carries the same statement as text — the anchor, the online
+          devices and the offline ones still holding a roster seat — so the
+          panel can be verified without reading a screenshot
+          (doubao-cloud-vm-01, round 58). Visually hidden, not display:none:
+          a display:none node is not in the accessibility tree either. */}
+      <div className="sr-only" data-testid="cockpit-canvas-mirror">
+        <p>
+          锚点：{members.filter((m) => m.is_anchor).map((m) => m.display_name || m.device_id).join('、') || '无'}
+        </p>
+        <p>
+          在线设备：
+          {members.filter((m) => m.online && !m.is_anchor).map((m) => m.display_name || m.device_id).join('、') || '无'}
+        </p>
+        <p>
+          离线仍在册：
+          {members.filter((m) => !m.online).map((m) => m.display_name || m.device_id).join('、') || '无'}
+        </p>
+      </div>
 
       {/* Top-Left Global Holographic Earth Hierarchy Breadcrumb & Quick Geolocation Locator */}
       <div className="absolute top-3.5 left-3.5 z-10 flex flex-col gap-1.5 max-w-[calc(100%-180px)]">
@@ -2470,34 +2390,6 @@ export const IsometricMeshCockpit: React.FC<IsometricMeshCockpitProps> = ({
               <span>返回上级</span>
             </button>
           )}
-
-          {/* 1-Click Same-City Multi-Server Smart Cluster Ring Demo Toggle */}
-          <button
-            onClick={() => {
-              const next = !simulateHkMultiNodes;
-              setSimulateHkMultiNodes(next);
-              if (
-                !next &&
-                (selectedDeviceId === 'dev_06_hk_infer' ||
-                  selectedDeviceId === 'dev_07_hk_sandbox')
-              ) {
-                onSelectDevice(null);
-              }
-            }}
-            className={`ml-auto px-2 py-0.5 rounded text-[11px] font-medium flex items-center gap-1 border transition-colors cursor-pointer whitespace-nowrap ${
-              simulateHkMultiNodes
-                ? 'bg-emerald-700 text-white border-emerald-700'
-                : 'bg-sky-50 hover:bg-sky-100 text-sky-800 border-sky-200'
-            }`}
-            title="开启后香港区域包含 3 台同城设备：远景下自动合并为带数值的『区域聚合圆环』，点击圆环或滚轮放大后自动散开展示具体节点"
-          >
-            <CopyPlus className="w-3 h-3" />
-            <span>
-              {simulateHkMultiNodes
-                ? '香港3机智能聚合: 已开启'
-                : '开启香港3机智能聚合演示'}
-            </span>
-          </button>
         </div>
 
         {/* 1-Click Global Geolocation Node Bar */}
