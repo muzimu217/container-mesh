@@ -319,3 +319,39 @@ func TestLocalAddrTreatsLoopbackAsLocal(t *testing.T) {
 		}
 	}
 }
+
+// TestEndpointPortZeroResolvesToTheBoundPort pins oh-no-agent's defect B-2:
+// `--listen 0` expands and prints the port it bound, so writing
+// `--endpoint 127.0.0.1:0` plainly means "announce me on that same port".
+// The literal ":0" used to be announced verbatim and the anchor rejected it
+// as malformed — the join failed over a flag that reads as valid.
+func TestEndpointPortZeroResolvesToTheBoundPort(t *testing.T) {
+	var notes bytes.Buffer
+	got := resolvePortZeroEndpoints(
+		[]string{"127.0.0.1:0", "203.0.113.7:18090", "example.com:0"},
+		[]string{"127.0.0.1:54321"},
+		&notes,
+	)
+	want := []string{"127.0.0.1:54321", "203.0.113.7:18090", "example.com:54321"}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("endpoint %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+	if !strings.Contains(notes.String(), "54321") {
+		t.Errorf("the resolution was not reported to the operator: %q", notes.String())
+	}
+
+	// Nothing to resolve against (wildcard-only bind): leave the input as-is
+	// rather than inventing a port.
+	wild := resolvePortZeroEndpoints([]string{"127.0.0.1:0"}, nil, io.Discard)
+	if wild[0] != "127.0.0.1:0" {
+		t.Errorf("with no bound address the endpoint must be left alone; got %q", wild[0])
+	}
+
+	// Malformed input must not panic or be rewritten.
+	odd := resolvePortZeroEndpoints([]string{"not-an-address"}, []string{"127.0.0.1:7"}, io.Discard)
+	if odd[0] != "not-an-address" {
+		t.Errorf("a malformed endpoint was rewritten to %q", odd[0])
+	}
+}

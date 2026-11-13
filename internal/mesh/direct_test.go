@@ -9,6 +9,7 @@ import (
 	"context"
 	crand "crypto/rand"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -16,6 +17,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/muzimu217/container-mesh/internal/credential"
+	"github.com/muzimu217/container-mesh/internal/discovery"
 	"github.com/muzimu217/container-mesh/internal/identity"
 )
 
@@ -409,5 +412,109 @@ func TestRevokedMemberCannotConnect(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("revoked member must fail to connect")
+	}
+}
+
+// TestSnapshotAdapterAdmitsDelegatedMembers: a device that joined under a
+// team credential holds a certificate signed by the credential's DELEGATOR,
+// not by the account. Verifying it against the account key fails by design
+// (identity.ErrCertDelegated), so a client that only checked the account key
+// could SEE a delegated member in its roster but never DIAL it — joined,
+// visible, unreachable (oh-no-agent, round 58, defect B-1).
+//
+// The snapshot travels with the delegation records for exactly this reason.
+// This test pins both halves: the delegation in the snapshot makes dialling
+// work, and its absence still refuses the key.
+func TestSnapshotAdapterAdmitsDelegatedMembers(t *testing.T) {
+	acc, err := identity.GenerateAccount()
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	cred, err := credential.Create(acc, []string{"mesh.example:7000"}, time.Hour, 5, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The member on the listening side joined under the credential.
+	aline, err := identity.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	delegatedCert, err := cred.MintCert(aline.PublicKey(), time.Hour, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The dialer is an ordinary, account-signed member.
+	bob, err := identity.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	bobCert, err := acc.IssueCert(bob, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	members := identity.NewMemberList(acc.ID())
+	if err := members.Add(*delegatedCert); err != nil {
+		t.Fatal(err)
+	}
+	if err := members.Add(*bobCert); err != nil {
+		t.Fatal(err)
+	}
+	if err := members.AddDelegation(*cred.Delegation()); err != nil {
+		t.Fatal(err)
+	}
+
+	node := discovery.NewNode(members)
+	snap := discovery.BuildSnapshot(members, node, now)
+	// The dialer's own resolver: the snapshot it verified, plus the account
+	// key it trusts. This is the client side of the trust model.
+	adapter := SnapshotAdapter{Snap: snap, AccountPub: acc.PublicKey()}
+	if _, err := adapter.KeyFor(aline.ID()); err != nil {
+		t.Fatalf("a delegated member's key must resolve when its delegation is in the snapshot: %v", err)
+	}
+
+	// The delegated certificate is not account-signed; that refusal is the
+	// property the fix must NOT weaken.
+	if err := delegatedCert.Verify(acc.PublicKey()); !errors.Is(err, identity.ErrCertDelegated) {
+		t.Fatalf("a delegated certificate must not verify against the account key; got %v", err)
+	}
+
+	// Strip the delegation: the same certificate must now be refused, not
+	// silently admitted on the strength of its presence in the roster.
+	stripped := discovery.BuildSnapshot(members, node, now)
+	stripped.Delegations = nil
+	if _, err := (SnapshotAdapter{Snap: stripped, AccountPub: acc.PublicKey()}).KeyFor(aline.ID()); err == nil {
+		t.Fatal("a delegated certificate with no delegation in the snapshot must be refused")
+	}
+
+	l, err := NewListener(context.Background(), ListenerConfig{
+		Device:  aline,
+		Members: MemberListAdapter{List: members},
+		Addrs:   []string{"127.0.0.1:0"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(l.Close)
+
+	// And it dials: the acceptance this test exists for.
+	link, err := DialDirect(context.Background(), DialConfig{
+		Device:           bob,
+		Resolver:         adapter,
+		Target:           aline.ID(),
+		Endpoints:        l.BoundAddrs(),
+		Kind:             KindPing,
+		HandshakeTimeout: 5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("a client that verified the snapshot must be able to dial a delegated member: %v", err)
+	}
+	t.Cleanup(func() { _ = link.Close() })
+	rtts, err := PingExchange(context.Background(), link, 5, 5*time.Millisecond)
+	if err != nil {
+		t.Fatalf("ping exchange with a delegated member: %v", err)
+	}
+	if len(rtts) != 5 {
+		t.Fatalf("got %d RTTs, want 5", len(rtts))
 	}
 }

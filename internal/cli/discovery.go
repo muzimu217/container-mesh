@@ -342,6 +342,15 @@ func runJoin(args []string) error {
 		}
 		listener = l
 		defer listener.Close()
+
+		// An --endpoint whose port is 0 means "use whatever --listen
+		// actually bound" (oh-no-agent: --listen 0 expands and prints the
+		// bound port, but --endpoint 127.0.0.1:0 kept announcing port 0 and
+		// the anchor refused it as malformed). Resolve those against the
+		// listener's bound ports — keeping the announced host, replacing
+		// only the port.
+		announced = resolvePortZeroEndpoints(announced, l.BoundAddrs(), os.Stderr)
+
 		if len(eps) == 0 {
 			announced = l.BoundAddrs()
 			if len(announced) == 0 {
@@ -741,6 +750,38 @@ func runServeDiscovery(args []string) error {
 		return ExitError{Code: 1, Err: fmt.Errorf("serve-discovery: %w", err)}
 	}
 	return nil
+}
+
+// resolvePortZeroEndpoints rewrites announced endpoints whose port is 0 to
+// the port the listener actually bound, keeping the announced host.
+//
+// The reason this exists: `--listen 0` already expands and prints the bound
+// port, so `--endpoint 127.0.0.1:0` reads as "same port as the listener" to
+// anyone writing it — but the literal ":0" used to be announced verbatim and
+// the anchor refused it as malformed (oh-no-agent, round 58, defect B-2).
+// Wildcard binds announce nothing, so with no bound address to borrow a port
+// from the endpoints are returned unchanged.
+func resolvePortZeroEndpoints(announced, bound []string, log io.Writer) []string {
+	if len(bound) == 0 {
+		return announced
+	}
+	_, boundPort, err := net.SplitHostPort(bound[0])
+	if err != nil || boundPort == "" || boundPort == "0" {
+		return announced
+	}
+	out := make([]string, len(announced))
+	copy(out, announced)
+	for i, a := range announced {
+		host, port, err := net.SplitHostPort(a)
+		if err != nil || port != "0" {
+			continue
+		}
+		out[i] = net.JoinHostPort(host, boundPort)
+		if log != nil {
+			fmt.Fprintf(log, "  note: --endpoint port 0 resolved to the bound port %s\n", boundPort)
+		}
+	}
+	return out
 }
 
 // localAddr reports whether host is an address of this machine's own

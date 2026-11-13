@@ -212,6 +212,25 @@ func (a SnapshotAdapter) KeyFor(id identity.DeviceID) (ed25519.PublicKey, error)
 	if !ok {
 		return nil, fmt.Errorf("mesh: %s is not in the current view", id)
 	}
+	// A member that joined under a team credential holds a certificate
+	// signed by the credential's DELEGATOR, not by the account — verifying
+	// it against the account key fails by design. The snapshot carries the
+	// delegation records (already re-verified against the account key when
+	// the snapshot was accepted), so a delegated member is admitted here
+	// through the delegation that vouches for its signer. A delegated
+	// certificate with no matching delegation never reaches this adapter:
+	// verifySnapshot drops it when the snapshot is accepted.
+	if len(mv.Cert.SignerPub) > 0 {
+		for _, d := range a.Snap.Delegations {
+			if d.DelegatorPub.Equal(mv.Cert.SignerPub) {
+				if err := mv.Cert.VerifySigner(d.DelegatorPub); err != nil {
+					return nil, fmt.Errorf("mesh: %s delegated certificate failed verification: %w", id, err)
+				}
+				return mv.Cert.DevicePub, nil
+			}
+		}
+		return nil, fmt.Errorf("mesh: %s certificate was signed by a delegator this view does not authorise", id)
+	}
 	if err := mv.Cert.Verify(a.AccountPub); err != nil {
 		return nil, fmt.Errorf("mesh: %s certificate failed verification: %w", id, err)
 	}
