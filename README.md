@@ -46,6 +46,8 @@ go build -o cmesh ./cmd/cm
 
 ```bash
 go run ./tools/mkrelease --in dist/bin --out dist/release --version v1.0.0
+#   需要 packaging/install.sh 存在（发布必带安装器）；缺它会明确失败且不留半成品。
+#   编译源：先按平台交叉编译出 dist/bin/cmesh-<version>-<os>-<arch>，再组装。
 ```
 
 产物：各平台二进制 + 同名 `.tar.gz`（内含二进制、installer、LICENSE）+ `install.sh`
@@ -70,17 +72,24 @@ cmesh init --passphrase <口令>                       # 生成本机身份（�
 cmesh account create --passphrase <口令>             # 生成团队账号密钥（只放最信任的机器上）
 cmesh account device-add --device-passphrase <口令> --account-passphrase <口令>
 cmesh serve-discovery --addr 0.0.0.0:18090 --announce <公网IP>:18090 \
-    --account-pub <账号公钥> --panel
+    --device-passphrase <口令> --account-pub <账号公钥> --panel
 #   --account-pub：让锚点能验证成员证书与团队凭证（`cmesh account show` 打印）
 #   --panel：开启可视化面板（终端会打印面板地址与令牌）
 
-# ② 另一台机器（容器、受限沙箱都行）
+# ② 另一台机器（容器、受限沙箱都行）—— 方式 A：团队凭证，一条命令入网
+cmesh join --cred <凭证串> --device-passphrase <口令> --listen 0.0.0.0:18090
+#   凭证串由锚点机器 `cmesh cred create --disc <锚点IP>:18090 --ttl 24h \
+#     --max-devices 10 --account-passphrase <口令>` 打印（一行，cmesh1. 开头）。
+#   注意：锚点必须带 --account-pub 启动，否则准入端点不开启（join 会收到 404）。
+
+# ②' 方式 B：逐台审批（邀请串路径）
 cmesh init --passphrase <口令>
-cmesh show-pub                                      # 把本机公钥给账号持有方
+cmesh show-pub --device-passphrase <口令>            # 把本机公钥给账号持有方
 # 账号持有方执行：签发证书后，把证书文件放进锚点的 <state>/certs/ 目录
 cmesh account authorize --pub <对端公钥> --account-passphrase <口令>
-cmesh join <invite-string> --listen 0.0.0.0:18090 --device-passphrase <口令>
-#   邀请串由 `cmesh invite --disc <发现节点>` 打印；它必须放在旗标之后
+cmesh join --listen 0.0.0.0:18090 --device-passphrase <口令> <invite-string>
+#   邀请串由 `cmesh invite --state <目录> --disc 127.0.0.1:18090 \
+#     --account-passphrase <口令>` 打印；它必须放在旗标之后
 ```
 
 `cmesh join` 加入并常驻，持续打印实时成员视图。
@@ -97,10 +106,10 @@ cmesh join <invite-string> --listen 0.0.0.0:18090 --device-passphrase <口令>
 | 动作 | 命令 | 说明 |
 |---|---|---|
 | 看全网 | `cmesh serve-discovery --panel` | 驾驶舱面板（3D 名册视图、成员名册、四维状态核验）；离线设备**保留在名册里**，不除名。极简版在 `/panel-lite` |
-| 测延迟 | `cmesh mesh ping <deviceID>` | 自定义 RTT 测量（非 ICMP） |
-| 发消息 | `cmesh msg --text "…" <deviceID>` | 对端常驻进程实时打印 |
-| 传文件 | `cmesh send-to --file PATH <deviceID>` | 直连流式传输，sha256 校验；**仅常规文件** |
-| 传目录 | `cmesh send --file DIR` / `cmesh recv --out DIR` | 走 relay 配对通道：目录按 tar 打包，权限逐位保留（0700 不会被放宽成 0755） |
+| 测延迟 | `cmesh mesh ping --device-passphrase <口令> <deviceID>` | 自定义 RTT 测量（非 ICMP） |
+| 发消息 | `cmesh msg --device-passphrase <口令> --text "…" <deviceID>` | 对端常驻进程实时打印 |
+| 传文件 | `cmesh send-to --device-passphrase <口令> --file PATH <deviceID>` | 直连流式传输，sha256 校验；**仅常规文件** |
+| 传目录 | `cmesh send --relay ws://<锚点>:18090/ws --code <配对码> --file DIR` / `cmesh recv --relay ws://<锚点>:18090/ws --code <配对码> --out DIR` | 走 relay 配对通道：目录按 tar 打包，权限逐位保留（0700 不会被放宽成 0755） |
 | 远程诊断 | `cmesh run <deviceID> @info` | 内置只读动词（`@info/@disk/@mem/@cat/@ls`），退出码透传 |
 
 > 任意命令执行尚未开放（需要权限分层 ACL），当前只有内置只读动词可用。
@@ -118,10 +127,9 @@ cmesh join <invite-string> --listen 0.0.0.0:18090 --device-passphrase <口令>
 **明确未做到**（不藏着）：
 
 - 中继路由（R-3.2/R-3.3）与增量视图：**尚未实现**，S3 全受限场景暂靠人工转发兜底
-- 统一凭证一键入网：**基础包已落地**（凭证格式、委派签发、额度与有效期），发现节点的准入接线与客户端命令**下一步**
 - 组网内的**断点续传**仍待实现（`docs/REQUIREMENTS.md` R-4.2 记录为「待 PR-M5」）；断点续传目前只在 relay 配对通道可用
 - 桌面 / 手机 App：方案已定（[APP-PACKAGING.md](docs/architecture/APP-PACKAGING.md)），**尚无安装包**
-- 图形界面（面板）为轻量只读版；完整可视化按已验收的原型重建
+- 图形界面为**驾驶舱**（按已验收原型实现，3D 名册视图）+ 轻量版 `/panel-lite`
 
 **关于「零入站端口」**：这句话描述的是**客户端**：成员设备只出站连到发现节点，
 不需要为入网开任何端口。锚点本身要开一个端口（发现与成员流走 TCP，直连走同一
