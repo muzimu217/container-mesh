@@ -42,59 +42,91 @@ go build -o cmesh ./cmd/cm
 ```
 
 发布件覆盖 linux/amd64、linux/arm64、darwin/amd64、darwin/arm64、windows/amd64；
-组装命令见 `tools/mkrelease`（`go run ./tools/mkrelease --in dist/bin --out dist/release --version v1.0.0`），
-发布时每个平台另存一份 `cmesh-latest-<os>-<arch>` 别名，上面的默认地址即可直取。
+组装命令见 `tools/mkrelease`：
+
+```bash
+go run ./tools/mkrelease --in dist/bin --out dist/release --version v1.0.0
+```
+
+产物：各平台二进制 + 同名 `.tar.gz`（内含二进制、installer、LICENSE）+ `install.sh`
++ `SHA256SUMS`（覆盖全部 11 个文件，可用 `shasum -a 256 -c SHA256SUMS` 校验）。
+
+> **`cmesh-latest-<os>-<arch>` 是发布时的别名**：`mkrelease` 除了版本化文件名
+> （`cmesh-v1.0.0-linux-amd64`），还会为每个平台产出一份 `cmesh-latest-<os>-<arch>`
+> 副本——GitHub 的 `releases/latest/download/<name>` 只认名字里带 `latest` 的资产，
+> 有了这个副本，上面的默认地址就能直取。发布时把 `dist/release/` 整个目录上传即可。
+
 
 ## 2. 三步组网
 
+> **旗标与位置参数**：口令类旗标（`--passphrase` / `--account-passphrase` /
+> `--device-passphrase`）在非交互环境必填，否则命令会等口令直到 EOF 而失败；
+> **位置参数一律放最后**（`cmesh join <invite>` 的邀请串、`msg`/`send-to`/
+> `mesh ping` 的设备 ID 都在旗标之后）。
+
 ```bash
 # ① 锚点机器（通常是那台有公网 IP 的服务器）
-cmesh init                 # 生成本机身份（私钥加密存储在本机）
-cmesh account create       # 生成团队账号密钥（只放最信任的机器上）
-cmesh account device-add   # 把本机签进账号
-cmesh serve-discovery --addr 0.0.0.0:18090 --announce <公网IP>:18090 --panel
+cmesh init --passphrase <口令>                       # 生成本机身份（私钥加密存储在本机）
+cmesh account create --passphrase <口令>             # 生成团队账号密钥（只放最信任的机器上）
+cmesh account device-add --device-passphrase <口令> --account-passphrase <口令>
+cmesh serve-discovery --addr 0.0.0.0:18090 --announce <公网IP>:18090 \
+    --account-pub <账号公钥> --panel
+#   --account-pub：让锚点能验证成员证书与团队凭证（`cmesh account show` 打印）
+#   --panel：开启可视化面板（终端会打印面板地址与令牌）
 
 # ② 另一台机器（容器、受限沙箱都行）
-cmesh init
-cmesh account authorize --pub <对端公钥>     # 由账号持有方签发
-cmesh join <invite> --listen 0.0.0.0:18090
-
-# ③ 面板（可选，但这是产品最直观的一面）
-#    启动时终端会打印面板地址与令牌，浏览器打开后粘贴令牌即可
+cmesh init --passphrase <口令>
+cmesh show-pub                                      # 把本机公钥给账号持有方
+# 账号持有方执行：签发证书后，把证书文件放进锚点的 <state>/certs/ 目录
+cmesh account authorize --pub <对端公钥> --account-passphrase <口令>
+cmesh join <invite-string> --listen 0.0.0.0:18090 --device-passphrase <口令>
+#   邀请串由 `cmesh invite --disc <发现节点>` 打印；它必须放在旗标之后
 ```
 
-`cmesh invite --disc <发现节点>` 打印加入串；`cmesh join <invite>` 加入并常驻，
-持续打印实时成员视图。
+`cmesh join` 加入并常驻，持续打印实时成员视图。
+
+> **状态目录**：以上命令默认用 `~/.cmesh`；想放别处，每个命令都要带 `--state <目录>`
+>（`cmesh account show` 用 `--state`，`cmesh invite` 也用——漏一个就会去读默认目录，
+> 报「account.json not found」）。
 
 ## 3. 网里能做什么
+
+> **设备 ID 放最后**：这些命令的位置参数是设备 ID，写在旗标前面会被当成
+> 未知旗标（`rc=2`）。
 
 | 动作 | 命令 | 说明 |
 |---|---|---|
 | 看全网 | `cmesh serve-discovery --panel` | 面板显示在线数、名册、端点；离线设备**保留在名册里**，不除名 |
-| 测延迟 | `cmesh mesh ping <deviceID>` | 自定义 RTT 测量（非 ICMP），直连 p95 < 5 ms |
-| 发消息 | `cmesh msg <deviceID> --text "…"` | 对端常驻进程实时打印 |
-| 传文件 | `cmesh send-to <deviceID> --file PATH` | 直连流式传输，sha256 校验；目录按 tar 打包，权限逐位保留 |
+| 测延迟 | `cmesh mesh ping <deviceID>` | 自定义 RTT 测量（非 ICMP） |
+| 发消息 | `cmesh msg --text "…" <deviceID>` | 对端常驻进程实时打印 |
+| 传文件 | `cmesh send-to --file PATH <deviceID>` | 直连流式传输，sha256 校验；**仅常规文件** |
+| 传目录 | `cmesh send --file DIR` / `cmesh recv --out DIR` | 走 relay 配对通道：目录按 tar 打包，权限逐位保留（0700 不会被放宽成 0755） |
 | 远程诊断 | `cmesh run <deviceID> @info` | 内置只读动词（`@info/@disk/@mem/@cat/@ls`），退出码透传 |
 
 > 任意命令执行尚未开放（需要权限分层 ACL），当前只有内置只读动词可用。
 
 ## 4. 现在的状态
 
-**已实测通过**（多环境交叉验证）：
+**已实测通过**（多环境交叉验证；每条都可在 `docs/ROUND-LOG.md` 查到记录）：
 
 - 端到端组网：三台设备互相可见、互拨、互传（100 MB 实测 72.3 MB/s）
-- 审批 → 可拨：≤5 秒（长待批场景原为 26 秒，已修复）
-- 成员离线/上线可见性：秒级收敛（原最长 147.7 秒，已修复）
-- 直连 RTT：同机房 p95 0.63–2.13 ms
-- 断线重连、断点续传、目录传输权限语义、限流退避：均已闭环
-- 跨公网真实组网：Mac（NAT 后）↔ 云服务器（锚点）实测通过
+- 成员离线/上线可见性：秒级收敛（实测下线 0.01–1.12s、恢复 0.25–3.09s，含慢消费者形态）
+- 面板：401/200 鉴权正确、页面 14,699 B 零外部引用、上下线跟随秒级
+- 目录传输权限语义：0755/0750/0700/0600/0400 与目录模式逐位保留
+- 429 限流退避、握手错误文案、面板令牌鉴权：均已闭环
 
 **明确未做到**（不藏着）：
 
 - 中继路由（R-3.2/R-3.3）与增量视图：**尚未实现**，S3 全受限场景暂靠人工转发兜底
 - 统一凭证一键入网：**基础包已落地**（凭证格式、委派签发、额度与有效期），发现节点的准入接线与客户端命令**下一步**
+- 组网内的**断点续传**仍待实现（`docs/REQUIREMENTS.md` R-4.2 记录为「待 PR-M5」）；断点续传目前只在 relay 配对通道可用
 - 桌面 / 手机 App：方案已定（[APP-PACKAGING.md](docs/architecture/APP-PACKAGING.md)），**尚无安装包**
 - 图形界面（面板）为轻量只读版；完整可视化按已验收的原型重建
+
+**关于「零入站端口」**：这句话描述的是**客户端**：成员设备只出站连到发现节点，
+不需要为入网开任何端口。锚点本身要开一个端口（发现与成员流走 TCP，直连走同一
+端口号的 UDP），这是它作为入网点的代价——不开放锚点端口的网络只能靠他人中转。
+
 
 ## 5. 文档
 

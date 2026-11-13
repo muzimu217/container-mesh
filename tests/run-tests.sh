@@ -453,6 +453,75 @@ else
 fi
 
 # ---------------------------------------------------------------
+section "11. 端到端: 统一凭证一条命令入网 (M4-a)"
+# The whole point of the team credential: a machine with NO identity and NO
+# approval joins the network with ONE command. Everything the account owner
+# does happens once, before this: create the account, sign the anchor in,
+# issue the credential.
+CPORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')
+CPASS="e2e-test-passphrase"
+COWNER="$TMP/cred-owner"
+CJOINER="$TMP/cred-joiner"
+mkdir -p "$COWNER" "$CJOINER"
+
+"$BIN" init --state "$COWNER" --passphrase "$CPASS" >/dev/null 2>&1
+"$BIN" account create --state "$COWNER" --passphrase "$CPASS" >/dev/null 2>&1
+"$BIN" account device-add --state "$COWNER" --device-passphrase "$CPASS" --account-passphrase "$CPASS" >/dev/null 2>&1
+ACCT_PUB=$("$BIN" account show --state "$COWNER" --passphrase "$CPASS" 2>/dev/null | sed -n 's/^pubkey.hex //p')
+if [ -n "$ACCT_PUB" ]; then
+    "$BIN" serve-discovery --state "$COWNER" --addr "127.0.0.1:$CPORT" --account-pub "$ACCT_PUB" \
+        --device-passphrase "$CPASS" > "$TMP/cred-anchor.log" 2>&1 &
+    ANCHOR_PID=$!
+    if wait_log "$TMP/cred-anchor.log" "discovery node listening" 10; then
+        ok "锚点启动"
+        CRED=$("$BIN" cred create --state "$COWNER" --account-passphrase "$CPASS" \
+            --disc "127.0.0.1:$CPORT" --ttl 1h --max-devices 2 2>/dev/null | tail -1)
+        case "$CRED" in
+            cmesh1.*) ok "凭证签发（单行、以 cmesh1. 开头）" ;;
+            *) bad "凭证签发（单行、以 cmesh1. 开头）" "得到 [${CRED:0:24}]" ;;
+        esac
+        # The joiner has NO identity file: the credential path must create it.
+        JOIN_LOG="$TMP/cred-join.log"
+        "$BIN" join --state "$CJOINER" --device-passphrase "$CPASS" --cred "$CRED" --timeout 15s > "$JOIN_LOG" 2>&1
+        if grep -q "Enrolled with a team credential" "$JOIN_LOG"; then
+            ok "一条命令入网（无人工审批）"
+        else
+            bad "一条命令入网（无人工审批）" "日志未出现已入网"
+        fi
+        if [ -f "$CJOINER/device.json" ]; then
+            ok "入网时自动创建了设备身份"
+        else
+            bad "入网时自动创建了设备身份" "缺少 device.json"
+        fi
+        if wait_log "$TMP/cred-anchor.log" "enrolled device" 10; then
+            ok "锚点记录了委派签发的成员"
+        else
+            bad "锚点记录了委派签发的成员" "锚点日志未出现 enrolled device"
+        fi
+        # The roster must show the device as delegator-signed, and the
+        # delegation must be on record (otherwise other members drop it).
+        if python3 - "$COWNER/members.json" <<'PY' >/dev/null 2>&1
+import json, sys
+m = json.load(open(sys.argv[1]))
+dels = m.get("delegations") or {}
+assert dels, "no delegation recorded"
+assert any((rec.get("cert") or {}).get("signer_pub") for rec in (m.get("members") or {}).values()), "no delegated member"
+PY
+        then
+            ok "名册里有委派记录与委派签名的成员"
+        else
+            bad "名册里有委派记录与委派签名的成员" "名册内容不符合预期"
+        fi
+    else
+        bad "锚点启动" "锚点未在 10s 内就绪"
+    fi
+    kill "$ANCHOR_PID" 2>/dev/null
+    wait "$ANCHOR_PID" 2>/dev/null
+else
+    bad "锚点启动" "取不到账号公钥"
+fi
+
+# ---------------------------------------------------------------
 section "结果"
 printf '通过 %d, 失败 %d\n' "$PASS" "$FAIL"
 if [ "$FAIL" -ne 0 ]; then

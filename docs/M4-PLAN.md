@@ -28,8 +28,12 @@ M4 原有四组：(a) 统一凭证+一键入网、(b) 锚点端口自检+可视�
 | 步 | 落点 | 验收 |
 |---|---|---|
 | A1 凭证格式与签发 | `internal/identity`：凭证 = 账号公钥 + 设备槽位 + 过期时间 + 账号签名 | 单测：过期/撤销/签名不符三类凭证全部被拒 |
-| A2 加入码自举 | `internal/cli`：`cmesh join --cred <串>` 一条命令完成邀请解析、证书签发、加入 | e2e：三进程拓扑一条命令入网，`cmesh status` 可见 |
-| A3 端口自检 | 锚点启动时检查 443/18090 可达性与防火墙建议，输出可执行结论 | 单测：端口占用/被防火墙挡住两种形态给出不同结论 |
+| A1.5 委派签发（已落地） | `internal/credential` + `identity.Delegation` + `DeviceCert.SignerPub`：账号私钥不出门，委派私钥只存在于凭证私密半；额度与有效期随凭证 | 8 项测试 + 变异验证（`internal/credential/credential_test.go`） |
+| A2 加入码自举 | `internal/cli`：`cmesh join --cred <串>` 一条命令完成凭证解码、证书签发、加入 | e2e：三进程拓扑一条命令入网，`cmesh status` 可见 |
+| A2.7 客户端 `--cred`（**已落地**） | `internal/cli/join_cred.go`：解码凭证 → 本机签发自己的证书（委派私钥不出本机）→ 首次 announce 之前先 POST 准入 → 之后走正常 join 流程；无设备身份时自动创建 | 端到端测试：从未被签名过的设备用一串凭证入网、出现在名册、委派记录随名册持久化并在重载后仍在 |
+| A2.5 节点侧准入（**服务端已落地**） | `internal/relay`：`POST /mesh/enroll`（仅在装了准入回调时挂载；共享出口限流预算同 register）→ `internal/cli` 的信任判定：验凭证签名/有效期/额度 → 验委派签名证书 → 记录委派 → 落名册并持久化 | 8 项测试（准入成功/篡改凭证/外部委派者/过期/额度用尽/跨账号/无账号公钥/非委派证书）；**客户端 `join --cred` 仍待做** |
+| A2.6 快照带委派（**已落地**） | `internal/discovery`：`MemberSnapshot` 携带委派列表，客户端遇到 `SignerPub != nil` 的证书时按委派验签，而不是当伪造丢掉；`identity.MemberList` 新增委派段（Add/Remove/DelegationFor/DelegatedCount + 持久化） | 新设备出现在所有成员视图里（含未持凭证的旧成员）；无委派记录的委派证书仍被丢弃 |
+| A3 端口自检（**已落地**） | `internal/cli/portcheck.go`：锚点启动时列出 TCP/UDP 端口占用状态，并给出可执行动作（开哪个端口、开哪个协议、回环绑定的后果） | 5 项测试；真实二进制输出已核验（含「同端口号 TCP+UDP 都要开」这条最容易漏的提示） |
 | A4 凭证撤销传播 | 撤销后既有会话在一个推送往返内销毁（R-1.3） | e2e：撤销→旧会话断、新握手被拒，≤30 s |
 
 **注意**：注册请求与配对 /ws 共用**按出口共享**的限流预算（120/min + 2/s）。
@@ -59,6 +63,8 @@ B1/B2 是 Go 侧工作，与 (a) 共用锚点进程；B3 是前端单文件产�
 | D3 固定下载地址 | GitHub Release 资产 + 稳定 URL（版本无关的 latest 别名） | README 里的地址与实际资产一致（脚本自动核对） |
 | D3.1 latest 别名 | 发布环节把每个平台二进制**同时**以 `cmesh-latest-<os>-<arch>` 名义上传一次——GitHub 的 `releases/latest/download/<name>` 只对名为 `latest` 的资产生效 | `curl -fsSLO .../releases/latest/download/cmesh-latest-linux-amd64` 能取到文件 |
 | D4 README 重写 | 面向中文用户：一条命令入网、面板地址、常见错误码 | 新用户按 README 走通一条命令入网 |
+| D5 完整性校验命令（已落地） | `cmesh verify --file PATH --checksums SHA256SUMS`：纯本地校验，不下载不执行被校验物 | 实测：匹配 rc=0、被篡改 rc=1 且拒绝执行 |
+| D6 发布合并检查单（**必读，方向已按 doubao 第 57 轮更正**） | main 与 develop 已分叉：**develop 领先 39 笔、main 领先 7 笔**，develop 历史线性（从未合入 main），main 仍停在 stage-1（`internal/relay/mesh.go`、`panel.html` 在 main 上都不存在）。`git diff main develop` = 89 files / **+21044 / −498**。**读法**：**+21,044 是 develop 独有的实现**（面板、凭证、mkrelease、R37 系列修复等）——合并时必须**原样保留**，它不是「删除」；**−498 才是 main 独有、develop 没有的内容**，那才是需要逐行看的一侧（构成：README.md 406 + docs/REQUIREMENTS.md 33 + 真实代码约 53 行 + 零星 docs） | 合并 develop→main 时：① +21,044 那侧**逐字保留**；② −498 那侧**逐行过**——README/需求文档以 develop 新版覆盖即可，**代码那约 50 行**要手工确认没有丢掉 main 独有的行为；③ 合并后 `git diff main develop --stat` 应只剩文档措辞差异；④ `git log --merges develop` 仍应为 **0**（保持线性发布历史），**不要整树取一边**（doubao-cloud-vm-01 第 56/57 轮提醒与更正） |
 
 ## 4. 排期与门禁
 
