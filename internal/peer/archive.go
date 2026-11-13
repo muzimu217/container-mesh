@@ -67,8 +67,12 @@ func PackDir(dir string, w io.Writer) (int64, error) {
 			hdr := &tar.Header{
 				Typeflag: tar.TypeDir,
 				Name:     name + "/",
-				Mode:     0o755,
-				ModTime:  fi.ModTime(),
+				// The sender's own bits travel with the entry: a private
+				// directory must arrive private, not widened to 0755 by a
+				// hardcoded default (doubao round 53 — the pack side was
+				// discarding the mode the receiver then had to guess).
+				Mode:    int64(fi.Mode().Perm()),
+				ModTime: fi.ModTime(),
 			}
 			if err := tw.WriteHeader(hdr); err != nil {
 				return err
@@ -134,6 +138,10 @@ func EstimateDirSize(dir string) (int64, error) {
 // components and symlinks are refused, so a malicious sender cannot write
 // outside the destination. Files that already exist are only replaced when
 // overwrite is true.
+//
+// Permissions follow the sender's own bits, tightened only (see
+// archiveFileMode): a private file or directory must not arrive wider than
+// it was sent (oh-no-agent round 53, doubao round 53).
 func UnpackArchive(archive string, dir string, overwrite bool) error {
 	f, err := os.Open(archive)
 	if err != nil {
@@ -141,50 +149,94 @@ func UnpackArchive(archive string, dir string, overwrite bool) error {
 	}
 	defer f.Close()
 
-	tr := tar.NewReader(f)
+	dirModes, err := extractEntries(tar.NewReader(f), dir, overwrite)
+	if err != nil {
+		return err
+	}
+	// Directory modes are applied only after every entry landed: a
+	// directory sent as 0500/0400 would otherwise refuse the writes that
+	// still had to happen inside it. Deepest first, so a parent that ends
+	// up non-traversable cannot block the chmod of its children.
+	for i := len(dirModes) - 1; i >= 0; i-- {
+		if err := os.Chmod(dirModes[i].path, dirModes[i].mode); err != nil {
+			return fmt.Errorf("peer: set mode %s: %w", dirModes[i].path, err)
+		}
+	}
+	return nil
+}
+
+// dirMode is a directory whose final permissions are applied after the
+// extraction pass.
+type dirMode struct {
+	path string
+	mode os.FileMode
+}
+
+// extractEntries writes every archive entry below dir and returns the
+// directories whose final mode was deferred.
+func extractEntries(tr *tar.Reader, dir string, overwrite bool) ([]dirMode, error) {
+	var dirModes []dirMode
 	for {
 		hdr, err := tr.Next()
 		if errors.Is(err, io.EOF) {
-			return nil
+			return dirModes, nil
 		}
 		if err != nil {
-			return fmt.Errorf("peer: read archive: %w", err)
+			return nil, fmt.Errorf("peer: read archive: %w", err)
 		}
 
 		clean, err := safeArchivePath(hdr.Name)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		target := filepath.Join(dir, clean)
 
 		switch hdr.Typeflag {
 		case tar.TypeDir:
 			if err := os.MkdirAll(target, 0o755); err != nil {
-				return fmt.Errorf("peer: mkdir %s: %w", target, err)
+				return nil, fmt.Errorf("peer: mkdir %s: %w", target, err)
 			}
+			// Owner rwx during the extraction (the final mode may forbid
+			// writes), then the exact mode afterwards.
+			create := archiveFileMode(os.FileMode(hdr.Mode)) | 0o700
+			if err := os.Chmod(target, create); err != nil {
+				return nil, fmt.Errorf("peer: set mode %s: %w", target, err)
+			}
+			dirModes = append(dirModes, dirMode{path: target, mode: archiveFileMode(os.FileMode(hdr.Mode))})
 		case tar.TypeReg:
 			if !overwrite {
 				if _, statErr := os.Stat(target); statErr == nil {
-					return fmt.Errorf("peer: refusing to overwrite existing file %s", target)
+					return nil, fmt.Errorf("peer: refusing to overwrite existing file %s", target)
 				}
 			}
 			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-				return err
+				return nil, err
 			}
 			out, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, archiveFileMode(os.FileMode(hdr.Mode)))
 			if err != nil {
-				return fmt.Errorf("peer: create %s: %w", target, err)
+				return nil, fmt.Errorf("peer: create %s: %w", target, err)
+			}
+			// The umask can only REMOVE bits, so a private header mode
+			// (0700/0600) written through archiveFileMode's exec-bit answer
+			// lands WIDER than sent (oh-no-agent round 53: 0700 → 0755).
+			// Re-state the exact permitted mode now that the file exists —
+			// chmod is not umask-filtered. This is a tightening move only:
+			// archiveFileMode already refused setuid/group-write, so the
+			// chmod never adds what OpenFile did not grant.
+			if err := out.Chmod(archiveFileMode(os.FileMode(hdr.Mode))); err != nil {
+				_ = out.Close()
+				return nil, fmt.Errorf("peer: set mode %s: %w", target, err)
 			}
 			if _, err := io.Copy(out, tr); err != nil {
 				_ = out.Close()
-				return fmt.Errorf("peer: write %s: %w", target, err)
+				return nil, fmt.Errorf("peer: write %s: %w", target, err)
 			}
 			if err := out.Close(); err != nil {
-				return err
+				return nil, err
 			}
 		case tar.TypeSymlink, tar.TypeLink:
 			// Refused: a link can point outside the destination.
-			return fmt.Errorf("peer: archive contains a link (%s); refused", hdr.Name)
+			return nil, fmt.Errorf("peer: archive contains a link (%s); refused", hdr.Name)
 		default:
 			// Other types (devices, fifos) are skipped rather than extracted.
 			continue
@@ -234,12 +286,15 @@ func packDirToTemp(dir string) (string, error) {
 // archiveFileMode picks the on-disk mode for an unpacked entry. Regular
 // files keep their executable bit — scripts and binaries sent as a
 // directory must stay runnable (netns-probe round 37, R37-1: the old
-// blanket &0o644 silently stripped +x). Nothing else survives the trip:
-// no setuid/setgid/sticky, no group/world write — the header is attacker
-// controllable and the receiver runs as an ordinary user.
+// blanket &0o644 silently stripped +x).
+//
+// The mode is the sender's permission bits masked down, never remapped:
+// setuid/setgid/sticky never survive, and group/world WRITE never survives
+// (the header is attacker controllable and the receiver runs as an
+// ordinary user) — but private READ/EXEC scope does: a 0700 script must
+// land as 0700, not be widened to 0755 (oh-no-agent round 53; the old
+// exec-bit→0755 remap also made 0600 land as 0644, world-readable).
+// Masking only removes bits, so the result is never wider than sent.
 func archiveFileMode(m os.FileMode) os.FileMode {
-	if m&0o100 != 0 { // owner-exec in the tar header
-		return 0o755
-	}
-	return 0o644
+	return m.Perm() & 0o755 &^ 0o022
 }

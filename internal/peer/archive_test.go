@@ -40,6 +40,26 @@ func TestDirectoryRoundTrip(t *testing.T) {
 	if err := os.WriteFile(script, []byte("#!/bin/sh\necho ok\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	// A PRIVATE-mode file must arrive no wider than sent (oh-no-agent round
+	// 53: the exec bit survived but 0700 landed as 0755 — the process umask
+	// only ever removes bits, so OpenFile cannot tighten a wide answer; the
+	// fix must re-state the exact mode after writing).
+	private := filepath.Join(src, "secret.sh")
+	if err := os.WriteFile(private, []byte("#!/bin/sh\necho shh\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// A private DIRECTORY must not be widened either: the old code created
+	// every directory 0755 regardless of the header (doubao round 53 noted
+	// the same binary-normalisation for files; the directory branch had the
+	// same flaw). The final mode is applied after extraction, so a 0500
+	// directory still receives its contents.
+	privDir := filepath.Join(src, "private")
+	if err := os.Mkdir(privDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(privDir, "inside.txt"), []byte("hidden"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 
 	res, err := a.SendFile(src, nil)
 	if err != nil {
@@ -73,6 +93,34 @@ func TestDirectoryRoundTrip(t *testing.T) {
 	}
 	if gotScript.Mode().Perm() != 0o755 {
 		t.Fatalf("script mode = %v; want exactly 0755 (no setuid/group-write survival)", gotScript.Mode().Perm())
+	}
+
+	gotPrivate, err := os.Stat(filepath.Join(hb.dir, "project", "secret.sh"))
+	if err != nil {
+		t.Fatalf("missing secret.sh: %v", err)
+	}
+	if got := gotPrivate.Mode().Perm(); got != 0o700 {
+		t.Fatalf("private script mode = %v; want exactly 0700 — a transferred file must not arrive wider than sent", got)
+	}
+
+	// A private DIRECTORY must not be widened either: the old code created
+	// every directory 0755 regardless of the header (doubao round 53 noted
+	// the same binary-normalisation for files; the directory branch had the
+	// same flaw). The final mode is applied after extraction, so a 0500
+	// directory still receives its contents.
+	gotPrivDir, err := os.Stat(filepath.Join(hb.dir, "project", "private"))
+	if err != nil {
+		t.Fatalf("missing private dir: %v", err)
+	}
+	if got := gotPrivDir.Mode().Perm(); got != 0o700 {
+		t.Fatalf("private dir mode = %v; want exactly 0700", got)
+	}
+	gotInside, err := os.Stat(filepath.Join(hb.dir, "project", "private", "inside.txt"))
+	if err != nil {
+		t.Fatalf("missing private/inside.txt: %v", err)
+	}
+	if got := gotInside.Mode().Perm(); got != 0o600 {
+		t.Fatalf("private file mode = %v; want exactly 0600", got)
 	}
 
 	// The archive itself must not be left behind.
