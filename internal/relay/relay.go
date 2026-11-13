@@ -281,7 +281,12 @@ func (s *Server) Handler() http.Handler {
 		s.meshSnapshotMux(mux)
 		// The panel: a static shell plus a token-protected data endpoint.
 		if s.panelToken != "" {
-			mux.HandleFunc("/panel", s.handlePanel)
+			// "/panel" is an exact pattern in net/http's mux, so the built
+			// app's own asset requests (/panel/assets/*.js) would fall
+			// through to the catch-all and 404 — the page would load and
+			// render nothing. Register the subtree too.
+			mux.HandleFunc("/panel", s.handleCockpit)
+			mux.HandleFunc("/panel/", s.handleCockpit)
 			mux.HandleFunc("/panel-lite", s.handlePanelLite)
 			mux.HandleFunc("/api/mesh", s.handleAPIMesh)
 		}

@@ -31,9 +31,6 @@ import (
 //go:embed panel.html
 var panelHTML []byte
 
-//go:embed assets/cockpit.html
-var cockpitHTML []byte
-
 // PanelMember is one device's row in the panel payload.
 //
 // The field set is a superset of two consumers:
@@ -131,21 +128,6 @@ func relativeTime(t time.Time) string {
 	default:
 		return fmt.Sprintf("%d 天前", int(d.Hours()/24))
 	}
-}
-
-// handlePanel serves the cockpit: the accepted prototype, wired to the live
-// API and embedded in the binary.
-//
-// The page is the product's face and its design was approved as it stands,
-// so it is shipped as the accepted design rather than re-implemented: the
-// only changes to the prototype are (1) the demo scenarios and their
-// switcher are gone, (2) the data comes from GET /api/mesh with the panel
-// token in the header, and (3) a token gate asks for the token once.
-//
-// The lighter single-file page remains available at /panel-lite for
-// environments that want the smallest possible surface.
-func (s *Server) handlePanel(w http.ResponseWriter, r *http.Request) {
-	s.serveEmbedded(w, r, cockpitHTML)
 }
 
 // handlePanelLite serves the lightweight single-file page.
@@ -276,9 +258,52 @@ func (s *Server) handleAPIMesh(w http.ResponseWriter, r *http.Request) {
 	}
 	data.Summary.Members = len(data.Members)
 
+	// ONE response shape for both views. The cockpit reads zones,
+	// archetypes and per-device diagnostics; the light page reads the flat
+	// fields. Merging them into one document means the two interfaces can
+	// never disagree about the same roster — and the cockpit's member model
+	// is a superset of what the light page needs, so one members[] array
+	// serves both.
+	response := MeshResponse{
+		AccountID:       data.AccountID,
+		Version:         data.Version,
+		GeneratedAt:     data.GeneratedAt,
+		Summary:         data.Summary,
+		NetworkName:     string(members.AccountID),
+		RosterVersion:   data.Version,
+		DiscoveryStatus: "connected",
+		IsCached:        false,
+		LastSyncAt:      data.GeneratedAt,
+	}
+	cockpit := buildCockpitPayload(data.Members, members.AccountID, data.Version, time.Now().UTC(), true, 0)
+	response.Zones = cockpit.Zones
+	response.Members = cockpit.Members
+
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
-	_ = json.NewEncoder(w).Encode(data)
+	_ = json.NewEncoder(w).Encode(response)
+}
+
+// MeshResponse is the roster document both interfaces read.
+//
+// It is deliberately one shape: the light page and the cockpit must never
+// see different numbers for the same network.
+type MeshResponse struct {
+	// Flat fields (the light page).
+	AccountID   identity.DeviceID `json:"account_id"`
+	Version     uint64            `json:"version"`
+	GeneratedAt string            `json:"generated_at"`
+	Summary     PanelSummary      `json:"summary"`
+
+	// Cockpit fields.
+	NetworkName     string          `json:"network_name"`
+	RosterVersion   uint64          `json:"roster_version"`
+	DiscoveryStatus string          `json:"discovery_status"`
+	IsCached        bool            `json:"is_cached"`
+	LastSyncAt      string          `json:"last_sync_at"`
+	RetryInSeconds  *int            `json:"retry_in_seconds"`
+	Zones           []CockpitZone   `json:"zones"`
+	Members         []CockpitMember `json:"members"`
 }
 
 // panelAuthorized reports whether the request carries the panel token.

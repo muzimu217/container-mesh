@@ -73,14 +73,16 @@ func TestPanelDataRequiresToken(t *testing.T) {
 		t.Fatalf("the 401 body leaked roster data: %s", body)
 	}
 
-	// The page is a shell: it may be served, but it holds no state.
-	page, err := http.Get(ts.URL + "/panel")
+	// The LIGHT page is a shell: it may be served, but it holds no state.
+	// (The full cockpit at /panel is a built application and references its
+	// own local asset files; that is checked separately.)
+	page, err := http.Get(ts.URL + "/panel-lite")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer page.Body.Close()
 	if page.StatusCode != http.StatusOK {
-		t.Fatalf("GET /panel returned %d, want 200", page.StatusCode)
+		t.Fatalf("GET /panel-lite returned %d, want 200", page.StatusCode)
 	}
 	html, _ := io.ReadAll(page.Body)
 	text := string(html)
