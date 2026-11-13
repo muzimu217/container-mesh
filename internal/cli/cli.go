@@ -59,6 +59,10 @@ func Run(args []string) error {
 		return runInvite(args[1:])
 	case "join":
 		return runJoin(args[1:])
+	case "cred":
+		return runCred(args[1:])
+	case "verify":
+		return runVerify(args[1:])
 	case "serve-discovery":
 		return runServeDiscovery(args[1:])
 	case "mesh":
@@ -140,6 +144,16 @@ Usage:
         Print a join string for this account. It carries no secret: using it
         only lets a device ASK to join (R-1.5).
 
+  cmesh cred create --disc host:port [--ttl 24h] [--max-devices 10]
+        Print a TEAM credential: one string a member's device can join with,
+        without the owner signing that device by hand. The credential is
+        bound to an expiry and a device quota, and it is a SECRET — hand it
+        over like a password.
+
+  cmesh verify --file PATH [--checksums SHA256SUMS] [--sha256 HEX]
+        Check a downloaded binary against the published digest. Reads local
+        files only: it never downloads, and never runs what it verifies.
+
   cmesh join <invite> [--endpoint host:port ...] [--listen host:port ...] [--once]
         Join the network announced by an invite: announce on a heartbeat and
         wait until an existing member approves this device's certificate.
@@ -209,7 +223,7 @@ func addCommon(fs *flag.FlagSet, cf *commonFlags) {
 	fs.StringVar(&cf.name, "name", hostnameOr("peer"),
 		"name advertised to the peer")
 	fs.DurationVar(&cf.pairWindow, "pair-window", 0,
-		"how long to wait for the partner on one relay before trying the next (0 = wait forever; one-shot commands default to 25s)")
+		"how long to wait for the partner on one relay before trying the next (0 = wait forever with a single relay, 60s with several; one-shot commands use 25s)")
 	// Off by default: measured on loopback the user-space UDP path is ~16x
 	// slower than the relay path (13 MiB/s vs 256 MiB/s on a 1 GiB transfer),
 	// because it pays a syscall + AEAD operation per 1177-byte datagram while

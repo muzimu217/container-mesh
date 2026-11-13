@@ -331,9 +331,18 @@ func runAccountShow(args []string) error {
 	fs := flag.NewFlagSet("account show", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	state := fs.String("state", "", "state directory (default ~/.cmesh)")
-	pass := fs.String("passphrase", "", "passphrase for the account file")
+	// Both spellings are accepted: the account commands use
+	// --account-passphrase everywhere except here, and a flag that differs
+	// between sibling commands is a trap (doubao-cloud-vm-01 round 56 hit
+	// "flag provided but not defined").
+	pass := fs.String("account-passphrase", "", "passphrase for the account file")
+	passAlias := fs.String("passphrase", "", "alias for --account-passphrase")
 	if err := fs.Parse(args); err != nil {
 		return ExitError{Code: 2, Err: err}
+	}
+	accountPass := *pass
+	if accountPass == "" {
+		accountPass = *passAlias
 	}
 	dir, err := stateDir(*state)
 	if err != nil {
@@ -343,7 +352,7 @@ func runAccountShow(args []string) error {
 	if _, err := os.Stat(accPath); err != nil {
 		return ExitError{Code: 1, Err: fmt.Errorf("%s not found; run cmesh account create first", accPath)}
 	}
-	phrase, err := readPassphrase(*pass, "account passphrase")
+	phrase, err := readPassphrase(accountPass, "account passphrase")
 	if err != nil {
 		return ExitError{Code: 1, Err: err}
 	}

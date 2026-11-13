@@ -42,6 +42,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/muzimu217/container-mesh/internal/credential"
 	"github.com/muzimu217/container-mesh/internal/discovery"
 	"github.com/muzimu217/container-mesh/internal/identity"
 	"github.com/muzimu217/container-mesh/internal/mesh"
@@ -220,6 +221,7 @@ func runJoin(args []string) error {
 	fs.Var(&listen, "listen", "bind UDP endpoint(s) for direct links and answer them, repeatable host:port (port 0 = auto; the bound ports are what gets announced)")
 	once := fs.Bool("once", false, "exit as soon as this device is a member")
 	timeout := fs.Duration("timeout", 10*time.Minute, "how long to wait for approval before giving up (0 = forever)")
+	credStr := fs.String("cred", "", "team credential: join with this string instead of an invite (no per-device approval needed)")
 	if err := fs.Parse(args); err != nil {
 		return ExitError{Code: 2, Err: err}
 	}
@@ -227,32 +229,69 @@ func runJoin(args []string) error {
 		return ExitError{Code: 2, Err: errors.New(
 			"--once exits after approval; --listen needs a serving process (drop --once)")}
 	}
-	if fs.NArg() != 1 {
+	if *credStr == "" && fs.NArg() != 1 {
 		return ExitError{Code: 2, Err: errors.New(
-			"usage: cmesh join [flags] <invite-string> (the invite goes last: flag parsing stops at the first positional argument)")}
+			"usage: cmesh join [flags] <invite-string> | cmesh join --cred <credential> (the invite goes last: flag parsing stops at the first positional argument)")}
 	}
-
-	inv, err := discovery.DecodeInvite(fs.Arg(0))
-	if err != nil {
-		return ExitError{Code: 1, Err: fmt.Errorf("bad invite: %w", err)}
+	if *credStr != "" && fs.NArg() != 0 {
+		return ExitError{Code: 2, Err: errors.New(
+			"pass either --cred or an invite string, not both")}
 	}
 
 	dir, err := stateDir(*state)
 	if err != nil {
 		return ExitError{Code: 2, Err: err}
 	}
-	devPath := identity.IdentityPath(dir, identity.DeviceFileName)
-	if _, err := os.Stat(devPath); err != nil {
-		return ExitError{Code: 1, Err: fmt.Errorf(
-			"%s not found; this device needs its own identity first: run cmesh init, then ask the account owner to sign it in (cmesh account device-add)", devPath)}
-	}
 	phrase, err := readPassphrase(*pass, "device passphrase")
 	if err != nil {
 		return ExitError{Code: 1, Err: err}
 	}
-	dev, err := identity.LoadDevice(devPath, phrase)
-	if err != nil {
-		return ExitError{Code: 1, Err: err}
+
+	// Two ways in. With a credential the device enrolls ITSELF: it mints a
+	// certificate under the credential's delegator key and asks the
+	// discovery node to admit it. With an invite it asks, and waits for the
+	// account owner to approve.
+	var inv discovery.Invite
+	var dev *identity.Device
+	if *credStr != "" {
+		cred, err := credential.Decode(*credStr)
+		if err != nil {
+			return ExitError{Code: 1, Err: fmt.Errorf("bad credential: %w", err)}
+		}
+		// Self-check for a friendly error; the node's check is the real one.
+		if err := cred.Verify(cred.Public.AccountPub, time.Now().UTC()); err != nil {
+			return ExitError{Code: 1, Err: fmt.Errorf("credential rejected: %w", err)}
+		}
+		dev, err = ensureDeviceIdentity(dir, phrase)
+		if err != nil {
+			return ExitError{Code: 1, Err: err}
+		}
+		if dev.ID() == cred.Public.AccountID {
+			return ExitError{Code: 1, Err: errors.New(
+				"this device's ID equals the account ID; a credential introduces a device, it does not make one an account")}
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), enrollTimeout)
+		err = enrollWithCredential(ctx, cred, dev)
+		cancel()
+		if err != nil {
+			return ExitError{Code: 1, Err: err}
+		}
+		fmt.Fprintf(os.Stderr, "enrolled as device %s\n", dev.ID())
+		inv = inviteFromCredential(cred)
+	} else {
+		inv, err = discovery.DecodeInvite(fs.Arg(0))
+		if err != nil {
+			return ExitError{Code: 1, Err: fmt.Errorf("bad invite: %w", err)}
+		}
+		devPath := identity.IdentityPath(dir, identity.DeviceFileName)
+		if _, err := os.Stat(devPath); err != nil {
+			return ExitError{Code: 1, Err: fmt.Errorf(
+				"%s not found; this device needs its own identity first: run cmesh init, then ask the account owner to sign it in (cmesh account device-add)", devPath)}
+		}
+		dev, err = identity.LoadDevice(devPath, phrase)
+		if err != nil {
+			return ExitError{Code: 1, Err: err}
+		}
 	}
 
 	if dev.ID() == inv.AccountID {
@@ -344,8 +383,18 @@ func runJoin(args []string) error {
 
 	// Persisted only after every check passed: a failed join must not leave
 	// a config file that looks approved (review F9).
+	//
+	// The invite field carries whichever string got us in: an invite for the
+	// approval path, the credential for the self-enrollment path. Both are
+	// enough to re-derive the account and the discovery addresses, which is
+	// what later commands need.
+	entry := fs.Arg(0)
+	viaCredential := *credStr != ""
+	if viaCredential {
+		entry = *credStr
+	}
 	cfgPath, err := saveDiscoveryConfig(dir, discoveryConfig{
-		Invite:    fs.Arg(0),
+		Invite:    entry,
 		Endpoints: []string(eps),
 		SavedAt:   time.Now(),
 	})
@@ -356,11 +405,18 @@ func runJoin(args []string) error {
 	fmt.Fprintf(os.Stderr, "joining account %s via %s\n", inv.AccountID, strings.Join(inv.DiscoveryAddrs, ", "))
 	fmt.Fprintf(os.Stderr, "  device   %s\n", dev.ID())
 	fmt.Fprintf(os.Stderr, "  config   %s\n", cfgPath)
-	fmt.Fprintf(os.Stderr, "\nWaiting for membership approval (R-1.5). To approve this device:\n")
-	fmt.Fprintf(os.Stderr, "  1. copy the line below to the account owner\n")
-	fmt.Fprintf(os.Stderr, "  2. owner runs: cmesh account authorize --pub <that value>\n")
-	fmt.Fprintf(os.Stderr, "  3. the cert file goes into the discovery host's certs directory\n\n")
-	fmt.Fprintf(os.Stderr, "PUBKEY: %s\n\n", base64.StdEncoding.EncodeToString(dev.PublicKey()))
+	if viaCredential {
+		// The device enrolled itself: there is no approval to wait for, and
+		// the instructions below would send the operator on an errand that
+		// is already done.
+		fmt.Fprintf(os.Stderr, "\nEnrolled with a team credential — no approval needed.\n\n")
+	} else {
+		fmt.Fprintf(os.Stderr, "\nWaiting for membership approval (R-1.5). To approve this device:\n")
+		fmt.Fprintf(os.Stderr, "  1. copy the line below to the account owner\n")
+		fmt.Fprintf(os.Stderr, "  2. owner runs: cmesh account authorize --pub <that value>\n")
+		fmt.Fprintf(os.Stderr, "  3. the cert file goes into the discovery host's certs directory\n\n")
+		fmt.Fprintf(os.Stderr, "PUBKEY: %s\n\n", base64.StdEncoding.EncodeToString(dev.PublicKey()))
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
@@ -589,6 +645,10 @@ func runServeDiscovery(args []string) error {
 	if accountPubKey == nil {
 		fmt.Fprintf(os.Stderr, "  NOTE: no --account-pub given; adopted certificates are checked for expiry but NOT signature-verified (pass the account key to close this)\n")
 	}
+	// Credential enrollment: the node admits devices that present a team
+	// credential. It needs the account key to verify one, so without
+	// --account-pub the endpoint is not installed at all.
+	installEnrollHandler(srv, *membersPath, members, accountPubKey)
 	go watchApprovals(context.Background(), *membersPath, certsDir, members, srv, accountPubKey)
 
 	// D-6: announce ourselves so the node is visible (and dialable) in the
@@ -597,6 +657,9 @@ func runServeDiscovery(args []string) error {
 	// alone cannot be announced — say so instead of staying silently
 	// invisible.
 	selfEPS := []string{}
+	// udpBound records where the direct-link listener actually bound, so
+	// the port self-check can report the real UDP port.
+	udpBound := []string{}
 	if *announce != "" {
 		selfEPS = []string{*announce}
 	} else if host, port, err := net.SplitHostPort(*addr); err == nil && host != "" {
@@ -644,9 +707,15 @@ func runServeDiscovery(args []string) error {
 			selfEPS = nil
 		} else {
 			defer ml.Close()
+			udpBound = ml.BoundAddrs()
 			fmt.Fprintf(os.Stderr, "  mesh direct-link listener: UDP %s\n", strings.Join(ml.BoundAddrs(), ", "))
 		}
 	}
+
+	// Port self-check: the operator's question is always "which port do I
+	// open, and why can nobody reach me?". Answer it here, with the port
+	// numbers and the action, instead of leaving it to guesswork.
+	printPortCheck(checkAnchorPorts(*addr, true, udpBound))
 	if len(selfEPS) > 0 {
 		_, port, _ := net.SplitHostPort(*addr)
 		// The self-announce must speak the same scheme the node serves:
