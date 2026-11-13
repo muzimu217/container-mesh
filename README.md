@@ -21,11 +21,18 @@
 
 ## 1. 安装
 
+发布页提供各平台静态二进制与 SHA256SUMS 校验清单。安装三步（下载 → 校验 → 落盘）：
+
 ```bash
-# 从发布页下载并安装（自动识别系统与架构，校验 sha256 后落盘）
-sh install.sh
-# 或者直接取对应平台的静态二进制：
-# https://github.com/muzimu217/container-mesh/releases/latest/download/cmesh-latest-linux-amd64
+# ① 下载（按你的系统与架构选一个；linux-arm64 / darwin-arm64 / windows-amd64 同理）
+curl -fsSLO https://github.com/muzimu217/container-mesh/releases/latest/download/cmesh-latest-linux-amd64
+curl -fsSLO https://github.com/muzimu217/container-mesh/releases/latest/download/SHA256SUMS
+
+# ② 校验完整性——不匹配就不要装
+sha256sum -c SHA256SUMS --ignore-missing
+
+# ③ 安装到 PATH 上的目录
+install -m 0755 cmesh-latest-linux-amd64 ~/.local/bin/cmesh
 ```
 
 也可以自行构建（无 CGO、单静态二进制）：
@@ -34,7 +41,9 @@ sh install.sh
 go build -o cmesh ./cmd/cm
 ```
 
-发布件覆盖 linux/amd64、linux/arm64、darwin/amd64、darwin/arm64、windows/amd64。
+发布件覆盖 linux/amd64、linux/arm64、darwin/amd64、darwin/arm64、windows/amd64；
+组装命令见 `tools/mkrelease`（`go run ./tools/mkrelease --in dist/bin --out dist/release --version v1.0.0`），
+发布时每个平台另存一份 `cmesh-latest-<os>-<arch>` 别名，上面的默认地址即可直取。
 
 ## 2. 三步组网
 

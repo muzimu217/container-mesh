@@ -57,6 +57,7 @@ B1/B2 是 Go 侧工作，与 (a) 共用锚点进程；B3 是前端单文件产�
 | D1 交叉编译矩阵 | `packaging/`：linux amd64/arm64、darwin amd64/arm64、windows amd64 | `packaging/build-demo.sh` 产出 5 个平台并校验 sha256 |
 | D2 安装脚本 | `curl … \| sh` 形态，含架构探测、目录创建、systemd 单元 | 干净容器内一条命令装成；卸载有对应路径 |
 | D3 固定下载地址 | GitHub Release 资产 + 稳定 URL（版本无关的 latest 别名） | README 里的地址与实际资产一致（脚本自动核对） |
+| D3.1 latest 别名 | 发布环节把每个平台二进制**同时**以 `cmesh-latest-<os>-<arch>` 名义上传一次——GitHub 的 `releases/latest/download/<name>` 只对名为 `latest` 的资产生效 | `curl -fsSLO .../releases/latest/download/cmesh-latest-linux-amd64` 能取到文件 |
 | D4 README 重写 | 面向中文用户：一条命令入网、面板地址、常见错误码 | 新用户按 README 走通一条命令入网 |
 
 ## 4. 排期与门禁
