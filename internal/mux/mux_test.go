@@ -493,8 +493,14 @@ func TestConcurrentOpenAndServe(t *testing.T) {
 			if _, err := io.ReadFull(st, buf); err != nil {
 				return
 			}
-			_, _ = st.Write(buf)
+			// Count BEFORE the echo leaves. The client's ReadFull returns as
+			// soon as these bytes land, so incrementing afterwards races
+			// wg.Wait(): the test could observe 127 of 128 handlers purely
+			// because one goroutine had not reached its Add yet (reproduced
+			// ~2% at -count=200). Not a product defect — but a test that
+			// fails on scheduling is a test people learn to ignore.
 			served.Add(1)
+			_, _ = st.Write(buf)
 		})
 	}()
 
