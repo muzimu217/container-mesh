@@ -157,10 +157,20 @@ type Session struct {
 	fwdResult chan []wire.ForwardListenStatus
 }
 
-// ErrHandshake is returned when the peers cannot agree on a key, which almost
-// always means the codes differ. It is permanent: retrying with the same code
-// and the same peer cannot succeed.
-var ErrHandshake = errors.New("peer: handshake failed (check that both sides use the same code)")
+// ErrHandshake is returned when the peers connected but could not complete
+// the key exchange.
+//
+// It does NOT mean the codes differ. The relay derives the room from the
+// code, so two sides with different codes never meet each other at all:
+// they wait out the pairing window and the failure is reported as "no
+// partner appeared". Blaming the code here sent operators looking in the
+// wrong place. A handshake failure means the exchange itself broke — the
+// connection dropped mid-handshake, a middlebox interfered, or the two
+// sides run incompatible protocol versions.
+//
+// It is treated as permanent: retrying the same exchange with the same
+// peer will not make it succeed.
+var ErrHandshake = errors.New("peer: handshake failed (the key exchange broke — a wrong code shows up as \"no partner\", not this)")
 
 // ErrProtocol covers permanent protocol disagreements (version, role clash).
 // Unlike transport errors these are not worth reconnecting over.
@@ -905,6 +915,11 @@ type InboundTransfer struct {
 	frames  chan *wire.Frame
 }
 
+// OfferInfo returns the offer this transfer carries. It exists so callers
+// that only need the offer (not the transfer machinery) can depend on a
+// narrow interface.
+func (tr *InboundTransfer) OfferInfo() wire.FileOffer { return tr.Offer }
+
 // Accept receives the offered file into dir, verifying the hash before the
 // file is renamed into place.
 //
@@ -930,6 +945,41 @@ func (tr *InboundTransfer) next() (*wire.Frame, error) {
 		return f, nil
 	case <-tr.session.done:
 		return nil, tr.session.Err()
+	}
+}
+
+// receiverStoreError phrases a local storage failure for the peer. The
+// cause has to survive the trip: "the receiver could not store your file"
+// without the reason is what made these failures undebuggable.
+func receiverStoreError(err error) string {
+	return fmt.Sprintf("receiver cannot store the file: %v", err)
+}
+
+// reportResult sends a failed verdict to the peer.
+func (tr *InboundTransfer) reportResult(msg string) {
+	res := wire.FileResult{OK: false, Message: msg}
+	rb, _ := json.Marshal(res)
+	if sendErr := tr.session.SendFrame(&wire.Frame{Type: wire.FrameFileResult, Payload: rb}); sendErr != nil {
+		tr.session.log.Warn("could not report the local failure to the sender", "err", sendErr)
+	}
+}
+
+// drain consumes the frames the peer keeps sending after an aborted
+// transfer, until it stops (file-done) or the session ends.
+//
+// It is what keeps the session alive long enough for the verdict to be
+// read: a chunk frame that arrives with no active transfer would
+// otherwise kill the read pump, and the peer would learn nothing but
+// "connection closed".
+func (tr *InboundTransfer) drain() {
+	for {
+		f, err := tr.next()
+		if err != nil {
+			return
+		}
+		if f.Type == wire.FrameFileDone {
+			return
+		}
 	}
 }
 
@@ -1003,14 +1053,12 @@ func (tr *InboundTransfer) accept(dir string, progress func(got, total int64)) (
 	}
 
 	acc, _ := json.Marshal(wire.FileAccept{ResumeFrom: have})
-	if err := s.SendFrame(&wire.Frame{Type: wire.FrameFileAccept, Payload: acc}); err != nil {
-		return nil, err
-	}
-
-	// "Already complete" means the bytes are in the FINAL file. A zero-byte
-	// .part also has have == offer.Size == 0, but it still has to go through
-	// the normal publish path (sync/close/hash/rename) to become the final
-	// file.
+	// Open the destination BEFORE the accept frame goes out. A local
+	// failure here — read-only volume, a path that is not a directory, no
+	// space — can then be reported as a plain REJECT while the sender is
+	// still waiting for accept/reject and has not streamed a byte. After
+	// the accept, the sender is already pushing chunks and only a RESULT
+	// frame is left to answer it with.
 	alreadyFinal := havePath == finalPath && have == offer.Size
 
 	var out *os.File
@@ -1018,24 +1066,34 @@ func (tr *InboundTransfer) accept(dir string, progress func(got, total int64)) (
 		// Already complete: open read-only and just verify.
 		fh, openErr := os.Open(finalPath)
 		if openErr != nil {
-			return nil, openErr
+			msg := receiverStoreError(openErr)
+			tr.Reject(msg)
+			return &wire.FileResult{OK: false, Message: msg}, nil
 		}
 		out = fh
 		defer out.Close()
 	} else {
 		fh, openErr := os.OpenFile(partPath, os.O_CREATE|os.O_WRONLY, 0o644)
 		if openErr != nil {
-			return nil, fmt.Errorf("peer: open %s: %w", partPath, openErr)
+			msg := receiverStoreError(openErr)
+			tr.Reject(msg)
+			return &wire.FileResult{OK: false, Message: msg}, nil
 		}
 		out = fh
 		defer out.Close()
 		if _, seekErr := out.Seek(have, io.SeekStart); seekErr != nil {
-			return nil, seekErr
+			msg := receiverStoreError(seekErr)
+			tr.Reject(msg)
+			return &wire.FileResult{OK: false, Message: msg}, nil
 		}
 		// Record where the bytes will live. Without this a zero-byte transfer
 		// (where the loop below never runs) would look for its data in the
 		// final path, which does not exist yet.
 		havePath = partPath
+	}
+
+	if err := s.SendFrame(&wire.Frame{Type: wire.FrameFileAccept, Payload: acc}); err != nil {
+		return nil, err
 	}
 
 	written := have
@@ -1061,7 +1119,18 @@ func (tr *InboundTransfer) accept(dir string, progress func(got, total int64)) (
 				return nil, fmt.Errorf("peer: chunk overruns declared size")
 			}
 			if _, err := out.Write(data); err != nil {
-				return nil, fmt.Errorf("peer: write: %w", err)
+				// A local storage failure in the MIDDLE of a transfer: the
+				// volume filled up, the mount went read-only. The sender is
+				// streaming chunks and waiting for exactly one verdict, so
+				// give it the CAUSE instead of letting the transfer die in
+				// silence — and keep draining the sender's remaining chunks
+				// so the session lives long enough for that verdict to be
+				// read. Without the drain the peer would see a bare
+				// transport error instead of the reason.
+				msg := receiverStoreError(err)
+				tr.reportResult(msg)
+				tr.drain()
+				return &wire.FileResult{OK: false, Message: msg}, nil
 			}
 			written += int64(len(data))
 			if progress != nil {

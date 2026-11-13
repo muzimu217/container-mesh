@@ -587,22 +587,42 @@ func (n *Node) handler() peer.Handler {
 			// Auto-accept every offer: the SPAKE2 handshake already proves
 			// the sender knows the code. The transfer runs on its own
 			// goroutine so the read pump keeps serving other traffic.
-			go func() {
-				res, err := tr.Accept(n.cfg.OutDir, progressPrinter(os.Stderr))
-				if err != nil {
-					n.status("file-error", err.Error())
-					return
-				}
-				if h := n.cfg.OnFile; h != nil {
-					h(res, tr.Offer.Name)
-				} else if res.OK {
-					fmt.Fprintf(os.Stderr, "received file: verified (%s)\n", res.Message)
-				} else {
-					fmt.Fprintf(os.Stderr, "file receive failed: %s\n", res.Message)
-				}
-			}()
+			go n.acceptInbound(tr)
 			return true
 		},
+	}
+}
+
+// inboundFile is the part of peer.InboundTransfer this node uses. The
+// narrow interface exists so the receive path can be exercised without a
+// live session.
+type inboundFile interface {
+	Accept(dir string, progress func(sent, total int64)) (*wire.FileResult, error)
+	OfferInfo() wire.FileOffer
+}
+
+// acceptInbound runs one inbound transfer and reports its outcome.
+//
+// A local failure (no space, a read-only volume, a path that is not a
+// directory) must reach the caller through the SAME callback as a verdict.
+// Otherwise a one-shot receiver waits for a file that will never arrive
+// and hangs until the session times out — the operator sees a hang, not an
+// error.
+func (n *Node) acceptInbound(tr inboundFile) {
+	res, err := tr.Accept(n.cfg.OutDir, progressPrinter(os.Stderr))
+	if err != nil {
+		n.status("file-error", err.Error())
+		if h := n.cfg.OnFile; h != nil {
+			h(&wire.FileResult{OK: false, Message: err.Error()}, tr.OfferInfo().Name)
+		}
+		return
+	}
+	if h := n.cfg.OnFile; h != nil {
+		h(res, tr.OfferInfo().Name)
+	} else if res.OK {
+		fmt.Fprintf(os.Stderr, "received file: verified (%s)\n", res.Message)
+	} else {
+		fmt.Fprintf(os.Stderr, "file receive failed: %s\n", res.Message)
 	}
 }
 
