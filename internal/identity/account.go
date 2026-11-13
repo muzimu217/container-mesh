@@ -88,6 +88,15 @@ func (a *Account) ID() DeviceID { return a.id }
 // needs in order to verify device certificates.
 func (a *Account) PublicKey() ed25519.PublicKey { return a.pub }
 
+// SignBytes signs an arbitrary body with the account key.
+//
+// The account key is the network's root of trust, so this is deliberately a
+// narrow escape hatch: it exists for formats whose signed body is not a
+// certificate or a delegation (the team join credential's public half).
+// Callers must define what the bytes mean — this method only says "the
+// account stands behind these bytes".
+func (a *Account) SignBytes(msg []byte) []byte { return ed25519.Sign(a.priv, msg) }
+
 // DeviceCert binds a device to an account. Any member can verify it with the
 // account public key alone; no server is involved.
 type DeviceCert struct {
@@ -96,6 +105,13 @@ type DeviceCert struct {
 	AccountID DeviceID          `json:"account_id"`
 	IssuedAt  time.Time         `json:"issued_at"`
 	ExpiresAt time.Time         `json:"expires_at"`
+	// SignerPub names the key that signed this certificate when it was NOT
+	// the account key — that is, a certificate issued under a Delegation.
+	// It is empty for ordinary account-signed certificates, and omitempty
+	// keeps those certificates byte-identical to what earlier versions
+	// signed (the canonical form is the struct minus Sig, so an absent
+	// field must stay absent from the signed bytes).
+	SignerPub ed25519.PublicKey `json:"signer_pub,omitempty"`
 	// Sig is the account's signature over the canonical form of the fields
 	// above. Canonical form = the JSON of the struct with Sig omitted, which
 	// is deterministic because every field has a fixed JSON shape.
@@ -162,12 +178,87 @@ var (
 	// ErrCertMismatch means the device ID does not match the device public
 	// key — the ID is not derived from the key in the cert.
 	ErrCertMismatch = errors.New("identity: device ID does not match device key")
+	// ErrCertDelegated means the certificate was signed by a delegator key
+	// under a Delegation, not by the account key. Such a cert is valid, but
+	// only against the delegation that authorised it — verifying it with
+	// the account key must not silently succeed.
+	ErrCertDelegated = errors.New("identity: certificate was signed by a delegator, not the account")
 )
+
+// SignDelegatedCert binds a device to an account using a delegator key
+// authorised by a Delegation.
+//
+// The delegator's private key is held by whoever received the team
+// credential; the account key stays with the account owner. The returned
+// certificate names the delegator in SignerPub, so any verifier can tell
+// WHICH authority admitted the device — and can check that the delegation
+// existed and was in force at the time.
+func SignDelegatedCert(delegatorPub ed25519.PublicKey, delegatorPriv ed25519.PrivateKey, accountID DeviceID, devPub ed25519.PublicKey, ttl time.Duration, now time.Time) (*DeviceCert, error) {
+	if len(delegatorPub) != ed25519.PublicKeySize {
+		return nil, fmt.Errorf("identity: delegator public key must be %d bytes, got %d", ed25519.PublicKeySize, len(delegatorPub))
+	}
+	if len(delegatorPriv) != ed25519.PrivateKeySize {
+		return nil, fmt.Errorf("identity: delegator private key must be %d bytes, got %d", ed25519.PrivateKeySize, len(delegatorPriv))
+	}
+	if !ed25519.PublicKey(delegatorPriv.Public().(ed25519.PublicKey)).Equal(delegatorPub) {
+		return nil, errors.New("identity: delegator private key does not match its public key")
+	}
+	if len(devPub) != ed25519.PublicKeySize {
+		return nil, fmt.Errorf("identity: public key must be %d bytes, got %d", ed25519.PublicKeySize, len(devPub))
+	}
+	if ttl <= 0 {
+		return nil, fmt.Errorf("identity: cert ttl must be positive, got %v", ttl)
+	}
+	now = now.UTC()
+	c := &DeviceCert{
+		DeviceID:  IDFromKey(devPub),
+		DevicePub: devPub,
+		AccountID: accountID,
+		IssuedAt:  now,
+		ExpiresAt: now.Add(ttl),
+		SignerPub: delegatorPub,
+	}
+	b, err := c.certSignable()
+	if err != nil {
+		return nil, err
+	}
+	c.Sig = ed25519.Sign(delegatorPriv, b)
+	return c, nil
+}
+
+// VerifySigner checks a certificate against the key that signed it — the
+// account key for ordinary certificates, a delegator key for certificates
+// issued under a delegation. It enforces the ID/key binding, the signature
+// and the expiry.
+func (c *DeviceCert) VerifySigner(pub ed25519.PublicKey) error {
+	if IDFromKey(c.DevicePub) != c.DeviceID {
+		return ErrCertMismatch
+	}
+	b, err := c.certSignable()
+	if err != nil {
+		return err
+	}
+	if !ed25519.Verify(pub, b, c.Sig) {
+		return ErrCertBadSignature
+	}
+	if time.Now().UTC().After(c.ExpiresAt) {
+		return ErrCertExpired
+	}
+	return nil
+}
 
 // Verify checks a certificate against an account public key. It enforces the
 // ID/key binding as well as the signature: a cert whose DeviceID is not
 // derived from its DevicePub is broken no matter who signed it.
+//
+// A certificate issued under a delegation is NOT verifiable this way — it
+// was signed by the delegator, and the account never signed it. Such certs
+// are checked with VerifySigner against the delegator key, after the
+// delegation that authorised it has been verified.
 func (c *DeviceCert) Verify(accountPub ed25519.PublicKey) error {
+	if len(c.SignerPub) > 0 {
+		return ErrCertDelegated
+	}
 	if IDFromKey(c.DevicePub) != c.DeviceID {
 		return ErrCertMismatch
 	}
