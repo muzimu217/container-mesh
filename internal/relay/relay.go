@@ -282,6 +282,7 @@ func (s *Server) Handler() http.Handler {
 		// The panel: a static shell plus a token-protected data endpoint.
 		if s.panelToken != "" {
 			mux.HandleFunc("/panel", s.handlePanel)
+			mux.HandleFunc("/panel-lite", s.handlePanelLite)
 			mux.HandleFunc("/api/mesh", s.handleAPIMesh)
 		}
 	}

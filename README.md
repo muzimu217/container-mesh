@@ -96,7 +96,7 @@ cmesh join <invite-string> --listen 0.0.0.0:18090 --device-passphrase <口令>
 
 | 动作 | 命令 | 说明 |
 |---|---|---|
-| 看全网 | `cmesh serve-discovery --panel` | 面板显示在线数、名册、端点；离线设备**保留在名册里**，不除名 |
+| 看全网 | `cmesh serve-discovery --panel` | 驾驶舱面板（3D 名册视图、成员名册、四维状态核验）；离线设备**保留在名册里**，不除名。极简版在 `/panel-lite` |
 | 测延迟 | `cmesh mesh ping <deviceID>` | 自定义 RTT 测量（非 ICMP） |
 | 发消息 | `cmesh msg --text "…" <deviceID>` | 对端常驻进程实时打印 |
 | 传文件 | `cmesh send-to --file PATH <deviceID>` | 直连流式传输，sha256 校验；**仅常规文件** |

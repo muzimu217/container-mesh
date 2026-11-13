@@ -1,0 +1,3180 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>cmesh · container-mesh 私有网络技术驾驶舱 (高保真交互原型)</title>
+  <style>
+    :root {
+      --bg-canvas: #0A0E14;
+      --bg-surface-1: #111722;
+      --bg-surface-2: #17202E;
+      --bg-surface-3: #1E293B;
+      --bg-hud-glass: rgba(17, 23, 34, 0.88);
+      --border-subtle: #1E293B;
+      --border-medium: #334155;
+      --border-focus: #38BDF8;
+      --text-primary: #F1F5F9;
+      --text-secondary: #94A3B8;
+      --text-muted: #64748B;
+      --accent-mesh: #38BDF8;
+      --accent-mesh-dim: rgba(56, 189, 248, 0.14);
+      --accent-relay: #2DD4BF;
+      --accent-relay-dim: rgba(45, 212, 191, 0.14);
+      --status-online: #10B981;
+      --status-online-dim: rgba(16, 185, 129, 0.14);
+      --status-offline: #64748B;
+      --status-offline-dim: rgba(100, 116, 139, 0.16);
+      --status-warning: #F59E0B;
+      --status-warning-dim: rgba(245, 158, 11, 0.15);
+      --status-danger: #EF4444;
+      --status-danger-dim: rgba(239, 68, 68, 0.15);
+      --font-sans: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC", "Segoe UI", sans-serif;
+      --font-mono: ui-monospace, "SFMono-Regular", "SF Mono", "JetBrains Mono", "Cascadia Mono", "Consolas", "Liberation Mono", monospace;
+      --radius-lg: 6px;
+      --radius-md: 4px;
+      --radius-sm: 2px;
+      --shadow-hud: 0 10px 28px rgba(0, 0, 0, 0.5), inset 0 1px 0 rgba(255, 255, 255, 0.05);
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    html, body {
+      width: 100%;
+      height: 100%;
+      background-color: var(--bg-canvas);
+      color: var(--text-primary);
+      font-family: var(--font-sans);
+      font-size: 13px;
+      line-height: 1.5;
+      overflow: hidden;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    .mono {
+      font-family: var(--font-mono);
+      font-variant-numeric: tabular-nums slashed-zero;
+    }
+
+    /* App Layout Shell */
+    .app-shell {
+      display: flex;
+      flex-direction: column;
+      width: 100vw;
+      height: 100vh;
+      position: relative;
+      overflow: hidden;
+    }
+
+    /* 1. Top Telemetry Bar */
+    .top-bar {
+      height: 52px;
+      min-height: 52px;
+      background: var(--bg-surface-1);
+      border-bottom: 1px solid var(--border-subtle);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 16px;
+      z-index: 40;
+      gap: 12px;
+    }
+
+    .brand-cluster {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-shrink: 0;
+    }
+
+    .brand-logo {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-weight: 700;
+      font-size: 15px;
+      letter-spacing: 0.02em;
+      color: var(--text-primary);
+    }
+
+    .brand-cube {
+      width: 22px;
+      height: 22px;
+      border: 1.5px solid var(--accent-mesh);
+      background: var(--accent-mesh-dim);
+      border-radius: var(--radius-sm);
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--accent-mesh);
+      font-family: var(--font-mono);
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .divider-v {
+      width: 1px;
+      height: 20px;
+      background: var(--border-subtle);
+    }
+
+    .network-switcher-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      background: var(--bg-surface-2);
+      border: 1px solid var(--border-subtle);
+      color: var(--text-primary);
+      padding: 4px 10px;
+      border-radius: var(--radius-md);
+      font-size: 12px;
+      cursor: pointer;
+      transition: border-color 0.15s, background 0.15s;
+    }
+
+    .network-switcher-btn:hover {
+      border-color: var(--border-medium);
+      background: var(--bg-surface-3);
+    }
+
+    .telemetry-cluster {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .telemetry-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 9px;
+      border-radius: var(--radius-sm);
+      background: var(--bg-surface-2);
+      border: 1px solid var(--border-subtle);
+      font-size: 12px;
+      color: var(--text-secondary);
+    }
+
+    .telemetry-pill.clickable {
+      cursor: pointer;
+      transition: border-color 0.15s;
+    }
+
+    .telemetry-pill.clickable:hover {
+      border-color: var(--accent-mesh);
+      color: var(--text-primary);
+    }
+
+    .sync-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      border-radius: var(--radius-sm);
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      border: 1px solid transparent;
+      transition: transform 0.15s, opacity 0.15s;
+    }
+
+    .sync-badge.live {
+      background: var(--status-online-dim);
+      color: #34D399;
+      border-color: rgba(16, 185, 129, 0.35);
+    }
+
+    .sync-badge.cached {
+      background: var(--status-warning-dim);
+      color: #FBBF24;
+      border-color: rgba(245, 158, 11, 0.45);
+    }
+
+    .sync-badge.error {
+      background: var(--status-danger-dim);
+      color: #F87171;
+      border-color: rgba(239, 68, 68, 0.45);
+    }
+
+    /* Prototype Scenario Switcher Bar */
+    .scenario-bar {
+      background: #0D131D;
+      border-bottom: 1px solid var(--border-subtle);
+      padding: 6px 16px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      z-index: 38;
+      flex-wrap: wrap;
+    }
+
+    .scenario-group {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+
+    .scenario-label {
+      font-size: 11px;
+      font-family: var(--font-mono);
+      color: var(--accent-mesh);
+      background: var(--accent-mesh-dim);
+      border: 1px solid rgba(56, 189, 248, 0.3);
+      padding: 2px 7px;
+      border-radius: var(--radius-sm);
+      letter-spacing: 0.03em;
+    }
+
+    .scenario-btn {
+      background: var(--bg-surface-1);
+      border: 1px solid var(--border-subtle);
+      color: var(--text-secondary);
+      padding: 4px 10px;
+      border-radius: var(--radius-sm);
+      font-size: 12px;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      transition: all 0.15s;
+    }
+
+    .scenario-btn:hover {
+      color: var(--text-primary);
+      border-color: var(--border-medium);
+    }
+
+    .scenario-btn.active {
+      background: rgba(56, 189, 248, 0.16);
+      color: var(--text-primary);
+      border-color: var(--accent-mesh);
+      font-weight: 600;
+    }
+
+    /* 2. Cache & Stale Warning Banner */
+    .cache-banner {
+      background: rgba(245, 158, 11, 0.14);
+      border-bottom: 1px solid rgba(245, 158, 11, 0.45);
+      color: #FDE68A;
+      padding: 7px 16px;
+      display: none;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      font-size: 12px;
+      z-index: 35;
+    }
+
+    .cache-banner.visible {
+      display: flex;
+    }
+
+    .cache-banner-left {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .cache-action-btn {
+      background: rgba(245, 158, 11, 0.25);
+      border: 1px solid #F59E0B;
+      color: #FEF3C7;
+      padding: 3px 10px;
+      border-radius: var(--radius-sm);
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+
+    .cache-action-btn:hover {
+      background: rgba(245, 158, 11, 0.4);
+    }
+
+    /* Main Workspace Container */
+    .cockpit-main {
+      flex: 1;
+      position: relative;
+      display: flex;
+      overflow: hidden;
+    }
+
+    /* 3D Viewport Stage */
+    .viewport-stage {
+      flex: 1;
+      position: relative;
+      background: radial-gradient(circle at 46% 52%, #131C2B 0%, #0A0E14 72%);
+      overflow: hidden;
+      user-select: none;
+    }
+
+    #meshCanvas {
+      width: 100%;
+      height: 100%;
+      display: block;
+      cursor: grab;
+    }
+
+    #meshCanvas:active {
+      cursor: grabbing;
+    }
+
+    /* 2D Projected Node Billboards Layer */
+    .billboards-layer {
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      overflow: hidden;
+      z-index: 10;
+    }
+
+    .node-billboard {
+      position: absolute;
+      transform: translate(-50%, -100%);
+      pointer-events: auto;
+      background: rgba(15, 21, 31, 0.92);
+      border: 1px solid var(--border-medium);
+      border-radius: var(--radius-md);
+      padding: 4px 8px;
+      min-width: 124px;
+      box-shadow: 0 4px 14px rgba(0, 0, 0, 0.55);
+      cursor: pointer;
+      transition: border-color 0.15s, background 0.15s;
+    }
+
+    .node-billboard:hover {
+      border-color: var(--accent-mesh);
+      background: rgba(23, 32, 46, 0.96);
+      z-index: 25;
+    }
+
+    .node-billboard.selected {
+      border: 1.5px solid var(--accent-mesh);
+      background: rgba(20, 32, 48, 0.98);
+      box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.25), 0 6px 18px rgba(0, 0, 0, 0.65);
+      z-index: 30;
+    }
+
+    .node-billboard.dimmed {
+      opacity: 0.42;
+    }
+
+    .bb-row-1 {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+      font-weight: 600;
+      font-size: 12px;
+      color: var(--text-primary);
+      white-space: nowrap;
+    }
+
+    .bb-row-2 {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+      font-family: var(--font-mono);
+      font-size: 10.5px;
+      color: var(--text-secondary);
+      margin-top: 2px;
+      white-space: nowrap;
+    }
+
+    .bb-role-tag {
+      font-family: var(--font-mono);
+      font-size: 9.5px;
+      font-weight: 700;
+      padding: 1px 4px;
+      border-radius: 2px;
+      text-transform: uppercase;
+    }
+
+    .bb-role-tag.anchor {
+      background: var(--accent-mesh-dim);
+      color: var(--accent-mesh);
+      border: 1px solid rgba(56, 189, 248, 0.35);
+    }
+
+    .bb-role-tag.local {
+      background: rgba(241, 245, 249, 0.12);
+      color: #E2E8F0;
+      border: 1px solid rgba(241, 245, 249, 0.25);
+    }
+
+    /* Left Summary HUD Panel */
+    .left-hud {
+      position: absolute;
+      top: 14px;
+      left: 14px;
+      width: 316px;
+      background: var(--bg-hud-glass);
+      backdrop-filter: blur(12px);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-lg);
+      box-shadow: var(--shadow-hud);
+      padding: 14px;
+      z-index: 20;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      max-height: calc(100% - 76px);
+      overflow-y: auto;
+    }
+
+    .hud-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .hud-title {
+      font-size: 11px;
+      font-family: var(--font-mono);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--text-secondary);
+      font-weight: 600;
+    }
+
+    .source-tag {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      padding: 2px 6px;
+      border-radius: var(--radius-sm);
+      font-weight: 600;
+    }
+
+    .source-tag.live {
+      background: var(--status-online-dim);
+      color: #34D399;
+      border: 1px solid rgba(16, 185, 129, 0.3);
+    }
+
+    .source-tag.cached {
+      background: var(--status-warning-dim);
+      color: #FBBF24;
+      border: 1px solid rgba(245, 158, 11, 0.4);
+    }
+
+    .hero-counter-box {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      padding: 10px 12px;
+      background: var(--bg-surface-2);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-md);
+    }
+
+    .hero-numbers {
+      font-family: var(--font-mono);
+      font-size: 34px;
+      line-height: 1.1;
+      font-weight: 700;
+      color: var(--text-primary);
+      font-variant-numeric: tabular-nums;
+    }
+
+    .hero-numbers .denom {
+      color: var(--text-muted);
+      font-size: 24px;
+      font-weight: 500;
+    }
+
+    .hero-caption {
+      text-align: right;
+    }
+
+    .hero-caption-main {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text-primary);
+    }
+
+    .hero-caption-sub {
+      font-size: 11px;
+      color: var(--text-secondary);
+      margin-top: 2px;
+    }
+
+    /* 4-Grid Metric Filter Cards */
+    .metric-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+
+    .metric-card {
+      background: var(--bg-surface-2);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-md);
+      padding: 8px 10px;
+      cursor: pointer;
+      transition: border-color 0.15s, background 0.15s;
+      text-align: left;
+    }
+
+    .metric-card:hover {
+      border-color: var(--border-medium);
+      background: var(--bg-surface-3);
+    }
+
+    .metric-card.active-filter {
+      border-color: var(--accent-mesh);
+      background: rgba(56, 189, 248, 0.12);
+    }
+
+    .metric-card-label {
+      font-size: 11px;
+      color: var(--text-secondary);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .metric-card-val {
+      font-family: var(--font-mono);
+      font-size: 18px;
+      font-weight: 700;
+      color: var(--text-primary);
+      margin-top: 3px;
+    }
+
+    /* Transport & Anchor Summary Rows */
+    .telemetry-list {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      padding-top: 6px;
+      border-top: 1px solid var(--border-subtle);
+      font-size: 12px;
+    }
+
+    .telemetry-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      color: var(--text-secondary);
+    }
+
+    .telemetry-row strong {
+      color: var(--text-primary);
+      font-weight: 600;
+    }
+
+    .transport-bar-wrap {
+      display: flex;
+      height: 6px;
+      border-radius: 2px;
+      overflow: hidden;
+      background: var(--bg-surface-3);
+      gap: 2px;
+      margin-top: 2px;
+    }
+
+    .t-seg-direct { background: var(--accent-mesh); }
+    .t-seg-relay { background: var(--accent-relay); }
+    .t-seg-pending { background: var(--status-warning); }
+    .t-seg-offline { background: var(--status-offline); }
+
+    /* Viewport Floating Controls & Legend */
+    .viewport-controls {
+      position: absolute;
+      bottom: 48px;
+      left: 14px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      z-index: 20;
+      flex-wrap: wrap;
+    }
+
+    .vp-btn {
+      background: var(--bg-hud-glass);
+      backdrop-filter: blur(8px);
+      border: 1px solid var(--border-subtle);
+      color: var(--text-secondary);
+      padding: 5px 10px;
+      border-radius: var(--radius-md);
+      font-size: 11.5px;
+      font-family: var(--font-mono);
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      transition: all 0.15s;
+    }
+
+    .vp-btn:hover {
+      color: var(--text-primary);
+      border-color: var(--border-medium);
+    }
+
+    .vp-btn.active {
+      color: var(--accent-mesh);
+      border-color: var(--accent-mesh);
+      background: rgba(56, 189, 248, 0.14);
+    }
+
+    .viewport-legend {
+      position: absolute;
+      bottom: 48px;
+      right: 14px;
+      background: var(--bg-hud-glass);
+      backdrop-filter: blur(8px);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-md);
+      padding: 6px 12px;
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      font-size: 11px;
+      color: var(--text-secondary);
+      z-index: 20;
+      flex-wrap: wrap;
+    }
+
+    .legend-item {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      white-space: nowrap;
+    }
+
+    /* Cached Watermark on 3D Stage */
+    .stage-watermark {
+      position: absolute;
+      top: 14px;
+      right: 16px;
+      font-family: var(--font-mono);
+      font-size: 11px;
+      padding: 4px 10px;
+      border-radius: var(--radius-sm);
+      background: rgba(15, 21, 31, 0.82);
+      border: 1px solid var(--border-subtle);
+      color: var(--text-muted);
+      z-index: 15;
+      pointer-events: none;
+    }
+
+    .stage-watermark.cached-mode {
+      border-color: rgba(245, 158, 11, 0.55);
+      color: #FBBF24;
+      background: rgba(245, 158, 11, 0.12);
+    }
+
+    /* 4. Right Panel: Roster & Node Inspector */
+    .right-drawer {
+      width: 410px;
+      min-width: 410px;
+      background: var(--bg-surface-1);
+      border-left: 1px solid var(--border-subtle);
+      display: flex;
+      flex-direction: column;
+      z-index: 30;
+      height: 100%;
+    }
+
+    .drawer-header {
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--border-subtle);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    .drawer-title {
+      font-size: 14px;
+      font-weight: 600;
+      color: var(--text-primary);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .filter-tabs {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      padding: 8px 16px;
+      border-bottom: 1px solid var(--border-subtle);
+      background: #0E141E;
+    }
+
+    .filter-tab {
+      background: transparent;
+      border: 1px solid transparent;
+      color: var(--text-secondary);
+      padding: 4px 9px;
+      border-radius: var(--radius-sm);
+      font-size: 12px;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+    }
+
+    .filter-tab:hover {
+      color: var(--text-primary);
+      background: var(--bg-surface-2);
+    }
+
+    .filter-tab.active {
+      background: var(--bg-surface-2);
+      color: var(--text-primary);
+      border-color: var(--border-medium);
+      font-weight: 600;
+    }
+
+    .roster-list {
+      flex: 1;
+      overflow-y: auto;
+      padding: 10px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .roster-item {
+      background: var(--bg-surface-2);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-md);
+      padding: 10px 12px;
+      cursor: pointer;
+      transition: border-color 0.15s, background 0.15s;
+    }
+
+    .roster-item:hover {
+      border-color: var(--border-medium);
+      background: #1C2738;
+    }
+
+    .roster-item.selected {
+      border-color: var(--accent-mesh);
+      background: rgba(56, 189, 248, 0.09);
+    }
+
+    .roster-item-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    .roster-name-group {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      font-weight: 600;
+      color: var(--text-primary);
+      font-size: 13px;
+    }
+
+    .status-symbol {
+      font-family: var(--font-mono);
+      font-size: 13px;
+      line-height: 1;
+    }
+
+    .sym-online { color: var(--status-online); }
+    .sym-anchor { color: var(--accent-mesh); }
+    .sym-warning { color: var(--status-warning); }
+    .sym-offline { color: var(--status-offline); }
+
+    .badge {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      font-weight: 600;
+      padding: 2px 6px;
+      border-radius: var(--radius-sm);
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      white-space: nowrap;
+    }
+
+    .badge-online {
+      background: var(--status-online-dim);
+      color: #34D399;
+      border: 1px solid rgba(16, 185, 129, 0.3);
+    }
+
+    .badge-anchor {
+      background: var(--accent-mesh-dim);
+      color: var(--accent-mesh);
+      border: 1px solid rgba(56, 189, 248, 0.35);
+    }
+
+    .badge-relay {
+      background: var(--accent-relay-dim);
+      color: var(--accent-relay);
+      border: 1px solid rgba(45, 212, 191, 0.35);
+    }
+
+    .badge-warning {
+      background: var(--status-warning-dim);
+      color: #FBBF24;
+      border: 1px solid rgba(245, 158, 11, 0.38);
+    }
+
+    .badge-offline {
+      background: var(--status-offline-dim);
+      color: #94A3B8;
+      border: 1px solid rgba(100, 116, 139, 0.35);
+    }
+
+    .roster-item-meta {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-top: 6px;
+      font-size: 11.5px;
+      color: var(--text-secondary);
+      font-family: var(--font-mono);
+    }
+
+    /* Node Detail Inspector View */
+    .inspector-panel {
+      border-top: 1px solid var(--border-medium);
+      background: #0E141F;
+      display: flex;
+      flex-direction: column;
+      max-height: 58%;
+      overflow-y: auto;
+      padding: 14px 16px;
+      gap: 12px;
+    }
+
+    .inspector-top {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    .inspector-title {
+      font-size: 14px;
+      font-weight: 700;
+      color: var(--text-primary);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .inspector-id {
+      font-family: var(--font-mono);
+      font-size: 11.5px;
+      color: var(--text-secondary);
+      margin-top: 2px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .mini-btn {
+      background: var(--bg-surface-2);
+      border: 1px solid var(--border-subtle);
+      color: var(--text-secondary);
+      padding: 2px 7px;
+      border-radius: var(--radius-sm);
+      font-size: 11px;
+      font-family: var(--font-mono);
+      cursor: pointer;
+    }
+
+    .mini-btn:hover {
+      color: var(--text-primary);
+      border-color: var(--accent-mesh);
+    }
+
+    /* Orthogonal 4-State Matrix Card */
+    .section-label {
+      font-size: 11px;
+      font-family: var(--font-mono);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-secondary);
+      font-weight: 600;
+      margin-bottom: 6px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .ortho-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 6px;
+    }
+
+    .ortho-cell {
+      background: var(--bg-surface-2);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-md);
+      padding: 7px 9px;
+    }
+
+    .ortho-dim-name {
+      font-size: 10.5px;
+      color: var(--text-muted);
+      font-family: var(--font-mono);
+    }
+
+    .ortho-dim-val {
+      font-size: 12px;
+      font-weight: 600;
+      margin-top: 2px;
+      display: flex;
+      align-items: center;
+      gap: 5px;
+    }
+
+    .ortho-dim-desc {
+      font-size: 11px;
+      color: var(--text-secondary);
+      margin-top: 2px;
+      line-height: 1.35;
+    }
+
+    /* Diagnostic / State Explanation Box inside Inspector */
+    .state-explain-box {
+      padding: 9px 11px;
+      border-radius: var(--radius-md);
+      font-size: 12px;
+      line-height: 1.45;
+      border: 1px solid var(--border-subtle);
+      background: var(--bg-surface-2);
+    }
+
+    .state-explain-box.warn {
+      background: rgba(245, 158, 11, 0.1);
+      border-color: rgba(245, 158, 11, 0.4);
+      color: #FDE68A;
+    }
+
+    .state-explain-box.offline {
+      background: rgba(100, 116, 139, 0.12);
+      border-color: rgba(100, 116, 139, 0.38);
+      color: #CBD5E1;
+    }
+
+    .endpoint-list {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .endpoint-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 5px 8px;
+      background: var(--bg-surface-2);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-sm);
+      font-family: var(--font-mono);
+      font-size: 11.5px;
+    }
+
+    .cli-box {
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+    }
+
+    .cli-cmd-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+      background: #090D13;
+      border: 1px solid var(--border-subtle);
+      padding: 5px 8px;
+      border-radius: var(--radius-sm);
+      font-family: var(--font-mono);
+      font-size: 11px;
+      color: #CBD5E1;
+    }
+
+    .future-slots {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 4px;
+    }
+
+    .future-slot-pill {
+      font-size: 11px;
+      padding: 3px 8px;
+      border-radius: var(--radius-sm);
+      background: rgba(30, 41, 59, 0.5);
+      border: 1px dashed var(--border-medium);
+      color: var(--text-muted);
+    }
+
+    /* 5. Bottom Collapsible Diagnostics Bar */
+    .diag-drawer {
+      background: var(--bg-surface-1);
+      border-top: 1px solid var(--border-subtle);
+      z-index: 35;
+      transition: height 0.2s ease;
+    }
+
+    .diag-summary-bar {
+      height: 36px;
+      padding: 0 16px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      cursor: pointer;
+      user-select: none;
+      font-size: 12px;
+      color: var(--text-secondary);
+    }
+
+    .diag-summary-bar:hover {
+      background: var(--bg-surface-2);
+      color: var(--text-primary);
+    }
+
+    .diag-body {
+      display: none;
+      padding: 12px 16px 16px;
+      border-top: 1px solid var(--border-subtle);
+      background: #0C111A;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 12px;
+      max-height: 210px;
+      overflow-y: auto;
+    }
+
+    .diag-drawer.expanded .diag-body {
+      display: grid;
+    }
+
+    .diag-card {
+      background: var(--bg-surface-1);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-md);
+      padding: 10px 12px;
+    }
+
+    .diag-card h4 {
+      font-size: 11.5px;
+      font-family: var(--font-mono);
+      color: var(--text-secondary);
+      margin-bottom: 6px;
+      text-transform: uppercase;
+    }
+
+    .diag-kv {
+      display: flex;
+      justify-content: space-between;
+      font-size: 12px;
+      padding: 2px 0;
+      color: var(--text-secondary);
+    }
+
+    .diag-kv span:last-child {
+      color: var(--text-primary);
+      font-family: var(--font-mono);
+    }
+
+    /* Modal Overlay (for Raw JSON / Join Guide / Multi-Mesh Roadmap) */
+    .modal-backdrop {
+      position: fixed;
+      inset: 0;
+      background: rgba(5, 8, 13, 0.76);
+      backdrop-filter: blur(4px);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 100;
+      padding: 20px;
+    }
+
+    .modal-backdrop.open {
+      display: flex;
+    }
+
+    .modal-card {
+      background: var(--bg-surface-1);
+      border: 1px solid var(--border-medium);
+      border-radius: var(--radius-lg);
+      width: 100%;
+      max-width: 640px;
+      max-height: 82vh;
+      display: flex;
+      flex-direction: column;
+      box-shadow: 0 20px 50px rgba(0, 0, 0, 0.7);
+    }
+
+    .modal-header {
+      padding: 14px 18px;
+      border-bottom: 1px solid var(--border-subtle);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-weight: 600;
+      font-size: 14px;
+    }
+
+    .modal-body {
+      padding: 16px 18px;
+      overflow-y: auto;
+      font-size: 13px;
+      line-height: 1.6;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .code-pre {
+      background: #080B10;
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-md);
+      padding: 12px;
+      font-family: var(--font-mono);
+      font-size: 12px;
+      color: #A5F3FC;
+      overflow-x: auto;
+      white-space: pre;
+    }
+
+    /* Toast Notification */
+    .toast-box {
+      position: fixed;
+      bottom: 52px;
+      left: 50%;
+      transform: translateX(-50%) translateY(20px);
+      background: #1E293B;
+      border: 1px solid var(--accent-mesh);
+      color: var(--text-primary);
+      padding: 7px 16px;
+      border-radius: var(--radius-md);
+      font-size: 12px;
+      font-family: var(--font-mono);
+      opacity: 0;
+      pointer-events: none;
+      transition: all 0.2s ease;
+      z-index: 120;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+    }
+
+    .toast-box.show {
+      opacity: 1;
+      transform: translateX(-50%) translateY(0);
+    }
+
+    /* Responsive Breakpoints */
+    @media (max-width: 1180px) {
+      .left-hud {
+        width: 270px;
+        padding: 10px;
+      }
+      .right-drawer {
+        width: 350px;
+        min-width: 350px;
+      }
+      .viewport-legend {
+        display: none;
+      }
+    }
+
+    @media (max-width: 860px) {
+      .cockpit-main {
+        flex-direction: column;
+        overflow-y: auto;
+      }
+      .viewport-stage {
+        min-height: 360px;
+        flex: none;
+      }
+      .left-hud {
+        position: static;
+        width: 100%;
+        max-height: none;
+        border-radius: 0;
+        border-left: none;
+        border-right: none;
+      }
+      .right-drawer {
+        width: 100%;
+        min-width: 0;
+        border-left: none;
+        border-top: 1px solid var(--border-subtle);
+        height: auto;
+      }
+      .inspector-panel {
+        max-height: none;
+      }
+      .diag-body {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="app-shell">
+    <!-- 1. Top Telemetry Bar -->
+    <header class="top-bar">
+      <div class="brand-cluster">
+        <div class="brand-logo">
+          <span class="brand-cube">◆</span>
+          <span>cmesh</span>
+          <span class="mono" style="font-size:11px;color:var(--text-muted);font-weight:500;">container-mesh</span>
+        </div>
+        <div class="divider-v"></div>
+        <button type="button" class="network-switcher-btn" id="btnNetworkContext" title="查看网络身份与后续一机多网扩展槽位">
+          <span style="color:var(--accent-mesh);">●</span>
+          <span id="topNetworkName" style="font-weight:600;">prod-container-mesh</span>
+          <span class="mono" id="topAccountId" style="color:var(--text-secondary);">acct_8f92a1c4</span>
+          <span style="color:var(--text-muted);font-size:10px;">▾</span>
+        </button>
+        <span class="badge" style="background:rgba(148,163,184,0.1);color:var(--text-secondary);border:1px solid var(--border-subtle);">
+          只读监控模式
+        </span>
+      </div>
+
+      <div class="telemetry-cluster">
+        <button type="button" class="sync-badge live" id="topSyncBadge" title="点击展开/收起底部诊断抽屉">
+          <span id="topSyncIcon">●</span>
+          <span id="topSyncText">发现节点已同步 (实时)</span>
+        </button>
+        <div class="telemetry-pill mono" title="当前网络名册版本号 (Roster Version)">
+          <span>名册版本:</span>
+          <strong id="topRosterVersion" style="color:var(--text-primary);">v19</strong>
+        </div>
+        <div class="telemetry-pill mono" title="数据快照生成时间 (generated_at)">
+          <span>更新时间:</span>
+          <strong id="topGeneratedAt" style="color:var(--text-primary);">16:05:48 UTC</strong>
+          <span id="topRelativeAge" style="color:var(--text-muted);">(刚刚)</span>
+        </div>
+        <button type="button" class="telemetry-pill clickable mono" id="btnShowApiModal">
+          <span>{ } GET /api/mesh</span>
+        </button>
+      </div>
+    </header>
+
+    <!-- Token gate: the data endpoint is protected, so the cockpit asks for
+         the token once and keeps it in this browser. -->
+    <div id="tokenGate" style="display:none;position:fixed;inset:0;z-index:9999;
+         background:rgba(10,14,20,0.88);backdrop-filter:blur(8px);
+         align-items:center;justify-content:center;">
+      <div style="background:var(--bg-surface-1);border:1px solid var(--border-medium);
+           border-radius:14px;padding:28px 30px;max-width:460px;
+           box-shadow:0 24px 60px -12px rgba(0,0,0,0.6);">
+        <div style="font-size:12px;letter-spacing:0.12em;color:var(--accent-mesh);
+             font-family:var(--font-mono);margin-bottom:10px;">C M E S H · PANEL</div>
+        <div style="font-size:17px;font-weight:600;color:var(--text-primary);
+             margin-bottom:8px;">需要面板令牌</div>
+        <div style="font-size:13px;color:var(--text-secondary);line-height:1.6;
+             margin-bottom:18px;">
+          令牌在启动发现节点的终端里打印（<span class="mono">panel token</span>）。
+          它只用于读取本网络的状态，请勿外传。
+        </div>
+        <div style="display:flex;gap:10px;">
+          <input id="tokenInput" type="password" autocomplete="off" placeholder="粘贴面板令牌"
+                 style="flex:1;min-width:0;padding:10px 12px;border-radius:9px;
+                        border:1px solid var(--border-medium);
+                        background:var(--bg-surface-2);color:var(--text-primary);
+                        font-family:var(--font-mono);font-size:13px;">
+          <button id="tokenSubmit" type="button"
+                  style="padding:10px 20px;border-radius:9px;border:1px solid var(--accent-mesh);
+                         background:var(--accent-mesh);color:#06131c;font-size:13px;
+                         font-weight:600;cursor:pointer;">连接</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 数据源: GET /api/mesh（真实名册）。
+         原型的场景切换器已移除——生产界面不提供假状态：每一个读数都必须来自真实接口。 -->
+    <div class="scenario-bar" style="justify-content:flex-end">
+      <div class="scenario-group">
+        <span class="mono" style="font-size:11px;color:var(--text-muted);">
+          数据源: GET /api/mesh · 实时名册
+        </span>
+      </div>
+    </div>
+
+    <!-- 2. Cache & Discovery Disconnected Warning Banner -->
+    <div class="cache-banner" id="cacheBanner">
+      <div class="cache-banner-left">
+        <span class="mono" style="font-weight:700;font-size:14px;">▲</span>
+        <div>
+          <strong>发现节点暂时失联 · 当前显示的是缓存数据快照</strong>
+          <span style="margin-left:8px;opacity:0.9;" id="cacheBannerDetail">
+            保留最后一次有效网络快照（名册版本 v19，快照时间 16:04:12 UTC）。后台正在自动重试（<span class="mono" id="retryCountdownText">3s</span> 后第 4 次重试），无需手动刷新页面。
+          </span>
+        </div>
+      </div>
+      <button type="button" class="cache-action-btn" id="btnSimulateReconnect">
+        立即重试
+      </button>
+    </div>
+
+    <!-- 3. Main Cockpit Body -->
+    <main class="cockpit-main">
+      <!-- Center 3D Isometric Viewport -->
+      <section class="viewport-stage" id="viewportStage">
+        <!-- Left Floating Network Summary HUD -->
+        <aside class="left-hud" aria-label="网络总览面板">
+          <div class="hud-header">
+            <span class="hud-title">NETWORK TELEMETRY · 网络总览</span>
+            <span class="source-tag live" id="hudSourceTag">● 实时数据</span>
+          </div>
+
+          <div class="hero-counter-box">
+            <div class="hero-numbers">
+              <span id="heroOnlineCount">4</span>
+              <span class="denom">/ <span id="heroTotalCount">5</span></span>
+            </div>
+            <div class="hero-caption">
+              <div class="hero-caption-main">在线设备</div>
+              <div class="hero-caption-sub" id="heroSubStatus">1 台离线 (保留在名册)</div>
+            </div>
+          </div>
+
+          <!-- 4-Card Filterable Metric Grid -->
+          <div class="metric-grid">
+            <button type="button" class="metric-card active-filter" data-filter="all" id="metricCardAll">
+              <div class="metric-card-label">
+                <span>名册成员总数</span>
+                <span class="mono">ALL</span>
+              </div>
+              <div class="metric-card-val" id="statTotalMembers">5</div>
+            </button>
+            <button type="button" class="metric-card" data-filter="online" id="metricCardOnline">
+              <div class="metric-card-label">
+                <span>当前在线可达</span>
+                <span class="sym-online">●</span>
+              </div>
+              <div class="metric-card-val" id="statOnlineMembers" style="color:#34D399;">4</div>
+            </button>
+            <button type="button" class="metric-card" data-filter="no_endpoint" id="metricCardNoEp">
+              <div class="metric-card-label">
+                <span>无公告端点</span>
+                <span class="sym-warning">◐</span>
+              </div>
+              <div class="metric-card-val" id="statNoEndpointMembers" style="color:#FBBF24;">0</div>
+            </button>
+            <button type="button" class="metric-card" data-filter="offline" id="metricCardOffline">
+              <div class="metric-card-label">
+                <span>离线仍在名册</span>
+                <span class="sym-offline">○</span>
+              </div>
+              <div class="metric-card-val" id="statOfflineMembers" style="color:#94A3B8;">1</div>
+            </button>
+          </div>
+
+          <!-- Detailed Structural Telemetry -->
+          <div class="telemetry-list">
+            <div class="telemetry-row">
+              <span>自托管锚点状态 (`is_anchor`)</span>
+              <strong class="mono" id="hudAnchorStatus" style="color:var(--accent-mesh);">◆ 1 / 1 在线</strong>
+            </div>
+            <div class="telemetry-row">
+              <span>当前连接方式分布 (`transport`)</span>
+              <strong class="mono" id="hudTransportRatio">3 直连 · 1 中继</strong>
+            </div>
+            <div class="transport-bar-wrap" id="transportBarWrap" title="直连 / 中继 / 待命 / 离线比例">
+              <div class="t-seg-direct" style="width:60%"></div>
+              <div class="t-seg-relay" style="width:20%"></div>
+              <div class="t-seg-offline" style="width:20%"></div>
+            </div>
+            <div class="telemetry-row" style="margin-top:4px;">
+              <span>最近一次名册变化</span>
+              <strong class="mono" id="hudLastChange">v19 · 2分钟前</strong>
+            </div>
+          </div>
+        </aside>
+
+        <!-- Stage Mode Watermark -->
+        <div class="stage-watermark" id="stageWatermark">
+          ISOMETRIC TELEMETRY BENCH · 拖拽微调视角 / 滚轮缩放 / 点击节点检视
+        </div>
+
+        <!-- HTML5 3D Isometric Canvas -->
+        <canvas id="meshCanvas"></canvas>
+
+        <!-- Crisp 2D Projected Node Billboards -->
+        <div class="billboards-layer" id="billboardsLayer"></div>
+
+        <!-- Bottom-Left Viewport Controls -->
+        <div class="viewport-controls">
+          <button type="button" class="vp-btn" id="btnResetView" title="将 3D 等轴测相机复位至标准角度">
+            <span>⌖ 复位视角 (R)</span>
+          </button>
+          <button type="button" class="vp-btn active" id="btnToggleLabels" title="显示或隐藏 3D 节点悬浮铭牌">
+            <span>🏷 节点铭牌: 开</span>
+          </button>
+          <button type="button" class="vp-btn" id="btnToggleMotion" title="无障碍静态模式 (Reduced Motion)：停止脉冲流动与镜头平滑插值">
+            <span>⏸ 静态模式: 关</span>
+          </button>
+        </div>
+
+        <!-- Bottom-Right Visual Encoding Legend (Color + Icon + Text) -->
+        <div class="viewport-legend" aria-label="状态与轨道图例">
+          <span class="legend-item"><strong style="color:var(--accent-mesh);">◆</strong> 发现节点/锚点</span>
+          <span class="legend-item"><strong style="color:var(--status-online);">●</strong> 在线可达</span>
+          <span class="legend-item"><strong style="color:var(--status-warning);">◐</strong> 在册无端点</span>
+          <span class="legend-item"><strong style="color:var(--status-offline);">○</strong> 离线(仍在名册)</span>
+          <span class="legend-item"><span class="mono" style="color:var(--accent-mesh);">━━</span> 点对点直连</span>
+          <span class="legend-item"><span class="mono" style="color:var(--accent-relay);">━⇄━</span> 锚点中继</span>
+          <span class="legend-item"><span class="mono" style="color:var(--status-warning);">╌╌</span> 无入站端点</span>
+        </div>
+      </section>
+
+      <!-- 4. Right Panel: Roster List & Selected Node Inspector -->
+      <aside class="right-drawer" aria-label="设备名册与节点详情">
+        <div class="drawer-header">
+          <div class="drawer-title">
+            <span>网络成员名册 (Roster)</span>
+            <span class="badge mono" id="rosterCountBadge" style="background:var(--bg-surface-2);color:var(--text-secondary);">5 台设备</span>
+          </div>
+          <button type="button" class="mini-btn" id="btnOpenJoinGuide">+ 加入设备指南</button>
+        </div>
+
+        <!-- Filter Tabs -->
+        <div class="filter-tabs" role="tablist">
+          <button type="button" class="filter-tab active" data-tab="all" id="tabFilterAll">全部 (5)</button>
+          <button type="button" class="filter-tab" data-tab="online" id="tabFilterOnline">● 在线 (4)</button>
+          <button type="button" class="filter-tab" data-tab="no_endpoint" id="tabFilterNoEp">◐ 无端点 (0)</button>
+          <button type="button" class="filter-tab" data-tab="offline" id="tabFilterOffline">○ 离线 (1)</button>
+        </div>
+
+        <!-- Scrollable Device Roster List -->
+        <div class="roster-list" id="rosterListContainer"></div>
+
+        <!-- Selected Node Detail Inspector -->
+        <section class="inspector-panel" id="nodeInspectorPanel" aria-label="选中节点详情检查器">
+          <div class="inspector-top">
+            <div>
+              <div class="inspector-title">
+                <span id="inspSymbol" class="status-symbol sym-anchor">◆</span>
+                <span id="inspName">anchor-hk-01</span>
+                <span id="inspRoleBadge" class="badge badge-anchor">核心锚点</span>
+              </div>
+              <div class="inspector-id">
+                <span>ID: <strong id="inspDeviceId" class="mono">dev_anchor_hk01_99a2</strong></span>
+                <button type="button" class="mini-btn" id="btnCopyDeviceId">复制 ID</button>
+              </div>
+            </div>
+            <div style="display:flex;gap:4px;">
+              <button type="button" class="mini-btn" id="btnSimToggleOnline" title="原型交互测试：切换该节点的在线/离线状态">
+                切换在线/离线
+              </button>
+              <button type="button" class="mini-btn" id="btnSimToggleEndpoint" title="原型交互测试：切换该节点是否有公告端点">
+                切换端点
+              </button>
+            </div>
+          </div>
+
+          <!-- Dynamic State Explanation Banner (Shown when offline, no-endpoint, or cached) -->
+          <div class="state-explain-box" id="inspExplainBox"></div>
+
+          <!-- Orthogonal 4-State Matrix Verification Card -->
+          <div>
+            <div class="section-label">
+              <span>四维正交状态核验 (Orthogonal State Model)</span>
+              <span id="inspSnapshotLabel" style="color:var(--text-muted);">实时核验</span>
+            </div>
+            <div class="ortho-grid">
+              <div class="ortho-cell">
+                <div class="ortho-dim-name">1. Membership (成员关系)</div>
+                <div class="ortho-dim-val" id="orthoMembershipVal" style="color:#34D399;">✓ 已属于私有网络</div>
+                <div class="ortho-dim-desc" id="orthoMembershipDesc">位于名册 v19 中，身份已授权</div>
+              </div>
+              <div class="ortho-cell">
+                <div class="ortho-dim-name">2. Liveness (当前在线)</div>
+                <div class="ortho-dim-val" id="orthoLivenessVal">● 当前在线可达</div>
+                <div class="ortho-dim-desc" id="orthoLivenessDesc">最近心跳: 2 秒前</div>
+              </div>
+              <div class="ortho-cell">
+                <div class="ortho-dim-name">3. Announcement (公告端点)</div>
+                <div class="ortho-dim-val" id="orthoEndpointVal">✓ 已公告 2 个端点</div>
+                <div class="ortho-dim-desc" id="orthoEndpointDesc">允许其他节点主动拨号连接</div>
+              </div>
+              <div class="ortho-cell">
+                <div class="ortho-dim-name">4. Transport (连接方式)</div>
+                <div class="ortho-dim-val" id="orthoTransportVal">━━ 点对点直连 (direct)</div>
+                <div class="ortho-dim-desc" id="orthoTransportDesc">数据面不经过第三方云平台</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Announced Endpoints List -->
+          <div>
+            <div class="section-label">
+              <span>公告端点列表 (`endpoints[]`)</span>
+              <span class="mono" id="inspEndpointCount">2 个可拨地址</span>
+            </div>
+            <div class="endpoint-list" id="inspEndpointList"></div>
+          </div>
+
+          <!-- CLI Workflow Bridge & Future Capabilities -->
+          <div>
+            <div class="section-label">
+              <span>受控工作流与 CLI 联动 (已验证底层能力)</span>
+              <span style="color:var(--accent-mesh);">点击复制命令</span>
+            </div>
+            <div class="cli-box" id="inspCliBox"></div>
+            <div class="future-slots">
+              <span class="future-slot-pill" title="后续产品化阶段开放 Web 端直接触发">🔒 Web 端发送消息 (规划中)</span>
+              <span class="future-slot-pill" title="后续产品化阶段开放 Web 端直接触发">🔒 Web 端文件传输 (规划中)</span>
+              <span class="future-slot-pill" title="后续产品化阶段开放统一凭证生命周期管理">🔒 统一凭证管理: 自主密钥有效</span>
+            </div>
+          </div>
+        </section>
+      </aside>
+    </main>
+
+    <!-- 5. Bottom On-Demand Diagnostics Drawer -->
+    <footer class="diag-drawer" id="diagDrawer">
+      <div class="diag-summary-bar" id="diagSummaryToggle" role="button" tabindex="0" aria-expanded="false">
+        <div style="display:flex;align-items:center;gap:10px;">
+          <span class="mono" style="font-weight:700;color:var(--accent-mesh);">[DIAGNOSTICS · 诊断栏]</span>
+          <span id="diagSummaryText">✓ 发现节点连接正常 · 名册 v19 实时同步 · 1 台设备当前离线（保留在名册中）</span>
+        </div>
+        <div class="mono" style="font-size:11.5px;color:var(--text-muted);">
+          <span id="diagToggleHint">点击按需展开诊断详情 ▴</span>
+        </div>
+      </div>
+
+      <div class="diag-body" id="diagBody">
+        <div class="diag-card">
+          <h4>发现节点与同步链路 (Discovery Connection)</h4>
+          <div class="diag-kv"><span>连接状态:</span><span id="diagSyncState">● HTTP 200 正常同步</span></div>
+          <div class="diag-kv"><span>数据视图属性:</span><span id="diagViewMode">实时数据 (Live)</span></div>
+          <div class="diag-kv"><span>自动重试状态:</span><span id="diagRetryState">空闲 (轮询间隔 5s)</span></div>
+          <div class="diag-kv"><span>最后快照时间:</span><span id="diagSnapshotTime">2026-11-11T16:05:48Z</span></div>
+        </div>
+
+        <div class="diag-card">
+          <h4>不可达与受限节点成因诊断 (Node Reachability)</h4>
+          <div id="diagNodeReasons" style="font-size:12px;color:var(--text-secondary);display:flex;flex-direction:column;gap:4px;"></div>
+        </div>
+
+        <div class="diag-card">
+          <h4>最近状态变化记录 (Recent Roster Events)</h4>
+          <div id="diagRecentEvents" class="mono" style="font-size:11.5px;color:var(--text-secondary);display:flex;flex-direction:column;gap:4px;"></div>
+        </div>
+      </div>
+    </footer>
+
+    <!-- Modal: Raw /api/mesh JSON & Multi-Mesh / Join Guide -->
+    <div class="modal-backdrop" id="appModalBackdrop">
+      <div class="modal-card">
+        <div class="modal-header">
+          <span id="modalTitle">GET /api/mesh 实时响应数据结构</span>
+          <button type="button" class="mini-btn" id="btnCloseModal">关闭 (Esc)</button>
+        </div>
+        <div class="modal-body" id="modalBodyContent"></div>
+      </div>
+    </div>
+
+    <!-- Toast Notification -->
+    <div class="toast-box" id="toastBox">已复制到剪贴板</div>
+  </div>
+
+  <script>
+    (function () {
+      "use strict";
+
+      // =========================================================================
+      // 1. REALISTIC DATA MODEL STRICTLY ALIGNED WITH `GET /api/mesh` CONTRACT
+      // =========================================================================
+      // (The prototype's demo scenarios were removed: the product shows the
+      // real roster only. A dashboard that can paint fiction is a dashboard
+      // that lies — and the accepted design was never the fiction, it was
+      // the way this data is laid out.)
+
+      // Deep clone helper
+      function cloneData(obj) {
+        return JSON.parse(JSON.stringify(obj));
+      }
+
+      // Application Reactive State
+      // The product starts EMPTY: the cockpit shows the real roster as soon
+      // as the first /api/mesh answer arrives, and never paints the
+      // prototype's demo numbers in the meantime (a dashboard that shows
+      // fiction for a second is a dashboard that lies).
+      var EMPTY_STATE = {
+        scenarioKey: "live",
+        scenarioTitle: "正在连接发现节点…",
+        discoveryConnected: false,
+        retryCount: 0,
+        retrySeconds: 0,
+        recentEvent: "等待名册…",
+        payload: {
+          account_id: "",
+          network_name: "",
+          roster_version: 0,
+          generated_at: "",
+          members: []
+        }
+      };
+      var state = {
+        currentScenario: "live",
+        data: cloneData(EMPTY_STATE),
+        selectedDeviceId: null,
+        hoveredDeviceId: null,
+        rosterFilter: "all", // 'all' | 'online' | 'no_endpoint' | 'offline'
+        showLabels: true,
+        reducedMotion: window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches,
+        diagExpanded: false,
+        // 3D Camera Parameters (Isometric precision bench)
+        camYaw: 0.62,          // radians (~35.5 deg)
+        camPitch: 0.56,        // radians (~32 deg isometric elevation)
+        camZoom: 1.0,
+        targetYaw: 0.62,
+        targetPitch: 0.56,
+        targetZoom: 1.0,
+        isDragging: false,
+        dragStartX: 0,
+        dragStartY: 0,
+        pulsePhase: 0
+      };
+
+      // =========================================================================
+      // 2. CLASSIFICATION & ORTHOGONAL STATE HELPERS
+      // =========================================================================
+      function classifyMember(m) {
+        // Orthogonal dimensions:
+        // 1. Membership: always true if in members[]
+        // 2. Liveness: m.online
+        // 3. Announcement: m.endpoints && m.endpoints.length > 0
+        var hasEndpoints = Array.isArray(m.endpoints) && m.endpoints.length > 0;
+        if (!m.online) {
+          return {
+            category: "offline",
+            symbol: "○",
+            symClass: "sym-offline",
+            badgeClass: "badge-offline",
+            badgeText: "○ 离线 · 仍在名册",
+            shortStatus: "离线 (在册)",
+            colorHex: "#64748B",
+            hasEndpoints: hasEndpoints
+          };
+        }
+        if (m.is_anchor) {
+          return {
+            category: "online",
+            symbol: "◆",
+            symClass: "sym-anchor",
+            badgeClass: "badge-anchor",
+            badgeText: "◆ 在线 · 核心锚点",
+            shortStatus: "锚点 · 直连",
+            colorHex: "#38BDF8",
+            hasEndpoints: hasEndpoints
+          };
+        }
+        if (!hasEndpoints) {
+          return {
+            category: "no_endpoint",
+            symbol: "◐",
+            symClass: "sym-warning",
+            badgeClass: "badge-warning",
+            badgeText: "◐ 在册 · 无可拨端点",
+            shortStatus: "在线 · 无端点",
+            colorHex: "#F59E0B",
+            hasEndpoints: false
+          };
+        }
+        if (m.transport === "relay") {
+          return {
+            category: "online",
+            symbol: "⇄",
+            symClass: "sym-online",
+            badgeClass: "badge-relay",
+            badgeText: "⇄ 在线 · 锚点中继",
+            shortStatus: "在线 · 中继",
+            colorHex: "#2DD4BF",
+            hasEndpoints: true
+          };
+        }
+        return {
+          category: "online",
+          symbol: "●",
+          symClass: "sym-online",
+          badgeClass: "badge-online",
+          badgeText: "● 在线 · 点对点直连",
+          shortStatus: "在线 · 直连",
+          colorHex: "#10B981",
+          hasEndpoints: true
+        };
+      }
+
+      // Assign deterministic 3D coordinates on the Isometric Telemetry Bench
+      function computeNodeLayout(members) {
+        var layout = [];
+        var nonAnchors = [];
+        var i;
+        for (i = 0; i < members.length; i++) {
+          if (members[i].is_anchor) {
+            layout.push({
+              member: members[i],
+              x: 0,
+              y: 0,
+              z: 0,
+              ring: "CORE"
+            });
+          } else {
+            nonAnchors.push(members[i]);
+          }
+        }
+
+        // Fixed well-spaced slots around the bench so nodes never overlap
+        var activeSlots = [
+          { x: 0, z: 145 },     // Front (Local priority)
+          { x: 150, z: -25 },   // Right-Back
+          { x: -145, z: -20 },  // Left-Back
+          { x: 115, z: 115 },   // Front-Right
+          { x: -120, z: 110 }   // Front-Left
+        ];
+        var dockSlots = [
+          { x: -185, z: -135 }, // Outer Roster Dock 1
+          { x: 185, z: -135 },  // Outer Roster Dock 2
+          { x: 0, z: -185 },    // Outer Roster Dock 3
+          { x: -195, z: 60 }    // Outer Roster Dock 4
+        ];
+
+        var activeIdx = 0;
+        var dockIdx = 0;
+        for (i = 0; i < nonAnchors.length; i++) {
+          var m = nonAnchors[i];
+          var pos;
+          if (!m.online) {
+            pos = dockSlots[dockIdx % dockSlots.length];
+            dockIdx++;
+            layout.push({
+              member: m,
+              x: pos.x,
+              y: 0,
+              z: pos.z,
+              ring: "ROSTER_DOCK"
+            });
+          } else {
+            pos = activeSlots[activeIdx % activeSlots.length];
+            activeIdx++;
+            layout.push({
+              member: m,
+              x: pos.x,
+              y: 0,
+              z: pos.z,
+              ring: (m.endpoints && m.endpoints.length > 0) ? "ACTIVE_RING" : "OUTBOUND_ZONE"
+            });
+          }
+        }
+        return layout;
+      }
+
+      // =========================================================================
+      // 3. UI RENDERING & STATE SYNCHRONIZATION
+      // =========================================================================
+      function syncAllUI() {
+        var d = state.data;
+        var payload = d.payload;
+        var members = payload.members || [];
+        var isLive = d.discoveryConnected;
+
+        // Counts
+        var totalCount = members.length;
+        var onlineCount = 0;
+        var noEpCount = 0;
+        var offlineCount = 0;
+        var anchorOnline = 0;
+        var anchorTotal = 0;
+        var directCount = 0;
+        var relayCount = 0;
+        var pendingCount = 0;
+
+        for (var i = 0; i < members.length; i++) {
+          var m = members[i];
+          var hasEp = Array.isArray(m.endpoints) && m.endpoints.length > 0;
+          if (m.is_anchor) {
+            anchorTotal++;
+            if (m.online) anchorOnline++;
+          }
+          if (m.online) {
+            onlineCount++;
+            if (!hasEp) {
+              noEpCount++;
+            }
+            if (m.transport === "direct" && hasEp) directCount++;
+            else if (m.transport === "relay") relayCount++;
+            else pendingCount++;
+          } else {
+            offlineCount++;
+          }
+        }
+
+        // 1. Top Bar
+        document.getElementById("topNetworkName").textContent = payload.network_name || "prod-container-mesh";
+        document.getElementById("topAccountId").textContent = payload.account_id;
+        document.getElementById("topRosterVersion").textContent = "v" + payload.roster_version;
+        var timePart = payload.generated_at.replace("2026-11-11T", "").replace("Z", " UTC");
+        document.getElementById("topGeneratedAt").textContent = timePart;
+        document.getElementById("topRelativeAge").textContent = isLive ? "(实时同步)" : "(缓存快照 · 96秒前)";
+
+        var syncBadge = document.getElementById("topSyncBadge");
+        var syncIcon = document.getElementById("topSyncIcon");
+        var syncText = document.getElementById("topSyncText");
+        if (isLive) {
+          syncBadge.className = "sync-badge live";
+          syncIcon.textContent = "●";
+          syncText.textContent = "发现节点已同步 (实时)";
+        } else {
+          syncBadge.className = "sync-badge cached";
+          syncIcon.textContent = "▲";
+          syncText.textContent = "发现节点失联 · 缓存视图 (重试中)";
+        }
+
+        // Scenario Switcher Active Buttons
+        var scenBtns = document.querySelectorAll(".scenario-btn");
+        for (var sb = 0; sb < scenBtns.length; sb++) {
+          var key = scenBtns[sb].getAttribute("data-scenario");
+          scenBtns[sb].classList.toggle("active", key === state.currentScenario);
+        }
+
+        // 2. Cache Banner
+        var cacheBanner = document.getElementById("cacheBanner");
+        cacheBanner.classList.toggle("visible", !isLive);
+        if (!isLive) {
+          document.getElementById("retryCountdownText").textContent = d.retrySeconds + "s";
+        }
+
+        // 3. Left HUD Summary
+        var hudSourceTag = document.getElementById("hudSourceTag");
+        if (isLive) {
+          hudSourceTag.className = "source-tag live";
+          hudSourceTag.textContent = "● 实时快照";
+        } else {
+          hudSourceTag.className = "source-tag cached";
+          hudSourceTag.textContent = "◈ 本地缓存快照";
+        }
+
+        document.getElementById("heroOnlineCount").textContent = String(onlineCount);
+        document.getElementById("heroTotalCount").textContent = String(totalCount);
+
+        var subParts = [];
+        if (offlineCount > 0) subParts.push(offlineCount + " 台离线(在册)");
+        if (noEpCount > 0) subParts.push(noEpCount + " 台无端点");
+        if (subParts.length === 0) subParts.push("全员在线且可达");
+        if (!isLive) subParts.push("数据来自缓存");
+        document.getElementById("heroSubStatus").textContent = subParts.join(" · ");
+
+        document.getElementById("statTotalMembers").textContent = String(totalCount);
+        document.getElementById("statOnlineMembers").textContent = String(onlineCount);
+        document.getElementById("statNoEndpointMembers").textContent = String(noEpCount);
+        document.getElementById("statOfflineMembers").textContent = String(offlineCount);
+
+        var filterCards = document.querySelectorAll(".metric-card");
+        for (var fc = 0; fc < filterCards.length; fc++) {
+          var fType = filterCards[fc].getAttribute("data-filter");
+          filterCards[fc].classList.toggle("active-filter", fType === state.rosterFilter);
+        }
+
+        document.getElementById("hudAnchorStatus").textContent = "◆ " + anchorOnline + " / " + anchorTotal + " 在线";
+        var ratioStr = directCount + " 直连 · " + relayCount + " 中继";
+        if (noEpCount > 0) ratioStr += " · " + noEpCount + " 无端点";
+        document.getElementById("hudTransportRatio").textContent = ratioStr;
+
+        // Transport progress bar segments
+        var barWrap = document.getElementById("transportBarWrap");
+        var totalSafe = totalCount > 0 ? totalCount : 1;
+        barWrap.innerHTML =
+          '<div class="t-seg-direct" style="width:' + ((directCount / totalSafe) * 100) + '%"></div>' +
+          '<div class="t-seg-relay" style="width:' + ((relayCount / totalSafe) * 100) + '%"></div>' +
+          '<div class="t-seg-pending" style="width:' + ((noEpCount / totalSafe) * 100) + '%"></div>' +
+          '<div class="t-seg-offline" style="width:' + ((offlineCount / totalSafe) * 100) + '%"></div>';
+
+        document.getElementById("hudLastChange").textContent = "v" + payload.roster_version + (isLive ? " · 实时" : " · 缓存");
+
+        // Watermark
+        var wm = document.getElementById("stageWatermark");
+        if (isLive) {
+          wm.className = "stage-watermark";
+          wm.textContent = "ISOMETRIC TELEMETRY BENCH · 拖拽微调视角 / 滚轮缩放 / 点击节点检视";
+        } else {
+          wm.className = "stage-watermark cached-mode";
+          wm.textContent = "▲ CACHED SNAPSHOT VIEW (v" + payload.roster_version + ") · 发现节点失联，展示最后一次有效网络快照";
+        }
+
+        // Viewport Control Buttons
+        var btnLabels = document.getElementById("btnToggleLabels");
+        btnLabels.classList.toggle("active", state.showLabels);
+        btnLabels.innerHTML = "<span>🏷 节点铭牌: " + (state.showLabels ? "开" : "关") + "</span>";
+
+        var btnMotion = document.getElementById("btnToggleMotion");
+        btnMotion.classList.toggle("active", state.reducedMotion);
+        btnMotion.innerHTML = "<span>" + (state.reducedMotion ? "⏸ 静态模式: 开 (Reduced Motion)" : "▶ 静态模式: 关") + "</span>";
+
+        // 4. Right Roster Tabs & List
+        document.getElementById("rosterCountBadge").textContent = totalCount + " 台设备";
+        document.getElementById("tabFilterAll").textContent = "全部 (" + totalCount + ")";
+        document.getElementById("tabFilterOnline").textContent = "● 在线 (" + onlineCount + ")";
+        document.getElementById("tabFilterNoEp").textContent = "◐ 无端点 (" + noEpCount + ")";
+        document.getElementById("tabFilterOffline").textContent = "○ 离线 (" + offlineCount + ")";
+
+        var tabs = document.querySelectorAll(".filter-tab");
+        for (var t = 0; t < tabs.length; t++) {
+          tabs[t].classList.toggle("active", tabs[t].getAttribute("data-tab") === state.rosterFilter);
+        }
+
+        renderRosterList(members);
+        renderNodeInspector(members, payload, isLive);
+        renderDiagnostics(members, payload, isLive, onlineCount, totalCount, offlineCount, noEpCount);
+      }
+
+      function renderRosterList(members) {
+        var container = document.getElementById("rosterListContainer");
+        var html = [];
+
+        for (var i = 0; i < members.length; i++) {
+          var m = members[i];
+          var cls = classifyMember(m);
+          var match = true;
+          if (state.rosterFilter === "online" && !m.online) match = false;
+          if (state.rosterFilter === "no_endpoint" && (cls.hasEndpoints || !m.online)) match = false;
+          if (state.rosterFilter === "offline" && m.online) match = false;
+          if (!match) continue;
+
+          var isSel = m.device_id === state.selectedDeviceId;
+          var epSummary = cls.hasEndpoints ? (m.endpoints.length + " 个端点 (" + m.endpoints[0] + ")") : "无公告端点 (endpoints: [])";
+          if (!m.online && cls.hasEndpoints) {
+            epSummary = "历史端点: " + m.endpoints[0] + " (当前不可达)";
+          }
+
+          html.push(
+            '<div class="roster-item' + (isSel ? ' selected' : '') + '" data-device-id="' + m.device_id + '">' +
+              '<div class="roster-item-top">' +
+                '<div class="roster-name-group">' +
+                  '<span class="status-symbol ' + cls.symClass + '">' + cls.symbol + '</span>' +
+                  '<span>' + m.name + '</span>' +
+                  (m.is_local ? '<span class="bb-role-tag local">本机</span>' : '') +
+                '</div>' +
+                '<span class="badge ' + cls.badgeClass + '">' + cls.badgeText + '</span>' +
+              '</div>' +
+              '<div class="roster-item-meta">' +
+                '<span>ID: ' + m.device_id.slice(0, 15) + '…</span>' +
+                '<span>' + epSummary + '</span>' +
+              '</div>' +
+              '<div class="roster-item-meta" style="margin-top:3px;color:var(--text-muted);">' +
+                '<span>角色: ' + m.role_label + '</span>' +
+                '<span>最后在线: ' + m.last_seen_rel + '</span>' +
+              '</div>' +
+            '</div>'
+          );
+        }
+
+        if (html.length === 0) {
+          html.push(
+            '<div style="padding:24px 12px;text-align:center;color:var(--text-muted);border:1px dashed var(--border-subtle);border-radius:4px;">' +
+              '当前筛选条件下没有匹配的设备。<br/>点击“全部”查看完整网络名册。' +
+            '</div>'
+          );
+        }
+
+        container.innerHTML = html.join("");
+        var items = container.querySelectorAll(".roster-item");
+        for (var j = 0; j < items.length; j++) {
+          items[j].addEventListener("click", function () {
+            var id = this.getAttribute("data-device-id");
+            state.selectedDeviceId = id;
+            syncAllUI();
+          });
+          items[j].addEventListener("mouseenter", function () {
+            state.hoveredDeviceId = this.getAttribute("data-device-id");
+          });
+          items[j].addEventListener("mouseleave", function () {
+            state.hoveredDeviceId = null;
+          });
+        }
+      }
+
+      function renderNodeInspector(members, payload, isLive) {
+        var selected = null;
+        for (var i = 0; i < members.length; i++) {
+          if (members[i].device_id === state.selectedDeviceId) {
+            selected = members[i];
+            break;
+          }
+        }
+        if (!selected && members.length > 0) {
+          selected = members[0];
+          state.selectedDeviceId = selected.device_id;
+        }
+        if (!selected) return;
+
+        var cls = classifyMember(selected);
+        var symEl = document.getElementById("inspSymbol");
+        symEl.className = "status-symbol " + cls.symClass;
+        symEl.textContent = cls.symbol;
+
+        document.getElementById("inspName").textContent = selected.name;
+        var roleBadge = document.getElementById("inspRoleBadge");
+        roleBadge.className = "badge " + cls.badgeClass;
+        roleBadge.textContent = cls.badgeText;
+
+        document.getElementById("inspDeviceId").textContent = selected.device_id;
+        document.getElementById("inspSnapshotLabel").textContent = isLive
+          ? "实时核验 · Roster v" + payload.roster_version
+          : "▲ 缓存快照视图 · Roster v" + payload.roster_version;
+
+        // Explanation Box (Strict Copywriting Rules)
+        var explainBox = document.getElementById("inspExplainBox");
+        if (!selected.online) {
+          explainBox.className = "state-explain-box offline";
+          explainBox.innerHTML =
+            "<strong>设备当前离线 · 仍保留在网络名册中</strong><br/>" +
+            "最后在线时间：<span class='mono'>" + selected.last_seen + " (" + selected.last_seen_rel + ")</span>。" +
+            "离线不代表设备被移出私有网络，也不属于安全故障；待容器或设备进程恢复运行后，将自动恢复通信。";
+        } else if (!cls.hasEndpoints) {
+          explainBox.className = "state-explain-box warn";
+          explainBox.innerHTML =
+            "<strong>已属于当前私有网络，但当前没有可拨端点 (endpoints: [])</strong><br/>" +
+            "可能原因：① 该容器运行在纯出站受限环境中，启动时未开启 <span class='mono'>--listen</span>；" +
+            "② 设备刚刚获得入网批准，尚未完成首次端点公告。建议稍候重试或检查启动参数。";
+        } else if (!isLive) {
+          explainBox.className = "state-explain-box warn";
+          explainBox.innerHTML =
+            "<strong>当前展示的是缓存数据快照</strong><br/>" +
+            "面板与发现节点暂时失联，此处显示的是最后一次有效快照（<span class='mono'>" + payload.generated_at + "</span>）时该设备的状态。";
+        } else {
+          explainBox.className = "state-explain-box";
+          explainBox.innerHTML =
+            "<strong>节点通信状态正常</strong> · " + selected.env_note;
+        }
+
+        // 4 Orthogonal Dimensions
+        document.getElementById("orthoMembershipVal").innerHTML = '<span style="color:#34D399;">✓ 已在网络名册中</span>';
+        document.getElementById("orthoMembershipDesc").textContent = "归属网络 " + payload.account_id + " (v" + payload.roster_version + ")";
+
+        var liveVal = document.getElementById("orthoLivenessVal");
+        var liveDesc = document.getElementById("orthoLivenessDesc");
+        if (selected.online) {
+          liveVal.innerHTML = '<span style="color:#34D399;">● 在线 (Online)</span>';
+          liveDesc.textContent = "最后心跳: " + selected.last_seen_rel;
+        } else {
+          liveVal.innerHTML = '<span style="color:#94A3B8;">○ 离线 (Offline)</span>';
+          liveDesc.textContent = "最后在线: " + selected.last_seen_rel + " (未移出名册)";
+        }
+
+        var epVal = document.getElementById("orthoEndpointVal");
+        var epDesc = document.getElementById("orthoEndpointDesc");
+        if (cls.hasEndpoints && selected.online) {
+          epVal.innerHTML = '<span style="color:#34D399;">✓ 已公告 (' + selected.endpoints.length + ' 个端点)</span>';
+          epDesc.textContent = "其他节点可直接向该地址发起拨号";
+        } else if (cls.hasEndpoints && !selected.online) {
+          epVal.innerHTML = '<span style="color:#94A3B8;">○ 历史端点 (' + selected.endpoints.length + ' 个)</span>';
+          epDesc.textContent = "有历史端点记录，但因当前离线暂不可达";
+        } else {
+          epVal.innerHTML = '<span style="color:#FBBF24;">◐ 无公告端点 (0 个)</span>';
+          epDesc.textContent = "已入册但无可拨入地址 (仅支持主动出站)";
+        }
+
+        var transVal = document.getElementById("orthoTransportVal");
+        var transDesc = document.getElementById("orthoTransportDesc");
+        if (!selected.online) {
+          transVal.innerHTML = '<span style="color:#94A3B8;">╌╌ 暂不可用 (unavailable)</span>';
+          transDesc.textContent = "等待设备恢复在线后重新协商链路";
+        } else if (!cls.hasEndpoints) {
+          transVal.innerHTML = '<span style="color:#FBBF24;">╌╌ 待建立 / 仅出站 (pending)</span>';
+          transDesc.textContent = "可主动拨出，无法被其他设备被动拨通";
+        } else if (selected.transport === "relay") {
+          transVal.innerHTML = '<span style="color:#2DD4BF;">━⇄━ 锚点中继 (relay)</span>';
+          transDesc.textContent = "经自托管锚点转发，数据面端到端加密";
+        } else {
+          transVal.innerHTML = '<span style="color:#38BDF8;">━━ 点对点直连 (direct)</span>';
+          transDesc.textContent = "用户态直接建立点对点加密传输通道";
+        }
+
+        // Endpoints Table
+        var epCountEl = document.getElementById("inspEndpointCount");
+        var epListEl = document.getElementById("inspEndpointList");
+        if (cls.hasEndpoints) {
+          epCountEl.textContent = selected.online
+            ? (selected.endpoints.length + " 个可拨地址")
+            : (selected.endpoints.length + " 个历史地址 (当前离线)");
+          var epRows = [];
+          for (var e = 0; e < selected.endpoints.length; e++) {
+            var ep = selected.endpoints[e];
+            epRows.push(
+              '<div class="endpoint-row" style="' + (!selected.online ? 'opacity:0.6;' : '') + '">' +
+                '<span>' + (selected.online ? '● ' : '○ ') + ep + (!selected.online ? ' (当前不可达)' : '') + '</span>' +
+                '<button type="button" class="mini-btn btn-copy-text" data-copy="' + ep + '">复制端点</button>' +
+              '</div>'
+            );
+          }
+          epListEl.innerHTML = epRows.join("");
+        } else {
+          epCountEl.textContent = "0 个可拨地址 (endpoints: [])";
+          epListEl.innerHTML =
+            '<div class="endpoint-row" style="color:#FBBF24;border-color:rgba(245,158,11,0.35);background:rgba(245,158,11,0.08);">' +
+              '<span>◐ 当前未公告任何可拨端点 (可能未开启 --listen 或尚未首次上报)</span>' +
+            '</div>';
+        }
+
+        // CLI Bridge Commands
+        var cliBox = document.getElementById("inspCliBox");
+        var cmds = [
+          { label: "测量延迟", cmd: "cmesh ping " + selected.device_id },
+          { label: "发送消息", cmd: "cmesh msg " + selected.device_id + " \"status-check\"" },
+          { label: "传输文件", cmd: "cmesh send " + selected.device_id + " ./build-artifact.tar.gz" }
+        ];
+        var cliHtml = [];
+        for (var c = 0; c < cmds.length; c++) {
+          cliHtml.push(
+            '<div class="cli-cmd-row">' +
+              '<span><strong style="color:var(--text-secondary);">[' + cmds[c].label + ']</strong> $ ' + cmds[c].cmd + '</span>' +
+              '<button type="button" class="mini-btn btn-copy-text" data-copy="' + cmds[c].cmd + '">复制</button>' +
+            '</div>'
+          );
+        }
+        cliBox.innerHTML = cliHtml.join("");
+
+        // Wire dynamic copy buttons inside inspector
+        var copyBtns = document.querySelectorAll(".btn-copy-text");
+        for (var cb = 0; cb < copyBtns.length; cb++) {
+          copyBtns[cb].addEventListener("click", function () {
+            copyTextToClipboard(this.getAttribute("data-copy"));
+          });
+        }
+      }
+
+      function renderDiagnostics(members, payload, isLive, onlineCount, totalCount, offlineCount, noEpCount) {
+        var drawer = document.getElementById("diagDrawer");
+        drawer.classList.toggle("expanded", state.diagExpanded);
+        document.getElementById("diagSummaryToggle").setAttribute("aria-expanded", String(state.diagExpanded));
+        document.getElementById("diagToggleHint").textContent = state.diagExpanded ? "点击收起诊断详情 ▾" : "点击按需展开诊断详情 ▴";
+
+        var summaryText = document.getElementById("diagSummaryText");
+        if (!isLive) {
+          summaryText.innerHTML = '<span style="color:#FBBF24;">▲ 发现节点连接中断 · 当前显示缓存快照 (v' + payload.roster_version + ') · 正在后台自动重连</span>';
+        } else if (noEpCount > 0 || offlineCount > 0) {
+          summaryText.textContent = "● 发现节点同步正常 (v" + payload.roster_version + ") · " + onlineCount + "/" + totalCount + " 在线 · " +
+            (noEpCount > 0 ? (noEpCount + " 台无入站端点 · ") : "") +
+            (offlineCount > 0 ? (offlineCount + " 台离线在册") : "");
+        } else {
+          summaryText.textContent = "✓ 发现节点同步正常 (v" + payload.roster_version + ") · 全部 " + totalCount + " 台设备在线且具备可拨端点";
+        }
+
+        document.getElementById("diagSyncState").textContent = isLive ? "● HTTP 200 (发现节点同步正常)" : "▲ 连接超时 (已启用本地快照保护)";
+        document.getElementById("diagViewMode").textContent = isLive ? "实时数据视图 (Live)" : "本地缓存快照 (Cached Snapshot)";
+        document.getElementById("diagRetryState").textContent = isLive
+          ? "正常轮询 (每 5 秒同步)"
+          : ("第 " + state.data.retryCount + " 次重试 (" + state.data.retrySeconds + "s 后执行)");
+        document.getElementById("diagSnapshotTime").textContent = payload.generated_at;
+
+        var reasons = [];
+        for (var i = 0; i < members.length; i++) {
+          var m = members[i];
+          var hasEp = Array.isArray(m.endpoints) && m.endpoints.length > 0;
+          if (!m.online) {
+            reasons.push("<div>○ <strong>" + m.name + "</strong>: 当前离线（最后在线 " + m.last_seen_rel + "），仍保留在名册中。</div>");
+          } else if (!hasEp) {
+            reasons.push("<div style='color:#FBBF24;'>◐ <strong>" + m.name + "</strong>: 在线但无公告端点 (endpoints: [])，可能未配置 --listen 或处于纯出站容器。</div>");
+          }
+        }
+        if (reasons.length === 0) {
+          reasons.push("<div style='color:#34D399;'>✓ 当前名册内所有设备均在线且已公告有效端点，无受限或离线节点。</div>");
+        }
+        document.getElementById("diagNodeReasons").innerHTML = reasons.join("");
+
+        document.getElementById("diagRecentEvents").innerHTML =
+          "<div>[最新] " + state.data.recentEvent + "</div>" +
+          "<div>[快照] account_id=" + payload.account_id + " · roster_version=v" + payload.roster_version + "</div>" +
+          "<div>[安全] 用户态点对点加密认证已启用 · 零 CAP_NET_ADMIN / 零 TUN 依赖</div>";
+      }
+
+      // =========================================================================
+      // 4. CUSTOM PRECISION 3D ISOMETRIC ENGINE (HTML5 CANVAS + DOM BILLBOARDS)
+      // =========================================================================
+      var canvas = document.getElementById("meshCanvas");
+      var ctx = canvas.getContext("2d");
+      var billboardsLayer = document.getElementById("billboardsLayer");
+      var billboardElements = {};
+      var projectedNodesCache = [];
+
+      function resizeCanvas() {
+        var rect = canvas.parentElement.getBoundingClientRect();
+        var dpr = window.devicePixelRatio || 1;
+        canvas.width = Math.max(1, Math.floor(rect.width * dpr));
+        canvas.height = Math.max(1, Math.floor(rect.height * dpr));
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      }
+
+      // Project 3D world point (x, y, z) to 2D canvas coordinates
+      // Center of projection is slightly shifted right on wide screens so the left HUD never covers the core
+      function project3D(x, y, z, width, height) {
+        var cosY = Math.cos(state.camYaw);
+        var sinY = Math.sin(state.camYaw);
+        var cosP = Math.cos(state.camPitch);
+        var sinP = Math.sin(state.camPitch);
+
+        var rx = x * cosY - z * sinY;
+        var rz = x * sinY + z * cosY;
+        var ry = y * cosP - rz * sinP;
+        var depth = y * sinP + rz * cosP;
+
+        var offsetX = width > 900 ? width * 0.56 : width * 0.5;
+        var offsetY = height * 0.52;
+        var scale = state.camZoom * Math.min(width, height) / 470;
+
+        return {
+          x: offsetX + rx * scale,
+          y: offsetY - ry * scale,
+          depth: depth,
+          scale: scale
+        };
+      }
+
+      // Helper to draw an isometric 3D prism/box with clean architectural shading
+      function drawIsoBox(cx, cy, cz, wx, wy, wz, colors, width, height, dashedWireframe) {
+        var hx = wx / 2;
+        var hz = wz / 2;
+        var v = [
+          project3D(cx - hx, cy,      cz - hz, width, height),
+          project3D(cx + hx, cy,      cz - hz, width, height),
+          project3D(cx + hx, cy,      cz + hz, width, height),
+          project3D(cx - hx, cy,      cz + hz, width, height),
+          project3D(cx - hx, cy + wy, cz - hz, width, height),
+          project3D(cx + hx, cy + wy, cz - hz, width, height),
+          project3D(cx + hx, cy + wy, cz + hz, width, height),
+          project3D(cx - hx, cy + wy, cz + hz, width, height)
+        ];
+
+        ctx.save();
+        if (dashedWireframe) {
+          ctx.setLineDash([4, 3]);
+        }
+
+        // Side faces (painter's order based on yaw)
+        var faces = [
+          { idx: [0, 1, 5, 4], fill: colors.sideA },
+          { idx: [1, 2, 6, 5], fill: colors.sideB },
+          { idx: [2, 3, 7, 6], fill: colors.sideA },
+          { idx: [3, 0, 4, 7], fill: colors.sideB }
+        ];
+        faces.sort(function (a, b) {
+          var da = (v[a.idx[0]].depth + v[a.idx[2]].depth) * 0.5;
+          var db = (v[b.idx[0]].depth + v[b.idx[2]].depth) * 0.5;
+          return da - db;
+        });
+
+        for (var f = 0; f < faces.length; f++) {
+          var pts = faces[f].idx;
+          ctx.beginPath();
+          ctx.moveTo(v[pts[0]].x, v[pts[0]].y);
+          ctx.lineTo(v[pts[1]].x, v[pts[1]].y);
+          ctx.lineTo(v[pts[2]].x, v[pts[2]].y);
+          ctx.lineTo(v[pts[3]].x, v[pts[3]].y);
+          ctx.closePath();
+          ctx.fillStyle = faces[f].fill;
+          ctx.fill();
+          ctx.strokeStyle = colors.stroke;
+          ctx.lineWidth = 1;
+          ctx.stroke();
+        }
+
+        // Top face
+        ctx.beginPath();
+        ctx.moveTo(v[4].x, v[4].y);
+        ctx.lineTo(v[5].x, v[5].y);
+        ctx.lineTo(v[6].x, v[6].y);
+        ctx.lineTo(v[7].x, v[7].y);
+        ctx.closePath();
+        ctx.fillStyle = colors.top;
+        ctx.fill();
+        ctx.strokeStyle = colors.strokeTop || colors.stroke;
+        ctx.lineWidth = 1.2;
+        ctx.stroke();
+
+        ctx.restore();
+      }
+
+      // Draw a flat ground ring or polygon on plane y = yLevel
+      function drawGroundPolygon(radius, segments, yLevel, strokeStyle, lineWidth, dash, fillStyle, width, height) {
+        ctx.save();
+        if (dash) ctx.setLineDash(dash);
+        ctx.beginPath();
+        for (var i = 0; i <= segments; i++) {
+          var ang = (i / segments) * Math.PI * 2;
+          var px = Math.cos(ang) * radius;
+          var pz = Math.sin(ang) * radius;
+          var p = project3D(px, yLevel, pz, width, height);
+          if (i === 0) ctx.moveTo(p.x, p.y);
+          else ctx.lineTo(p.x, p.y);
+        }
+        if (fillStyle) {
+          ctx.fillStyle = fillStyle;
+          ctx.fill();
+        }
+        if (strokeStyle) {
+          ctx.strokeStyle = strokeStyle;
+          ctx.lineWidth = lineWidth || 1;
+          ctx.stroke();
+        }
+        ctx.restore();
+      }
+
+      function render3DScene() {
+        var rect = canvas.parentElement.getBoundingClientRect();
+        var width = rect.width;
+        var height = rect.height;
+        ctx.clearRect(0, 0, width, height);
+
+        // Smooth camera interpolation (unless Reduced Motion is enabled)
+        if (state.reducedMotion) {
+          state.camYaw = state.targetYaw;
+          state.camPitch = state.targetPitch;
+          state.camZoom = state.targetZoom;
+        } else {
+          state.camYaw += (state.targetYaw - state.camYaw) * 0.14;
+          state.camPitch += (state.targetPitch - state.camPitch) * 0.14;
+          state.camZoom += (state.targetZoom - state.camZoom) * 0.14;
+          if (state.data.discoveryConnected) {
+            state.pulsePhase = (state.pulsePhase + 0.0055) % 1;
+          }
+        }
+
+        // 1. Draw Isometric Datum Platform & Precision Grid
+        drawIsoBox(0, -10, 0, 440, 10, 440, {
+          top: "#0E1520",
+          sideA: "#090D14",
+          sideB: "#070A10",
+          stroke: "#1E293B",
+          strokeTop: "#26354D"
+        }, width, height, false);
+
+        // Grid lines on y = 0
+        ctx.save();
+        ctx.strokeStyle = "rgba(30, 41, 59, 0.65)";
+        ctx.lineWidth = 1;
+        for (var g = -200; g <= 200; g += 40) {
+          var p1 = project3D(g, 0, -200, width, height);
+          var p2 = project3D(g, 0, 200, width, height);
+          ctx.beginPath();
+          ctx.moveTo(p1.x, p1.y);
+          ctx.lineTo(p2.x, p2.y);
+          ctx.stroke();
+
+          var p3 = project3D(-200, 0, g, width, height);
+          var p4 = project3D(200, 0, g, width, height);
+          ctx.beginPath();
+          ctx.moveTo(p3.x, p3.y);
+          ctx.lineTo(p4.x, p4.y);
+          ctx.stroke();
+        }
+        ctx.restore();
+
+        // Concentric Zone Rings on Datum Plane
+        // Inner Anchor Zone (r = 52)
+        drawGroundPolygon(52, 32, 0.5, "rgba(56, 189, 248, 0.35)", 1.2, null, "rgba(56, 189, 248, 0.04)", width, height);
+        // Active Mesh Ring (r = 150)
+        drawGroundPolygon(150, 48, 0.5, "rgba(148, 163, 184, 0.22)", 1, [6, 4], null, width, height);
+        // Outer Roster Dock Ring (r = 215)
+        drawGroundPolygon(215, 48, 0.5, "rgba(100, 116, 139, 0.2)", 1, [2, 4], null, width, height);
+
+        // Platform technical zone inscriptions
+        var labelPosCore = project3D(0, 0, 66, width, height);
+        var labelPosDock = project3D(0, 0, -202, width, height);
+        ctx.save();
+        ctx.font = "600 10px ui-monospace, SFMono-Regular, monospace";
+        ctx.fillStyle = "rgba(56, 189, 248, 0.55)";
+        ctx.textAlign = "center";
+        ctx.fillText("ANCHOR CORE (0,0)", labelPosCore.x, labelPosCore.y);
+        ctx.fillStyle = "rgba(100, 116, 139, 0.65)";
+        ctx.fillText("ROSTER STANDBY DOCK (OFFLINE IN ROSTER)", labelPosDock.x, labelPosDock.y);
+        ctx.restore();
+
+        // 2. Compute Node Positions & Draw Connection Rails
+        var members = state.data.payload.members || [];
+        var layout = computeNodeLayout(members);
+        var anchorNode = layout[0];
+        for (var k = 0; k < layout.length; k++) {
+          if (layout[k].member.is_anchor) {
+            anchorNode = layout[k];
+            break;
+          }
+        }
+
+        // Draw Orthogonal Rails from Anchor / Peers
+        for (var r = 0; r < layout.length; r++) {
+          var item = layout[r];
+          var m = item.member;
+          if (m.is_anchor) continue;
+
+          var cls = classifyMember(m);
+          var isRelatedToSelected = (state.selectedDeviceId === m.device_id) ||
+                                    (state.selectedDeviceId === anchorNode.member.device_id) ||
+                                    (state.hoveredDeviceId === m.device_id);
+          var alphaMultiplier = isRelatedToSelected ? 1.0 : 0.35;
+
+          // Orthogonal elbow point on ground plane (y = 2)
+          var elbowX = item.x * 0.55;
+          var elbowZ = item.z;
+
+          var pStart = project3D(0, 2, 0, width, height);
+          var pElbow = project3D(elbowX, 2, elbowZ, width, height);
+          var pEnd = project3D(item.x, 2, item.z, width, height);
+
+          ctx.save();
+          ctx.globalAlpha = alphaMultiplier;
+
+          if (!m.online) {
+            // Unavailable / Offline in roster: static slate reference line
+            ctx.strokeStyle = "#475569";
+            ctx.lineWidth = 1.2;
+            ctx.setLineDash([3, 5]);
+            ctx.beginPath();
+            ctx.moveTo(pStart.x, pStart.y);
+            ctx.lineTo(pElbow.x, pElbow.y);
+            ctx.lineTo(pEnd.x, pEnd.y);
+            ctx.stroke();
+          } else if (!cls.hasEndpoints) {
+            // Online but No Endpoint: Amber dashed line stopping 24% short of the node with an open terminal
+            var stopX = elbowX + (item.x - elbowX) * 0.68;
+            var stopZ = elbowZ + (item.z - elbowZ) * 0.68;
+            var pStop = project3D(stopX, 2, stopZ, width, height);
+
+            ctx.strokeStyle = "#F59E0B";
+            ctx.lineWidth = 1.8;
+            ctx.setLineDash([5, 4]);
+            ctx.beginPath();
+            ctx.moveTo(pStart.x, pStart.y);
+            ctx.lineTo(pElbow.x, pElbow.y);
+            ctx.lineTo(pStop.x, pStop.y);
+            ctx.stroke();
+
+            // Open terminal bar showing no inbound endpoint
+            ctx.setLineDash([]);
+            ctx.fillStyle = "#F59E0B";
+            ctx.beginPath();
+            ctx.arc(pStop.x, pStop.y, 3.5, 0, Math.PI * 2);
+            ctx.fill();
+          } else if (m.transport === "relay") {
+            // Relay via Anchor: Teal rail with relay bridge marker at elbow
+            ctx.strokeStyle = "#2DD4BF";
+            ctx.lineWidth = isRelatedToSelected ? 2.4 : 1.6;
+            ctx.beginPath();
+            ctx.moveTo(pStart.x, pStart.y);
+            ctx.lineTo(pElbow.x, pElbow.y);
+            ctx.lineTo(pEnd.x, pEnd.y);
+            ctx.stroke();
+
+            // Relay diamond node at elbow
+            ctx.fillStyle = "#0F172A";
+            ctx.strokeStyle = "#2DD4BF";
+            ctx.lineWidth = 1.5;
+            ctx.beginPath();
+            ctx.arc(pElbow.x, pElbow.y, 4, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.stroke();
+
+            // Pulse particle along relay rail
+            if (!state.reducedMotion && state.data.discoveryConnected) {
+              drawRailPulse(pStart, pElbow, pEnd, (state.pulsePhase + r * 0.23) % 1, "#2DD4BF");
+            }
+          } else {
+            // Direct P2P: Crisp Cyan rail
+            ctx.strokeStyle = "#38BDF8";
+            ctx.lineWidth = isRelatedToSelected ? 2.5 : 1.8;
+            ctx.beginPath();
+            ctx.moveTo(pStart.x, pStart.y);
+            ctx.lineTo(pElbow.x, pElbow.y);
+            ctx.lineTo(pEnd.x, pEnd.y);
+            ctx.stroke();
+
+            if (!state.reducedMotion && state.data.discoveryConnected) {
+              drawRailPulse(pStart, pElbow, pEnd, (state.pulsePhase + r * 0.19) % 1, "#38BDF8");
+            }
+          }
+          ctx.restore();
+        }
+
+        // Also draw a direct P2P cross-rail between local workstation and vps-fra-prod-02 when both are online & direct
+        var localNode = null;
+        var peerDirectNode = null;
+        for (var dIdx = 0; dIdx < layout.length; dIdx++) {
+          var dm = layout[dIdx].member;
+          if (dm.is_local && dm.online) localNode = layout[dIdx];
+          else if (!dm.is_anchor && dm.online && dm.transport === "direct" && dm.endpoints && dm.endpoints.length > 0 && !peerDirectNode) {
+            peerDirectNode = layout[dIdx];
+          }
+        }
+        if (localNode && peerDirectNode) {
+          var pL = project3D(localNode.x, 3, localNode.z, width, height);
+          var pMid = project3D((localNode.x + peerDirectNode.x) * 0.5, 3, (localNode.z + peerDirectNode.z) * 0.5, width, height);
+          var pP = project3D(peerDirectNode.x, 3, peerDirectNode.z, width, height);
+          ctx.save();
+          ctx.strokeStyle = "rgba(56, 189, 248, 0.55)";
+          ctx.lineWidth = 1.6;
+          ctx.beginPath();
+          ctx.moveTo(pL.x, pL.y);
+          ctx.lineTo(pP.x, pP.y);
+          ctx.stroke();
+          if (!state.reducedMotion && state.data.discoveryConnected) {
+            drawRailPulse(pL, pMid, pP, (state.pulsePhase + 0.5) % 1, "#38BDF8");
+          }
+          ctx.restore();
+        }
+
+        // 3. Sort Nodes Back-to-Front (Painter's Algorithm) and Draw 3D Structures
+        var sortableNodes = [];
+        for (var n = 0; n < layout.length; n++) {
+          var projBase = project3D(layout[n].x, 0, layout[n].z, width, height);
+          sortableNodes.push({
+            layoutItem: layout[n],
+            projBase: projBase,
+            depth: projBase.depth
+          });
+        }
+        sortableNodes.sort(function (a, b) {
+          return a.depth - b.depth;
+        });
+
+        projectedNodesCache = [];
+        for (var s = 0; s < sortableNodes.length; s++) {
+          var nItem = sortableNodes[s].layoutItem;
+          var member = nItem.member;
+          var mCls = classifyMember(member);
+          var isSelected = member.device_id === state.selectedDeviceId;
+          var isHovered = member.device_id === state.hoveredDeviceId;
+
+          // Selection / Hover Ground Ring
+          if (isSelected || isHovered) {
+            drawNodeFocusRing(nItem.x, nItem.z, member.is_anchor ? 42 : 32, isSelected ? "#38BDF8" : "#94A3B8", width, height);
+          }
+
+          var topHeight = 32;
+          if (member.is_anchor) {
+            topHeight = 52;
+            // Anchor Pedestal Base
+            drawIsoBox(nItem.x, 0, nItem.z, 52, 10, 52, {
+              top: "#1E293B",
+              sideA: "#0F172A",
+              sideB: "#090D16",
+              stroke: "#334155",
+              strokeTop: "#475569"
+            }, width, height, false);
+            // Inner Cyan Emissive Core
+            drawIsoBox(nItem.x, 10, nItem.z, 22, 34, 22, {
+              top: "#38BDF8",
+              sideA: "#0284C7",
+              sideB: "#0369A1",
+              stroke: "#7DD3FC",
+              strokeTop: "#BAE6FD"
+            }, width, height, false);
+            // Outer Transparent Glass Enclosure
+            drawIsoBox(nItem.x, 10, nItem.z, 40, 40, 40, {
+              top: "rgba(241, 245, 249, 0.18)",
+              sideA: "rgba(148, 163, 184, 0.12)",
+              sideB: "rgba(100, 116, 139, 0.10)",
+              stroke: "rgba(56, 189, 248, 0.65)",
+              strokeTop: "#E2E8F0"
+            }, width, height, false);
+          } else if (!member.online) {
+            // Offline Member in Roster Dock: Matte Slate Wireframe Module (Never removed, never red)
+            topHeight = 28;
+            drawIsoBox(nItem.x, 0, nItem.z, 42, 4, 42, {
+              top: "#111827",
+              sideA: "#0B0F19",
+              sideB: "#090D16",
+              stroke: "#334155"
+            }, width, height, false);
+            drawIsoBox(nItem.x, 4, nItem.z, 30, 24, 30, {
+              top: "rgba(30, 41, 59, 0.45)",
+              sideA: "rgba(15, 23, 42, 0.45)",
+              sideB: "rgba(15, 23, 42, 0.35)",
+              stroke: "#64748B",
+              strokeTop: "#94A3B8"
+            }, width, height, true);
+          } else if (!mCls.hasEndpoints) {
+            // Online Member WITHOUT Endpoints: Matte body + Amber dashed outer cage
+            topHeight = 34;
+            drawIsoBox(nItem.x, 0, nItem.z, 30, 26, 30, {
+              top: "#334155",
+              sideA: "#1E293B",
+              sideB: "#0F172A",
+              stroke: "#475569",
+              strokeTop: "#F59E0B"
+            }, width, height, false);
+            // Amber warning cap
+            drawIsoBox(nItem.x, 26, nItem.z, 36, 6, 36, {
+              top: "rgba(245, 158, 11, 0.22)",
+              sideA: "rgba(245, 158, 11, 0.14)",
+              sideB: "rgba(245, 158, 11, 0.10)",
+              stroke: "#F59E0B",
+              strokeTop: "#FBBF24"
+            }, width, height, true);
+          } else {
+            // Online Reachable Member (Direct or Relay): Matte White/Slate Scientific Module + Emerald/Teal Emissive Cap
+            topHeight = 32;
+            drawIsoBox(nItem.x, 0, nItem.z, 38, 6, 38, {
+              top: "#1E293B",
+              sideA: "#0F172A",
+              sideB: "#090D16",
+              stroke: "#334155"
+            }, width, height, false);
+            drawIsoBox(nItem.x, 6, nItem.z, 30, 22, 30, {
+              top: "#E2E8F0",
+              sideA: "#CBD5E1",
+              sideB: "#94A3B8",
+              stroke: "#475569",
+              strokeTop: "#F8FAFC"
+            }, width, height, false);
+            // Emissive status cap
+            var capColor = member.transport === "relay" ? "#2DD4BF" : "#10B981";
+            drawIsoBox(nItem.x, 28, nItem.z, 20, 4, 20, {
+              top: capColor,
+              sideA: capColor,
+              sideB: capColor,
+              stroke: "#0F172A",
+              strokeTop: "#ECFDF5"
+            }, width, height, false);
+          }
+
+          var projTop = project3D(nItem.x, topHeight + 10, nItem.z, width, height);
+          var projCenter = project3D(nItem.x, topHeight * 0.5, nItem.z, width, height);
+          projectedNodesCache.push({
+            device_id: member.device_id,
+            member: member,
+            cls: mCls,
+            screenX: projTop.x,
+            screenY: projTop.y,
+            hitX: projCenter.x,
+            hitY: projCenter.y
+          });
+        }
+
+        // 4. Sync 2D Crisp Vector DOM Billboards
+        updateDOMBillboards(projectedNodesCache);
+      }
+
+      function drawRailPulse(pStart, pElbow, pEnd, t, color) {
+        var x, y;
+        if (t < 0.5) {
+          var u = t * 2;
+          x = pStart.x + (pElbow.x - pStart.x) * u;
+          y = pStart.y + (pElbow.y - pStart.y) * u;
+        } else {
+          var v = (t - 0.5) * 2;
+          x = pElbow.x + (pEnd.x - pElbow.x) * v;
+          y = pElbow.y + (pEnd.y - pElbow.y) * v;
+        }
+        ctx.save();
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        ctx.arc(x, y, 3.2, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+      }
+
+      function drawNodeFocusRing(cx, cz, radius, color, width, height) {
+        ctx.save();
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        var segs = 28;
+        for (var i = 0; i <= segs; i++) {
+          var a = (i / segs) * Math.PI * 2;
+          var p = project3D(cx + Math.cos(a) * radius, 1, cz + Math.sin(a) * radius, width, height);
+          if (i === 0) ctx.moveTo(p.x, p.y);
+          else ctx.lineTo(p.x, p.y);
+        }
+        ctx.stroke();
+        ctx.restore();
+      }
+
+      function updateDOMBillboards(projList) {
+        billboardsLayer.style.display = state.showLabels ? "block" : "none";
+        if (!state.showLabels) return;
+
+        var activeIds = {};
+        for (var i = 0; i < projList.length; i++) {
+          var item = projList[i];
+          var id = item.device_id;
+          activeIds[id] = true;
+
+          var el = billboardElements[id];
+          if (!el) {
+            el = document.createElement("div");
+            el.className = "node-billboard";
+            el.setAttribute("data-device-id", id);
+            el.addEventListener("click", function (ev) {
+              ev.stopPropagation();
+              state.selectedDeviceId = this.getAttribute("data-device-id");
+              syncAllUI();
+            });
+            el.addEventListener("mouseenter", function () {
+              state.hoveredDeviceId = this.getAttribute("data-device-id");
+            });
+            el.addEventListener("mouseleave", function () {
+              state.hoveredDeviceId = null;
+            });
+            billboardsLayer.appendChild(el);
+            billboardElements[id] = el;
+          }
+
+          var m = item.member;
+          var cls = item.cls;
+          var isSelected = state.selectedDeviceId === id;
+
+          var matchFilter = true;
+          if (state.rosterFilter === "online" && !m.online) matchFilter = false;
+          if (state.rosterFilter === "no_endpoint" && (cls.hasEndpoints || !m.online)) matchFilter = false;
+          if (state.rosterFilter === "offline" && m.online) matchFilter = false;
+
+          el.className = "node-billboard" + (isSelected ? " selected" : "") + (!matchFilter ? " dimmed" : "");
+          el.style.left = Math.round(item.screenX) + "px";
+          el.style.top = Math.round(item.screenY - 6) + "px";
+
+          var roleBadgeHtml = "";
+          if (m.is_anchor) {
+            roleBadgeHtml = '<span class="bb-role-tag anchor">ANCHOR</span>';
+          } else if (m.is_local) {
+            roleBadgeHtml = '<span class="bb-role-tag local">LOCAL</span>';
+          }
+
+          var epCountText = cls.hasEndpoints
+            ? (m.endpoints.length + " 端点")
+            : "无端点";
+          if (!m.online) epCountText = m.last_seen_rel;
+
+          el.innerHTML =
+            '<div class="bb-row-1">' +
+              '<span><strong class="' + cls.symClass + '">' + cls.symbol + '</strong> ' + m.name + '</span>' +
+              roleBadgeHtml +
+            '</div>' +
+            '<div class="bb-row-2">' +
+              '<span>' + cls.shortStatus + '</span>' +
+              '<span>' + epCountText + '</span>' +
+            '</div>';
+        }
+
+        // Clean up stale billboards if any
+        for (var existingId in billboardElements) {
+          if (Object.prototype.hasOwnProperty.call(billboardElements, existingId) && !activeIds[existingId]) {
+            if (billboardElements[existingId].parentNode) {
+              billboardElements[existingId].parentNode.removeChild(billboardElements[existingId]);
+            }
+            delete billboardElements[existingId];
+          }
+        }
+      }
+
+      // Animation Loop
+      function animateLoop() {
+        render3DScene();
+        requestAnimationFrame(animateLoop);
+      }
+
+      // =========================================================================
+      // 5. INTERACTION HANDLERS (CANVAS ORBIT, PICKING, SCENARIOS, MODALS)
+      // =========================================================================
+      canvas.addEventListener("mousedown", function (e) {
+        state.isDragging = true;
+        state.dragStartX = e.clientX;
+        state.dragStartY = e.clientY;
+      });
+
+      window.addEventListener("mousemove", function (e) {
+        if (state.isDragging) {
+          var dx = e.clientX - state.dragStartX;
+          var dy = e.clientY - state.dragStartY;
+          state.dragStartX = e.clientX;
+          state.dragStartY = e.clientY;
+          // Restricted angle bounds so the user never loses orientation
+          state.targetYaw = Math.max(-0.4, Math.min(1.5, state.targetYaw + dx * 0.006));
+          state.targetPitch = Math.max(0.32, Math.min(0.95, state.targetPitch + dy * 0.005));
+          return;
+        }
+
+        // Hover hit-test on canvas
+        var rect = canvas.getBoundingClientRect();
+        if (e.clientX >= rect.left && e.clientX <= rect.right && e.clientY >= rect.top && e.clientY <= rect.bottom) {
+          var mx = e.clientX - rect.left;
+          var my = e.clientY - rect.top;
+          var hitId = null;
+          var bestDist = 34;
+          for (var i = 0; i < projectedNodesCache.length; i++) {
+            var pn = projectedNodesCache[i];
+            var dist = Math.hypot(mx - pn.hitX, my - pn.hitY);
+            if (dist < bestDist) {
+              bestDist = dist;
+              hitId = pn.device_id;
+            }
+          }
+          state.hoveredDeviceId = hitId;
+          canvas.style.cursor = hitId ? "pointer" : (state.isDragging ? "grabbing" : "grab");
+        }
+      });
+
+      window.addEventListener("mouseup", function () {
+        state.isDragging = false;
+      });
+
+      canvas.addEventListener("click", function (e) {
+        var rect = canvas.getBoundingClientRect();
+        var mx = e.clientX - rect.left;
+        var my = e.clientY - rect.top;
+        var hitId = null;
+        var bestDist = 36;
+        for (var i = 0; i < projectedNodesCache.length; i++) {
+          var pn = projectedNodesCache[i];
+          var dist = Math.hypot(mx - pn.hitX, my - pn.hitY);
+          if (dist < bestDist) {
+            bestDist = dist;
+            hitId = pn.device_id;
+          }
+        }
+        if (hitId) {
+          state.selectedDeviceId = hitId;
+          syncAllUI();
+        }
+      });
+
+      canvas.addEventListener("wheel", function (e) {
+        e.preventDefault();
+        var delta = e.deltaY > 0 ? -0.07 : 0.07;
+        state.targetZoom = Math.max(0.72, Math.min(1.42, state.targetZoom + delta));
+      }, { passive: false });
+
+      // (The prototype's scenario-switcher handlers were removed together
+      // with the buttons: a production interface must not offer canned
+      // states, and a leftover handler over a removed element would throw.)
+
+      // Reconnect Button on Cache Banner — a REAL retry against the node.
+      // (The prototype reset itself to a canned scenario here, which would
+      // have painted fake state over a genuinely unreachable node.)
+      document.getElementById("btnSimulateReconnect").addEventListener("click", function () {
+        state.data.retryCount = 0;
+        state.data.retrySeconds = 0;
+        fetchLiveMesh();
+        showToast("正在重新连接发现节点…");
+      });
+
+      // Metric Cards & Filter Tabs
+      var filterCards = document.querySelectorAll(".metric-card");
+      for (var fc = 0; fc < filterCards.length; fc++) {
+        filterCards[fc].addEventListener("click", function () {
+          state.rosterFilter = this.getAttribute("data-filter");
+          syncAllUI();
+        });
+      }
+
+      var filterTabs = document.querySelectorAll(".filter-tab");
+      for (var ft = 0; ft < filterTabs.length; ft++) {
+        filterTabs[ft].addEventListener("click", function () {
+          state.rosterFilter = this.getAttribute("data-tab");
+          syncAllUI();
+        });
+      }
+
+      // Viewport Controls
+      document.getElementById("btnResetView").addEventListener("click", function () {
+        state.targetYaw = 0.62;
+        state.targetPitch = 0.56;
+        state.targetZoom = 1.0;
+        showToast("3D 等轴测视角已复位");
+      });
+
+      document.getElementById("btnToggleLabels").addEventListener("click", function () {
+        state.showLabels = !state.showLabels;
+        syncAllUI();
+      });
+
+      document.getElementById("btnToggleMotion").addEventListener("click", function () {
+        state.reducedMotion = !state.reducedMotion;
+        syncAllUI();
+        showToast(state.reducedMotion ? "已开启静态模式 (Reduced Motion)" : "已恢复标准脉冲动效");
+      });
+
+      // Single-Node Interactive State Mutation Buttons inside Inspector
+      document.getElementById("btnSimToggleOnline").addEventListener("click", function () {
+        var members = state.data.payload.members;
+        for (var i = 0; i < members.length; i++) {
+          if (members[i].device_id === state.selectedDeviceId) {
+            members[i].online = !members[i].online;
+            if (members[i].online) {
+              members[i].last_seen_rel = "刚刚 (已恢复)";
+              members[i].transport = (members[i].endpoints && members[i].endpoints.length > 0) ? "direct" : "pending";
+              state.data.recentEvent = "节点 " + members[i].name + " 恢复在线";
+            } else {
+              members[i].last_seen_rel = "刚刚离线";
+              members[i].transport = "unavailable";
+              state.data.recentEvent = "节点 " + members[i].name + " 转为离线 (仍保留在网络名册)";
+            }
+            syncAllUI();
+            showToast(members[i].name + (members[i].online ? " 已模拟恢复在线" : " 已模拟离线 (保留在名册)"));
+            break;
+          }
+        }
+      });
+
+      document.getElementById("btnSimToggleEndpoint").addEventListener("click", function () {
+        var members = state.data.payload.members;
+        for (var i = 0; i < members.length; i++) {
+          if (members[i].device_id === state.selectedDeviceId) {
+            var m = members[i];
+            if (m.endpoints && m.endpoints.length > 0) {
+              m._savedEndpoints = m.endpoints.slice();
+              m.endpoints = [];
+              if (m.online && !m.is_anchor) m.transport = "pending";
+              state.data.recentEvent = "节点 " + m.name + " 变更为无公告端点 (endpoints: [])";
+              showToast("已模拟清空 " + m.name + " 的公告端点");
+            } else {
+              m.endpoints = m._savedEndpoints || ["198.51.100.204:41820"];
+              if (m.online) m.transport = "direct";
+              state.data.recentEvent = "节点 " + m.name + " 已完成端点公告 (" + m.endpoints[0] + ")";
+              showToast("已模拟恢复 " + m.name + " 的公告端点");
+            }
+            syncAllUI();
+            break;
+          }
+        }
+      });
+
+      document.getElementById("btnCopyDeviceId").addEventListener("click", function () {
+        copyTextToClipboard(state.selectedDeviceId);
+      });
+
+      // Diagnostics Drawer Toggle
+      function toggleDiagnostics() {
+        state.diagExpanded = !state.diagExpanded;
+        syncAllUI();
+      }
+      document.getElementById("diagSummaryToggle").addEventListener("click", toggleDiagnostics);
+      document.getElementById("topSyncBadge").addEventListener("click", toggleDiagnostics);
+
+      // Modals (API JSON / Network Context / Join Guide)
+      var modalBackdrop = document.getElementById("appModalBackdrop");
+      var modalTitle = document.getElementById("modalTitle");
+      var modalBody = document.getElementById("modalBodyContent");
+
+      function openModal(title, htmlContent) {
+        modalTitle.textContent = title;
+        modalBody.innerHTML = htmlContent;
+        modalBackdrop.classList.add("open");
+      }
+
+      function closeModal() {
+        modalBackdrop.classList.remove("open");
+      }
+
+      document.getElementById("btnCloseModal").addEventListener("click", closeModal);
+      modalBackdrop.addEventListener("click", function (e) {
+        if (e.target === modalBackdrop) closeModal();
+      });
+
+      document.getElementById("btnShowApiModal").addEventListener("click", function () {
+        var jsonStr = JSON.stringify(state.data.payload, null, 2);
+        openModal(
+          "GET /api/mesh 实时数据契约快照 (Roster v" + state.data.payload.roster_version + ")",
+          "<p style='color:var(--text-secondary);'>当前面板所有读数、3D 节点状态与端点列表均严格映射自以下 <code class='mono'>GET /api/mesh</code> JSON 响应结构，绝不编造虚假指标：</p>" +
+          "<pre class='code-pre'>" + jsonStr + "</pre>"
+        );
+      });
+
+      document.getElementById("btnNetworkContext").addEventListener("click", function () {
+        openModal(
+          "网络身份与后续演进架构预留 (一机多网 & 统一凭证)",
+          "<div class='diag-card'>" +
+            "<h4>当前激活网络 (首版只读监控视图)</h4>" +
+            "<div class='diag-kv'><span>网络名称:</span><span>" + state.data.payload.network_name + "</span></div>" +
+            "<div class='diag-kv'><span>网络身份 (account_id):</span><span>" + state.data.payload.account_id + "</span></div>" +
+            "<div class='diag-kv'><span>信任根模式:</span><span>用户自托管锚点 (不依赖第三方云平台)</span></div>" +
+          "</div>" +
+          "<div class='diag-card'>" +
+            "<h4>后续产品化预留能力边界 (明确区分阶段，不伪装已上线功能)</h4>" +
+            "<p style='color:var(--text-secondary);font-size:12px;'>1. <strong>一机多网与多租网切换</strong>：顶部网络选择器已预留上下文切换结构，后续支持同一容器同时加入多张隔离网络并一键切换 3D 拓扑视图。<br/>" +
+            "2. <strong>统一凭证生命周期管理</strong>：支持凭证签发、过期预警 (Amber) 与即时吊销 (Red)。</p>" +
+          "</div>"
+        );
+      });
+
+      document.getElementById("btnOpenJoinGuide").addEventListener("click", function () {
+        openModal(
+          "加入 container-mesh 私有网络 (零特权用户态组网)",
+          "<p style='color:var(--text-secondary);'>在无 root、无 <code class='mono'>CAP_NET_ADMIN</code>、无 TUN 设备或无公网入站端口的容器中，通过以下步骤加入当前私有网络：</p>" +
+          "<pre class='code-pre'># 1. 启动用户态节点并连接自托管锚点 (若环境支持入站可附加 --listen :41820)\ncmesh up --account " + state.data.payload.account_id + " --anchor 203.0.113.42:41820 --listen :41820\n\n# 2. 纯出站受限容器 (如 CI 沙箱 / Serverless，无需入站端口)\ncmesh up --account " + state.data.payload.account_id + " --anchor 203.0.113.42:41820\n\n# 3. 查看名册与连通状态\ncmesh status</pre>" +
+          "<p style='color:var(--text-muted);font-size:12px;'>注：一键自动安装脚本与统一临时入网凭证将在后续产品化阶段上线。</p>"
+        );
+      });
+
+      // Keyboard Shortcuts
+      window.addEventListener("keydown", function (e) {
+        if (e.key === "Escape") {
+          closeModal();
+        } else if (e.key === "r" || e.key === "R") {
+          state.targetYaw = 0.62;
+          state.targetPitch = 0.56;
+          state.targetZoom = 1.0;
+        }
+      });
+
+      // Clipboard & Toast helper (Canvas sandbox safe)
+      var toastTimer = null;
+      function showToast(msg) {
+        var box = document.getElementById("toastBox");
+        box.textContent = msg;
+        box.classList.add("show");
+        if (toastTimer) clearTimeout(toastTimer);
+        toastTimer = setTimeout(function () {
+          box.classList.remove("show");
+        }, 2200);
+      }
+
+      function copyTextToClipboard(text) {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(text).then(function () {
+            showToast("已复制: " + text);
+          }).catch(function () {
+            fallbackCopy(text);
+          });
+        } else {
+          fallbackCopy(text);
+        }
+      }
+
+      function fallbackCopy(text) {
+        var ta = document.createElement("textarea");
+        ta.value = text;
+        ta.style.position = "fixed";
+        ta.style.opacity = "0";
+        document.body.appendChild(ta);
+        ta.select();
+        try {
+          document.execCommand("copy");
+          showToast("已复制: " + text);
+        } catch (err) {
+          showToast("复制失败，请手动选择复制");
+        }
+        document.body.removeChild(ta);
+      }
+
+      // Countdown ticker for Discovery Disconnected scenario
+      setInterval(function () {
+        if (!state.data.discoveryConnected) {
+          if (state.data.retrySeconds > 1) {
+            state.data.retrySeconds--;
+          } else {
+            state.data.retryCount++;
+            state.data.retrySeconds = 5;
+          }
+          var cdEl = document.getElementById("retryCountdownText");
+          if (cdEl) cdEl.textContent = state.data.retrySeconds + "s";
+          var diagRetry = document.getElementById("diagRetryState");
+          if (diagRetry) {
+            diagRetry.textContent = "第 " + state.data.retryCount + " 次重试 (" + state.data.retrySeconds + "s 后执行)";
+          }
+        }
+      }, 1000);
+
+      // =========================================================================
+      // LIVE `/api/mesh` ADAPTER
+      // =========================================================================
+      // The prototype probed the real backend only behind ?live=1 and kept
+      // its mock state as the fallback. In the product the real API is the
+      // ONLY source: the mock is never painted, a failed poll shows the
+      // cached view with the "node unreachable" banner, and the poll keeps
+      // running so the cockpit heals itself when the node comes back.
+      var LIVE_POLL_MS = 5000;
+      var TOKEN_KEY = "cmesh.panel.token";
+
+      function panelToken() {
+        try { return window.localStorage.getItem(TOKEN_KEY) || ""; } catch (e) { return ""; }
+      }
+
+      function savePanelToken(v) {
+        try { window.localStorage.setItem(TOKEN_KEY, v); } catch (e) {}
+      }
+
+      function fetchLiveMesh() {
+        var headers = {};
+        var tok = panelToken();
+        if (tok) headers["X-Panel-Token"] = tok;
+        return window.fetch("/api/mesh", { headers: headers, cache: "no-store" })
+          .then(function (r) {
+            if (r.status === 401) { showTokenGate(); throw new Error("panel token required"); }
+            if (!r.ok) throw new Error("HTTP " + r.status);
+            return r.json();
+          })
+          .then(function (json) {
+            if (!json || !Array.isArray(json.members)) throw new Error("unexpected payload");
+            state.data.discoveryConnected = true;
+            state.data.retryCount = 0;
+            state.data.retrySeconds = 0;
+            state.data.payload = json;
+            state.data.scenarioTitle = "实时名册 · " + json.summary.online + "/" + json.summary.members + " 在线";
+            state.data.recentEvent = "名册版本 v" + (json.roster_version || 0) + " · 数据时间 " + (json.generated_at || "");
+            if (!state.selectedDeviceId ||
+                !json.members.some(function (m) { return m.device_id === state.selectedDeviceId; })) {
+              state.selectedDeviceId = json.members.length ? json.members[0].device_id : null;
+            }
+            hideTokenGate();
+            syncAllUI();
+          })
+          .catch(function (e) {
+            // The node is unreachable (or the token is wrong): keep the last
+            // good view on screen and say so, instead of blanking the cockpit.
+            state.data.discoveryConnected = false;
+            state.data.retryCount = (state.data.retryCount || 0) + 1;
+            state.data.retrySeconds = Math.round(LIVE_POLL_MS / 1000);
+            syncAllUI();
+          });
+      }
+
+      // Token gate: the data endpoint is protected, so the cockpit asks for
+      // the token once and remembers it in this browser.
+      function showTokenGate() {
+        var gate = document.getElementById("tokenGate");
+        if (gate) gate.style.display = "flex";
+      }
+      function hideTokenGate() {
+        var gate = document.getElementById("tokenGate");
+        if (gate) gate.style.display = "none";
+      }
+      function wireTokenGate() {
+        var gate = document.getElementById("tokenGate");
+        if (!gate) return;
+        var input = document.getElementById("tokenInput");
+        var submit = document.getElementById("tokenSubmit");
+        var stored = panelToken();
+        if (stored) input.value = stored;
+        function submitToken() {
+          var v = (input.value || "").trim();
+          if (!v) return;
+          savePanelToken(v);
+          hideTokenGate();
+          fetchLiveMesh();
+        }
+        submit.addEventListener("click", submitToken);
+        input.addEventListener("keydown", function (e) {
+          if (e.key === "Enter") submitToken();
+        });
+      }
+
+      // Initialize
+      window.addEventListener("resize", resizeCanvas);
+      resizeCanvas();
+      wireTokenGate();
+      syncAllUI();
+      fetchLiveMesh();
+      window.setInterval(fetchLiveMesh, LIVE_POLL_MS);
+      requestAnimationFrame(animateLoop);
+    })();
+  </script>
+</body>
+</html>
