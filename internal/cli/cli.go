@@ -41,6 +41,10 @@ func Run(args []string) error {
 	switch args[0] {
 	case "probe":
 		return runProbe(args[1:])
+	case "status":
+		return runStatus(args[1:])
+	case "doctor":
+		return runDoctor(args[1:])
 	case "relay":
 		return runRelay(args[1:])
 	case "send":
@@ -91,10 +95,13 @@ func usage(w io.Writer) {
 	fmt.Fprint(w, `cmesh — userspace container-to-container messaging and file transfer
 
 Usage:
-  cmesh probe [--json] [--skip-network] [--device PATH]
-        Report whether this container can create a TUN device, what
-        capabilities it holds, and whether outbound networking works.
-        Exit codes: 0 = TUN usable, 10 = userspace only, 20 = unusable.
+  cmesh status [--state DIR] [--device-passphrase PASS] [--json]
+        Show the last verified member view, including offline members,
+        announced endpoints, last_seen and the roster version.
+
+  cmesh doctor [--json] [--skip-network]
+        Check local capability and outbound-network health. Exit codes match
+        cmesh probe.
 
   cmesh relay [--addr :8080] [--path /ws]
         Run the rendezvous server. Only the first and last hop of a transfer
