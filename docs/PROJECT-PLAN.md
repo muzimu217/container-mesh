@@ -1,6 +1,6 @@
 # container-mesh 项目总规划与交付口径
 
-更新时间：2026-11-14。当前分支：`develop`。待推送 tip：`b143884`。
+更新时间：2026-11-14。当前分支：`develop`。待推送 tip：`c530c7d`。
 
 ## 项目状态口径
 
@@ -28,7 +28,7 @@
 - B-3：凭证设备入网后的 `mesh ping/msg` 配置读取已修复；本地真实二进制验证 ping 5/5、msg delivered 1。
 - e2e 已纳入第 11 节，当前门禁 41/41。
 
-待推送 tip `b143884` 已包含 B-1/B-2 和基础凭证实现；B-3 最终修复与本地面板收口仍在本地批次，推送后派外部复测。
+待推送 tip `c530c7d` 已包含 B-1/B-2 和基础凭证实现；B-3 最终修复与本地面板收口仍在本地批次，推送后派外部复测。
 
 ### M4-B：端口自检与真实驾驶舱
 
@@ -54,7 +54,9 @@
 
 ### 本地新增运维线
 
-- `cmesh status`：读取已验证 snapshot，输出成员、版本、在线状态、端点和 `last_seen`。
+- `cmesh status`：读取已验证 snapshot，输出成员、版本、在线状态、端点、`last_seen` 和保守 reachability。
+- `cmesh mesh ping`：100ms 最小采样间隔、最多 1000 包、丢包统计、p50/p95，direct/degraded/unknown 不伪造。
+- `cmesh bench`：默认每方向 100MB，独立 direct QUIC 测试流，支持 rate 限制，不写业务文件；QUIC 重传计数不可观测时明确输出 `n/a`。
 - `cmesh doctor`：复用现有 probe 能力与退出码。
 - `@cat` 大输出：修复 ACK reader 的 4 KiB stream 截断，新增长输出 QUIC 回归测试。
 
@@ -121,13 +123,13 @@ relay 配对通道已有恢复能力；组网直连的 `.part`、offset、hash �
 - `cmesh probe` / `cmesh doctor`：TUN 真实 ioctl、capability、UDP/TCP 出站、DNS、localhost listen、STUN 反射地址与 NAT 判定，JSON + 退出码。
 - 锚点端口自检（`internal/cli/portcheck.go`）：区分已监听 / 防火墙丢弃 / 仅 loopback / UDP 未绑 / 公告地址不可达，且只报观测事实。
 - `internal/p2p`：STUN 候选 + UDP 打洞，默认关闭（实验性加速器），可把 punched socket 交给 QUIC 复用。
-- `cmesh status`：成员、端点、版本、`last_seen`，JSON 稳定输出。
+- `cmesh status`：成员、端点、版本、`last_seen`、reachability，JSON 稳定输出。当前 reachability 在没有实际 transport probe 时保守为 `unknown`，不把端点候选伪装成直连。
 
 ### 缺口（归 M4-C / v1.1，不混入 v1.0 收口）
 
 - 纯出站 NAT 反拨失败已复现（netns 实测出站 10/10、锚点反拨失败）：需要中继路由与路径回退。
 - S3 全受限自动可达、增量快照、慢消费者协议优化尚未开始。
-- 现有 probe / portcheck 给出观测与人工动作，**尚未串成一条自动链路**；`status` 还没有 reachability 分类字段。
+- 现有 probe / portcheck 给出观测与人工动作，**尚未串成一条自动链路**；`status` 已有 reachability 字段，但 relay-only 只有在真实 relay session/transport 证据可用时才填充，当前 snapshot 默认 `unknown`。
 
 ### 一步打通与端口选择（候选，未实现）
 
@@ -138,19 +140,27 @@ relay 配对通道已有恢复能力；组网直连的 `.part`、offset、hash �
 3. 把 probe / portcheck / p2p / forward 串成单一 `up` 流程，结果进 `cmesh status` JSON，供脚本消费。
 4. 无公网容器默认路径：主动出站连锚点 + 中继；打洞与直连是可选加速，不是前置条件。
 
-### 远期候选：TUN / 全局虚拟 IP / SOCKS5（需求变更候选，未立项）
+### 明确不做：自研 L3 / 虚拟网卡 / 全局虚拟 IP（R3 硬边界）
 
-- 端口转发与 SOCKS5 属应用层适配；SOCKS5 仅覆盖 TCP 且需程序走代理，**不作为核心路径**，`cmesh run` / `cmesh forward` 仍是主路径。
-- TUN 虚拟网卡 + 全局虚拟 IP + subnet router / exit node / DNS 属 L3 平面，需要 CAP_NET_ADMIN、MTU/MSS、DNS、ACL 与子网路由。`probe` 已能实测 TUN 是否可用，但产品主路径仍是 `userspace_only`。
-- **需求冲突提示**：`REQUIREMENTS.md` R3 §1.3「不是 VPN」与 N-7 已排除透明 L3 / subnet router / exit node / MagicDNS，U3 定义为无 root、无入站端口、无 TUN。本节仅为**需求变更候选，不是已批准路线**；按 `CONVENTIONS.md` T-0.1，无需求编号不得开工。若决定变更，须走变更流程并升版需求文档（详见 `docs/PM-REVIEW.md` §3.1）。
-- 若将来提供 L3，只能以独立可选模块挂载；core profile 与 `cmesh-core`（无 UI 包）不背权限、不背体积。
-- 参考对象：Tailscale userspace networking / kernel-vs-netstack subnet routing、quic-go 可插拔拥塞控制与 connection migration、PostgreSQL 扩展与 hook、libp2p 可组合 transport / muxer / security。
+- `REQUIREMENTS.md` R3 §1.3「**不是 VPN**」与 N-7 明确排除透明 L3 / subnet router / exit node / MagicDNS；U3 定义为无 root、无入站端口、无 TUN。
+- 产品**不自研** TUN 虚拟网卡、全局虚拟 IP、整机流量接管。按 `CONVENTIONS.md` T-0.1，这不是「远期候选」：**不立项、不排期、不写进里程碑**；任何重新提出须先走需求变更流程并升版 `REQUIREMENTS.md`。
+- `probe` 已能实测 TUN 是否可用，但产品主路径仍是 `userspace_only`；能力探测用于告知「此路不通」，不是为了启用它。
+- 参考对象（仅供了解边界，不作为实现清单）：Tailscale userspace networking / kernel-vs-netstack subnet routing、quic-go 可插拔拥塞控制与 connection migration、PostgreSQL 扩展与 hook、libp2p 可组合 transport / muxer / security。
+
+### 后期可选：外部代理通道（C-5 范围内，连接层适配）
+
+- 含义：**接入**一个已有的外部代理 / VPN 通道，让传输流量在 hub 带宽、容量有限或低流量场景下经该通道送出；产品本身**不变成 VPN**，不建网卡、不发全局 IP、不接管整机流量。
+- 归类：`REQUIREMENTS.md` **C-5**（传输须能穿过仅允许 HTTP(S)/WebSocket 出站的环境：代理、CDN 前置）范围内的**连接层适配**，落在 `internal/wsconn/` 一侧；**不是需求变更，不升 R4，不动 core profile，不给低权限容器加权限**。
+- 形态边界：出站流量经可配置代理地址（HTTP CONNECT / SOCKS5 / WS over 反代或 CDN）；**不进主链**，`cmesh run` / `cmesh forward` / 中继仍是主路径。涉及本机跑 VPN 客户端建网卡的需权限、U3 跑不了，不做。
+- 前置：v1.1 / M4-C 的中继选路与路径回退（先有选路支点，才知道何时切到外部通道）。
+- 边界：端到端加密不破，外部代理只能见密文（`DESIGN.md`「中转节点只转发密文」）；若走第三方 CDN 前置，先查 `decisions.md` 的 no-Cloudflare 结论。
+- 状态：**M5 候选项、非阻塞**，不属于 M4 收口，也不单独新增里程碑。
 
 ### 里程碑归属
 
 - **M4（当前收口）**：不含本节任何候选项，只做凭证、面板、安装器与本地运维线。
-- **M5 / v1.1**：中继路由、路径回退、S3 自动可达、一步打通与端口策略、连接生命周期、断点续传。
-- **M6 之后（须先完成需求变更立项）**：扩展点正式开放、L3 网络平面（TUN / 虚拟 IP / SOCKS5）、插件式协议预研；未获立项前只保持接口预留。
+- **M5 / v1.1**：中继路由、路径回退、S3 自动可达、一步打通与端口策略、连接生命周期、断点续传；外部代理通道作为**后置候选项**挂在本阶段之后，不阻塞前述交付。
+- **M6 之后**：扩展点正式开放、插件式协议预研；未立项前只保持接口预留。
 
 ## 里程碑
 

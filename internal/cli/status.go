@@ -21,11 +21,26 @@ import (
 // statusMember is the stable, read-only status contract. It deliberately
 // mirrors the facts the discovery snapshot carries; runtime metrics belong to
 // doctor or a future telemetry API and must not be invented here.
+const (
+	reachabilityDirect    = "direct"
+	reachabilityRelayOnly = "relay-only"
+	reachabilityUnknown   = "unknown"
+	reachabilityDegraded  = "degraded"
+
+	defaultStatusSnapshotTimeout = 800 * time.Millisecond
+)
+
+// statusMember is the stable, read-only status contract. Reachability is
+// deliberately conservative: discovery proves membership, liveness, and
+// advertised candidates, but it does not prove that a peer can be dialled or
+// that a relay data path is available. Those cases remain unknown until a
+// transport probe supplies evidence.
 type statusMember struct {
-	DeviceID  identity.DeviceID `json:"device_id"`
-	Online    bool              `json:"online"`
-	Endpoints []string          `json:"endpoints"`
-	LastSeen  string            `json:"last_seen,omitempty"`
+	DeviceID     identity.DeviceID `json:"device_id"`
+	Online       bool              `json:"online"`
+	Reachability string            `json:"reachability"`
+	Endpoints    []string          `json:"endpoints"`
+	LastSeen     string            `json:"last_seen,omitempty"`
 }
 
 type statusReport struct {
@@ -46,14 +61,14 @@ func runStatus(args []string) error {
 	state := fs.String("state", "", "state directory (default ~/.cmesh)")
 	pass := fs.String("device-passphrase", "", "passphrase for the device file (for scripting)")
 	asJSON := fs.Bool("json", false, "emit structured JSON")
-	timeout := fs.Duration("timeout", 15*time.Second, "budget for discovery")
+	timeout := fs.Duration("timeout", defaultStatusSnapshotTimeout, "budget for the verified discovery snapshot")
 	if err := fs.Parse(args); err != nil {
 		return ExitError{Code: 2, Err: err}
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
-	sess, err := openMeshSession(ctx, *state, *pass, nil)
+	sess, err := openMeshSessionWithSnapshotTimeout(ctx, *state, *pass, nil, *timeout)
 	if err != nil {
 		return ExitError{Code: 1, Err: fmt.Errorf("status: %w", err)}
 	}
@@ -76,7 +91,12 @@ func runStatus(args []string) error {
 	}
 	for _, id := range ids {
 		mv := snap.Members[id]
-		row := statusMember{DeviceID: id, Online: mv.Online, Endpoints: append([]string(nil), mv.Endpoints...)}
+		row := statusMember{
+			DeviceID:     id,
+			Online:       mv.Online,
+			Reachability: statusReachability(mv),
+			Endpoints:    append([]string(nil), mv.Endpoints...),
+		}
 		if !mv.LastSeen.IsZero() {
 			row.LastSeen = mv.LastSeen.UTC().Format(time.RFC3339)
 		}
@@ -101,7 +121,9 @@ func runStatus(args []string) error {
 		}
 		extra := ""
 		if len(row.Endpoints) > 0 {
-			extra = " endpoints=" + strings.Join(row.Endpoints, ",")
+			extra = " reachability=" + row.Reachability + " endpoints=" + strings.Join(row.Endpoints, ",")
+		} else {
+			extra = " reachability=" + row.Reachability
 		}
 		if row.LastSeen != "" {
 			extra += " last_seen=" + row.LastSeen
@@ -109,6 +131,15 @@ func runStatus(args []string) error {
 		fmt.Fprintf(os.Stdout, "  %-16s %-7s%s\n", row.DeviceID, state, extra)
 	}
 	return nil
+}
+
+// statusReachability reports only what the current discovery snapshot proves.
+// An advertised endpoint is a candidate, not a successful direct path, and an
+// online member does not imply that this process has a relay data session to
+// it. Keeping these cases unknown avoids turning membership facts into
+// invented transport telemetry.
+func statusReachability(_ discovery.MemberView) string {
+	return reachabilityUnknown
 }
 
 // MemberSnapshot does not carry a generation timestamp. Keep status honest by

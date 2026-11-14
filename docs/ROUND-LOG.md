@@ -415,7 +415,24 @@ init → account create → device-add → serve-discovery（自举 members.json
 
 **下一轮**：等四线复测（驾驶舱面板 / 权限矩阵 / 一键入网 / mkrelease）→ v1.0 收口（主分支发布合并检查单见 docs/M4-PLAN.md D6：main 与 develop 已分叉，须逐行看过 −498 那侧）→ M5（一机多网 / 多租锚点）
 
-## Round 13（2026-11-13/14，e94cd81 → 24bbf2f，双环境复测全 PASS）
+## Round 14（2026-11-14 · 诊断测速 CLI 第一批）
+
+**催办目标**：实现 `status`、ping 采样约束和 `bench`，同时保持不依赖 Cockpit、不抢业务流、不伪造 relay/retransmission 证据。
+
+### 已落地（本地 worktree，待推送）
+
+- `cmesh status`：snapshot 等待预算默认 **800ms**；文本/JSON 输出成员、版本、online、端点、last_seen、reachability。没有 transport probe 证据时输出 `unknown`，不把端点候选写成直连，不把 relay 写成已连接。
+- `cmesh mesh ping`：`--interval` 最小 **100ms**，`--count` 限制 **1..1000**；超时回复计为 loss 并继续采样；输出 sent/received/lost、丢包率、p50/p95 和 direct/degraded/unknown。兼容保留 `PingExchange`，新增 `PingExchangeStats`。
+- `cmesh bench <peer-id>`：默认每方向 **100MB**，独立 `KindBench` QUIC stream，双向并发、`--rate` 每方向限速、帧边界和结束/统计帧校验，不写业务文件、不占用消息/文件/forward 流；QUIC 的逐流 retransmission counter 当前不可观测，命令明确输出 `retransmissions=n/a`，不伪造为 0。
+- `@cat` 大输出：ACK 读取不再用 stream 级 `io.LimitReader(4097)`，新增 4KiB+真实 run frame/exit frame 回归测试，修复前稳定 `unexpected EOF`。
+
+### 证据与边界
+
+- 本地 focused tests：`go test ./internal/cli ./internal/mesh -count=1` PASS。
+- 完整 Go tests、race、e2e 41/41、Linux amd64/arm64、Windows amd64 交叉编译已在本轮通过。
+- netns 真 NAT：凭证入网 0.857/0.851s，client→anchor 10/10；anchor→纯出站 client 失败，因为无 DNAT 且现有直连命令无中继回退。该结论归 v1.1 中继路由/路径回退，不归因 B-3。
+- CPU≤8%/内存≤15MB 尚无统一采样定义和端到端阈值测试，暂不标 PASS；下一步需定义 RSS/Heap、采样窗口和端点分离后再测。
+
 
 ### 1. 缺陷闭环（agent 抓到，协调者修复）
 

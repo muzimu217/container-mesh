@@ -44,6 +44,10 @@ type meshSession struct {
 // as it does for init/join — the container-deploy path in the guide depends
 // on it (issue #8 D-5).
 func openMeshSession(ctx context.Context, state, passFlag string, eps []string) (*meshSession, error) {
+	return openMeshSessionWithSnapshotTimeout(ctx, state, passFlag, eps, 15*time.Second)
+}
+
+func openMeshSessionWithSnapshotTimeout(ctx context.Context, state, passFlag string, eps []string, snapshotTimeout time.Duration) (*meshSession, error) {
 	dir, err := stateDir(state)
 	if err != nil {
 		return nil, err
@@ -102,7 +106,10 @@ func openMeshSession(ctx context.Context, state, passFlag string, eps []string) 
 	}
 	go func() { _ = cl.Run(ctx) }()
 
-	waitCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	if snapshotTimeout <= 0 {
+		snapshotTimeout = 15 * time.Second
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, snapshotTimeout)
 	defer cancel()
 	t := time.NewTicker(50 * time.Millisecond)
 	defer t.Stop()
@@ -120,7 +127,7 @@ func openMeshSession(ctx context.Context, state, passFlag string, eps []string) 
 				if perr := cl.Announce(waitCtx); perr != nil && strings.Contains(perr.Error(), "not a member") {
 					return nil, fmt.Errorf("this device has been removed from this network (revoked by the account owner, or the approval never happened)")
 				}
-				return nil, fmt.Errorf("no member view within 15s (discovery node unreachable, or not approved yet?)")
+				return nil, fmt.Errorf("no member view within %s (discovery node unreachable, or not approved yet?)", snapshotTimeout)
 			}
 			resolver := &liveViewResolver{accountPub: []byte(inv.AccountPub)}
 			resolver.set(cl)
@@ -347,8 +354,8 @@ func runMeshPing(args []string) error {
 	fs.SetOutput(os.Stderr)
 	state := fs.String("state", "", "state directory (default ~/.cmesh)")
 	pass := fs.String("device-passphrase", "", "passphrase for the device file (for scripting)")
-	count := fs.Int("count", 10, "pings to send")
-	interval := fs.Duration("interval", 200*time.Millisecond, "delay between pings")
+	count := fs.Int("count", 10, "pings to send (1-1000)")
+	interval := fs.Duration("interval", 200*time.Millisecond, "delay between pings (minimum 100ms)")
 	timeout := fs.Duration("timeout", 20*time.Second, "overall budget including discovery")
 	if err := fs.Parse(args); err != nil {
 		return ExitError{Code: 2, Err: err}
@@ -356,6 +363,12 @@ func runMeshPing(args []string) error {
 	if fs.NArg() != 1 {
 		return ExitError{Code: 2, Err: errors.New(
 			"usage: cmesh mesh ping [flags] <deviceID> (the device ID goes last: flag parsing stops at the first positional argument)")}
+	}
+	if *count < 1 || *count > 1000 {
+		return ExitError{Code: 2, Err: errors.New("mesh ping --count must be between 1 and 1000 packets")}
+	}
+	if *interval < 100*time.Millisecond {
+		return ExitError{Code: 2, Err: errors.New("mesh ping --interval must be at least 100ms")}
 	}
 	target := identity.DeviceID(fs.Arg(0))
 	if !target.Valid() {
@@ -388,17 +401,26 @@ func runMeshPing(args []string) error {
 	}
 	defer link.Close()
 
-	rtts, err := mesh.PingExchange(ctx, link, *count, *interval)
-	if err != nil && len(rtts) == 0 {
+	stats, err := mesh.PingExchangeStats(ctx, link, *count, *interval)
+	if err != nil && stats.Sent == 0 {
 		return ExitError{Code: 1, Err: fmt.Errorf("ping exchange failed: %w", err)}
 	}
-	for i, rtt := range rtts {
-		fmt.Printf("seq=%d rtt=%.3fms\n", i+1, rtt)
+	for i, rtt := range stats.RTTs {
+		fmt.Printf("reply=%d rtt=%.3fms\n", i+1, rtt)
 	}
-	p50 := mesh.Percentile(rtts, 50)
-	p95 := mesh.Percentile(rtts, 95)
-	fmt.Printf("--- %s: %d/%d pings, p50 %.3fms p95 %.3fms (P-1 line: <5ms)\n",
-		target, len(rtts), *count, p50, p95)
+	p50 := mesh.Percentile(stats.RTTs, 50)
+	p95 := mesh.Percentile(stats.RTTs, 95)
+	linkClass := reachabilityUnknown
+	if stats.Received > 0 && stats.Lost == 0 {
+		linkClass = reachabilityDirect
+	} else if stats.Sent > 0 {
+		linkClass = reachabilityDegraded
+	}
+	fmt.Printf("--- %s: %d/%d pings, lost %d (%.1f%%), p50 %.3fms p95 %.3fms, link=%s (P-1 line: <5ms)\n",
+		target, stats.Received, stats.Sent, stats.Lost, stats.LossPercent(), p50, p95, linkClass)
+	if err != nil {
+		return ExitError{Code: 1, Err: fmt.Errorf("ping exchange stopped after %d/%d packets: %w", stats.Sent, *count, err)}
+	}
 	if p95 >= 5.0 {
 		fmt.Fprintf(os.Stderr, "note: p95 above the P-1 acceptance line (5ms) — expected across real networks, investigate only on same-machine links\n")
 	}

@@ -72,6 +72,8 @@ const (
 	// dial [--cmd]). Authenticated by the same membership mTLS: only
 	// approved members can exec, and the listener can refuse entirely.
 	KindExec = "exec"
+	// KindBench is an isolated bidirectional throughput measurement stream.
+	KindBench = "bench"
 )
 
 // ExecRequest is the header line of an exec session: the argv to run.
@@ -485,7 +487,7 @@ func (l *Listener) serveStream(peerID identity.DeviceID, st *quic.Stream) error 
 		return errors.New("mesh: bad hello")
 	}
 	switch h.Kind {
-	case KindPing, KindDial, KindMsg, KindFile, KindRun, KindExec:
+	case KindPing, KindDial, KindMsg, KindFile, KindRun, KindExec, KindBench:
 	default:
 		return fmt.Errorf("mesh: unknown hello kind %q", h.Kind)
 	}
@@ -508,9 +510,11 @@ func (l *Listener) serveStream(peerID identity.DeviceID, st *quic.Stream) error 
 		return receiveFile(peerID, br, st, l.cfg)
 	case KindRun:
 		return receiveRun(br, st, l.cfg)
-	// KindExec (arbitrary remote commands) is pending: the implementation
-	// is gated on the operator adjusting the code-scanner rule that blocks
-	// os/exec writes. Built-in verbs above cover remote diagnosis today.
+	case KindBench:
+		return receiveBench(br, st)
+		// KindExec (arbitrary remote commands) is pending: the implementation
+		// is gated on the operator adjusting the code-scanner rule that blocks
+		// os/exec writes. Built-in verbs above cover remote diagnosis today.
 	default:
 		return fmt.Errorf("mesh: unknown hello kind %q", h.Kind)
 	}
@@ -912,38 +916,92 @@ func (l *Link) Reader() *bufio.Reader { return l.br }
 // Close tears the link down.
 func (l *Link) Close() error { return l.qc.CloseWithError(0, "bye") }
 
+// PingStats is the result of a ping exchange. Sent includes packets that
+// were written successfully; Lost is the number whose reply timed out.
+type PingStats struct {
+	Sent     int
+	Received int
+	Lost     int
+	RTTs     []float64
+}
+
+// LossPercent returns packet loss as a percentage. With no sent packets it is
+// zero because no measurement was made.
+func (s PingStats) LossPercent() float64 {
+	if s.Sent == 0 {
+		return 0
+	}
+	return float64(s.Lost) * 100 / float64(s.Sent)
+}
+
+const pingReplyTimeout = time.Second
+
 // PingExchange runs count pings over an established ping-kind link and
-// returns the RTTs in milliseconds.
+// returns the RTTs in milliseconds. It is kept as a compatibility wrapper;
+// callers that need loss accounting should use PingExchangeStats.
 func PingExchange(ctx context.Context, l *Link, count int, interval time.Duration) ([]float64, error) {
+	stats, err := PingExchangeStats(ctx, l, count, interval)
+	return stats.RTTs, err
+}
+
+// PingExchangeStats sends one packet at a time and records timed-out replies
+// as loss, allowing later packets to be measured instead of aborting at the
+// first missing reply. The CLI validates its user-facing count and interval
+// limits; this lower-level API remains permissive for existing callers.
+func PingExchangeStats(ctx context.Context, l *Link, count int, interval time.Duration) (PingStats, error) {
 	if count <= 0 {
 		count = 1
 	}
-	rtts := make([]float64, 0, count)
+	stats := PingStats{RTTs: make([]float64, 0, count)}
 	buf := make([]byte, pingRecordSize)
 	for i := 1; i <= count; i++ {
 		if err := ctx.Err(); err != nil {
-			return rtts, err
+			return stats, err
 		}
 		if i > 1 && interval > 0 {
 			select {
 			case <-ctx.Done():
-				return rtts, ctx.Err()
+				return stats, ctx.Err()
 			case <-time.After(interval):
 			}
 		}
 		binary.BigEndian.PutUint64(buf[0:], uint64(i))
 		binary.BigEndian.PutUint64(buf[8:], uint64(time.Now().UnixNano()))
 		if _, err := l.st.Write(buf); err != nil {
-			return rtts, err
+			return stats, err
 		}
-		_ = l.st.SetReadDeadline(time.Now().Add(5 * time.Second))
-		if _, err := io.ReadFull(l.br, buf); err != nil {
-			return rtts, err
+		stats.Sent++
+
+		deadline := time.Now().Add(pingReplyTimeout)
+		if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+			deadline = ctxDeadline
 		}
-		sendAt := int64(binary.BigEndian.Uint64(buf[8:]))
-		rtts = append(rtts, float64(time.Now().UnixNano()-sendAt)/1e6)
+		_ = l.st.SetReadDeadline(deadline)
+		for {
+			if _, err := io.ReadFull(l.br, buf); err != nil {
+				var netErr net.Error
+				if errors.As(err, &netErr) && netErr.Timeout() {
+					stats.Lost++
+					break
+				}
+				if ctx.Err() != nil {
+					return stats, ctx.Err()
+				}
+				return stats, err
+			}
+			if binary.BigEndian.Uint64(buf[0:]) != uint64(i) {
+				// A late reply for an earlier timed-out packet is not a reply to
+				// this packet. Keep reading until this packet's deadline.
+				continue
+			}
+			sendAt := int64(binary.BigEndian.Uint64(buf[8:]))
+			stats.RTTs = append(stats.RTTs, float64(time.Now().UnixNano()-sendAt)/1e6)
+			stats.Received++
+			break
+		}
 	}
-	return rtts, nil
+	_ = l.st.SetReadDeadline(time.Time{})
+	return stats, nil
 }
 
 // Percentile returns the p-th percentile of RTTs (linear interpolation on a

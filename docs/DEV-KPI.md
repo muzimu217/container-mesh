@@ -1,6 +1,6 @@
 # container-mesh 开发与平台 KPI 看板
 
-更新时间：2026-11-14 10:30Z。分支：`develop`。远端 tip：`b143884`。
+更新时间：2026-11-14 15:00Z。分支：`develop`。远端 tip：`c530c7d`。
 
 这张表把代码、可运行产物、安装包、真机验收分开记账。交叉编译通过不等于平台交付完成；设计方案存在也不等于安装包完成。
 
@@ -11,9 +11,9 @@
 | 真实锚点面板 `/panel` | **已完成，已在远端 tip 验收** | React + Vite + Three.js 构建产物由 Go 内嵌；令牌头鉴权；离线成员保留；`/panel-lite` 保留 |
 | 面板白屏修复 | **本地已完成，待放行** | `/panel` → `308 /panel/`，`Cache-Control: no-store`；资源按浏览器 URL 解析测试 |
 | 假设备 / 假遥测清除 | **本地已完成，待放行** | 删除香港假节点、假拓扑、假 CPU/RAM/SLA/流量、假动作成功回显；未知数据显示「未采集」 |
-| 委派成员可拨 B-1 | **已完成并在 `b143884` 验收** | oh-no 双向测试；10/10；本地另有凭证设备主动 ping/msg 验证 |
+| 委派成员可拨 B-1 | **已完成并在 `c530c7d` 验收** | oh-no 双向测试；10/10；本地另有凭证设备主动 ping/msg 验证 |
 | 凭证设备后续命令 B-3 | **本地已完成，待放行** | `discovery.json` 保存派生字段；`join --cred` 后 `mesh ping` 5/5、`msg` delivered 1 |
-| `--endpoint :0` B-2 | **已完成并在 `b143884` 验收** | 绑定端口替换纯函数 + 回归测试 |
+| `--endpoint :0` B-2 | **已完成并在 `c530c7d` 验收** | 绑定端口替换纯函数 + 回归测试 |
 | 端口自检 | **已完成** | TCP/UDP 同端口提示、回环绑定提示、可执行动作 |
 | 安装器 / 发布组装 | **已完成代码，真实 release 尚未验收** | `packaging/install.sh`、`tools/cmesh-install`、`tools/mkrelease`；需真实 GitHub Release 资产验收 |
 | 中继路由 / 增量视图 | **未开始，推迟 v1.1** | M4-PLAN C 组；不混入当前 v1.0 收口 |
@@ -22,7 +22,10 @@
 
 | 任务 | 状态 | 验收 |
 |---|---|---|
-| `cmesh status` | **本地完成，完整门禁通过，待放行** | 注册命令；输出 account、roster version、online/total、成员 ID、端点、`last_seen`；JSON 稳定；离线成员保留 |
+| `cmesh status` | **本地完成，完整门禁通过，待放行** | 注册命令；输出 account、roster version、online/total、成员 ID、端点、`last_seen`、reachability；JSON 稳定；离线成员保留 |
+| `cmesh mesh ping` | **本地完成，待本地门禁重跑/放行** | 100ms 最小间隔、1–1000 包、超时计 loss、p50/p95；当前 direct QUIC，relay-only 不伪造 |
+| `cmesh bench` | **本地完成，待本地门禁重跑/放行** | 默认 100MB/方向、双向独立 bench stream、可限速；QUIC retransmission 当前明确 `n/a` |
+| `@cat` 大输出 | **本地完成，待放行** | 4095/4096/4097B+真实 run frame/exit frame 测试，修复 stream 级 4KiB 截断 |
 | `cmesh doctor` | **本地完成，完整门禁通过，待放行** | 复用 `cmesh probe` 的能力报告与退出码，避免第二套漂移实现 |
 | 撤销后切断活跃连接 | **未开始，需先定连接事件接口** | 成员撤销后旧连接关闭、新握手拒绝、普通版本 bump 不误杀 |
 | 优雅 LEAVE | **未开始，依赖连接生命周期接口** | 正常退出 ≤3s；kill -9 保持 ≤10s 兜底；迟到 LEAVE 不误杀重连成员 |
