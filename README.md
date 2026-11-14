@@ -51,7 +51,7 @@ go run ./tools/mkrelease --in dist/bin --out dist/release --version v1.0.0
 ```
 
 产物：各平台二进制 + 同名 `.tar.gz`（内含二进制、installer、LICENSE）+ `install.sh`
-+ `SHA256SUMS`（覆盖全部 11 个文件，可用 `shasum -a 256 -c SHA256SUMS` 校验）。
++ `SHA256SUMS`（覆盖除自身以外的全部 16 个文件，可用 `shasum -a 256 -c SHA256SUMS` 校验）。
 
 > **`cmesh-latest-<os>-<arch>` 是发布时的别名**：`mkrelease` 除了版本化文件名
 > （`cmesh-v1.0.0-linux-amd64`），还会为每个平台产出一份 `cmesh-latest-<os>-<arch>`
@@ -120,7 +120,7 @@ cmesh join --listen 0.0.0.0:18090 --device-passphrase <口令> <invite-string>
 
 - 端到端组网：三台设备互相可见、互拨、互传（100 MB 实测 72.3 MB/s）
 - 成员离线/上线可见性：秒级收敛（实测下线 0.01–1.12s、恢复 0.25–3.09s，含慢消费者形态）
-- 面板：401/200 鉴权正确、页面 14,699 B 零外部引用、上下线跟随秒级
+- 面板：401/200 鉴权正确、**零外部引用**（外壳 + 已入库的构建产物：JS ~996 KB / CSS ~64 KB）、上下线跟随秒级
 - 目录传输权限语义：0755/0750/0700/0600/0400 与目录模式逐位保留
 - 429 限流退避、握手错误文案、面板令牌鉴权：均已闭环
 
@@ -145,6 +145,9 @@ cmesh join --listen 0.0.0.0:18090 --device-passphrase <口令> <invite-string>
 | 部署一台锚点 | [deploy/MESH-NET.md](deploy/MESH-NET.md) |
 | 跨平台 App 方案 | [docs/architecture/APP-PACKAGING.md](docs/architecture/APP-PACKAGING.md) |
 | M4 交付计划 | [docs/M4-PLAN.md](docs/M4-PLAN.md) |
+| 当前开发与平台 KPI | [DEV-KPI.md](docs/DEV-KPI.md) |
+| 每日项目进度看板 | [project-dashboard.html](docs/project-dashboard.html) |
+| 路线规划图谱 | [PROJECT-ROADMAP.gpm](docs/PROJECT-ROADMAP.gpm) |
 | 技术决策历史（含被否决的方案） | [docs/decisions.md](docs/decisions.md) |
 | 每轮实测报告 | [docs/ROUND-LOG.md](docs/ROUND-LOG.md) |
 

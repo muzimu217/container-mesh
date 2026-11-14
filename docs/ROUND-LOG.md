@@ -414,3 +414,47 @@ init → account create → device-add → serve-discovery（自举 members.json
 - 发布件：`tools/mkrelease` 组装发布资产（缺 installer 时**明确失败且不留半成品**——此前会留下裸二进制与截断归档，`gzip -t` 还过）；`cmesh verify` 本地校验下载物；README 全部命令可照抄执行（此前 §2 照抄 0/6 通过、§3 四行里三行报 usage）。
 
 **下一轮**：等四线复测（驾驶舱面板 / 权限矩阵 / 一键入网 / mkrelease）→ v1.0 收口（主分支发布合并检查单见 docs/M4-PLAN.md D6：main 与 develop 已分叉，须逐行看过 −498 那侧）→ M5（一机多网 / 多租锚点）
+
+## Round 13（2026-11-13/14，e94cd81 → 24bbf2f，双环境复测全 PASS）
+
+### 1. 缺陷闭环（agent 抓到，协调者修复）
+
+| 编号 | 缺陷 | 根因 | 修复 | 复测 |
+|---|---|---|---|---|
+| B-1 | 委派成员能入网、在名册、**谁都拨不通** | `SnapshotAdapter.KeyFor` 只按账号公钥验签；凭证证书由委派者签 | 用快照携带的委派记录验签；无匹配委派仍拒 | oh-no：anchor→D9 10/10（p50 0.393ms）、D9→E9 10/10 |
+| B-2 | `--endpoint host:0` 被原样公告、锚点判畸形 | `--listen 0` 会展开而 `--endpoint` 不会 | `resolvePortZeroEndpoints` 按监听器实际端口解析（纯函数+测试） | oh-no：stderr 精确提示 + 名册 online + 10/10 可拨 |
+| B-3 | 凭证设备第二条命令起全废（`saved invite is malformed`） | `join --cred` 把凭证串存 `discovery.json.invite`，meshcmd 无条件 `DecodeInvite`（只认 `cmesh://join?`） | 配置改存派生字段（account_id/account_pub/discovery_addrs）；`cfg.invite()` 优先字段、旧格式回退解码 | 协调者真实二进制：入网→ping 5/5 p50 0.531ms→msg delivered 1；oh-no 待新 SHA 复跑三步+双向臂 |
+| — | 面板白屏（启动横幅的 `/panel` 无尾斜杠） | RFC 3986：文档在 `/panel` 时 base 是 `/`，`./assets/x` → `/assets/x` → 404 | `/panel` → 308 → `/panel/`（带 `Cache-Control: no-store`，防缓存毒化后续验证） | 协调者实测 308→200，JS/CSS 200；doubao 新 SHA 复测（黑盒口径已定） |
+| — | **面板默认显示两台不存在的设备** | 原型「香港3机智能聚合」开关**默认开启**，append 两台合成设备（伪造坐标/端点/运行时/online）+ 1.5s 定时器抖动假遥测 | 删设备/开关/连线弧/假遥测表/抖动循环/编造国旗发行版/虚构拓扑硬编码弧线；「失败后谎报已发起探测」改为如实报错；缺数据显示**未采集** | doubao：九串产物+源码+二进制 `strings` 全 0 命中；3D 设备数==members；40 个按钮无开关 |
+
+### 2. 验收工具本身的缺陷（与被测缺陷同样重要）
+
+| 工具错误 | 后果 | 规则 |
+|---|---|---|
+| `TestCockpitAssetsLoadThroughTheMount` 手工拼 `"/panel/"+ref` | 断言了写测试者的假设，不是浏览器行为；白屏存在时测试全绿 | **验证浏览器行为必须用 URL 解析器**（`ResolveReference`/`urljoin`），不得手工拼接路径；与第 12 轮 §5「探针共享令牌桶」同根 |
+| 协调者的真实锚点验证脚本与测试犯同一个错 | 两道绿灯互相印证、双双无效 | **两个共用同一错误假设的绿灯不构成交叉验证** |
+| 红测第一轮只把关键词包进括号，子串仍在 | 测试照绿＝无效红测 | 见 §3 |
+| canvas `fillText` 画的内容 DOM 查不到 | 「像素里有」≠「可核验」 | 给 canvas 挂 `sr-only` 文本镜像 + `role="img"`/`aria-label`（doubao 建议，已落地并通过 DOM 断言验收） |
+
+### 3. 方法学：红测的三条规则（doubao，round 60 回执）
+
+1. **变异必须是语义删除**——删词/删整句/改指向；包裹、加前缀、改大小写（除非被测逻辑确实大小写敏感）不算。本轮实例：把免责声明句改成同义句 → 测试红且报文精确；只把关键词包进括号 → 子串仍在 → 测试照绿（无效红测）。
+2. **红文必须匹配预期的失败原因**——不止"红了"：要确认红文正是那条断言（如 `demo-content exemption has lost its cover`），而不是编译失败、nil panic 或另一个断言先炸。
+3. **恢复后同一次运行内绿**——不能靠"上次是绿的"。
+
+同根结论（与 §2、第 12 轮 §5 并列）：**任何验证装置都要先证明它测的是被测物。**
+
+### 4. 其它
+
+- `anchor-hk-01` 特意不入演示黑名单：它只活在设计规范页的免责声明句里；黑名单化会逼测试删免责声明，方向反了。配套 `TestCockpitDesignSpecCarriesItsDisclaimer`：bundle 中凡出现该名处必须同时存在免责句（防豁免变成无人看守的门）；doubao 指出字节共现 ≠ 界面可见，DOM 侧黑盒断言由其下轮补（分工：Go 侧管构建产物，黑盒管渲染）。
+  - doubao 追加（round 60 收尾）：**DOM 共现 ≠ 读表人可见**——免责句落在页脚或总则，`body.innerText` 一样命中。三方收敛为**作用域断言**：免责句与被免责内容必须同区块；协调者已给 06 区块挂 `data-testid="spec-state-matrix-06"`（doubao 按此定位，文本定位做后备）。
+  - doubao 黑盒基线（`24bbf2f`，headless 实测）：设计规范 06 表是**五台假设备的完整名册矩阵**（编造名册版本 v42/v43、四态俱全），与同屏真实数据（1 台、v1）直接矛盾，且同页立着「数据诚信铁律」——免责缺失时这张表就是伪装成名册的示意。协调者已删全部假版本号（`In Roster（示意）`），免责句（worktree）落在 06 区块内。
+- 308 重定向显式 `no-store`：缓存过的 308 会让「撤掉重定向看红」读出假数据（doubao）。
+- 308 测试必须用显式 no-follow 客户端：Go 默认客户端会跟随 308，断言 308 会红、断言最终 200 则什么都没测（doubao；实现从第一版即是，价值在把理由写进注释）。
+- 操作坑：`show-pub` 打印**设备**公钥，`cred create` 凭证验签要**账号**公钥（`account show` 的 pubkey.b64/hex）——oh-no 实踩，记入部署文档待办。
+- 308 会被浏览器缓存，`no-store` 只落在转发响应上（同上 doubao ③）。
+
+### 5. 协调
+
+- kuku（28.5h）/ netns-probe（28.2h）静默：四次触达（三次催办+一次广播）无响应 → **最终通知已发**，48h（约 11-16 04:30Z）不回按失联结案、任务永久改派。netns 的 429 项已由 doubao 闭环（第 12 轮 §5）。
+- `24bbf2f` 双环境复测全 PASS（见 §1 复测列）；工作树另有一批未推修复（B-3/308/假遥测/文档），等网主放行后公告新 SHA，doubao 按 ①②③ 口径 + 字节差值核对（期望 −3,847 / −507 B）复测。

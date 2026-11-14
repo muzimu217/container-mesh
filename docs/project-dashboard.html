@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>container-mesh · 每日项目进度</title>
+<style>
+:root{--bg:#0b1220;--surface:#121d31;--surface2:#172640;--line:#29415f;--text:#e8f0fb;--muted:#94a9c3;--cyan:#54d6e5;--green:#55d69b;--yellow:#f2c96d;--red:#ff7d8b;--purple:#a89bff;--shadow:0 18px 60px #0004;font-family:Inter,ui-sans-serif,system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 20% -10%,#193355 0,#0b1220 48%);color:var(--text);line-height:1.55}a{color:var(--cyan)}button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}.wrap{max-width:1440px;margin:auto;padding:28px 22px 60px}.top{display:flex;justify-content:space-between;gap:24px;align-items:flex-end;margin-bottom:24px}.eyebrow{color:var(--cyan);font:600 12px ui-monospace,monospace;letter-spacing:.12em;text-transform:uppercase}.title{font-size:clamp(27px,4vw,48px);line-height:1.1;margin:8px 0}.sub{color:var(--muted);max-width:750px}.stamp{text-align:right;color:var(--muted);font:12px ui-monospace,monospace}.grid{display:grid;gap:16px}.kpis{grid-template-columns:repeat(6,minmax(0,1fr));margin-bottom:16px}.card{background:linear-gradient(145deg,#172640e8,#101b2ee8);border:1px solid var(--line);border-radius:16px;box-shadow:var(--shadow);padding:18px}.kpi .label{font-size:12px;color:var(--muted)}.kpi .value{font-size:27px;font-weight:750;margin:7px 0 1px;font-variant-numeric:tabular-nums}.ok{color:var(--green)}.warn{color:var(--yellow)}.bad{color:var(--red)}.info{color:var(--cyan)}.muted{color:var(--muted)}.section{margin-top:20px}.section-head{display:flex;justify-content:space-between;align-items:baseline;margin:0 0 12px}.section-head h2{font-size:20px;margin:0}.section-head p{margin:0;color:var(--muted);font-size:13px}.two{grid-template-columns:minmax(0,1.25fr) minmax(320px,.75fr)}.three{grid-template-columns:repeat(3,minmax(0,1fr))}.timeline{position:relative;padding-left:22px}.timeline:before{content:"";position:absolute;left:5px;top:5px;bottom:8px;width:2px;background:var(--line)}.day{position:relative;padding:0 0 20px}.day:before{content:"";position:absolute;left:-22px;top:7px;width:10px;height:10px;border-radius:50%;background:var(--cyan);box-shadow:0 0 0 4px #54d6e522}.day h3{font-size:15px;margin:0 0 4px}.day p{margin:0;color:var(--muted);font-size:13px}.pill{display:inline-flex;align-items:center;border:1px solid currentColor;border-radius:999px;padding:2px 8px;font-size:11px;margin:2px}.pill.green{color:var(--green)}.pill.yellow{color:var(--yellow)}.pill.red{color:var(--red)}.pill.blue{color:var(--cyan)}.pill.purple{color:var(--purple)}.route{overflow:auto}.route svg{min-width:800px;width:100%;height:420px}.node rect{fill:var(--surface2);stroke:var(--line);stroke-width:1.5}.node.ready rect{stroke:var(--green)}.node.active rect{stroke:var(--cyan)}.node.defer rect{stroke:var(--purple)}.node text{fill:var(--text);font-size:13px}.node .small{fill:var(--muted);font-size:11px}.edge{stroke:var(--line);stroke-width:2;fill:none;marker-end:url(#arrow)}.edge.ready{stroke:var(--green)}.legend{display:flex;flex-wrap:wrap;gap:7px;margin-top:8px}.matrix{width:100%;border-collapse:collapse;font-size:13px}.matrix th,.matrix td{text-align:left;padding:10px 9px;border-bottom:1px solid #29415f88;vertical-align:top}.matrix th{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.06em}.matrix td:first-child{font-weight:650}.progress{height:8px;background:#091321;border-radius:99px;overflow:hidden;margin-top:6px}.progress i{display:block;height:100%;background:linear-gradient(90deg,var(--cyan),var(--green));border-radius:inherit}.checklist{display:grid;gap:9px}.check{display:flex;gap:10px;align-items:flex-start;font-size:13px}.check b{font-size:15px}.check span{color:var(--muted)}.quote{border-left:3px solid var(--yellow);padding-left:12px;color:#dbe7f5;font-size:13px}.evidence{font:12px ui-monospace,monospace;color:#bdd0e5;white-space:pre-wrap;background:#091321;border-radius:10px;padding:12px;overflow:auto}.tabs{display:flex;gap:6px;overflow:auto;margin-bottom:12px}.tab{border:1px solid var(--line);border-radius:999px;padding:7px 12px;color:var(--muted);white-space:nowrap}.tab.active,.tab:hover{color:var(--text);border-color:var(--cyan);background:#54d6e511}.panel{display:none}.panel.active{display:block}.footer{margin-top:28px;color:var(--muted);font-size:12px;text-align:center}.notice{border-left:3px solid var(--red);background:#ff7d8b0e}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-variant-numeric:tabular-nums}@media(max-width:1100px){.kpis{grid-template-columns:repeat(3,1fr)}.two{grid-template-columns:1fr}.three{grid-template-columns:1fr 1fr}}@media(max-width:650px){.wrap{padding:20px 14px 45px}.top{display:block}.stamp{text-align:left;margin-top:12px}.kpis{grid-template-columns:repeat(2,1fr)}.three{grid-template-columns:1fr}.card{padding:14px}.matrix{min-width:680px}.matrix-wrap{overflow:auto}}
+</style>
+</head>
+<body>
+<main class="wrap">
+<header class="top">
+  <div><div class="eyebrow">container-mesh / daily delivery board</div><h1 class="title">项目进度与路线看板</h1><p class="sub">每天看这里：当前开发完成到哪一步、门禁是否全绿、哪个平台真的能安装运行、下一步由谁推进。状态按代码和测试证据记录。</p></div>
+  <div class="stamp">看板更新<br><strong id="updated">2026-11-14 10:30Z</strong><br>远端 develop<br><strong>24bbf2f</strong></div>
+</header>
+<section class="grid kpis">
+  <div class="card kpi"><div class="label">M4 收口</div><div class="value ok">76%</div><div class="label">凭证 / 面板 / 发布件</div></div>
+  <div class="card kpi"><div class="label">Go 全量测试</div><div class="value ok">PASS</div><div class="label">17 packages</div></div>
+  <div class="card kpi"><div class="label">Race detector</div><div class="value ok">PASS</div><div class="label">-race exit 0</div></div>
+  <div class="card kpi"><div class="label">本地 e2e</div><div class="value ok">41/41</div><div class="label">quick suite</div></div>
+  <div class="card kpi"><div class="label">可运行看板</div><div class="value ok">2</div><div class="label">/panel + /panel-lite</div></div>
+  <div class="card kpi"><div class="label">平台安装包</div><div class="value warn">0</div><div class="label">Wails/mobile/NAS/router</div></div>
+</section>
+<section class="grid two section">
+  <article class="card"><div class="section-head"><h2>今日状态</h2><p>本地 worktree，待网主放行</p></div><div class="checklist">
+    <div class="check"><b class="ok">✓</b><div><strong>驾驶舱已接真实数据</strong><br><span>/api/mesh → /panel，资源内嵌，令牌只走请求头</span></div></div>
+    <div class="check"><b class="ok">✓</b><div><strong>真实边界已收口</strong><br><span>假设备、假遥测、假拓扑、模拟离线、浏览器动作假成功已清除</span></div></div>
+    <div class="check"><b class="ok">✓</b><div><strong>凭证链路已本地闭环</strong><br><span>join --cred → enrollment → snapshot delegation → ping/msg</span></div></div>
+    <div class="check"><b class="warn">!</b><div><strong>远端未包含本批修复</strong><br><span>origin/develop 仍为 24bbf2f；新改动等交互会话拆分提交后推送</span></div></div>
+    <div class="check"><b class="warn">!</b><div><strong>平台包装仍未完成</strong><br><span>先闭合 Linux headless 安装，再做 Wails 和移动真机最小链路</span></div></div>
+  </div></article>
+  <article class="card"><div class="section-head"><h2>当前阻塞</h2><p>不是测试红</p></div>
+    <div class="notice card"><strong>网主放行</strong><p class="muted">本地 23 项改动已验证，值守会话不执行 commit/push/merge。</p></div>
+    <div class="notice card"><strong>纯出站反向拨号</strong><p class="muted">真实 NAT：客户端→锚点 10/10；锚点→客户端无 DNAT 且无中继回退，归 v1.1 路由缺口。</p></div>
+    <div class="quote">判断规则：设计完成、能构建、能运行、能安装、真机验收分别记账。</div>
+  </article>
+</section>
+<section class="section">
+  <div class="section-head"><h2>每日进度</h2><p>每天 17:00 更新；没有开发缺口时如实显示等待对象</p></div>
+  <article class="card timeline">
+    <div class="day"><h3>2026-11-14 · 本地开发批次 <span class="pill green">全绿</span></h3><p>新增 status/doctor CLI；清理 Inspector/Minimalist 假动作；修复 @cat 4KiB 截断；建立平台 KPI 表和项目路线图。门禁：test、race、e2e 41/41、交叉编译均通过。</p></div>
+    <div class="day"><h3>2026-11-13/14 · Round 60–67 <span class="pill green">复测闭环</span></h3><p>oh-no/doubao/kuku/netns 复测 24bbf2f；B-1/B-2 PASS；真实 NAT 纯出站结论；设计规范页 A1–A5 验收规则；@cat 新缺陷红→绿。</p></div>
+    <div class="day"><h3>2026-11-13 · Round 58–59 <span class="pill blue">已推送基线</span></h3><p>驾驶舱 React 源码与嵌入资源入仓，B-1/B-2 修复、安装器、README 修正、假设备清除。</p></div>
+  </article>
+</section>
+<section class="section"><div class="section-head"><h2>路线图</h2><p>绿色=已完成/验证，青色=本地开发，紫色=后续版本</p></div><article class="card route">
+<svg viewBox="0 0 1050 420" role="img" aria-label="container-mesh M4 M5 M6 路线图">
+<defs><marker id="arrow" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L0,6 L8,3 z" fill="#546d8d"/></marker></defs>
+<path class="edge ready" d="M170 90 C260 90 265 75 350 75"/><path class="edge ready" d="M170 145 C260 145 270 120 350 105"/><path class="edge ready" d="M170 200 C260 200 270 150 350 135"/><path class="edge active" d="M170 255 C265 255 280 190 350 165"/>
+<path class="edge" d="M520 120 C640 120 650 95 745 95"/><path class="edge" d="M520 165 C640 165 650 135 745 125"/><path class="edge" d="M520 210 C640 210 650 175 745 155"/><path class="edge defer" d="M520 255 C650 255 665 210 745 185"/>
+<path class="edge" d="M870 125 C920 125 920 260 870 300"/><path class="edge" d="M870 165 C950 165 950 300 870 330"/>
+<g class="node ready"><rect x="30" y="55" width="140" height="52" rx="9"/><text x="48" y="78">M4 v1.0</text><text class="small" x="48" y="96">当前收口</text></g>
+<g class="node ready"><rect x="30" y="125" width="140" height="52" rx="9"/><text x="48" y="148">凭证入网</text><text class="small" x="48" y="166">B-1/B-2/B-3</text></g>
+<g class="node ready"><rect x="30" y="195" width="140" height="52" rx="9"/><text x="48" y="218">真实驾驶舱</text><text class="small" x="48" y="236">/panel + /api/mesh</text></g>
+<g class="node active"><rect x="30" y="265" width="140" height="52" rx="9"/><text x="48" y="288">status/doctor</text><text class="small" x="48" y="306">本地新 KPI</text></g>
+<g class="node ready"><rect x="350" y="90" width="170" height="72" rx="9"/><text x="370" y="118">M4 交付包</text><text class="small" x="370" y="139">面板 + 凭证 + 发布件</text><text class="small" x="370" y="155">待远端放行</text></g>
+<g class="node active"><rect x="350" y="190" width="170" height="72" rx="9"/><text x="370" y="218">M5 可靠传输</text><text class="small" x="370" y="239">LEAVE / 撤销切断</text><text class="small" x="370" y="255">断点续传</text></g>
+<g class="node defer"><rect x="350" y="290" width="170" height="72" rx="9"/><text x="370" y="318">M5 / v1.1 网络</text><text class="small" x="370" y="339">中继路由 + 增量视图</text><text class="small" x="370" y="355">纯出站反向拨号</text></g>
+<g class="node active"><rect x="745" y="90" width="180" height="72" rx="9"/><text x="765" y="118">Linux headless</text><text class="small" x="765" y="139">systemd / 卸载 / 回滚</text><text class="small" x="765" y="155">下一平台批次</text></g>
+<g class="node"><rect x="745" y="190" width="180" height="72" rx="9"/><text x="765" y="218">桌面 Wails</text><text class="small" x="765" y="239">Windows/macOS/Linux</text><text class="small" x="765" y="255">安装包 + 签名</text></g>
+<g class="node"><rect x="745" y="290" width="180" height="72" rx="9"/><text x="765" y="318">移动 / NAS / Router</text><text class="small" x="765" y="339">gomobile / 厂商矩阵</text><text class="small" x="765" y="355">真机与设备验收</text></g>
+</svg><div class="legend"><span class="pill green">已完成/外部验证</span><span class="pill blue">本地待放行</span><span class="pill yellow">下一批开发</span><span class="pill purple">v1.1 延后</span></div>
+</article></section>
+<section class="section"><div class="section-head"><h2>平台 KPI</h2><p>方案、构建、运行、安装、真机验收分开</p></div><article class="card matrix-wrap"><table class="matrix"><thead><tr><th>平台</th><th>设计</th><th>可构建</th><th>可运行</th><th>安装/签名</th><th>真机验收</th><th>下一步</th></tr></thead><tbody>
+<tr><td>Linux headless</td><td class="ok">完成</td><td class="ok">完成</td><td class="ok">完成</td><td class="warn">手工安装</td><td class="warn">待矩阵</td><td>systemd、服务用户、升级回滚</td></tr>
+<tr><td>Windows CLI/桌面</td><td class="ok">方案</td><td class="ok">amd64</td><td class="warn">实机待测</td><td class="bad">无 MSI/签名</td><td class="bad">未验收</td><td>Wails + WebView2 + 安装卸载</td></tr>
+<tr><td>macOS CLI/桌面</td><td class="ok">方案</td><td class="ok">amd64/arm64</td><td class="warn">CLI 可跑</td><td class="bad">无 app/公证</td><td class="bad">未验收</td><td>Wails、Keychain、公证</td></tr>
+<tr><td>Android/iOS</td><td class="ok">gomobile 方案</td><td class="bad">未开始</td><td class="bad">未开始</td><td class="bad">无 APK/IPA</td><td class="bad">未验收</td><td>最小 binding + 真机单链路</td></tr>
+<tr><td>NAS/router</td><td class="warn">方向</td><td class="warn">部分 Linux</td><td class="warn">通用能力</td><td class="bad">无专用包</td><td class="bad">未验收</td><td>确定厂商/架构矩阵</td></tr>
+</tbody></table></article></section>
+<section class="section"><div class="section-head"><h2>门禁与证据</h2><p>当前本地批次</p></div><div class="grid three"><article class="card"><h3>Go CI</h3><div class="evidence">gofmt        PASS
+go vet ./...  PASS
+go build ./... PASS
+go test ./...  PASS
+-race         PASS</div></article><article class="card"><h3>端到端</h3><div class="evidence">tests/run-tests.sh --quick
+41 passed / 0 failed
+credential join included
+relay / reconnect included</div></article><article class="card"><h3>真实链路</h3><div class="evidence">B-1 delegated member: PASS
+B-2 endpoint :0: PASS
+B-3 follow-up ping/msg: PASS
+NAT client→anchor: 10/10
+anchor→NAT: v1.1 relay gap</div></article></div></section>
+<section class="section"><div class="section-head"><h2>每日计划与等待项</h2><p>下一次 17:00 更新</p></div><div class="grid two"><article class="card"><h3>下一开发日</h3><ol class="muted"><li>完成 Linux headless systemd/卸载/升级回滚设计与本地测试</li><li>保持 status/doctor 与 cockpit 当前门禁绿</li><li>准备交互会话的逻辑提交拆分和 develop 推送</li><li>推送后派 oh-no：B-3 三步 + 双向性；派 doubao：A1-A5 + 资源/字节差值</li></ol></article><article class="card"><h3>外部等待</h3><div class="checklist"><div class="check"><b class="warn">!</b><div><strong>网主放行</strong><br><span>当前 worktree 改动 23 项，未提交</span></div></div><div class="check"><b class="warn">!</b><div><strong>kuku/netns</strong><br><span>已恢复在线并已报告；后续按新 SHA 复测</span></div></div><div class="check"><b class="info">→</b><div><strong>v1.1</strong><br><span>中继/增量视图，纯出站反向拨号</span></div></div></div></article></div></section>
+<footer class="footer">数据来源：当前 develop、本地门禁输出、Hub 报告与 docs/PROJECT-PLAN.md。未采集或未验收的平台不显示为完成。</footer>
+</main>
+<script>
+(function(){
+  const tabs=[...document.querySelectorAll('.tab')];
+  tabs.forEach(b=>b.addEventListener('click',()=>{tabs.forEach(x=>x.classList.remove('active'));b.classList.add('active')}));
+  const d=new Date();
+  const stamp=document.getElementById('updated');
+  if(stamp) stamp.title='本文件由值守开发批次更新，日常自动化应在每日17点刷新实际数据';
+})();
+</script>
+</body>
+</html>
