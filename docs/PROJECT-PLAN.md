@@ -87,6 +87,68 @@ relay 配对通道已有恢复能力；组网直连的 `.part`、offset、hash �
 | NAS | Linux/容器能力可复用 | 目标厂商矩阵、持久化、服务编排、升级回滚 |
 | router/OpenWrt | 设计方向 | target/架构、BusyBox/procd、资源和断电恢复 |
 
+## 网络平面、端口可达性与扩展点预留（路线约束）
+
+本节记录边界与路线判断，**不计入 M4 完成判定**。凡标「候选」者均为方案，不等于代码实现、也不等于平台验收。
+
+### 核心 profile 不可变清单
+
+以下属于基础形态，任何 PR 不得改动语义；新增能力只能以可选、可降级的方式叠加：
+
+- 线格式帧头与 magic、协议版本与最低兼容版本字段。
+- 握手、密钥派生、mTLS 设备证书身份与委派验签。
+- 成员 / 存活 / 公告三态语义、快照单调版本、凭证与委派记录结构。
+- 基础流类型与分帧（msg / file / run / ping / forward preamble）。
+- 端点公告规则：`--endpoint` 是对外可拨地址，`--listen` 是绑定地址，port 0 解析为实际绑定端口；无端点成员可见但不可拨。
+
+**基础形态不可插拔。** 插件式协议是 M6 之后的远期议题：当前不实现插件加载、不引入动态库、不引入 go-plugin / WASM。
+
+### 前期只预留接口，不开插件
+
+随 M5 任务零成本落地，不单独设里程碑：
+
+- 端口分配、可达性探测、选路决策、连接事件写成 Go interface + 编译期注册表，默认实现唯一；build tag 控制可选组件（含 UI 体积裁剪）。
+- 握手帧预留 `capabilities` 位图与 `min_compatible_version`，当前恒为 core profile，不解析、不启用。
+- 连接事件接口与 LEAVE / 撤销切断共用（见 `DEV-KPI.md` 并行开发队列 2），避免两套漂移实现。
+- 第三方 UI 只依赖带版本号的 `/api/mesh` 契约，不读内部结构。
+
+### 端口与可达性：已有能力，不重复建设
+
+- `cmesh forward -L/-R`：本地端口 ↔ 对端服务转发；默认拒绝，`--allow-host` / `--allow-port` / `--allow-listen-port` 白名单，`--accept` / `--accept-reverse` 开关。SSH 类场景无需 TUN：本地监听口 → mesh 流 → 对端目标端口。
+- `cmesh join --endpoint/--listen`：`--listen` port 0 自动绑定并回读实际端口公告（B-2 已验收）；显式 `--endpoint` 优先。
+- `cmesh probe` / `cmesh doctor`：TUN 真实 ioctl、capability、UDP/TCP 出站、DNS、localhost listen、STUN 反射地址与 NAT 判定，JSON + 退出码。
+- 锚点端口自检（`internal/cli/portcheck.go`）：区分已监听 / 防火墙丢弃 / 仅 loopback / UDP 未绑 / 公告地址不可达，且只报观测事实。
+- `internal/p2p`：STUN 候选 + UDP 打洞，默认关闭（实验性加速器），可把 punched socket 交给 QUIC 复用。
+- `cmesh status`：成员、端点、版本、`last_seen`，JSON 稳定输出。
+
+### 缺口（归 M4-C / v1.1，不混入 v1.0 收口）
+
+- 纯出站 NAT 反拨失败已复现（netns 实测出站 10/10、锚点反拨失败）：需要中继路由与路径回退。
+- S3 全受限自动可达、增量快照、慢消费者协议优化尚未开始。
+- 现有 probe / portcheck 给出观测与人工动作，**尚未串成一条自动链路**；`status` 还没有 reachability 分类字段。
+
+### 一步打通与端口选择（候选，未实现）
+
+目标：一条命令完成入网与局域网 / 无公网容器打通，端口策略可配置、可观测、可复现。
+
+1. 给用户选项，不暗中猜：`--endpoint auto|<host:port>`、`--listen` port 0、`--port-range`（候选范围）、`--reachability auto|direct|relay-only`、`--no-punch`、`--allow-upnp`。
+2. 自动判定链路：本地绑定回读 → 自连自检 → STUN 反射地址与 NAT 类型 → **锚点反向拨号验证**（唯一能证明「别人能连进来」的判据）→ 公告 `listen_addr` / `observed_addr` / reachability class → 直连优先、失败立即降级中继。
+3. 把 probe / portcheck / p2p / forward 串成单一 `up` 流程，结果进 `cmesh status` JSON，供脚本消费。
+4. 无公网容器默认路径：主动出站连锚点 + 中继；打洞与直连是可选加速，不是前置条件。
+
+### 远期候选：TUN / 全局虚拟 IP / SOCKS5（M6 之后，核心不引入）
+
+- 端口转发与 SOCKS5 属应用层适配；SOCKS5 仅覆盖 TCP 且需程序走代理，**不作为核心路径**，`cmesh run` / `cmesh forward` 仍是主路径。
+- TUN 虚拟网卡 + 全局虚拟 IP + subnet router / exit node / DNS 属 L3 平面，需要 CAP_NET_ADMIN、MTU/MSS、DNS、ACL 与子网路由。`probe` 已能实测 TUN 是否可用，但产品主路径仍是 `userspace_only`。
+- 若将来提供 L3，只能以独立可选模块挂载；core profile 与 `cmesh-core`（无 UI 包）不背权限、不背体积。
+- 参考对象：Tailscale userspace networking / kernel-vs-netstack subnet routing、quic-go 可插拔拥塞控制与 connection migration、PostgreSQL 扩展与 hook、libp2p 可组合 transport / muxer / security。
+
+### 里程碑归属
+
+- **M4（当前收口）**：不含本节任何候选项，只做凭证、面板、安装器与本地运维线。
+- **M5 / v1.1**：中继路由、路径回退、S3 自动可达、一步打通与端口策略、连接生命周期、断点续传。
+- **M6 之后**：扩展点正式开放、L3 网络平面（TUN / 虚拟 IP / SOCKS5）、插件式协议预研。
+
 ## 里程碑
 
 ### M4：当前收口
