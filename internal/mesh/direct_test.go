@@ -9,6 +9,8 @@ import (
 	"context"
 	crand "crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -375,7 +377,64 @@ func TestBoundAddrsFiltersWildcard(t *testing.T) {
 	}
 }
 
-// TestRevokedMemberCannotConnect pins revocation on the listener side: once
+// TestRunCatStreamsPastHelloLimit pins the regression where the dialer's
+// handshake reader was built on io.LimitReader(MaxHelloBytes+1). The ACK
+// then worked, but the same reader truncated the later run response at about
+// 4 KiB; @cat returned unexpected EOF for larger files (kuku-sandbox-01,
+// round 52). The handshake cap belongs to readLine, not the session body.
+func TestRunCatStreamsPastHelloLimit(t *testing.T) {
+	f := newDirectFixture(t)
+	l := startListener(t, f)
+	path := filepath.Join(t.TempDir(), "cat-large.txt")
+	want := bytes.Repeat([]byte("x"), MaxHelloBytes+1024)
+	if err := os.WriteFile(path, want, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	link, err := DialDirect(context.Background(), DialConfig{
+		Device:           f.bob,
+		Resolver:         MemberListAdapter{List: f.members},
+		Target:           f.aline.ID(),
+		Endpoints:        l.BoundAddrs(),
+		Kind:             KindRun,
+		HandshakeTimeout: 5 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer link.Close()
+	request, err := json.Marshal(RunRequest{Verb: "@cat", Args: []string{path}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fmt.Fprintf(link.Stream(), "%s\n", request); err != nil {
+		t.Fatal(err)
+	}
+	var got bytes.Buffer
+	for {
+		tag, payload, err := readRunFrame(link.br)
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch tag {
+		case RunTagOut:
+			got.Write(payload)
+		case RunTagErr:
+			t.Fatalf("remote @cat failed: %s", payload)
+		case RunTagExit:
+			if len(payload) < 4 || binary.BigEndian.Uint32(payload) != 0 {
+				t.Fatalf("remote @cat exit payload = %v", payload)
+			}
+			if !bytes.Equal(got.Bytes(), want) {
+				t.Fatalf("remote @cat returned %d bytes, want %d", got.Len(), len(want))
+			}
+			return
+		default:
+			t.Fatalf("unknown run tag %q", tag)
+		}
+	}
+}
+
 // the device is out of the member list, its certificate no longer pins and
 // the TLS handshake fails.
 func TestRevokedMemberCannotConnect(t *testing.T) {

@@ -742,7 +742,7 @@ func dialOne(ctx context.Context, udp net.PacketConn, addr *net.UDPAddr, cfg Dia
 		return nil, fmt.Errorf("send hello: %w", err)
 	}
 	_ = st.SetReadDeadline(time.Now().Add(10 * time.Second))
-	br := bufio.NewReader(io.LimitReader(st, MaxHelloBytes+1))
+	br := bufio.NewReader(st)
 	ackLine, err := readLine(br, MaxHelloBytes)
 	if err != nil {
 		return nil, fmt.Errorf("read ack: %w", err)
