@@ -77,6 +77,8 @@ func Run(args []string) error {
 		return runMsg(args[1:])
 	case "send-to":
 		return runSendTo(args[1:])
+	case "bench":
+		return runBench(args[1:])
 	case "run":
 		return runRun(args[1:])
 	case "version", "-v", "--version":
@@ -185,6 +187,11 @@ Usage:
   cmesh send-to <deviceID> --file PATH
         Stream a file to a member over a direct link, sha256-verified.
         The receiver saves it into its inbox (📬).
+
+  cmesh bench <deviceID> [--size 100MB] [--rate 0]
+        Measure bidirectional direct-link throughput without writing a file.
+        Size applies to each direction; --rate is bytes per second per
+        direction (0 = unlimited). QUIC retransmissions are reported as n/a.
 
   cmesh run <deviceID> @info | @disk [PATH] | @mem | @cat FILE | @ls [DIR]
         Run a built-in read-only verb on a member and print the result.
