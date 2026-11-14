@@ -49,7 +49,7 @@
     {"from":"m5","to":"m6","label":"平台化"}
   ],
   "kpis": {
-    "remoteTip": "24bbf2f",
+    "remoteTip": "b143884",
     "localPendingFiles": 23,
     "e2eCases": "41/41",
     "goRace": "PASS",

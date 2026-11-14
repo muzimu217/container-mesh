@@ -1,6 +1,6 @@
 # container-mesh 项目总规划与交付口径
 
-更新时间：2026-11-14。当前分支：`develop`。远端 tip：`24bbf2f`。
+更新时间：2026-11-14。当前分支：`develop`。待推送 tip：`b143884`。
 
 ## 项目状态口径
 
@@ -12,6 +12,8 @@
 4. **平台验收**：是否在目标系统安装、运行、入网、传输、退出和恢复。
 
 只有第 3 层之后的结果才派给远程 agent 复测。交叉编译只证明目标二进制可以生成，不等于平台安装包或真机验收完成。
+
+产品侧评审意见、开发交付要求与红线见 `docs/PM-REVIEW.md`（可直接作为开发者 brief 派发）。本文件仍是路线与完成判定的文字正典。
 
 ## 当前已完成
 
@@ -26,7 +28,7 @@
 - B-3：凭证设备入网后的 `mesh ping/msg` 配置读取已修复；本地真实二进制验证 ping 5/5、msg delivered 1。
 - e2e 已纳入第 11 节，当前门禁 41/41。
 
-远端 `24bbf2f` 已包含 B-1/B-2 和基础凭证实现；B-3 最终修复仍在本地 worktree，需放行后推送。
+待推送 tip `b143884` 已包含 B-1/B-2 和基础凭证实现；B-3 最终修复与本地面板收口仍在本地批次，推送后派外部复测。
 
 ### M4-B：端口自检与真实驾驶舱
 
@@ -136,10 +138,11 @@ relay 配对通道已有恢复能力；组网直连的 `.part`、offset、hash �
 3. 把 probe / portcheck / p2p / forward 串成单一 `up` 流程，结果进 `cmesh status` JSON，供脚本消费。
 4. 无公网容器默认路径：主动出站连锚点 + 中继；打洞与直连是可选加速，不是前置条件。
 
-### 远期候选：TUN / 全局虚拟 IP / SOCKS5（M6 之后，核心不引入）
+### 远期候选：TUN / 全局虚拟 IP / SOCKS5（需求变更候选，未立项）
 
 - 端口转发与 SOCKS5 属应用层适配；SOCKS5 仅覆盖 TCP 且需程序走代理，**不作为核心路径**，`cmesh run` / `cmesh forward` 仍是主路径。
 - TUN 虚拟网卡 + 全局虚拟 IP + subnet router / exit node / DNS 属 L3 平面，需要 CAP_NET_ADMIN、MTU/MSS、DNS、ACL 与子网路由。`probe` 已能实测 TUN 是否可用，但产品主路径仍是 `userspace_only`。
+- **需求冲突提示**：`REQUIREMENTS.md` R3 §1.3「不是 VPN」与 N-7 已排除透明 L3 / subnet router / exit node / MagicDNS，U3 定义为无 root、无入站端口、无 TUN。本节仅为**需求变更候选，不是已批准路线**；按 `CONVENTIONS.md` T-0.1，无需求编号不得开工。若决定变更，须走变更流程并升版需求文档（详见 `docs/PM-REVIEW.md` §3.1）。
 - 若将来提供 L3，只能以独立可选模块挂载；core profile 与 `cmesh-core`（无 UI 包）不背权限、不背体积。
 - 参考对象：Tailscale userspace networking / kernel-vs-netstack subnet routing、quic-go 可插拔拥塞控制与 connection migration、PostgreSQL 扩展与 hook、libp2p 可组合 transport / muxer / security。
 
@@ -147,7 +150,7 @@ relay 配对通道已有恢复能力；组网直连的 `.part`、offset、hash �
 
 - **M4（当前收口）**：不含本节任何候选项，只做凭证、面板、安装器与本地运维线。
 - **M5 / v1.1**：中继路由、路径回退、S3 自动可达、一步打通与端口策略、连接生命周期、断点续传。
-- **M6 之后**：扩展点正式开放、L3 网络平面（TUN / 虚拟 IP / SOCKS5）、插件式协议预研。
+- **M6 之后（须先完成需求变更立项）**：扩展点正式开放、L3 网络平面（TUN / 虚拟 IP / SOCKS5）、插件式协议预研；未获立项前只保持接口预留。
 
 ## 里程碑
 
