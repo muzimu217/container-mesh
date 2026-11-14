@@ -40,11 +40,30 @@ var cockpitFS = func() fs.FS {
 // /panel/ (the app's assets are requested relative to the page, so they
 // arrive as /panel/assets/*).
 //
+// "/panel" without a trailing slash is REDIRECTED to "/panel/", and that is
+// not cosmetic: the page references its assets relatively (./assets/x.js).
+// For a document at "/panel" the base is "/", so a browser resolves that to
+// "/assets/x.js" — which this binary does not serve. The shell loaded, both
+// assets 404'd, and the panel rendered a blank page. The startup banner
+// prints exactly "/panel", so this was the path every operator took
+// (doubao-cloud-vm-01, round 59).
+//
 // Unknown paths fall back to index.html, because the app is a single page
 // with its own routing.
 func (s *Server) handleCockpit(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		http.Error(w, "GET only", http.StatusMethodNotAllowed)
+		return
+	}
+	if r.URL.Path == "/panel" {
+		// 308 keeps the method and the page is an idempotent GET — but it is
+		// also cached by browsers by default. Cache it and a future revert
+		// (or another change of the mount) cannot be taken back cleanly, and
+		// a tester disabling the redirect would read stale entries as if it
+		// were still on. One header keeps the redirect uncacheable
+		// (doubao-cloud-vm-01, round 60).
+		w.Header().Set("Cache-Control", "no-store")
+		http.Redirect(w, r, "/panel/", http.StatusPermanentRedirect)
 		return
 	}
 	p := path.Clean(r.URL.Path)

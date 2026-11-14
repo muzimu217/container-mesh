@@ -6,11 +6,6 @@ import {
   Box,
   ChevronRight,
   ArrowLeft,
-  Send,
-  FileUp,
-  Activity,
-  Terminal,
-  Power,
   AlertTriangle,
   CheckCircle2,
   Sliders,
@@ -25,8 +20,6 @@ interface NestedHierarchyInspectorProps {
   selectedDeviceId: string | null;
   onSelectZone: (zoneId: string | null) => void;
   onSelectDevice: (deviceId: string | null) => void;
-  onToggleDeviceOnline: (deviceId: string) => void;
-  onTriggerCommEvent: (fromId: string, toId: string, label: string) => void;
 }
 
 export const NestedHierarchyInspector: React.FC<NestedHierarchyInspectorProps> = ({
@@ -35,24 +28,12 @@ export const NestedHierarchyInspector: React.FC<NestedHierarchyInspectorProps> =
   selectedDeviceId,
   onSelectZone,
   onSelectDevice,
-  onToggleDeviceOnline,
-  onTriggerCommEvent,
 }) => {
   const [rosterFilter, setRosterFilter] = useState<'all' | 'online' | 'offline' | 'no_endpoint'>(
     'all'
   );
   const [showConfigAccordion, setShowConfigAccordion] = useState<boolean>(false);
   const [showDiagnosticsDrawer, setShowDiagnosticsDrawer] = useState<boolean>(false);
-
-  // Action feedback state for verified capabilities
-  const [actionLoading, setActionLoading] = useState<string | null>(null);
-  const [actionOutput, setActionOutput] = useState<{
-    title: string;
-    timestamp: string;
-    detail: string;
-  } | null>(null);
-  const [msgInput, setMsgInput] = useState<string>('PING_CHECK: 请求同步容器构建状态');
-  const [selectedCmd, setSelectedCmd] = useState<string>('cmesh status --json');
 
   const selectedZone = meshData.zones.find((z) => z.zone_id === selectedZoneId) || null;
   const selectedDevice = meshData.members.find((m) => m.device_id === selectedDeviceId) || null;
@@ -64,84 +45,6 @@ export const NestedHierarchyInspector: React.FC<NestedHierarchyInspectorProps> =
     if (rosterFilter === 'no_endpoint') return m.endpoints.length === 0;
     return true;
   });
-
-  const executeDeviceAction = async (
-    member: MeshMember,
-    action: 'ping' | 'message' | 'file_transfer' | 'exec_whitelist'
-  ) => {
-    setActionLoading(action);
-    try {
-      const response = await fetch('/api/mesh/action', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          device_id: member.device_id,
-          action,
-          payload: {
-            text: msgInput,
-            command: selectedCmd,
-            fileName: 'checkpoint-shard-04.safetensors',
-            fileSize: '256.0 MB',
-          },
-        }),
-      });
-      const json = await response.json();
-
-      if (action === 'ping') {
-        onTriggerCommEvent(
-          'dev_02_local_ws',
-          member.device_id,
-          `RTT 测量完成: macbook-studio-local ⇄ ${member.display_name} (${json.result.avg_rtt_ms} ms)`
-        );
-        setActionOutput({
-          title: `用户态 RTT 延迟探测 — ${member.display_name}`,
-          timestamp: json.timestamp,
-          detail: `模式: ${json.result.mode}\n样本: ${json.result.samples_ms.join(' ms, ')} ms\n平均往返延迟: ${json.result.avg_rtt_ms} ms (丢包率 ${json.result.packet_loss})`,
-        });
-      } else if (action === 'message') {
-        onTriggerCommEvent(
-          'dev_02_local_ws',
-          member.device_id,
-          `加密消息已送达: -> ${member.display_name} [${json.result.msg_id}]`
-        );
-        setActionOutput({
-          title: `点对点消息发送成功 (${json.result.encrypted})`,
-          timestamp: json.timestamp,
-          detail: `${json.result.echo}\n消息回执 ID: ${json.result.msg_id}`,
-        });
-      } else if (action === 'file_transfer') {
-        onTriggerCommEvent(
-          'dev_02_local_ws',
-          member.device_id,
-          `大文件分片校验完成: -> ${member.display_name} (256.0 MB)`
-        );
-        setActionOutput({
-          title: `用户态大文件流式传输 — ${json.result.file_name}`,
-          timestamp: json.timestamp,
-          detail: `文件大小: ${json.result.file_size} · 分片校验: ${json.result.chunks_verified}\nSHA-256: ${json.result.sha256.slice(0, 32)}...`,
-        });
-      } else if (action === 'exec_whitelist') {
-        onTriggerCommEvent(
-          'dev_02_local_ws',
-          member.device_id,
-          `受控白名单命令执行: ${selectedCmd} @ ${member.display_name}`
-        );
-        setActionOutput({
-          title: `受控远程白名单操作 (${json.result.command})`,
-          timestamp: json.timestamp,
-          detail: json.result.stdout,
-        });
-      }
-    } catch {
-      setActionOutput({
-        title: '本地回显 (离线或接口重试中)',
-        timestamp: new Date().toISOString(),
-        detail: `已向容器 [${member.display_name}] 发送用户态请求。`,
-      });
-    } finally {
-      setActionLoading(null);
-    }
-  };
 
   const renderTransportLabel = (member: MeshMember) => {
     if (!member.online) return '不可用 (Unavailable · 离线在册)';
@@ -185,7 +88,6 @@ export const NestedHierarchyInspector: React.FC<NestedHierarchyInspectorProps> =
         {(selectedZone || selectedDevice) && (
           <button
             onClick={() => {
-              setActionOutput(null);
               if (selectedDevice) {
                 onSelectDevice(null);
               } else {
@@ -326,7 +228,6 @@ export const NestedHierarchyInspector: React.FC<NestedHierarchyInspectorProps> =
                       onClick={() => {
                         onSelectZone(member.zone_id);
                         onSelectDevice(member.device_id);
-                        setActionOutput(null);
                       }}
                       className={`p-2.5 rounded-md border transition-all cursor-pointer group ${
                         !member.online
@@ -382,22 +283,11 @@ export const NestedHierarchyInspector: React.FC<NestedHierarchyInspectorProps> =
                   <h3 className="text-base font-bold text-slate-900 font-mono mt-0.5">
                     {selectedDevice.display_name}
                   </h3>
-                  <div className="text-xs text-slate-600 mt-0.5">{selectedDevice.alias}</div>
+                <div className="text-xs text-slate-600 mt-0.5">{selectedDevice.alias}</div>
                 </div>
-
-                {/* Simulate Online/Offline Transition Button */}
-                <button
-                  onClick={() => onToggleDeviceOnline(selectedDevice.device_id)}
-                  className={`px-2.5 py-1.5 rounded text-xs font-medium border flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap ${
-                    selectedDevice.online
-                      ? 'bg-white border-slate-300 text-slate-700 hover:bg-slate-100'
-                      : 'bg-emerald-600 border-emerald-600 text-white hover:bg-emerald-700'
-                  }`}
-                  title="模拟节点离线时，节点变为中性灰并保留在名册中，无红色灾难感"
-                >
-                  <Power className="w-3.5 h-3.5" />
-                  <span>{selectedDevice.online ? '模拟离线' : '恢复上线'}</span>
-                </button>
+                <span className="px-2.5 py-1.5 rounded text-xs font-medium border border-slate-200 text-slate-500">
+                  只读名册
+                </span>
               </div>
 
               <div className="mt-2.5 pt-2.5 border-t border-slate-200/80 text-[11px] text-slate-600 space-y-1 font-mono">
@@ -573,10 +463,10 @@ export const NestedHierarchyInspector: React.FC<NestedHierarchyInspectorProps> =
                       </span>
                     </div>
                     <div>
-                      <span className="text-slate-400 block text-[10px]">内核特权依赖</span>
-                      <span className="text-emerald-700 font-semibold">
-                        CAP_NET_ADMIN: 否 · TUN: 否
-                      </span>
+                        <span className="text-slate-400 block text-[10px]">内核特权依赖（本面板未采集）</span>
+                        <span className="text-slate-500 font-semibold">
+                          CAP_NET_ADMIN: 未采集 · TUN: 未采集
+                        </span>
                     </div>
                     <div>
                       <span className="text-slate-400 block text-[10px]">入站端口策略</span>
@@ -609,91 +499,11 @@ export const NestedHierarchyInspector: React.FC<NestedHierarchyInspectorProps> =
                 <span className="text-[11px] font-mono text-slate-400">Userspace Data Plane</span>
               </div>
 
-              {!selectedDevice.online ? (
-                <div className="p-2.5 bg-slate-100 rounded text-xs text-slate-600">
-                  当前容器处于离线状态（仍在名册中），实时通信操作已挂起。点击上方「恢复该容器上线」即可测试通信。
-                </div>
-              ) : (
-                <>
-                  {/* Quick Action Buttons */}
-                  <div className="grid grid-cols-2 gap-2">
-                    <button
-                      disabled={actionLoading !== null}
-                      onClick={() => executeDeviceAction(selectedDevice, 'ping')}
-                      className="px-3 py-2 bg-slate-900 hover:bg-slate-800 text-white rounded text-xs font-medium flex items-center justify-center gap-1.5 transition-colors cursor-pointer"
-                    >
-                      <Activity className="w-3.5 h-3.5 text-sky-400" />
-                      <span>测量 RTT 延迟</span>
-                    </button>
-
-                    <button
-                      disabled={actionLoading !== null}
-                      onClick={() => executeDeviceAction(selectedDevice, 'file_transfer')}
-                      className="px-3 py-2 bg-sky-700 hover:bg-sky-800 text-white rounded text-xs font-medium flex items-center justify-center gap-1.5 transition-colors cursor-pointer"
-                    >
-                      <FileUp className="w-3.5 h-3.5" />
-                      <span>传输构建产物 (256MB)</span>
-                    </button>
-                  </div>
-
-                  {/* Send P2P Message Input */}
-                  <div className="flex items-center gap-1.5">
-                    <input
-                      type="text"
-                      value={msgInput}
-                      onChange={(e) => setMsgInput(e.target.value)}
-                      placeholder="输入发送给该容器的消息..."
-                      className="flex-1 px-2.5 py-1.5 text-xs border border-slate-200 rounded font-mono focus:outline-none focus:border-sky-600"
-                    />
-                    <button
-                      disabled={actionLoading !== null}
-                      onClick={() => executeDeviceAction(selectedDevice, 'message')}
-                      className="px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-800 border border-slate-300 rounded text-xs font-medium flex items-center gap-1 shrink-0 cursor-pointer"
-                    >
-                      <Send className="w-3 h-3" />
-                      <span>发消息</span>
-                    </button>
-                  </div>
-
-                  {/* Controlled Whitelist Remote Command */}
-                  <div className="flex items-center gap-1.5">
-                    <select
-                      value={selectedCmd}
-                      onChange={(e) => setSelectedCmd(e.target.value)}
-                      className="flex-1 px-2 py-1.5 text-xs border border-slate-200 rounded font-mono bg-white focus:outline-none focus:border-sky-600"
-                    >
-                      {selectedDevice.container_config.whitelist_cmds.map((cmd) => (
-                        <option key={cmd} value={cmd}>
-                          白名单命令: {cmd}
-                        </option>
-                      ))}
-                    </select>
-                    <button
-                      disabled={actionLoading !== null}
-                      onClick={() => executeDeviceAction(selectedDevice, 'exec_whitelist')}
-                      className="px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-800 border border-slate-300 rounded text-xs font-medium flex items-center gap-1 shrink-0 cursor-pointer"
-                    >
-                      <Terminal className="w-3 h-3" />
-                      <span>受控执行</span>
-                    </button>
-                  </div>
-                </>
-              )}
-
-              {/* Action Execution Output Box */}
-              {actionOutput && (
-                <div className="p-2.5 bg-slate-900 text-slate-100 rounded text-[11px] font-mono space-y-1">
-                  <div className="flex items-center justify-between text-sky-400">
-                    <span className="font-semibold">{actionOutput.title}</span>
-                    <span className="text-[10px] text-slate-400">
-                      {actionOutput.timestamp.slice(11, 19)}
-                    </span>
-                  </div>
-                  <pre className="whitespace-pre-wrap text-slate-200 leading-relaxed overflow-x-auto">
-                    {actionOutput.detail}
-                  </pre>
-                </div>
-              )}
+              <div className="p-2.5 bg-slate-100 rounded text-xs text-slate-600">
+                {selectedDevice.online
+                  ? '该面板只读展示实时名册。RTT、消息、文件和远程命令请使用对应的 CLI；浏览器动作接口尚未提供。'
+                  : '当前容器处于离线状态（仍在名册中），面板只读；需要操作时请在设备上使用 CLI。'}
+              </div>
             </div>
           </div>
         )}
@@ -731,7 +541,7 @@ export const NestedHierarchyInspector: React.FC<NestedHierarchyInspectorProps> =
                   }
                 >
                   {meshData.discovery_status === 'connected'
-                    ? '● 正常连接 (anchor-hk-01)'
+                    ? '● 发现节点已连接'
                     : '▲ 发现节点失联 · 自动重连中'}
                 </span>
               </div>

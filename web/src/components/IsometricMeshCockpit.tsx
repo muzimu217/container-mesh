@@ -1296,6 +1296,10 @@ export const IsometricMeshCockpit: React.FC<IsometricMeshCockpitProps> = ({
       trailMeshes: THREE.Mesh[];
     }> = [];
 
+    // Draw a link only when the API explicitly reports the peer relation.
+    // The current payload leaves peers_connected empty because cmesh does not
+    // collect that fact yet. An empty relation must mean "no link rendered",
+    // not "infer every online member is connected to the anchor".
     const pairDefinitions: Array<{
       fromId: string;
       toId: string;
@@ -1303,62 +1307,24 @@ export const IsometricMeshCockpit: React.FC<IsometricMeshCockpitProps> = ({
       labArch: number;
       flowDirection: 1 | -1;
       baseIntensity: number;
-    }> = [
-      // Zurich Local Workstation ⇄ Hong Kong Anchor (Control & Roster Sync)
-      {
-        fromId: 'dev_02_local_ws',
-        toId: 'dev_01_anchor_hk',
-        peakAltitude: 1.55,
-        labArch: 1.65,
-        flowDirection: 1,
-        baseIntensity: 1.15,
-      },
-      // Frankfurt A100 GPU ⇄ Hong Kong Anchor (Control & Relay Fallback)
-      {
-        fromId: 'dev_01_anchor_hk',
-        toId: 'dev_03_gpu_fra',
-        peakAltitude: 1.42,
-        labArch: 1.65,
-        flowDirection: 1,
-        baseIntensity: 1.1,
-      },
-      // Zurich Local Workstation ⇄ Frankfurt A100 GPU (High-Intensity Direct P2P Tensor Stream)
-      {
-        fromId: 'dev_02_local_ws',
-        toId: 'dev_03_gpu_fra',
-        peakAltitude: 0.46,
-        labArch: 1.05,
-        flowDirection: 1,
-        baseIntensity: 1.65,
-      },
-      // Tokyo Outbound-Only Sandbox -> Hong Kong Anchor (Strict Egress-Only Outbound Stream)
-      {
-        fromId: 'dev_04_ci_sandbox',
-        toId: 'dev_01_anchor_hk',
-        peakAltitude: 0.72,
-        labArch: 1.65,
-        flowDirection: 1,
-        baseIntensity: 0.85,
-      },
-      // Singapore CGNAT Home NAS ⇄ Hong Kong Anchor (Archive / Relay Channel)
-      {
-        fromId: 'dev_05_home_nas',
-        toId: 'dev_01_anchor_hk',
-        peakAltitude: 0.68,
-        labArch: 1.65,
-        flowDirection: 1,
-        baseIntensity: 0.9,
-      },
-      // Zurich Local Workstation ⇄ Singapore Home NAS (Cross-Continental Direct/Relay Backup)
-      {
-        fromId: 'dev_02_local_ws',
-        toId: 'dev_05_home_nas',
-        peakAltitude: 1.75,
-        labArch: 1.95,
-        flowDirection: 1,
-        baseIntensity: 1.35,
-      },
-    ];
+    }> = [];
+
+    allPossibleMembers.forEach((member) => {
+      if (member.is_anchor || !member.online) return;
+      const peers = member.peers_connected ?? [];
+      peers.filter((peerID) => peerID !== member.device_id).forEach((peerID) => {
+        const peer = allPossibleMembers.find((candidate) => candidate.device_id === peerID);
+        if (!peer || !peer.online) return;
+        pairDefinitions.push({
+          fromId: member.device_id,
+          toId: peerID,
+          peakAltitude: member.endpoints.length > 0 ? 1.35 : 0.72,
+          labArch: 1.65,
+          flowDirection: 1,
+          baseIntensity: member.endpoints.length > 0 ? 1.15 : 0.85,
+        });
+      });
+    });
 
     pairDefinitions.forEach(
       ({ fromId, toId, peakAltitude, labArch, flowDirection, baseIntensity }) => {
@@ -2443,26 +2409,26 @@ export const IsometricMeshCockpit: React.FC<IsometricMeshCockpitProps> = ({
           {
             glyph: '◈',
             tone: 'text-sky-600',
-            title: '香港自托管公网锚点 (22.32°N, 114.17°E)',
-            desc: '无玻璃罩开放式信标塔 · 同城多台服务器自动按切平面微星环散开，互不遮挡',
+            title: '锚点（地理位置未登记）',
+            desc: '锚点角色来自实时名册；地理位置、运行时和资源信息未采集。',
           },
           {
             glyph: '●',
             tone: 'text-emerald-600',
-            title: '在线直连 (Direct P2P 跨国测地线)',
-            desc: '法兰克福裸露刀片矩阵(无玻璃罩) ⇄ 苏黎世锥形 NAT 终端(半高导流环)',
+            title: '在线直连（公告端点）',
+            desc: '实时名册报告在线且存在端点；实际连接质量以 CLI 探测为准。',
           },
           {
             glyph: '◆',
             tone: 'text-amber-600',
-            title: '受限 NAT 无端点 / 锚点中继',
-            desc: '东京全封闭隔离玻璃舱(无天线) · 仅出站连接香港锚点或受控中继',
+            title: '在线但无端点',
+            desc: '成员在线但当前没有公告端点；不推断 NAT 地理或中继路径。',
           },
           {
             glyph: '○',
             tone: 'text-slate-500',
-            title: '当前离线 (保留在名册中)',
-            desc: '新加坡 CGNAT 归档节点 · 中性灰休眠建模，离线不等于被移除或安全故障',
+            title: '当前离线（仍在名册）',
+            desc: '离线不等于被移除；最后在线时间来自名册，地理和运行时信息未采集。',
           },
         ].map((item, idx) => (
           <div key={idx} className="relative group flex items-center">

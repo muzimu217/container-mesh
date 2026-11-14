@@ -3,11 +3,6 @@ import { MeshApiResponse, MeshMember } from '../data/meshSnapshots';
 import {
   Search,
   Globe,
-  Activity,
-  Send,
-  FileUp,
-  Terminal,
-  Power,
   ChevronDown,
   ChevronUp,
   CheckCircle2,
@@ -37,8 +32,6 @@ interface MinimalistProbeDashboardProps {
   selectedDeviceId: string | null;
   onSelectZone: (zoneId: string | null) => void;
   onSelectDevice: (deviceId: string | null) => void;
-  onToggleDeviceOnline: (deviceId: string) => void;
-  onTriggerCommEvent: (fromId: string, toId: string, label: string) => void;
   onSwitchTo3DCockpit: (zoneId?: string | null, deviceId?: string | null) => void;
   colorSchemePref?: ColorSchemePreference;
   resolvedDark?: boolean;
@@ -49,153 +42,51 @@ interface MinimalistProbeDashboardProps {
 
 type ProbeLayoutMode = 'grid' | 'list';
 
+/**
+ * Runtime telemetry for one device.
+ *
+ * cmesh does NOT collect any of this. The roster (`GET /api/mesh`) carries
+ * identity, membership, liveness, endpoints and transport — no CPU, memory,
+ * disk, traffic, SLA or packet loss. The prototype invented a table of those
+ * numbers for five fake devices, fell back to it for every real member, and
+ * jittered the values on a 1.5 s timer so they looked live. Every device card
+ * therefore showed an uptime, an SLA and a traffic total that never happened
+ * (doubao-cloud-vm-01, round 59). Moving fabricated numbers are worse than
+ * none: they are indistinguishable from measurement.
+ *
+ * The type stays because the cards read it. Everything is optional, and
+ * undefined means "not collected" — which is what the UI now says.
+ */
 interface NodeRuntimeTelemetry {
-  flag: string;
-  regionCode: string;
-  osDistro: string;
-  kernelArch: string;
-  uptimeStr: string;
-  cpuCores: number;
-  cpuPercent: number;
-  memUsedGb: number;
-  memTotalGb: number;
-  diskUsedGb: number;
-  diskTotalGb: number;
-  netUpMbps: number;
-  netDownMbps: number;
-  trafficUpGb: number;
-  trafficDownGb: number;
-  load1: number;
-  sparkline: number[];
-  pingSeriesDirect: number[];
-  pingSeriesAnchor: number[];
-  pingSeriesRelay: number[];
-  slaPercent: number;
-  packetLossPercent: number;
+  // flag, osDistro and kernelArch stay OPTIONAL and are never populated: they
+  // were part of the invented table too (🇭🇰 HKG / Alpine 3.20 / Linux 6.6 ·
+  // x86_64). Leaving them undefined makes the cards render nothing where a
+  // guessed flag or distro used to appear.
+  flag?: string;
+  osDistro?: string;
+  kernelArch?: string;
+  uptimeStr?: string;
+  cpuCores?: number;
+  cpuPercent?: number;
+  memUsedGb?: number;
+  memTotalGb?: number;
+  diskUsedGb?: number;
+  diskTotalGb?: number;
+  netUpMbps?: number;
+  netDownMbps?: number;
+  trafficUpGb?: number;
+  trafficDownGb?: number;
+  load1?: number;
+  sparkline?: number[];
+  pingSeriesDirect?: number[];
+  pingSeriesAnchor?: number[];
+  pingSeriesRelay?: number[];
+  slaPercent?: number;
+  packetLossPercent?: number;
 }
 
-const INITIAL_TELEMETRY: Record<string, NodeRuntimeTelemetry> = {
-  dev_01_anchor_hk: {
-    flag: '🇭🇰',
-    regionCode: 'HKG',
-    osDistro: 'Alpine 3.20',
-    kernelArch: 'Linux 6.6 · x86_64',
-    uptimeStr: '42天 18小时',
-    cpuCores: 4,
-    cpuPercent: 24,
-    memUsedGb: 1.8,
-    memTotalGb: 8.0,
-    diskUsedGb: 28,
-    diskTotalGb: 120,
-    netUpMbps: 18.4,
-    netDownMbps: 16.9,
-    trafficUpGb: 842.6,
-    trafficDownGb: 791.2,
-    load1: 0.42,
-    sparkline: [18, 22, 25, 21, 28, 32, 26, 23, 29, 25, 22, 24],
-    pingSeriesDirect: [12, 13, 12, 14, 12, 13, 15, 12, 13, 12, 13, 12],
-    pingSeriesAnchor: [1, 1, 1, 1, 2, 1, 1, 1, 1, 1, 1, 1],
-    pingSeriesRelay: [18, 19, 18, 20, 19, 18, 21, 19, 18, 19, 18, 18],
-    slaPercent: 99.98,
-    packetLossPercent: 0.0,
-  },
-  dev_02_local_ws: {
-    flag: '🇩🇪',
-    regionCode: 'FRA',
-    osDistro: 'macOS 15.2',
-    kernelArch: 'Darwin · Apple M3 Max',
-    uptimeStr: '14天 06小时',
-    cpuCores: 14,
-    cpuPercent: 31,
-    memUsedGb: 19.4,
-    memTotalGb: 36.0,
-    diskUsedGb: 412,
-    diskTotalGb: 1000,
-    netUpMbps: 14.2,
-    netDownMbps: 29.6,
-    trafficUpGb: 312.4,
-    trafficDownGb: 628.9,
-    load1: 1.15,
-    sparkline: [25, 28, 35, 30, 27, 33, 38, 31, 29, 34, 30, 31],
-    pingSeriesDirect: [8, 9, 8, 8, 10, 9, 8, 9, 8, 8, 9, 8],
-    pingSeriesAnchor: [136, 138, 135, 139, 137, 136, 141, 137, 136, 138, 136, 137],
-    pingSeriesRelay: [152, 155, 151, 154, 153, 152, 158, 153, 151, 154, 152, 153],
-    slaPercent: 99.95,
-    packetLossPercent: 0.0,
-  },
-  dev_03_peer_direct: {
-    flag: '🇨🇭',
-    regionCode: 'ZRH',
-    osDistro: 'Ubuntu 24.04',
-    kernelArch: 'Linux 6.8 · CUDA 12.4',
-    uptimeStr: '29天 11小时',
-    cpuCores: 32,
-    cpuPercent: 78,
-    memUsedGb: 54.2,
-    memTotalGb: 64.0,
-    diskUsedGb: 1480,
-    diskTotalGb: 2000,
-    netUpMbps: 42.8,
-    netDownMbps: 38.5,
-    trafficUpGb: 2410.5,
-    trafficDownGb: 1980.3,
-    load1: 4.82,
-    sparkline: [68, 74, 79, 82, 75, 84, 88, 79, 76, 81, 77, 78],
-    pingSeriesDirect: [9, 9, 10, 9, 11, 9, 9, 10, 9, 9, 10, 9],
-    pingSeriesAnchor: [142, 144, 141, 145, 143, 142, 146, 143, 142, 144, 143, 142],
-    pingSeriesRelay: [161, 163, 160, 165, 162, 161, 166, 162, 160, 163, 161, 162],
-    slaPercent: 99.92,
-    packetLossPercent: 0.1,
-  },
-  dev_04_nat_container: {
-    flag: '🇯🇵',
-    regionCode: 'TYO',
-    osDistro: 'Debian 12',
-    kernelArch: 'containerd · Rootless',
-    uptimeStr: '07天 22小时',
-    cpuCores: 8,
-    cpuPercent: 46,
-    memUsedGb: 9.2,
-    memTotalGb: 16.0,
-    diskUsedGb: 64,
-    diskTotalGb: 100,
-    netUpMbps: 6.4,
-    netDownMbps: 11.8,
-    trafficUpGb: 128.7,
-    trafficDownGb: 294.1,
-    load1: 0.94,
-    sparkline: [38, 42, 49, 44, 51, 47, 43, 45, 50, 48, 44, 46],
-    pingSeriesDirect: [68, 72, 70, 74, 69, 71, 75, 70, 69, 72, 71, 70],
-    pingSeriesAnchor: [48, 49, 47, 51, 49, 48, 52, 49, 48, 50, 49, 48],
-    pingSeriesRelay: [54, 56, 53, 58, 55, 54, 59, 55, 54, 56, 55, 54],
-    slaPercent: 99.4,
-    packetLossPercent: 0.3,
-  },
-  dev_05_offline_nas: {
-    flag: '🇸🇬',
-    regionCode: 'SIN',
-    osDistro: 'Debian 12 NAS',
-    kernelArch: 'Podman · ARM64',
-    uptimeStr: '离线 18分钟',
-    cpuCores: 4,
-    cpuPercent: 19,
-    memUsedGb: 3.1,
-    memTotalGb: 16.0,
-    diskUsedGb: 6840,
-    diskTotalGb: 8000,
-    netUpMbps: 5.2,
-    netDownMbps: 8.4,
-    trafficUpGb: 512.0,
-    trafficDownGb: 1120.8,
-    load1: 0.28,
-    sparkline: [16, 19, 21, 18, 22, 20, 17, 19, 23, 20, 18, 19],
-    pingSeriesDirect: [34, 36, 35, 37, 35, 34, 38, 35, 34, 36, 35, 35],
-    pingSeriesAnchor: [36, 37, 35, 38, 36, 36, 39, 37, 36, 37, 36, 36],
-    pingSeriesRelay: [42, 44, 41, 45, 43, 42, 46, 43, 42, 44, 43, 42],
-    slaPercent: 94.2,
-    packetLossPercent: 1.2,
-  },
-};
+/** What the cards print where a value cmesh does not collect would go. */
+const NOT_COLLECTED = '未采集';
 
 export const MinimalistProbeDashboard: React.FC<MinimalistProbeDashboardProps> = ({
   meshData,
@@ -203,8 +94,6 @@ export const MinimalistProbeDashboard: React.FC<MinimalistProbeDashboardProps> =
   selectedDeviceId,
   onSelectZone,
   onSelectDevice,
-  onToggleDeviceOnline,
-  onTriggerCommEvent,
   onSwitchTo3DCockpit,
   colorSchemePref = 'dark',
   resolvedDark = true,
@@ -213,9 +102,9 @@ export const MinimalistProbeDashboard: React.FC<MinimalistProbeDashboardProps> =
   onChangeAmbientIntensity,
 }) => {
   const [layoutMode, setLayoutMode] = useState<ProbeLayoutMode>('grid');
-  const [liveStreamEnabled, setLiveStreamEnabled] = useState<boolean>(true);
-  const [telemetryMap, setTelemetryMap] =
-    useState<Record<string, NodeRuntimeTelemetry>>(INITIAL_TELEMETRY);
+  // Empty, and it stays empty: cmesh collects no runtime telemetry, so there
+  // is nothing to stream. The control that used to animate this is gone.
+  const [telemetryMap] = useState<Record<string, NodeRuntimeTelemetry>>({});
 
   // Filters & collapsible sections
   const [searchQuery, setSearchQuery] = useState<string>('');
@@ -228,74 +117,19 @@ export const MinimalistProbeDashboard: React.FC<MinimalistProbeDashboardProps> =
   const [showDiagnosticsAccordion, setShowDiagnosticsAccordion] = useState<boolean>(false);
   const [drilldownTab, setDrilldownTab] = useState<'ping_chart' | 'load_chart'>('ping_chart');
 
-  // Live probe action states
-  const [actionLoading, setActionLoading] = useState<string | null>(null);
-  const [actionOutput, setActionOutput] = useState<{
-    deviceId: string;
-    title: string;
-    timestamp: string;
-    detail: string;
-  } | null>(null);
-  const [msgInput, setMsgInput] = useState<string>('PING_PROBE: 验证容器用户态端到端连通');
-  const [selectedCmd, setSelectedCmd] = useState<string>('cmesh status --json');
+  // Runtime telemetry is not collected by cmesh. The panel is read-only;
+  // operations belong to the CLI and do not get simulated here.
 
-  // Smooth 1.5s real-time stream updates for online nodes
-  useEffect(() => {
-    if (!liveStreamEnabled) return;
-    const timer = setInterval(() => {
-      setTelemetryMap((prev) => {
-        const next: Record<string, NodeRuntimeTelemetry> = { ...prev };
-        meshData.members.forEach((member) => {
-          const cur = prev[member.device_id] || INITIAL_TELEMETRY.dev_01_anchor_hk;
-          if (!member.online) {
-            next[member.device_id] = cur;
-            return;
-          }
-          const deltaCpu = Math.round((Math.random() - 0.48) * 5);
-          const nextCpu = Math.max(6, Math.min(95, cur.cpuPercent + deltaCpu));
-          const deltaUp = (Math.random() - 0.48) * 2.4;
-          const deltaDown = (Math.random() - 0.48) * 3.1;
-          const nextUp = Math.max(0.4, Number((cur.netUpMbps + deltaUp).toFixed(1)));
-          const nextDown = Math.max(0.6, Number((cur.netDownMbps + deltaDown).toFixed(1)));
-          const nextSpark = [...cur.sparkline.slice(1), nextCpu];
-
-          const basePing = cur.pingSeriesDirect[cur.pingSeriesDirect.length - 1] || 15;
-          const nextPingDirect = Math.max(
-            4,
-            Math.round(basePing + (Math.random() - 0.5) * 3)
-          );
-          const baseAnchor = cur.pingSeriesAnchor[cur.pingSeriesAnchor.length - 1] || 30;
-          const nextPingAnchor = Math.max(
-            1,
-            Math.round(baseAnchor + (Math.random() - 0.5) * 3)
-          );
-          const baseRelay = cur.pingSeriesRelay[cur.pingSeriesRelay.length - 1] || 45;
-          const nextPingRelay = Math.max(
-            8,
-            Math.round(baseRelay + (Math.random() - 0.5) * 4)
-          );
-
-          next[member.device_id] = {
-            ...cur,
-            cpuPercent: nextCpu,
-            netUpMbps: nextUp,
-            netDownMbps: nextDown,
-            trafficUpGb: Number((cur.trafficUpGb + nextUp * 0.0005).toFixed(2)),
-            trafficDownGb: Number((cur.trafficDownGb + nextDown * 0.0005).toFixed(2)),
-            sparkline: nextSpark,
-            pingSeriesDirect: [...cur.pingSeriesDirect.slice(1), nextPingDirect],
-            pingSeriesAnchor: [...cur.pingSeriesAnchor.slice(1), nextPingAnchor],
-            pingSeriesRelay: [...cur.pingSeriesRelay.slice(1), nextPingRelay],
-          };
-        });
-        return next;
-      });
-    }, 1500);
-    return () => clearInterval(timer);
-  }, [liveStreamEnabled, meshData.members]);
+  // There used to be a 1.5 s setInterval here that jittered the invented
+  // telemetry so it looked live. cmesh does not collect runtime metrics, and
+  // animating a fabrication is the worst version of it, so the loop is gone
+  // rather than emptied (doubao-cloud-vm-01, round 59).
 
   const onlineMembers = meshData.members.filter((m) => m.online);
   const offlineMembers = meshData.members.filter((m) => !m.online);
+  const onlineCount = onlineMembers.length;
+  const memberCount = meshData.members.length;
+  const onlineRate = memberCount === 0 ? null : Math.round((onlineCount / memberCount) * 100);
   const directMembers = meshData.members.filter((m) => m.online && m.transport === 'direct');
   const noEndpointMembers = meshData.members.filter((m) => m.endpoints.length === 0);
   const anchorNode = meshData.members.find((m) => m.is_anchor);
@@ -337,89 +171,6 @@ export const MinimalistProbeDashboard: React.FC<MinimalistProbeDashboardProps> =
     }
     return true;
   });
-
-  const runProbeAction = async (
-    member: MeshMember,
-    action: 'ping' | 'message' | 'file_transfer' | 'exec_whitelist'
-  ) => {
-    setActionLoading(`${member.device_id}:${action}`);
-    try {
-      const response = await fetch('/api/mesh/action', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          device_id: member.device_id,
-          action,
-          payload: {
-            text: msgInput,
-            command: selectedCmd,
-            fileName: 'checkpoint-shard-04.safetensors',
-            fileSize: '256.0 MB',
-          },
-        }),
-      });
-      const json = await response.json();
-
-      if (action === 'ping') {
-        onTriggerCommEvent(
-          'dev_02_local_ws',
-          member.device_id,
-          `探针测速完成: macbook-studio-local ⇄ ${member.display_name} (${json.result.avg_rtt_ms} ms)`
-        );
-        setActionOutput({
-          deviceId: member.device_id,
-          title: `RTT 延迟探测结果 — ${member.display_name} (${member.geo_city})`,
-          timestamp: json.timestamp,
-          detail: `模式: ${json.result.mode} · 样本: [${json.result.samples_ms.join(' ms, ')} ms] · 平均 RTT: ${json.result.avg_rtt_ms} ms (丢包 ${json.result.packet_loss})`,
-        });
-      } else if (action === 'message') {
-        onTriggerCommEvent(
-          'dev_02_local_ws',
-          member.device_id,
-          `点对点消息已送达: -> ${member.display_name} [${json.result.msg_id}]`
-        );
-        setActionOutput({
-          deviceId: member.device_id,
-          title: `加密消息回执 (${json.result.encrypted}) — ${member.display_name}`,
-          timestamp: json.timestamp,
-          detail: `${json.result.echo} · 回执 ID: ${json.result.msg_id}`,
-        });
-      } else if (action === 'file_transfer') {
-        onTriggerCommEvent(
-          'dev_02_local_ws',
-          member.device_id,
-          `大文件分片校验完成: -> ${member.display_name} (256.0 MB)`
-        );
-        setActionOutput({
-          deviceId: member.device_id,
-          title: `大文件分片流式传输 — ${json.result.file_name}`,
-          timestamp: json.timestamp,
-          detail: `大小: ${json.result.file_size} · 校验: ${json.result.chunks_verified} · SHA-256: ${json.result.sha256.slice(0, 32)}...`,
-        });
-      } else if (action === 'exec_whitelist') {
-        onTriggerCommEvent(
-          'dev_02_local_ws',
-          member.device_id,
-          `受控白名单指令完成: ${selectedCmd} @ ${member.display_name}`
-        );
-        setActionOutput({
-          deviceId: member.device_id,
-          title: `受控白名单远程命令 (${json.result.command}) — ${member.display_name}`,
-          timestamp: json.timestamp,
-          detail: json.result.stdout,
-        });
-      }
-    } catch {
-      setActionOutput({
-        deviceId: member.device_id,
-        title: `本地探针回显 — ${member.display_name}`,
-        timestamp: new Date().toISOString(),
-        detail: `已通过用户态通道向 ${member.display_name} 发起探测请求。`,
-      });
-    } finally {
-      setActionLoading(null);
-    }
-  };
 
   const isDark = resolvedDark;
 
@@ -627,36 +378,22 @@ export const MinimalistProbeDashboard: React.FC<MinimalistProbeDashboardProps> =
           {/* Top-Left: Stream Title + Live Stream Toggle + Fluid Stream Intensity Slider */}
           <div className="flex flex-wrap items-center gap-2.5">
             <div className="flex items-center gap-2">
-              <Radio
-                className={`w-4 h-4 ${
-                  liveStreamEnabled
-                    ? isDark
-                      ? 'text-emerald-400 animate-pulse'
-                      : 'text-emerald-600 animate-pulse'
-                    : textMutedClass
-                }`}
-              />
+              <Radio className={`w-4 h-4 ${textMutedClass}`} />
               <span className={`text-xs font-bold tracking-tight ${textPrimaryClass}`}>
-                cmesh Pulse · 实时流组网探针台
+                cmesh Pulse · 组网探针台
               </span>
             </div>
 
             <span className={textMutedClass}>·</span>
 
-            {/* Live Stream 1.5s Toggle */}
-            <button
-              onClick={() => setLiveStreamEnabled(!liveStreamEnabled)}
-              className={`px-2.5 py-1 rounded-lg text-[11px] font-mono transition-colors cursor-pointer border ${
-                liveStreamEnabled
-                  ? isDark
-                    ? 'bg-emerald-500/15 text-emerald-300 border-emerald-400/30'
-                    : 'bg-emerald-500/15 text-emerald-800 border-emerald-500/30 font-semibold'
-                  : `${subtleBgClass} ${textMutedClass}`
-              }`}
-              title="切换 1.5 秒零刷新流式数据推送"
+            {/* The "实时流推送 (1.5s)" toggle is gone with the fabricated
+                telemetry it animated: there is no stream to enable. */}
+            <span
+              className={`px-2.5 py-1 rounded-lg text-[11px] font-mono border ${subtleBgClass} ${textMutedClass}`}
+              title="cmesh 只上报身份/成员/存活/端点/传输；CPU、内存、磁盘、流量、SLA 一律未采集"
             >
-              {liveStreamEnabled ? '● 实时流推送 (1.5s)' : '○ 实时流已暂停'}
-            </button>
+              ○ 运行时指标：未采集
+            </span>
 
             {/* Fluid Ambient Intensity Slider */}
             {onChangeAmbientIntensity && (
@@ -771,7 +508,7 @@ export const MinimalistProbeDashboard: React.FC<MinimalistProbeDashboardProps> =
                   isDark ? 'text-emerald-400' : 'text-emerald-700'
                 }`}
               >
-                ● {Math.round((onlineMembers.length / meshData.members.length) * 100)}% 在线率
+                ● {onlineRate == null ? '未同步' : `${onlineRate}% 在线率`}
               </span>
             </div>
             <div className="mt-2.5 flex items-baseline justify-between">
@@ -794,7 +531,7 @@ export const MinimalistProbeDashboard: React.FC<MinimalistProbeDashboardProps> =
             <div className="mt-3 h-1.5 w-full rounded-full overflow-hidden flex bg-slate-500/20">
               <div
                 className="bg-emerald-500 transition-all duration-500"
-                style={{ width: `${(onlineMembers.length / meshData.members.length) * 100}%` }}
+                                style={{ width: `${onlineRate ?? 0}%` }}
               />
             </div>
           </div>
@@ -885,11 +622,15 @@ export const MinimalistProbeDashboard: React.FC<MinimalistProbeDashboardProps> =
               </span>
             </div>
             <div className={`mt-2 font-mono text-sm font-bold truncate ${textPrimaryClass}`}>
-              ◈ {anchorNode?.display_name || 'anchor-hk-01'} ({anchorNode?.geo_city.split(' ')[0]})
+              {/* The fallbacks here used to be 'anchor-hk-01' and
+                  '203.0.113.10:41820' — a device name and a public address that
+                  belong to nobody. When the roster has no anchor, say so. */}
+              ◈ {anchorNode?.display_name || '未发现锚点'}
+              {anchorNode?.geo_city ? ` (${anchorNode.geo_city.split(' ')[0]})` : ''}
             </div>
             <div className="mt-2.5 flex items-center justify-between gap-2">
               <span className={`text-[11px] font-mono tabular-nums truncate ${textMutedClass}`}>
-                {anchorNode?.endpoints[0] || '203.0.113.10:41820'}
+                {anchorNode ? anchorNode.endpoints[0] || '无入站端点 (仅出站)' : '—'}
               </span>
               <button
                 onClick={() => onSwitchTo3DCockpit(selectedZoneId, selectedDeviceId)}
@@ -1019,7 +760,7 @@ export const MinimalistProbeDashboard: React.FC<MinimalistProbeDashboardProps> =
             <div className="mt-3 grid grid-cols-1 md:grid-cols-5 gap-2.5">
               {meshData.members.map((m) => {
                 const st = getDeviceStatusPresentation(m);
-                const t = telemetryMap[m.device_id] || INITIAL_TELEMETRY.dev_01_anchor_hk;
+                const t: NodeRuntimeTelemetry = telemetryMap[m.device_id] || {};
                 const isSel = selectedDeviceId === m.device_id;
                 return (
                   <button
@@ -1059,17 +800,20 @@ export const MinimalistProbeDashboard: React.FC<MinimalistProbeDashboardProps> =
               <div className="grid grid-cols-1 md:grid-cols-2 2xl:grid-cols-3 gap-4">
                 {filteredMembers.map((member) => {
                   const st = getDeviceStatusPresentation(member);
-                  const t =
-                    telemetryMap[member.device_id] || INITIAL_TELEMETRY.dev_01_anchor_hk;
+                  const t: NodeRuntimeTelemetry = telemetryMap[member.device_id] || {};
                   const isSelected = selectedDeviceId === member.device_id;
-                  const memPct = member.online
-                    ? Math.round((t.memUsedGb / t.memTotalGb) * 100)
-                    : 0;
-                  const diskPct = Math.round((t.diskUsedGb / t.diskTotalGb) * 100);
+                  // Percentages are only meaningful when both halves exist.
+                  const memPct =
+                    member.online && t.memUsedGb != null && t.memTotalGb
+                      ? Math.round((t.memUsedGb / t.memTotalGb) * 100)
+                      : null;
+                  const diskPct =
+                    t.diskUsedGb != null && t.diskTotalGb
+                      ? Math.round((t.diskUsedGb / t.diskTotalGb) * 100)
+                      : null;
                   const cpuPct = member.online ? t.cpuPercent : 0;
-                  const isPinging = actionLoading === `${member.device_id}:ping`;
-                  const latestRtt =
-                    t.pingSeriesDirect[t.pingSeriesDirect.length - 1] || 15;
+                  const rttSeries = t.pingSeriesDirect ?? [];
+                  const latestRtt = rttSeries.length ? rttSeries[rttSeries.length - 1] : null;
 
                   return (
                     <div
@@ -1152,27 +896,35 @@ export const MinimalistProbeDashboard: React.FC<MinimalistProbeDashboardProps> =
                             <div className="flex items-center justify-between text-[11px] font-mono tabular-nums mb-1">
                               <span className={`flex items-center gap-1 ${textMutedClass}`}>
                                 <Cpu className="w-3 h-3" />
-                                <span>CPU ({t.cpuCores}C)</span>
+                                <span>
+                                  CPU{t.cpuCores != null ? ` (${t.cpuCores}C)` : ''}
+                                </span>
                               </span>
                               <span
                                 className={
-                                  cpuPct >= 85
+                                  cpuPct == null
+                                    ? textMutedClass
+                                    : cpuPct >= 85
                                     ? 'text-rose-500 font-bold'
                                     : cpuPct >= 70
                                     ? 'text-amber-500 font-semibold'
                                     : textPrimaryClass
                                 }
                               >
-                                {member.online ? `${cpuPct}%` : '—'}
+                                {!member.online
+                                  ? '—'
+                                  : cpuPct == null
+                                  ? NOT_COLLECTED
+                                  : `${cpuPct}%`}
                               </span>
                             </div>
                             <div className="h-1.5 w-full rounded-full bg-slate-500/20 overflow-hidden">
                               <div
                                 className={`h-full rounded-full transition-all duration-500 ${getProgressBarColor(
-                                  cpuPct,
+                                  cpuPct ?? 0,
                                   member.online
                                 )}`}
-                                style={{ width: `${cpuPct}%` }}
+                                style={{ width: `${cpuPct ?? 0}%` }}
                               />
                             </div>
                           </div>
@@ -1183,18 +935,20 @@ export const MinimalistProbeDashboard: React.FC<MinimalistProbeDashboardProps> =
                               <div className="flex items-center justify-between text-[11px] font-mono tabular-nums mb-1">
                                 <span className={textMutedClass}>RAM</span>
                                 <span className={textPrimaryClass}>
-                                  {member.online
+                                  {member.online && t.memUsedGb != null && t.memTotalGb
                                     ? `${t.memUsedGb.toFixed(1)}/${t.memTotalGb}G`
+                                    : member.online
+                                    ? NOT_COLLECTED
                                     : '—'}
                                 </span>
                               </div>
                               <div className="h-1.5 w-full rounded-full bg-slate-500/20 overflow-hidden">
                                 <div
                                   className={`h-full rounded-full transition-all duration-500 ${getProgressBarColor(
-                                    memPct,
+                                    memPct ?? 0,
                                     member.online
                                   )}`}
-                                  style={{ width: `${memPct}%` }}
+                                  style={{ width: `${memPct ?? 0}%` }}
                                 />
                               </div>
                             </div>
@@ -1202,22 +956,27 @@ export const MinimalistProbeDashboard: React.FC<MinimalistProbeDashboardProps> =
                             <div>
                               <div className="flex items-center justify-between text-[11px] font-mono tabular-nums mb-1">
                                 <span className={textMutedClass}>DISK</span>
-                                <span className={textPrimaryClass}>{diskPct}%</span>
+                                <span className={textPrimaryClass}>
+                                  {diskPct == null ? NOT_COLLECTED : `${diskPct}%`}
+                                </span>
                               </div>
                               <div className="h-1.5 w-full rounded-full bg-slate-500/20 overflow-hidden">
                                 <div
                                   className={`h-full rounded-full transition-all duration-500 ${getProgressBarColor(
-                                    diskPct,
+                                    diskPct ?? 0,
                                     true
                                   )}`}
-                                  style={{ width: `${diskPct}%` }}
+                                  style={{ width: `${diskPct ?? 0}%` }}
                                 />
                               </div>
                             </div>
                           </div>
                         </div>
 
-                        {/* 3. Real-time Network Speed (Tabular Nums) + Lightweight Sparkline */}
+                        {/* 3. Network Speed + Sparkline. Offline, uncollected and
+                            zero all read differently on purpose: rendering an
+                            absent measurement as "0.0 MB/s" would claim we
+                            measured an idle link. */}
                         <div
                           className={`mt-3.5 pt-3 border-t flex items-center justify-between gap-2 ${dividerClass}`}
                         >
@@ -1228,25 +987,39 @@ export const MinimalistProbeDashboard: React.FC<MinimalistProbeDashboardProps> =
                                   isDark ? 'text-sky-400' : 'text-sky-700'
                                 }`}
                               >
-                                ↑ {member.online ? `${t.netUpMbps.toFixed(1)} MB/s` : '0.0 MB/s'}
+                                ↑{' '}
+                                {!member.online
+                                  ? '—'
+                                  : t.netUpMbps != null
+                                  ? `${t.netUpMbps.toFixed(1)} MB/s`
+                                  : NOT_COLLECTED}
                               </span>
                               <span
                                 className={`font-semibold ${
                                   isDark ? 'text-emerald-400' : 'text-emerald-700'
                                 }`}
                               >
-                                ↓ {member.online ? `${t.netDownMbps.toFixed(1)} MB/s` : '0.0 MB/s'}
+                                ↓{' '}
+                                {!member.online
+                                  ? '—'
+                                  : t.netDownMbps != null
+                                  ? `${t.netDownMbps.toFixed(1)} MB/s`
+                                  : NOT_COLLECTED}
                               </span>
                             </div>
                             <div className={`text-[11px] ${textMutedClass}`}>
-                              累计 ↑{t.trafficUpGb.toFixed(0)}G / ↓{t.trafficDownGb.toFixed(0)}G
+                              {t.trafficUpGb != null && t.trafficDownGb != null
+                                ? `累计 ↑${t.trafficUpGb.toFixed(0)}G / ↓${t.trafficDownGb.toFixed(
+                                    0
+                                  )}G`
+                                : `累计流量 ${NOT_COLLECTED}`}
                             </div>
                           </div>
 
                           {/* Embedded SVG Sparkline */}
                           <div className="flex flex-col items-end">
                             {renderSparkline(
-                              t.sparkline,
+                              t.sparkline ?? [],
                               member.online,
                               member.is_anchor
                                 ? 'sky'
@@ -1255,7 +1028,11 @@ export const MinimalistProbeDashboard: React.FC<MinimalistProbeDashboardProps> =
                                 : 'emerald'
                             )}
                             <span className={`text-[10px] font-mono tabular-nums ${textMutedClass}`}>
-                              {member.online ? `RTT ~${latestRtt}ms` : '无实时流'}
+                              {!member.online
+                                ? '离线'
+                                : latestRtt != null
+                                ? `RTT ~${latestRtt}ms`
+                                : `RTT ${NOT_COLLECTED}`}
                             </span>
                           </div>
                         </div>
@@ -1272,23 +1049,6 @@ export const MinimalistProbeDashboard: React.FC<MinimalistProbeDashboardProps> =
                             : '◆ 未公告入站端点 (仅出站)'}
                         </span>
                         <div className="flex items-center gap-1.5 shrink-0">
-                          <button
-                            disabled={!member.online || isPinging}
-                            onClick={() => {
-                              onSelectZone(member.zone_id);
-                              onSelectDevice(member.device_id);
-                              runProbeAction(member, 'ping');
-                            }}
-                            className={`px-2 py-0.5 rounded-md border transition-colors ${
-                              !member.online
-                                ? 'opacity-40 cursor-not-allowed border-slate-400/40'
-                                : isDark
-                                ? 'border-white/15 hover:border-sky-400 text-slate-200 hover:text-sky-300 cursor-pointer'
-                                : 'border-slate-300/80 bg-white/60 hover:border-sky-600 text-slate-700 hover:text-sky-700 cursor-pointer'
-                            }`}
-                          >
-                            {isPinging ? '测速中' : 'Ping'}
-                          </button>
                           <button
                             onClick={() => onSwitchTo3DCockpit(member.zone_id, member.device_id)}
                             className={`px-2 py-0.5 rounded-md border transition-colors cursor-pointer ${
@@ -1328,13 +1088,13 @@ export const MinimalistProbeDashboard: React.FC<MinimalistProbeDashboardProps> =
                     <tbody className={`divide-y text-xs font-mono ${dividerClass}`}>
                       {filteredMembers.map((member) => {
                         const st = getDeviceStatusPresentation(member);
-                        const t =
-                          telemetryMap[member.device_id] || INITIAL_TELEMETRY.dev_01_anchor_hk;
+                        const t: NodeRuntimeTelemetry = telemetryMap[member.device_id] || {};
                         const isSelected = selectedDeviceId === member.device_id;
                         const cpuPct = member.online ? t.cpuPercent : 0;
-                        const memPct = member.online
-                          ? Math.round((t.memUsedGb / t.memTotalGb) * 100)
-                          : 0;
+                        const memPct =
+                          member.online && t.memUsedGb != null && t.memTotalGb
+                            ? Math.round((t.memUsedGb / t.memTotalGb) * 100)
+                            : null;
 
                         return (
                           <tr
@@ -1379,42 +1139,54 @@ export const MinimalistProbeDashboard: React.FC<MinimalistProbeDashboardProps> =
                             </td>
                             <td className="py-2.5 px-3.5 whitespace-nowrap w-28">
                               <div className="flex items-center justify-between text-[11px] tabular-nums mb-1">
-                                <span>{member.online ? `${cpuPct}%` : '—'}</span>
+                                <span>
+                                  {!member.online
+                                    ? '—'
+                                    : cpuPct == null
+                                    ? NOT_COLLECTED
+                                    : `${cpuPct}%`}
+                                </span>
                               </div>
                               <div className="h-1.5 w-20 rounded-full bg-slate-500/20 overflow-hidden">
                                 <div
                                   className={`h-full rounded-full transition-all duration-500 ${getProgressBarColor(
-                                    cpuPct,
+                                    cpuPct ?? 0,
                                     member.online
                                   )}`}
-                                  style={{ width: `${cpuPct}%` }}
+                                  style={{ width: `${cpuPct ?? 0}%` }}
                                 />
                               </div>
                             </td>
                             <td className="py-2.5 px-3.5 whitespace-nowrap w-28">
                               <div className="flex items-center justify-between text-[11px] tabular-nums mb-1">
-                                <span>{member.online ? `${memPct}%` : '—'}</span>
+                                <span>
+                                  {!member.online
+                                    ? '—'
+                                    : memPct == null
+                                    ? NOT_COLLECTED
+                                    : `${memPct}%`}
+                                </span>
                               </div>
                               <div className="h-1.5 w-20 rounded-full bg-slate-500/20 overflow-hidden">
                                 <div
                                   className={`h-full rounded-full transition-all duration-500 ${getProgressBarColor(
-                                    memPct,
+                                    memPct ?? 0,
                                     member.online
                                   )}`}
-                                  style={{ width: `${memPct}%` }}
+                                  style={{ width: `${memPct ?? 0}%` }}
                                 />
                               </div>
                             </td>
                             <td className="py-2.5 px-3.5 whitespace-nowrap tabular-nums">
                               <span className={isDark ? 'text-sky-400' : 'text-sky-700 font-semibold'}>
-                                ↑{member.online ? t.netUpMbps.toFixed(1) : '0.0'}M
+                                ↑{!member.online ? '—' : t.netUpMbps != null ? t.netUpMbps.toFixed(1) : NOT_COLLECTED}M
                               </span>{' '}
                               <span
                                 className={
                                   isDark ? 'text-emerald-400' : 'text-emerald-700 font-semibold'
                                 }
                               >
-                                ↓{member.online ? t.netDownMbps.toFixed(1) : '0.0'}M
+                                ↓{!member.online ? '—' : t.netDownMbps != null ? t.netDownMbps.toFixed(1) : NOT_COLLECTED}M
                               </span>
                             </td>
                             <td
@@ -1448,27 +1220,7 @@ export const MinimalistProbeDashboard: React.FC<MinimalistProbeDashboardProps> =
               </div>
             )}
 
-            {/* Inline Action Output Toast */}
-            {actionOutput && (
-              <div className={`p-3.5 rounded-xl flex items-center justify-between gap-4 text-xs font-mono ${cardClass}`}>
-                <div className="min-w-0">
-                  <div className={`font-semibold ${isDark ? 'text-sky-400' : 'text-sky-700'}`}>
-                    {actionOutput.title}
-                  </div>
-                  <div className={`mt-0.5 truncate ${textPrimaryClass}`}>
-                    {actionOutput.detail}
-                  </div>
-                </div>
-                <button
-                  onClick={() => setActionOutput(null)}
-                  className={`text-[11px] shrink-0 cursor-pointer ${textMutedClass} hover:${textPrimaryClass}`}
-                >
-                  关闭回显
-                </button>
-              </div>
-            )}
-
-            {/* ================= 3. BOTTOM SERVICE AVAILABILITY & MULTI-PATH PING MONITOR (底部服务拨测区) ================= */}
+            {/* ================= 3. BOTTOM SERVICE AVAILABILITY & MULTI-PATH PING MONITOR (底部服务拨测区) */}
             <div className={`rounded-xl overflow-hidden ${cardClass}`}>
               <button
                 onClick={() => setShowServiceMonitor(!showServiceMonitor)}
@@ -1495,12 +1247,13 @@ export const MinimalistProbeDashboard: React.FC<MinimalistProbeDashboardProps> =
               {showServiceMonitor && (
                 <div className={`p-4 border-t space-y-2.5 ${dividerClass}`}>
                   {meshData.members.map((m) => {
-                    const t =
-                      telemetryMap[m.device_id] || INITIAL_TELEMETRY.dev_01_anchor_hk;
-                    const avgRtt = Math.round(
-                      t.pingSeriesDirect.reduce((a, b) => a + b, 0) /
-                        t.pingSeriesDirect.length
-                    );
+                    const t: NodeRuntimeTelemetry = telemetryMap[m.device_id] || {};
+                    const pingSeries = t.pingSeriesDirect ?? [];
+                    // No samples means no average. Showing 0 ms would read as
+                    // a perfect link; the honest answer is "not measured".
+                    const avgRtt = pingSeries.length
+                      ? Math.round(pingSeries.reduce((a, b) => a + b, 0) / pingSeries.length)
+                      : null;
                     return (
                       <div
                         key={m.device_id}
@@ -1513,18 +1266,24 @@ export const MinimalistProbeDashboard: React.FC<MinimalistProbeDashboardProps> =
                               {m.display_name}
                             </div>
                             <div className={`text-[11px] font-mono ${textMutedClass}`}>
+                              {/* The old labels named a fixed geography
+                                  ("香港锚点信标 (UDP 41820)") regardless of what
+                                  the device actually is — cmesh does not know
+                                  where it is, and the port was the prototype's. */}
                               {m.is_anchor
-                                ? '香港锚点信标 (UDP 41820)'
+                                ? '锚点（本部署）'
                                 : m.endpoints.length > 0
-                                ? 'Direct P2P 拨测探针'
-                                : 'Outbound 协调通道拨测'}
+                                ? '已公告入站端点 · 可直连'
+                                : '无入站端点 · 仅出站'}
                             </div>
                           </div>
                         </div>
 
-                        {/* 12-Slot Availability & Latency Micro-Bars */}
+                        {/* 12-Slot Availability & Latency Micro-Bars. With no
+                            samples the row is empty rather than 12 fabricated
+                            bars. */}
                         <div className="flex items-center gap-1 flex-1 max-w-md">
-                          {t.pingSeriesDirect.map((rtt, idx) => {
+                          {(t.pingSeriesDirect ?? []).map((rtt, idx) => {
                             const barColor = !m.online
                               ? 'bg-slate-500/35'
                               : rtt > 65
@@ -1538,33 +1297,40 @@ export const MinimalistProbeDashboard: React.FC<MinimalistProbeDashboardProps> =
                               />
                             );
                           })}
+                          {(t.pingSeriesDirect ?? []).length === 0 && (
+                            <span className={`text-[10px] font-mono ${textMutedClass}`}>
+                              RTT 序列 {NOT_COLLECTED}
+                            </span>
+                          )}
                         </div>
 
                         <div className="flex items-center gap-4 font-mono text-xs tabular-nums shrink-0">
                           <div>
                             <span className={textMutedClass}>SLA: </span>
-                            <span
-                              className={`font-semibold ${
-                                isDark ? 'text-emerald-400' : 'text-emerald-700'
-                              }`}
-                            >
-                              {t.slaPercent}%
+                            <span className={textMutedClass}>
+                              {t.slaPercent != null ? `${t.slaPercent}%` : NOT_COLLECTED}
                             </span>
                           </div>
                           <div>
                             <span className={textMutedClass}>丢包: </span>
                             <span
                               className={
-                                t.packetLossPercent > 0.5 ? 'text-amber-500' : textPrimaryClass
+                                t.packetLossPercent != null && t.packetLossPercent > 0.5
+                                  ? 'text-amber-500'
+                                  : textPrimaryClass
                               }
                             >
-                              {m.online ? `${t.packetLossPercent}%` : '—'}
+                              {!m.online
+                                ? '—'
+                                : t.packetLossPercent != null
+                                ? `${t.packetLossPercent}%`
+                                : NOT_COLLECTED}
                             </span>
                           </div>
                           <div className="w-20 text-right">
                             <span className={textMutedClass}>RTT: </span>
                             <span className={`font-bold ${textPrimaryClass}`}>
-                              {m.online ? `${avgRtt}ms` : '离线'}
+                              {!m.online ? '离线' : avgRtt != null ? `${avgRtt}ms` : NOT_COLLECTED}
                             </span>
                           </div>
                         </div>
@@ -1580,7 +1346,7 @@ export const MinimalistProbeDashboard: React.FC<MinimalistProbeDashboardProps> =
           {selectedDevice &&
             (() => {
               const t =
-                telemetryMap[selectedDevice.device_id] || INITIAL_TELEMETRY.dev_01_anchor_hk;
+                telemetryMap[selectedDevice.device_id] || {};
               return (
                 <aside
                   className={`w-full xl:w-[440px] shrink-0 rounded-xl overflow-hidden ${cardClass}`}
@@ -1629,22 +1395,12 @@ export const MinimalistProbeDashboard: React.FC<MinimalistProbeDashboardProps> =
                           {selectedDevice.display_name}
                         </div>
                         <div className={`text-xs mt-0.5 ${textMutedClass}`}>
-                          {t.osDistro} ({t.kernelArch})
+                          {t.osDistro && t.kernelArch ? `${t.osDistro} (${t.kernelArch})` : NOT_COLLECTED}
                         </div>
                       </div>
-                      <button
-                        onClick={() => onToggleDeviceOnline(selectedDevice.device_id)}
-                        className={`px-2.5 py-1.5 rounded-lg text-xs font-medium border flex items-center gap-1 transition-colors cursor-pointer shrink-0 ${
-                          selectedDevice.online
-                            ? isDark
-                              ? 'bg-slate-800/80 border-white/15 text-slate-200 hover:bg-slate-700'
-                              : 'bg-white border-slate-300 text-slate-700 hover:bg-slate-100'
-                            : 'bg-emerald-600 border-emerald-500 text-white hover:bg-emerald-500'
-                        }`}
-                      >
-                        <Power className="w-3.5 h-3.5" />
-                        <span>{selectedDevice.online ? '模拟离线' : '恢复上线'}</span>
-                      </button>
+                      <span className={`px-2.5 py-1.5 rounded-lg text-xs font-medium border ${subtleBgClass} ${textMutedClass}`}>
+                        只读名册
+                      </span>
                     </div>
 
                     {/* Drill-down Multi-Line Chart (3-Route Ping Comparison vs Resource Load) */}
@@ -1710,55 +1466,64 @@ export const MinimalistProbeDashboard: React.FC<MinimalistProbeDashboardProps> =
                               />
                               {selectedDevice.online &&
                                 (() => {
-                                  const maxVal = Math.max(
-                                    ...t.pingSeriesDirect,
-                                    ...t.pingSeriesAnchor,
-                                    ...t.pingSeriesRelay,
-                                    80
-                                  );
+                                  const direct = t.pingSeriesDirect ?? [];
+                                  const anchor = t.pingSeriesAnchor ?? [];
+                                  const relay = t.pingSeriesRelay ?? [];
+                                  // No samples means no chart. Drawing a flat
+                                  // line at an invented baseline is still a
+                                  // fabricated measurement.
+                                  if (!direct.length && !anchor.length && !relay.length) {
+                                    return null;
+                                  }
+                                  const maxVal = Math.max(...direct, ...anchor, ...relay, 80);
                                   const toPts = (arr: number[]) =>
                                     arr
                                       .map((v, i) => {
-                                        const x = (i / (arr.length - 1)) * 320;
+                                        const x = arr.length > 1 ? (i / (arr.length - 1)) * 320 : 0;
                                         const y = 86 - (v / maxVal) * 72;
                                         return `${x.toFixed(1)},${y.toFixed(1)}`;
                                       })
                                       .join(' ');
                                   return (
                                     <>
-                                      <polyline
-                                        fill="none"
-                                        stroke="#10b981"
-                                        strokeWidth="2"
-                                        points={toPts(t.pingSeriesDirect)}
-                                      />
-                                      <polyline
-                                        fill="none"
-                                        stroke="#0284c7"
-                                        strokeWidth="2"
-                                        points={toPts(t.pingSeriesAnchor)}
-                                      />
-                                      <polyline
-                                        fill="none"
-                                        stroke="#d97706"
-                                        strokeWidth="1.75"
-                                        strokeDasharray="4 3"
-                                        points={toPts(t.pingSeriesRelay)}
-                                      />
+                                      {direct.length > 0 && (
+                                        <polyline
+                                          fill="none"
+                                          stroke="#10b981"
+                                          strokeWidth="2"
+                                          points={toPts(direct)}
+                                        />
+                                      )}
+                                      {anchor.length > 0 && (
+                                        <polyline
+                                          fill="none"
+                                          stroke="#0284c7"
+                                          strokeWidth="2"
+                                          points={toPts(anchor)}
+                                        />
+                                      )}
+                                      {relay.length > 0 && (
+                                        <polyline
+                                          fill="none"
+                                          stroke="#d97706"
+                                          strokeWidth="1.75"
+                                          strokeDasharray="4 3"
+                                          points={toPts(relay)}
+                                        />
+                                      )}
                                     </>
                                   );
                                 })()}
                             </svg>
                             <div className="flex items-center justify-between text-[11px] font-mono tabular-nums pt-1">
-                              <span className={isDark ? 'text-emerald-400' : 'text-emerald-700'}>
-                                ● 欧洲直连: {t.pingSeriesDirect[t.pingSeriesDirect.length - 1]}ms
+                              {/* The three lanes were labelled "欧洲直连 / 香港锚点 /
+                                  中继通道" — names from the prototype's fictional
+                                  topology, shown for real devices that may be
+                                  none of those things. */}
+                              <span className={textMutedClass}>
+                                延迟序列：{t.pingSeriesDirect?.length ? '有样本' : NOT_COLLECTED}
                               </span>
-                              <span className={isDark ? 'text-sky-400' : 'text-sky-700'}>
-                                ● 香港锚点: {t.pingSeriesAnchor[t.pingSeriesAnchor.length - 1]}ms
-                              </span>
-                              <span className={isDark ? 'text-amber-400' : 'text-amber-700'}>
-                                ● 中继通道: {t.pingSeriesRelay[t.pingSeriesRelay.length - 1]}ms
-                              </span>
+                              <span className={textMutedClass}>cmesh 只测 RTT，不采集运行时指标</span>
                             </div>
                           </div>
                         ) : (
@@ -1788,28 +1553,33 @@ export const MinimalistProbeDashboard: React.FC<MinimalistProbeDashboardProps> =
                                 stroke="currentColor"
                                 strokeOpacity="0.1"
                               />
-                              {selectedDevice.online && (
-                                <polyline
-                                  fill="none"
-                                  stroke="#0284c7"
-                                  strokeWidth="2"
-                                  points={t.sparkline
-                                    .map((v, i) => {
-                                      const x = (i / (t.sparkline.length - 1)) * 320;
-                                      const y = 86 - (v / 100) * 72;
-                                      return `${x.toFixed(1)},${y.toFixed(1)}`;
-                                    })
-                                    .join(' ')}
-                                />
-                              )}
+                              {selectedDevice.online &&
+                                (t.sparkline?.length ?? 0) > 1 && (
+                                  <polyline
+                                    fill="none"
+                                    stroke="#0284c7"
+                                    strokeWidth="2"
+                                    points={(t.sparkline ?? [])
+                                      .map((v, i) => {
+                                        const arr = t.sparkline ?? [];
+                                        const x = (i / (arr.length - 1)) * 320;
+                                        const y = 86 - (v / 100) * 72;
+                                        return `${x.toFixed(1)},${y.toFixed(1)}`;
+                                      })
+                                      .join(' ')}
+                                  />
+                                )}
                             </svg>
                             <div
                               className={`flex items-center justify-between text-[11px] font-mono tabular-nums pt-1 ${textMutedClass}`}
                             >
-                              <span>Load 1m: {t.load1}</span>
-                              <span>CPU: {t.cpuPercent}%</span>
+                              <span>Load 1m: {t.load1 ?? NOT_COLLECTED}</span>
+                              <span>CPU: {t.cpuPercent != null ? `${t.cpuPercent}%` : NOT_COLLECTED}</span>
                               <span>
-                                RAM: {t.memUsedGb.toFixed(1)} / {t.memTotalGb} GB
+                                RAM:{' '}
+                                {t.memUsedGb != null && t.memTotalGb != null
+                                  ? `${t.memUsedGb.toFixed(1)} / ${t.memTotalGb} GB`
+                                  : NOT_COLLECTED}
                               </span>
                             </div>
                           </div>
@@ -1877,109 +1647,10 @@ export const MinimalistProbeDashboard: React.FC<MinimalistProbeDashboardProps> =
                       </div>
                     </div>
 
-                    {/* Userspace Operations Workbench */}
+                    {/* Browser dashboard is read-only; operations use CLI. */}
                     <div className={`p-3 rounded-xl space-y-2.5 ${subtleBgClass}`}>
-                      <div className="flex items-center justify-between text-xs">
-                        <span
-                          className={`font-semibold flex items-center gap-1.5 ${textPrimaryClass}`}
-                        >
-                          <ShieldCheck className="w-3.5 h-3.5 text-sky-500" />
-                          <span>受控用户态探测与操作台</span>
-                        </span>
-                        <span className={`font-mono text-[10px] ${textMutedClass}`}>
-                          实测按需触发
-                        </span>
-                      </div>
-
-                      <div className="grid grid-cols-2 gap-2">
-                        <button
-                          disabled={!selectedDevice.online || actionLoading !== null}
-                          onClick={() => runProbeAction(selectedDevice, 'ping')}
-                          className={`py-1.5 px-2.5 rounded-lg text-xs font-medium flex items-center justify-center gap-1.5 border transition-colors ${
-                            !selectedDevice.online
-                              ? 'opacity-40 cursor-not-allowed border-slate-500/30'
-                              : isDark
-                              ? 'bg-slate-900/70 hover:bg-sky-500/15 text-slate-100 border-white/15 hover:border-sky-400 cursor-pointer'
-                              : 'bg-white/80 hover:bg-sky-50 text-slate-800 border-slate-300 hover:border-sky-500 cursor-pointer'
-                          }`}
-                        >
-                          <Activity className="w-3.5 h-3.5 text-sky-500" />
-                          <span>测量延迟 (RTT)</span>
-                        </button>
-
-                        <button
-                          disabled={!selectedDevice.online || actionLoading !== null}
-                          onClick={() => runProbeAction(selectedDevice, 'file_transfer')}
-                          className={`py-1.5 px-2.5 rounded-lg text-xs font-medium flex items-center justify-center gap-1.5 border transition-colors ${
-                            !selectedDevice.online
-                              ? 'opacity-40 cursor-not-allowed border-slate-500/30'
-                              : isDark
-                              ? 'bg-slate-900/70 hover:bg-sky-500/15 text-slate-100 border-white/15 hover:border-sky-400 cursor-pointer'
-                              : 'bg-white/80 hover:bg-sky-50 text-slate-800 border-slate-300 hover:border-sky-500 cursor-pointer'
-                          }`}
-                        >
-                          <FileUp className="w-3.5 h-3.5 text-sky-500" />
-                          <span>传大文件分片</span>
-                        </button>
-                      </div>
-
-                      {/* Send Encrypted Message */}
-                      <div className="flex items-center gap-1.5">
-                        <input
-                          type="text"
-                          disabled={!selectedDevice.online}
-                          value={msgInput}
-                          onChange={(e) => setMsgInput(e.target.value)}
-                          className={`flex-1 px-2.5 py-1 text-xs border rounded-lg font-mono ${
-                            isDark
-                              ? 'bg-slate-900/90 border-white/15 text-slate-100'
-                              : 'bg-white/90 border-slate-300 text-slate-800'
-                          }`}
-                        />
-                        <button
-                          disabled={!selectedDevice.online || actionLoading !== null}
-                          onClick={() => runProbeAction(selectedDevice, 'message')}
-                          className={`px-2.5 py-1 rounded-lg text-xs font-medium flex items-center gap-1 shrink-0 ${
-                            !selectedDevice.online
-                              ? 'opacity-40 cursor-not-allowed bg-slate-700 text-slate-400'
-                              : 'bg-sky-600 hover:bg-sky-500 text-white cursor-pointer'
-                          }`}
-                        >
-                          <Send className="w-3 h-3" />
-                          <span>发送</span>
-                        </button>
-                      </div>
-
-                      {/* Whitelist Remote Command */}
-                      <div className="flex items-center gap-1.5">
-                        <select
-                          disabled={!selectedDevice.online}
-                          value={selectedCmd}
-                          onChange={(e) => setSelectedCmd(e.target.value)}
-                          className={`flex-1 px-2 py-1 text-xs border rounded-lg font-mono ${
-                            isDark
-                              ? 'bg-slate-900/90 border-white/15 text-slate-100'
-                              : 'bg-white/90 border-slate-300 text-slate-800'
-                          }`}
-                        >
-                          {selectedDevice.container_config.whitelist_cmds.map((cmd) => (
-                            <option key={cmd} value={cmd}>
-                              {cmd}
-                            </option>
-                          ))}
-                        </select>
-                        <button
-                          disabled={!selectedDevice.online || actionLoading !== null}
-                          onClick={() => runProbeAction(selectedDevice, 'exec_whitelist')}
-                          className={`px-2.5 py-1 rounded-lg text-xs font-medium flex items-center gap-1 shrink-0 ${
-                            !selectedDevice.online
-                              ? 'opacity-40 cursor-not-allowed bg-slate-700 text-slate-400'
-                              : 'bg-emerald-600 hover:bg-emerald-500 text-white cursor-pointer'
-                          }`}
-                        >
-                          <Terminal className="w-3 h-3" />
-                          <span>执行</span>
-                        </button>
+                      <div className={`text-xs ${textMutedClass}`}>
+                        此面板只读展示实时名册与连接状态。RTT、消息、文件和远程命令请使用 cmesh CLI；浏览器动作接口尚未提供。
                       </div>
                     </div>
 

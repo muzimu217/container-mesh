@@ -210,7 +210,7 @@ export const DesignSystemManual: React.FC<DesignSystemManualProps> = ({
               <div className="divide-y divide-slate-100 text-xs">
                 {[
                   ['C-01 客户端窗口顶栏 (Client Header)', '承载品牌、当前私有网络名、账号短 ID、只读/管理模式与工作区切换。'],
-                  ['C-02 首屏核心读数锚点 (Online Hero Readout)', '醒目展示 `4 / 5 在线设备`、名册版本 `v42`、锚点状态与主传输模式。'],
+                  ['C-02 首屏核心读数锚点 (Online Hero Readout)', '醒目展示在线设备数、名册版本号（示意编号，非真实版本）、锚点状态与主传输模式。'],
                   ['C-03 发现节点失联/缓存横幅 (Snapshot Alert Banner)', '当发现节点失联时以琥珀色提示“当前显示缓存数据 (时间)”及自动重试倒计时。'],
                   ['C-04 三级空间层级面包屑 (Spatial Breadcrumb)', '支持 `全网总览 -> 机房区域 -> 容器节点` 的嵌套定位与一键返回上级。'],
                   ['C-05 3D 等距机房与容器视图 (Isometric 3D Stage)', '含可抬升机房玻璃罩、7 部件复合容器模型、状态光环与通信脉冲轨迹。'],
@@ -230,11 +230,26 @@ export const DesignSystemManual: React.FC<DesignSystemManualProps> = ({
           </div>
 
           {/* 06. 设备状态矩阵 (Four-Dimensional State Matrix) */}
-          <div className="bg-white border border-slate-200 rounded-lg p-5 space-y-3">
+          {/* data-testid pinned for the black-box DOM assertion (doubao,
+              round 60): the disclaimer must be scoped INSIDE this block —
+              same section as the content it excuses — not merely somewhere
+              on the page. Name: spec-state-matrix-06. */}
+          <div
+            data-testid="spec-state-matrix-06"
+            className="bg-white border border-slate-200 rounded-lg p-5 space-y-3"
+          >
             <div className="text-xs font-mono text-slate-500">06. ORTHOGONAL DEVICE STATE MATRIX</div>
             <h2 className="text-base font-bold text-slate-900">
               06. 设备四维正交状态矩阵（Membership × Liveness × Announcement × Discovery）
             </h2>
+            {/* A specification page, not a roster. The device names below are
+                placeholders chosen to cover each combination; none of them
+                comes from /api/mesh. */}
+            <p className="text-[11px] text-slate-500">
+              说明：本页是设计规范。表格中的设备名（<code>anchor-hk-01</code>、
+              <code>gpu-trainer-02</code> …）是<b>示意占位</b>，不是本网络里的真实设备；
+              真实名册请看「标准面板」或「3D 驾驶舱模式」。
+            </p>
             <div className="overflow-x-auto">
               <table className="w-full text-left border-collapse text-xs">
                 <thead>
@@ -251,7 +266,7 @@ export const DesignSystemManual: React.FC<DesignSystemManualProps> = ({
                 <tbody className="divide-y divide-slate-200 text-slate-700">
                   <tr>
                     <td className="py-2.5 px-3 font-semibold text-slate-900">自托管发现锚点 (`anchor-hk-01`)</td>
-                    <td className="py-2.5 px-3 font-mono text-emerald-700">In Roster (v42)</td>
+                    <td className="py-2.5 px-3 font-mono text-emerald-700">In Roster（示意）</td>
                     <td className="py-2.5 px-3 font-mono text-emerald-700">Online</td>
                     <td className="py-2.5 px-3 font-mono">2 个公网端点</td>
                     <td className="py-2.5 px-3 font-mono text-sky-700">direct (Anchor)</td>
@@ -260,7 +275,7 @@ export const DesignSystemManual: React.FC<DesignSystemManualProps> = ({
                   </tr>
                   <tr>
                     <td className="py-2.5 px-3 font-semibold text-slate-900">在线直连容器 (`gpu-trainer-02`)</td>
-                    <td className="py-2.5 px-3 font-mono text-emerald-700">In Roster (v42)</td>
+                    <td className="py-2.5 px-3 font-mono text-emerald-700">In Roster（示意）</td>
                     <td className="py-2.5 px-3 font-mono text-emerald-700">Online</td>
                     <td className="py-2.5 px-3 font-mono">已公告可拨地址</td>
                     <td className="py-2.5 px-3 font-mono text-emerald-700">direct (P2P)</td>
@@ -269,7 +284,7 @@ export const DesignSystemManual: React.FC<DesignSystemManualProps> = ({
                   </tr>
                   <tr>
                     <td className="py-2.5 px-3 font-semibold text-slate-900">无端点受限沙箱 (`ci-runner-ephemeral`)</td>
-                    <td className="py-2.5 px-3 font-mono text-emerald-700">In Roster (v42)</td>
+                    <td className="py-2.5 px-3 font-mono text-emerald-700">In Roster（示意）</td>
                     <td className="py-2.5 px-3 font-mono text-emerald-700">Online</td>
                     <td className="py-2.5 px-3 font-mono text-amber-700">无 (`endpoints: []`)</td>
                     <td className="py-2.5 px-3 font-mono text-amber-700">pending (仅出站)</td>
@@ -278,7 +293,7 @@ export const DesignSystemManual: React.FC<DesignSystemManualProps> = ({
                   </tr>
                   <tr>
                     <td className="py-2.5 px-3 font-semibold text-slate-900">CGNAT 锚点中继节点</td>
-                    <td className="py-2.5 px-3 font-mono text-emerald-700">In Roster (v43)</td>
+                    <td className="py-2.5 px-3 font-mono text-emerald-700">In Roster（示意 · 版本已变）</td>
                     <td className="py-2.5 px-3 font-mono text-emerald-700">Online</td>
                     <td className="py-2.5 px-3 font-mono text-amber-700">无公网直连端点</td>
                     <td className="py-2.5 px-3 font-mono text-amber-700">relay (锚点转发)</td>
@@ -389,7 +404,7 @@ export const DesignSystemManual: React.FC<DesignSystemManualProps> = ({
               {[
                 {
                   wrong: '“设备 home-nas-vault 已离线并从网络移除 / 节点崩溃告警”',
-                  right: '“○ 当前离线（仍在网络名册 v42 中 · 最后在线 14:35:10）”',
+                  right: '“○ 当前离线（仍在网络名册中，版本号以实时面板为准 · 最后在线 时间示意）”',
                   why: '离线不等于被删除，也不等于安全事故。',
                 },
                 {

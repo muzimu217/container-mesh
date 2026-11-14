@@ -137,37 +137,6 @@ export default function App() {
     return () => clearInterval(timer);
   }, [meshData.discovery_status]);
 
-  // Toggle individual container online/offline state interactively
-  const handleToggleDeviceOnline = (deviceId: string) => {
-    setMeshData((prev) => {
-      const updatedMembers = prev.members.map((m) => {
-        if (m.device_id !== deviceId) return m;
-        const nextOnline = !m.online;
-        const nextTransport: TransportMode = nextOnline
-          ? m.endpoints.length > 0
-            ? 'direct'
-            : 'pending'
-          : 'unavailable';
-        return {
-          ...m,
-          online: nextOnline,
-          transport: nextTransport,
-          last_seen: new Date().toISOString(),
-          active_comm_summary: nextOnline
-            ? '已恢复在线可达 · 用户态控制与数据通道已重连'
-            : '当前离线（仍在网络名册中 · 刚刚手动模拟离线）',
-          diagnostic_reason: nextOnline
-            ? '节点心跳与用户态会话已恢复正常。'
-            : '用户模拟离线：在线设备计数减 1，节点转为中性灰并保留在名册中，无任何红色报错。',
-        };
-      });
-      return {
-        ...prev,
-        members: updatedMembers,
-      };
-    });
-  };
-
   const handleTriggerCommEvent = (fromId: string, toId: string, label: string) => {
     setActiveCommEvent({ fromId, toId, label });
     window.setTimeout(() => {
@@ -684,8 +653,6 @@ export default function App() {
             selectedDeviceId={selectedDeviceId}
             onSelectZone={(zId) => setSelectedZoneId(zId)}
             onSelectDevice={(dId) => setSelectedDeviceId(dId)}
-            onToggleDeviceOnline={handleToggleDeviceOnline}
-            onTriggerCommEvent={handleTriggerCommEvent}
             onSwitchTo3DCockpit={(zId, dId) => {
               if (zId !== undefined) setSelectedZoneId(zId);
               if (dId !== undefined) setSelectedDeviceId(dId);
@@ -724,8 +691,6 @@ export default function App() {
               selectedDeviceId={selectedDeviceId}
               onSelectZone={(zId) => setSelectedZoneId(zId)}
               onSelectDevice={(dId) => setSelectedDeviceId(dId)}
-              onToggleDeviceOnline={handleToggleDeviceOnline}
-              onTriggerCommEvent={handleTriggerCommEvent}
             />
           </div>
         )}

@@ -16,6 +16,7 @@ import (
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"regexp"
 	"strings"
 	"testing"
@@ -55,6 +56,34 @@ func TestCockpitAssetsAreLocal(t *testing.T) {
 		}
 		if !strings.HasPrefix(ref, "./") && !strings.HasPrefix(ref, "/") {
 			t.Errorf("the cockpit references a relative path that is not rooted: %s", ref)
+		}
+	}
+}
+
+// TestCockpitBundleHasNoBrowserProcessPrimitives: the cockpit is browser code
+// and must never contain a Node/Python process-execution primitive. A plain
+// `RegExp.exec()` is legal JavaScript library code and is deliberately not
+// blacklisted here; this guard targets actual process APIs and module loaders.
+func TestCockpitBundleHasNoBrowserProcessPrimitives(t *testing.T) {
+	assets, err := fs.ReadDir(cockpitFS, "assets")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range assets {
+		if !strings.HasSuffix(a.Name(), ".js") {
+			continue
+		}
+		bundle, err := fs.ReadFile(cockpitFS, "assets/"+a.Name())
+		if err != nil {
+			t.Fatal(err)
+		}
+		text := string(bundle)
+		for _, primitive := range []string{
+			"child_process", "execSync", "spawnSync", "process.spawn", "require(\"child_process\")",
+		} {
+			if strings.Contains(text, primitive) {
+				t.Errorf("the browser bundle contains a process-execution primitive %q in %s", primitive, a.Name())
+			}
 		}
 	}
 }
@@ -256,12 +285,19 @@ func TestCockpitIsServedAtPanel(t *testing.T) {
 	}
 }
 
-// TestCockpitAssetsLoadThroughTheMount: the page is served at /panel and its
-// assets are requested relative to it (/panel/assets/*). net/http's mux
-// treats "/panel" as an exact pattern, so without an explicit "/panel/"
-// route those asset requests fell through to the catch-all and 404'd — the
-// shell loaded and the app rendered nothing. A 200 on the page alone does
-// not prove the cockpit works; every reference it makes has to resolve.
+// TestCockpitAssetsLoadThroughTheMount: the panel must work at the URL the
+// STARTUP BANNER prints, which is "/panel" — no trailing slash.
+//
+// This test used to concatenate "/panel/" by hand and then fetch the
+// references under it. That asserted the author's assumption instead of the
+// browser's behaviour: for a document at "/panel" the base is "/", so a
+// browser resolves "./assets/x.js" to "/assets/x.js", which the binary does
+// not serve. The shell loaded 200, both assets 404'd, and the panel was a
+// blank page — with this test green (doubao-cloud-vm-01, round 59).
+//
+// The fix is a redirect from /panel to /panel/, and the test now resolves
+// references the way an HTTP client does: follow the redirect, then join the
+// reference against the URL that actually served the document.
 func TestCockpitAssetsLoadThroughTheMount(t *testing.T) {
 	acc, err := identity.GenerateAccount()
 	if err != nil {
@@ -274,11 +310,23 @@ func TestCockpitAssetsLoadThroughTheMount(t *testing.T) {
 	defer ts.Close()
 	defer srv.StopDiscovery()
 
+	// Ask for the banner's URL exactly, and let the client follow redirects.
 	resp, err := http.Get(ts.URL + "/panel")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /panel = %d, want 200 after redirect", resp.StatusCode)
+	}
+	// The document URL after redirects is what the browser uses as its base.
+	base, err := url.Parse(resp.Request.URL.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(base.Path, "/") {
+		t.Fatalf("the panel was served at %q, which is not a directory: relative assets resolve to /assets/* and 404", base.Path)
+	}
 	page, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatal(err)
@@ -293,24 +341,87 @@ func TestCockpitAssetsLoadThroughTheMount(t *testing.T) {
 			t.Errorf("external reference in the served page: %s", ref)
 			continue
 		}
-		// Resolve relative to /panel, the way a browser does.
-		u := ts.URL + "/panel/" + strings.TrimPrefix(ref, "./")
-		ar, err := http.Get(u)
+		// Resolve against the SERVED URL, the way a browser does.
+		target, err := base.Parse(ref)
 		if err != nil {
-			t.Errorf("GET %s: %v", u, err)
+			t.Errorf("cannot resolve %s against %s: %v", ref, base, err)
+			continue
+		}
+		ar, err := http.Get(target.String())
+		if err != nil {
+			t.Errorf("GET %s: %v", target, err)
 			continue
 		}
 		_ = ar.Body.Close()
 		if ar.StatusCode != http.StatusOK {
-			t.Errorf("the page references %s but the mount serves it as %d", ref, ar.StatusCode)
+			t.Errorf("the page at %s references %s, which resolves to %s and returns %d", base.Path, ref, target.Path, ar.StatusCode)
+			continue
 		}
-		if strings.HasSuffix(ref, ".js") && ar.Header.Get("Content-Type") == "" {
-			t.Errorf("%s was served with no Content-Type", ref)
+		if strings.HasSuffix(ref, ".js") && !strings.Contains(ar.Header.Get("Content-Type"), "javascript") {
+			t.Errorf("%s was served as %q, not JavaScript", target.Path, ar.Header.Get("Content-Type"))
 		}
 	}
 }
 
-// TestCockpitHasNoDemoControls: the prototype's demo scenarios and its
+// TestPanelRedirectsToItsSlashForm: the redirect itself is the contract the
+// test above depends on, so pin it directly.
+func TestPanelRedirectsToItsSlashForm(t *testing.T) {
+	members := identity.NewMemberList("acct")
+	srv := New(Config{PanelToken: "tok"})
+	srv.EnableDiscovery(members)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	defer srv.StopDiscovery()
+
+	// A client that does NOT follow redirects sees where it is being sent.
+	// Go's default client follows the 308 and would hand back the final 200,
+	// which is exactly the shape of "assert the assumption, not the
+	// behaviour" this file has been burned by before — the no-follow client
+	// is constructed explicitly so nobody can quietly revert it
+	// (doubao-cloud-vm-01, round 60).
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+	resp, err := client.Get(ts.URL + "/panel")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusPermanentRedirect {
+		t.Errorf("GET /panel = %d, want %d — without the redirect the browser resolves ./assets to /assets and the panel is blank",
+			resp.StatusCode, http.StatusPermanentRedirect)
+	}
+	if loc := resp.Header.Get("Location"); loc != "/panel/" {
+		t.Errorf("Location = %q, want /panel/", loc)
+	}
+	// And uncacheable: a cached 308 would outlive any later change of the
+	// mount and poison a tester's "remove the redirect, see red" check.
+	if cc := resp.Header.Get("Cache-Control"); cc != "no-store" {
+		t.Errorf("Cache-Control on the redirect = %q, want no-store", cc)
+	}
+}
+
+// TestCockpitIndexReferencesEmbeddedAssets ensures the HTML and embedded FS
+// agree on every local JS/CSS asset. A local build can appear green while a
+// commit forgets a newly hashed bundle; this test makes the embed surface
+// itself the source of truth.
+func TestCockpitIndexReferencesEmbeddedAssets(t *testing.T) {
+	index, err := fs.ReadFile(cockpitFS, "index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	refs := regexp.MustCompile(`(?:src|href)\s*=\s*"(\./assets/[^"?#]+)"`).FindAllStringSubmatch(string(index), -1)
+	if len(refs) == 0 {
+		t.Fatal("embedded index.html references no local assets")
+	}
+	for _, match := range refs {
+		name := strings.TrimPrefix(match[1], "./")
+		if _, err := fs.Stat(cockpitFS, name); err != nil {
+			t.Errorf("index.html references %s, but the embedded FS has no such asset: %v", match[1], err)
+		}
+	}
+}
+
 // single-node "simulate" buttons are gone. Those buttons mutated the
 // in-memory roster to fake a device's liveness or endpoints — still visible
 // and clickable after the scenario switcher was removed
@@ -355,7 +466,40 @@ func TestCockpitHasNoDemoControls(t *testing.T) {
 			"dev_07_hk_sandbox",
 			"hk-infer-blade-02",
 			"香港3机智能聚合",
+			// And the fabricated TELEMETRY, which needed no button at all: a
+			// table of uptime/CPU/disk/traffic/SLA numbers for invented
+			// devices, used as the fallback for every REAL one, jittered on a
+			// 1.5 s timer so it looked live. Any of these strings reaching the
+			// bundle means invented measurements are being shown as readings
+			// (doubao-cloud-vm-01, round 59).
+			"INITIAL_TELEMETRY",
+			"实时流推送 (1.5s)",
+			"香港锚点信标",
+			"欧洲直连",
+			"203.0.113.10:41820",
+			"dev_01_anchor_hk",
+			"42天 18小时",
+			"99.98",
+			// Browser-side actions are not implemented by the read-only panel.
+			// Keeping this endpoint string in the production bundle makes the
+			// unavailable controls look like a supported API.
+			"/api/mesh/action",
+			"模拟离线",
+			"恢复上线",
+			"用户模拟离线",
+			"香港自托管公网锚点",
+			"法兰克福裸露刀片",
+			"苏黎世锥形 NAT",
+			"东京全封闭隔离",
+			"新加坡 CGNAT 归档",
 		} {
+			// note: "anchor-hk-01" is NOT on this list. It survives in one
+			// place only — the design-specification page, where it is printed
+			// inside a sentence saying the names there are placeholders and
+			// the live roster is elsewhere. Blacklisting the token would force
+			// that disclaimer to be deleted to make a test pass, which is
+			// exactly backwards. TestCockpitDesignSpecCarriesItsDisclaimer
+			// pins the disclaimer itself, so the exemption stays deliberate.
 			if strings.Contains(text, bad) {
 				t.Errorf("the shipped cockpit bundle still contains prototype-only machinery (%q) in %s", bad, a.Name())
 			}
@@ -363,6 +507,41 @@ func TestCockpitHasNoDemoControls(t *testing.T) {
 	}
 	if scanned == 0 {
 		t.Fatal("no JavaScript bundle was found to scan — the cockpit build is missing")
+	}
+}
+
+// TestCockpitDesignSpecCarriesItsDisclaimer: "anchor-hk-01" is deliberately
+// exempt from the demo blacklist because it appears only on the design
+// specification page, inside a sentence that says the device names there are
+// placeholders, not members of this network. An exemption nobody guards is
+// just an open door — someone could later add real fake-roster content
+// around that name and the blacklist would never notice. So this pins the
+// disclaimer itself: it must stay in the bundle, and it must sit near the
+// name it excuses (doubao-cloud-vm-01, round 60).
+func TestCockpitDesignSpecCarriesItsDisclaimer(t *testing.T) {
+	assets, err := fs.ReadDir(cockpitFS, "assets")
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, a := range assets {
+		if !strings.HasSuffix(a.Name(), ".js") {
+			continue
+		}
+		bundle, err := fs.ReadFile(cockpitFS, "assets/"+a.Name())
+		if err != nil {
+			t.Fatal(err)
+		}
+		text := string(bundle)
+		if strings.Contains(text, "anchor-hk-01") {
+			if !strings.Contains(text, "示意占位") || !strings.Contains(text, "不是本网络里的真实设备") {
+				t.Errorf("%s uses anchor-hk-01 but no longer says the names on that page are placeholders — the demo-content exemption has lost its cover", a.Name())
+			}
+			found = true
+		}
+	}
+	if !found {
+		t.Error("the design-specification page's placeholder names are gone from the bundle; update the exemption note in TestCockpitHasNoDemoControls")
 	}
 }
 
