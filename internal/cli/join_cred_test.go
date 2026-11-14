@@ -12,6 +12,8 @@ package cli
 
 import (
 	"context"
+	"crypto/ed25519"
+	"encoding/json"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -133,4 +135,86 @@ func TestCredentialJoinRejectsBothInputs(t *testing.T) {
 		t.Fatal("join accepted both a credential and an invite")
 	}
 	var _ discovery.EnrollRequest
+}
+
+// TestCredentialJoinLeavesUsableConfig: a credential-joined device must be
+// able to run every follow-up command (ping, msg, send-to, run).
+//
+// Those commands rebuild the discovery view from discovery.json, which used
+// to store the RAW join string in Invite and re-parse it with DecodeInvite —
+// but on this path the raw string is a cmesh1. credential, which
+// DecodeInvite cannot read. The device joined successfully and then failed
+// everything with "saved invite is malformed" (oh-no-agent, defect B-3): the
+// one-command join broke at the second command. The config now carries the
+// account and addresses as fields, derived at join time.
+func TestCredentialJoinLeavesUsableConfig(t *testing.T) {
+	acc, err := identity.GenerateAccount()
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	cred, err := credential.Create(acc, []string{"127.0.0.1:18801"}, time.Hour, 5, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credStr, err := credential.Encode(cred)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dir := t.TempDir()
+	// Exactly what runJoin persists on the credential path.
+	inv := inviteFromCredential(cred)
+	if _, err := saveDiscoveryConfig(dir, discoveryConfig{
+		Invite:         credStr,
+		AccountID:      string(inv.AccountID),
+		AccountPub:     inv.AccountPub,
+		DiscoveryAddrs: inv.DiscoveryAddrs,
+		SavedAt:        now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	blob, err := os.ReadFile(filepath.Join(dir, "discovery.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg discoveryConfig
+	if err := json.Unmarshal(blob, &cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	// The raw credential string must NOT be re-parsed as an invite.
+	got, err := cfg.invite()
+	if err != nil {
+		t.Fatalf("a credential-joined device cannot rebuild its discovery view: %v", err)
+	}
+	if got.AccountID != acc.ID() {
+		t.Errorf("rebuilt account = %s, want %s", got.AccountID, acc.ID())
+	}
+	if len(got.DiscoveryAddrs) != 1 || got.DiscoveryAddrs[0] != "127.0.0.1:18801" {
+		t.Errorf("rebuilt discovery addresses = %v, want the credential's own", got.DiscoveryAddrs)
+	}
+	if len(got.AccountPub) != ed25519.PublicKeySize {
+		t.Errorf("rebuilt account key is %d bytes, want %d", len(got.AccountPub), ed25519.PublicKeySize)
+	}
+
+	// A config written by an older build has only the raw invite; that path
+	// must keep working, or upgrading would strand existing devices.
+	raw, err := discovery.EncodeInvite(discovery.Invite{
+		AccountID:      acc.ID(),
+		AccountPub:     acc.PublicKey(),
+		DiscoveryAddrs: []string{"127.0.0.1:18802"},
+		IssuedAt:       now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotLegacy, err := (discoveryConfig{Invite: raw}).invite()
+	if err != nil {
+		t.Fatalf("an older invite-only config no longer loads: %v", err)
+	}
+	if gotLegacy.AccountID != acc.ID() {
+		t.Errorf("legacy config rebuilt account %s, want %s", gotLegacy.AccountID, acc.ID())
+	}
 }

@@ -138,10 +138,43 @@ func runInvite(args []string) error {
 
 // discoveryConfig is the persisted join state, so later commands (dial, the
 // future daemon) can re-derive the same discovery setup without re-inviting.
+//
+// AccountID/AccountPub/DiscoveryAddrs are what later commands actually need.
+// They are derived ONCE, at join time, from whichever entry path was used —
+// so the saved file no longer has to encode "was this an invite or a
+// credential?" and no reader has to re-parse the right syntax.
+//
+// Invite is the raw string, kept for diagnostics and backward compatibility.
+// It is NOT the source of truth: `join --cred` stores a cmesh1. credential
+// there, and DecodeInvite only understands cmesh://join?... — re-parsing it
+// made every follow-up command fail with "saved invite is malformed"
+// (oh-no-agent, defect B-3: a credential-joined device could not ping, msg,
+// send-to or run at all).
 type discoveryConfig struct {
-	Invite    string    `json:"invite"`
-	Endpoints []string  `json:"endpoints,omitempty"`
-	SavedAt   time.Time `json:"saved_at"`
+	Invite         string    `json:"invite,omitempty"`
+	AccountID      string    `json:"account_id,omitempty"`
+	AccountPub     []byte    `json:"account_pub,omitempty"`
+	DiscoveryAddrs []string  `json:"discovery_addrs,omitempty"`
+	Endpoints      []string  `json:"endpoints,omitempty"`
+	SavedAt        time.Time `json:"saved_at"`
+}
+
+// invite rebuilds the invite view later commands need.
+//
+// Files written before account_id/discovery_addrs existed carry only the raw
+// string, so that case still decodes — it is the only case that needs to.
+func (c discoveryConfig) invite() (discovery.Invite, error) {
+	if c.AccountID != "" && len(c.DiscoveryAddrs) > 0 {
+		return discovery.Invite{
+			AccountID:      identity.DeviceID(c.AccountID),
+			AccountPub:     c.AccountPub,
+			DiscoveryAddrs: c.DiscoveryAddrs,
+		}, nil
+	}
+	if c.Invite == "" {
+		return discovery.Invite{}, errors.New("this device has no saved discovery configuration")
+	}
+	return discovery.DecodeInvite(c.Invite)
 }
 
 // parsePubKeyString accepts a 32-byte public key as either base64 (what
@@ -393,19 +426,23 @@ func runJoin(args []string) error {
 	// Persisted only after every check passed: a failed join must not leave
 	// a config file that looks approved (review F9).
 	//
-	// The invite field carries whichever string got us in: an invite for the
-	// approval path, the credential for the self-enrollment path. Both are
-	// enough to re-derive the account and the discovery addresses, which is
-	// what later commands need.
+	// The account and the discovery addresses are recorded as FIELDS, derived
+	// here where both entry paths already agree on them. Later commands read
+	// these instead of re-parsing the raw string: `join --cred` stores a
+	// cmesh1. credential, which DecodeInvite cannot read, and re-parsing it
+	// broke every follow-up command (oh-no-agent, defect B-3).
 	entry := fs.Arg(0)
 	viaCredential := *credStr != ""
 	if viaCredential {
 		entry = *credStr
 	}
 	cfgPath, err := saveDiscoveryConfig(dir, discoveryConfig{
-		Invite:    entry,
-		Endpoints: []string(eps),
-		SavedAt:   time.Now(),
+		Invite:         entry,
+		AccountID:      string(inv.AccountID),
+		AccountPub:     inv.AccountPub,
+		DiscoveryAddrs: inv.DiscoveryAddrs,
+		Endpoints:      []string(eps),
+		SavedAt:        time.Now(),
 	})
 	if err != nil {
 		return ExitError{Code: 1, Err: err}
@@ -580,7 +617,8 @@ func runServeDiscovery(args []string) error {
 	devPath := identity.IdentityPath(dir, identity.DeviceFileName)
 	if _, err := os.Stat(devPath); err != nil {
 		return ExitError{Code: 1, Err: fmt.Errorf(
-			"%s not found; a discovery node must itself be a network member: run cmesh init && cmesh account create && cmesh account device-add first", devPath)}
+			"%s not found; a discovery node must itself be a network member: run cmesh init && cmesh account create && cmesh account device-add first — all three accept --state, and this node is reading %s (oh-no-agent round 59: the hint sent first-time operators to ~/.cmesh while their state lived elsewhere)",
+			devPath, dir)}
 	}
 	phrase, err := readPassphrase(*pass, "device passphrase")
 	if err != nil {

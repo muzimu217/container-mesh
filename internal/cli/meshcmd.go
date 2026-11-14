@@ -69,9 +69,13 @@ func openMeshSession(ctx context.Context, state, passFlag string, eps []string) 
 	if err := json.Unmarshal(blob, &cfg); err != nil {
 		return nil, fmt.Errorf("%s is not a valid discovery config: %w", cfgPath, err)
 	}
-	inv, err := discovery.DecodeInvite(cfg.Invite)
+	// cfg.invite() prefers the fields join derived (account + addresses) and
+	// only falls back to decoding the raw string for configs written by an
+	// older build. Re-parsing the raw string unconditionally broke every
+	// follow-up command on a credential-joined device (defect B-3).
+	inv, err := cfg.invite()
 	if err != nil {
-		return nil, fmt.Errorf("saved invite is malformed: %w", err)
+		return nil, fmt.Errorf("saved join configuration is unusable: %w", err)
 	}
 	// Announce only what we KNOW: endpoints from --endpoint flags, else the
 	// set saved by the join that created this config. With neither, the
