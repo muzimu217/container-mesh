@@ -46,7 +46,7 @@
 - 生产面板动作统一改为只读提示；真实操作使用 CLI。
 - 设计规范页中的示例表已标记为示意，假版本号 `v42/v43` 已清除；`spec-state-matrix-06` 用于 DOM 作用域验收。
 
-M4 硬阻塞复核：真实 Release/checksum/download/安装升级回滚尚无证据；D2 原始计划要求 systemd/卸载，但现有安装器只写单一二进制；worktree panel bundle/status 改动与 `1f64cdc` 不是同一验收对象。M4 收口前必须固化一个候选 SHA，重新跑完整门禁和同 SHA panel/diagnostics 黑盒复测，并在真实 Linux systemd VPS/VM 完成安装、restart、kill 自动拉起、rollback、reboot 恢复。
+M4 硬阻塞复核（2026-11-15 更新）：真实 Release 与 Linux systemd 验收已在 prerelease `v1.0.0-rc1` + 175 服务器完成（16/17）：安装器真实下载+SHA256 一致、systemd 启动/kill-9 自动拉起/SIGTERM 优雅停止、重装轮换回滚、卸载保留状态。**剩余两项**：① reboot 恢复（需重启生产服务器或另找可重启 VM，待网主授权）；② 候选 SHA `6f07562` 的外部 agent 黑盒复测（已派发，水位居 18:17:33Z）。M4 完成判定四条中第 1/2/4 条已达成，第 3 条（同 SHA 复测）进行中。
 
 ### M4-D：二进制、安装器与 README
 

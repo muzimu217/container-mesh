@@ -413,7 +413,13 @@ init → account create → device-add → serve-discovery（自举 members.json
 - 握手错误不再甩锅给 code（码不一致实际表现为「no partner」）；`--pair-window` 帮助写全真实规则；账号口令旗标两种拼法都接受。
 - 发布件：`tools/mkrelease` 组装发布资产（缺 installer 时**明确失败且不留半成品**——此前会留下裸二进制与截断归档，`gzip -t` 还过）；`cmesh verify` 本地校验下载物；README 全部命令可照抄执行（此前 §2 照抄 0/6 通过、§3 四行里三行报 usage）。
 
-### Round 36（2026-11-15 · 复测就绪确认 + 水位推进）
+### Round 37（2026-11-15 · 6fc00c6 推送 + 复测派单 + 退出码回归修复）
+
+- **交互会话推送**：M4 冲刺全部改动进入远端，`1f64cdc` → **`6fc00c6`**（6 笔：dadbcf7 host policy/--probe/优雅停止、52303df panel 308、c90872e systemd+mkrelease 加固、47206a5 整改文档、c7b57bd CLI credential e2e、6fc00c6 installer 回归）。工作树只剩看板文档与一处修复。
+- **新 HEAD 门禁验证**：`go build ./...` PASS；`bash tests/run-tests.sh --quick` **通过 43, 失败 0**（结果段恢复后确认）。
+- **发现新 HEAD 真实回归**：`c7b57bd` 提交的 run-tests.sh 丢失结尾"结果汇总 + exit 1/0"段——e2e 失败时退出码不可靠。已在 worktree 修复（恢复结果段），复测通过 43/0 rc=0；**待推送**。
+- **复测派单**：四 agent 全部发出 6fc00c6 公告（构建命令 + 各家清单 + 退出码事项申报），四路 ok:true。issue #8 镜像：comment-6900431512。
+- 水位推进至 `2026-11-15T18:17:33Z`；oh-no/doubao 复测就绪确认已收，回信 ok:true。
 
 - 水位 `2026-11-15T04:19:45Z` → **`2026-11-15T18:17:33Z`**。水位后 2 条报告：oh-no `18:10:18Z`、doubao `18:17:33Z`，均为复测就绪确认，无缺陷。
 - oh-no：环境在线（fetch 至 1f64cdc），确认下一 SHA 复测清单——panel 308/令牌三态/假数据归零/B-3 五项含双向性臂/diagnostics 边界/#7 回归基线；限制沿用（无 root/netns、回环等价形态如实标注）。
@@ -604,3 +610,12 @@ init → account create → device-add → serve-discovery（自举 members.json
 
 - kuku（28.5h）/ netns-probe（28.2h）静默：四次触达（三次催办+一次广播）无响应 → **最终通知已发**，48h（约 11-16 04:30Z）不回按失联结案、任务永久改派。netns 的 429 项已由 doubao 闭环（第 12 轮 §5）。
 - `24bbf2f` 双环境复测全 PASS（见 §1 复测列）；工作树另有一批未推修复（B-3/308/假遥测/文档），等网主放行后公告新 SHA，doubao 按 ①②③ 口径 + 字节差值核对（期望 −3,847 / −507 B）复测。
+
+### Round 37（2026-11-15 · 交互会话：M4 双硬阻塞真机验收）
+
+- **推送**：develop `1f64cdc → 6fc00c6`（6 个逻辑提交：host policy/status probe/relay Shutdown、面板 308+新资产、systemd unit 资产、e2e 43 真实 CLI 化、安装器离线回归、文档）→ `6f07562`（口径同步）。身份 muzimu217 author+committer 双查通过（网主纠正后本地 override）。门禁：race 18 包、e2e 43/43、交叉编译全过。
+- **Release 验收**：prerelease `v1.0.0-rc1`（17 资产：5 平台二进制+tar.gz+latest 别名+安装器+SHA256SUMS；prerelease 不占 latest 正式位）。
+- **VPS 真机验收（175，OpenCloudOS 9.4，隔离目录+高位端口 39771，不碰生产 anchor/hub/nginx）**：16/17 PASS——A 真实下载/校验/安装 ✓；C systemd 启动/healthz/kill-9 Restart=always 自动拉起(PID 212244→212312)/SIGTERM 优雅停止(Shutdown 路径)/端口释放 ✓；D 重装替换轮换+current 回滚 ✓；E 卸载保留状态 ✓；F 清理 ✓。
+- **认账**：B 篡改用例 FAIL 为测试脚本设计错误（篡改本地旧文件而非下载源，安装器重新下载远端资产当然通过）——产品门禁证据=A 项 SHA256 一致+离线回归 fixture 篡改路径；不算产品缺陷，不悄悄改绿。
+- **未验收（如实）**：reboot 恢复（需重启生产服务器，待网主授权或另找 VM）；darwin/windows 归档资产后台上传中（10/17 已上）。
+- **派发**：hub channel+4 inbox 五路 ok:true（任务书同 SHA=6f07562）；issue #8 mirror=comment-6900352297。systemd/Release 项在任务书中标注环境阻塞（容器 agent 不可测）。

@@ -1,6 +1,6 @@
 # container-mesh 开发与平台 KPI 看板
 
-更新时间：2026-11-15 18:20Z。分支：`develop`。远端 tip：`1f64cdc`。Hub 水位：`2026-11-15T18:17:33Z`。水位后 2 条报告（oh-no/doubao 复测就绪确认，均回信 ok:true）；下一 SHA 复测范围已扩展到 M4 冲刺四批次。当前 worktree 43 条；quick 43 项全绿；批次 C 优雅停止 3 测试 PASS；批次 D（mclaw Linux systemd）运行中。
+更新时间：2026-11-15 18:40Z。分支：`develop`。远端 tip：**`6fc00c6`**（6 笔 M4 冲刺提交已推送：host policy/status --probe/优雅停止、panel 308、systemd+mkrelease 加固、整改文档、独立 CLI credential e2e、installer 回归）。Hub 水位：`2026-11-15T18:17:33Z`。复测已派四 agent（含 6fc00c6 e2e 退出码缺结果段的事项申报）。worktree 仅余看板文档与一处待推送修复：tests/run-tests.sh 结果汇总段恢复（43 项全绿 rc=0 已验证）。
 
 这张表把代码、可运行产物、安装包、真机验收分开记账。交叉编译通过不等于平台交付完成；设计方案存在也不等于安装包完成。
 
@@ -16,7 +16,7 @@
 | `--endpoint :0` B-2 | **已完成并在 `1f64cdc` 复测** | 绑定端口替换纯函数 + 回归测试；外部端口自检和直连通过 |
 | 端口自检 | **已完成** | TCP/UDP 同端口提示、回环绑定提示、可执行动作 |
 | Linux headless 安装闭环 | **本地代码完成，真实 Linux 验收运行中（批次 D）** | install.sh/cmesh-install 已实现 HTTPS+SHA 校验、版本目录/current symlink、卸载/保留状态/purge、mkrelease 加固；批次 D 正在授权 mclaw 执行真实安装+systemd（verify/enable/restart/kill/reboot）验收；SIGTERM 优雅停止由批次 C 实现中 |
-| 真实 Release / M4 安装验收 | **本地加固完成，真实发布未验收** | mkrelease 已加固：输入版本/平台矩阵校验、latest 输入拒绝、LICENSE 与 cwd 解耦、--license 显式指定、归档逐条校验（gofmt/vet/test 全绿）；仍无真实 GitHub Release 资产的 checksum/download/install/upgrade/rollback 证据，worktree 与 `1f64cdc` 需固化后同 SHA 黑盒复测 |
+| 真实 Release / M4 安装验收 | **已在 v1.0.0-rc1 真资产 + 175 systemd VPS 验收（16/17，reboot 除外）** | prerelease `v1.0.0-rc1`（不占 latest 正式位）：安装器真实下载/SHA256 一致/版本化落盘 ✓；systemd 启动/healthz/kill-9 自动拉起(新 PID)/SIGTERM 优雅停止/端口释放 ✓；重装替换轮换+current 回滚 ✓；卸载保留状态 ✓。B 项篡改用例为脚本设计错误（篡改本地旧文件而非下载源），产品门禁由 A 项 SHA256 一致 + 离线回归覆盖，不构成缺陷。**未验收**：reboot 恢复（需重启生产服务器，待网主授权或另找可重启 VM）；darwin/windows 归档资产后台上传中 |
 | systemd 前置与安全 | **示例未闭合，真实环境未验收** | unit 需 cmesh 用户/组、identity/account/members/account-pub 和非交互 secret；空口令可能 EOF，缺 account-pub 会降级证书验证；macOS 无法替代 systemd VPS/VM |
 | 性能观测补全 | **待补独立 bench/relay 观测** | 当前 direct bench 未稳定记录 Duration/MiB/s/CPU/alloc；relay status 无 per-session RTT/吞吐；下一步只补测试观测，不先改协议 |
 | 中继路由 / 增量视图 | **未开始，推迟 v1.1** | M4-PLAN C 组；不混入当前 v1.0 收口 |
