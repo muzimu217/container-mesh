@@ -2,74 +2,92 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 muzimu217
 #
-# install.sh — fetch a verified cmesh binary for this machine (M4 (d)).
+# Verified cmesh installer for POSIX shells. Installation is versioned and
+# separate from runtime state:
+#   <install>/versions/<version>/cmesh
+#   <install>/current -> versions/<version>
+#   <install>/cmesh -> current/cmesh
 #
-#   sh install.sh
-#
-# What it does:
-#   1. detects the OS and CPU architecture;
-#   2. downloads the matching static binary from the project's releases;
-#   3. verifies its SHA-256 against the published SHA256SUMS;
-#   4. writes it to the install directory.
-#
-# The binary is NOT installed before its checksum matches: a corrupted or
-# tampered download fails with nothing written.
-#
-# The default install directory is the current directory — cmesh's home is
-# containers and home directories, and writing into a system directory is a
-# decision the operator makes, not the script. Point it elsewhere with
-# CMESH_INSTALL, or copy the file yourself afterwards.
-#
-# Environment:
-#   CMESH_INSTALL   where to write the binary (default: current directory)
-#   CMESH_VERSION   release tag to fetch (default: latest)
-#   CMESH_BASE_URL  release base URL (default the project's GitHub releases)
+# Runtime identities, certificates, and member lists stay in CMESH_STATE (or
+# the normal ~/.cmesh default). This script never reads or writes credentials.
 
 set -eu
 
 BASE_URL=${CMESH_BASE_URL:-https://github.com/muzimu217/container-mesh/releases}
 VERSION=${CMESH_VERSION:-latest}
 INSTALL_DIR=${CMESH_INSTALL:-.}
-
-# The base URL decides where a binary is fetched from, so it is restricted to
-# https:// and to characters that cannot be confused with shell syntax.
-case "$BASE_URL" in
-    https://*) ;;
-    *) echo "cmesh installer: CMESH_BASE_URL must be https://" >&2; exit 2 ;;
-esac
-case "$BASE_URL" in
-    *[!A-Za-z0-9._~:/-]*) echo "cmesh installer: unsafe characters in CMESH_BASE_URL" >&2; exit 2 ;;
-esac
-case "$VERSION" in
-    *[!A-Za-z0-9._-]*) echo "cmesh installer: unsafe characters in CMESH_VERSION" >&2; exit 2 ;;
-esac
-case "$INSTALL_DIR" in
-    *[!A-Za-z0-9._/-]*) echo "cmesh installer: unsafe characters in CMESH_INSTALL" >&2; exit 2 ;;
-esac
+STATE_DIR=${CMESH_STATE:-${HOME:-}/.cmesh}
 
 say() { printf '%s\n' "$*"; }
 die() { printf 'cmesh installer: %s\n' "$*" >&2; exit 1; }
 
-# --- platform detection ---------------------------------------------------
+usage() {
+    cat >&2 <<'EOF'
+usage: install.sh
+       install.sh --uninstall [--purge]
+
+CMESH_INSTALL selects the managed install root. CMESH_STATE selects the
+runtime state directory used by --purge; it is never touched by a normal
+install or uninstall.
+EOF
+    exit 2
+}
+
+PURGE=0
+if [ "${1:-}" = "--uninstall" ]; then
+    shift
+    [ "${1:-}" = "--purge" ] && { PURGE=1; shift; }
+    [ "$#" -eq 0 ] || usage
+    marker="$INSTALL_DIR/.cmesh-install-root"
+    [ -f "$marker" ] || die "$INSTALL_DIR is not a cmesh install root"
+    case "$INSTALL_DIR" in
+        ""|/) die "refusing to uninstall from an empty path or filesystem root" ;;
+    esac
+    if [ "$PURGE" -eq 1 ]; then
+        rm -rf -- "$INSTALL_DIR"
+        if [ -n "$STATE_DIR" ] && [ "$STATE_DIR" != "$INSTALL_DIR" ]; then
+            rm -rf -- "$STATE_DIR"
+        fi
+        say "purged install root and runtime state"
+    else
+        rm -rf -- "$INSTALL_DIR/cmesh" "$INSTALL_DIR/current" "$INSTALL_DIR/versions" "$marker"
+        say "uninstalled binaries; runtime state was retained at $STATE_DIR"
+    fi
+    exit 0
+fi
+[ "$#" -eq 0 ] || usage
+
+case "$BASE_URL" in
+    https://*) ;;
+    *) die "CMESH_BASE_URL must be https://" ;;
+esac
+case "$BASE_URL" in
+    *[!A-Za-z0-9._~:/-]*) die "unsafe characters in CMESH_BASE_URL" ;;
+esac
+case "$VERSION" in
+    ''|*[!A-Za-z0-9._+-]*) die "unsafe characters in CMESH_VERSION" ;;
+esac
+case "$INSTALL_DIR" in
+    ''|*[!A-Za-z0-9._/-]*) die "unsafe characters in CMESH_INSTALL" ;;
+esac
+
 os=$(uname -s | tr '[:upper:]' '[:lower:]')
 case "$os" in
     linux) os=linux ;;
     darwin) os=darwin ;;
-    freebsd | openbsd | netbsd) os=freebsd ;;
-    mingw* | msys* | cygwin*) os=windows ;;
+    freebsd|openbsd|netbsd) os=freebsd ;;
+    mingw*|msys*|cygwin*) os=windows ;;
     *) die "unsupported operating system: $os" ;;
 esac
-
 arch=$(uname -m)
 case "$arch" in
-    x86_64 | amd64) arch=amd64 ;;
-    aarch64 | arm64) arch=arm64 ;;
+    x86_64|amd64) arch=amd64 ;;
+    aarch64|arm64) arch=arm64 ;;
     *) die "unsupported CPU architecture: $arch" ;;
 esac
 
 suffix=""
-[ "$os" = windows ] && suffix=".exe"
-
+[ "$os" = windows ] && suffix=.exe
 if [ "$VERSION" = latest ]; then
     asset_base="cmesh-latest-${os}-${arch}${suffix}"
     sums_url="$BASE_URL/latest/download/SHA256SUMS"
@@ -85,10 +103,8 @@ say "  platform : ${os}/${arch}"
 say "  asset    : $asset_base"
 say "  target   : $INSTALL_DIR"
 
-# --- download -------------------------------------------------------------
-tmpdir=$(mktemp -d)
+tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/cmesh-install.XXXXXX")
 trap 'rm -rf "$tmpdir"' EXIT INT TERM
-
 fetch() {
     url=$1
     out=$2
@@ -103,43 +119,58 @@ fetch() {
 
 say "  downloading checksums..."
 fetch "$sums_url" "$tmpdir/SHA256SUMS" || die "cannot fetch the release checksums"
-
 say "  downloading binary..."
 fetch "$binary_url" "$tmpdir/$asset_base" || die "cannot fetch the release binary"
 
-# --- verify ---------------------------------------------------------------
 say "  verifying checksum..."
 if command -v sha256sum >/dev/null 2>&1; then
-    checker="sha256sum"
+    checker=sha256sum
 elif command -v shasum >/dev/null 2>&1; then
     checker="shasum -a 256"
 else
     die "no sha256sum or shasum available; refusing to install an unverified binary"
 fi
+expected=$(awk -v name="$asset_base" '$2==name || $2=="*" name {print $1; exit}' "$tmpdir/SHA256SUMS")
+case "$expected" in
+    ''|*[!0-9A-Fa-f]*) die "the release does not list a valid checksum for $asset_base" ;;
+esac
+[ "${#expected}" -eq 64 ] || die "the release does not list a valid checksum for $asset_base"
+actual=$($checker "$tmpdir/$asset_base" | awk '{print $1}')
+[ "$(printf '%s' "$expected" | tr '[:upper:]' '[:lower:]')" = "$(printf '%s' "$actual" | tr '[:upper:]' '[:lower:]')" ] || die "checksum mismatch for $asset_base"
 
-expected=$(grep " $asset_base\$" "$tmpdir/SHA256SUMS" | cut -d' ' -f1 | head -n 1)
-[ -n "$expected" ] || die "the release does not list $asset_base"
-
-actual=$($checker "$tmpdir/$asset_base" | cut -d' ' -f1)
-[ "$expected" = "$actual" ] || die "checksum mismatch for $asset_base"
-
-# --- write ----------------------------------------------------------------
-if [ ! -d "$INSTALL_DIR" ]; then
-    die "install directory does not exist: $INSTALL_DIR"
+mkdir -p "$INSTALL_DIR/versions" || die "cannot create install directory $INSTALL_DIR"
+stage=$(mktemp -d "$INSTALL_DIR/versions/.cmesh-install.XXXXXX")
+old=""
+cleanup_stage() { rm -rf "$stage"; [ -z "$old" ] || rm -rf "$old"; }
+trap 'cleanup_stage' EXIT INT TERM
+replace_link() {
+    link=$1
+    target=$2
+    tmp=$(mktemp "$INSTALL_DIR/.cmesh-link.XXXXXX")
+    rm -f "$tmp"
+    ln -s "$target" "$tmp"
+    if mv -f -T "$tmp" "$link" 2>/dev/null; then
+        return 0
+    fi
+    # BSD mv has no -T and follows a directory symlink. Remove only the
+    # managed link after the new link is ready, then rename it into place.
+    rm -f "$link"
+    mv -f "$tmp" "$link"
+}
+cp "$tmpdir/$asset_base" "$stage/cmesh"
+chmod 0755 "$stage/cmesh"
+dest="$INSTALL_DIR/versions/$VERSION"
+if [ -e "$dest" ] || [ -L "$dest" ]; then
+    old=$(mktemp -d "$INSTALL_DIR/versions/.cmesh-old.XXXXXX")
+    rmdir "$old"
+    mv "$dest" "$old" || die "cannot replace existing version $VERSION"
 fi
-if [ ! -w "$INSTALL_DIR" ]; then
-    die "install directory is not writable: $INSTALL_DIR (set CMESH_INSTALL to a writable path)"
-fi
-
-target="$INSTALL_DIR/cmesh${suffix}"
-cp "$tmpdir/$asset_base" "$target"
-chmod 0755 "$target"
-
-say "  installed: $target"
-"$target" version || true
-say ""
-say "next steps:"
-say "  cmesh init                       # create this device's identity"
-say "  cmesh account create             # create the team account (anchor machine)"
-say "  cmesh account device-add         # sign this device in"
-say "  cmesh serve-discovery --panel    # run the anchor, then open the panel"
+mv "$stage" "$dest" || die "cannot commit version $VERSION"
+stage=""
+replace_link "$INSTALL_DIR/current" "versions/$VERSION"
+replace_link "$INSTALL_DIR/cmesh" current/cmesh
+printf '%s\n' 'container-mesh managed install' > "$INSTALL_DIR/.cmesh-install-root"
+[ -z "$old" ] || rm -rf "$old"
+old=""
+say "  installed: $INSTALL_DIR/current/cmesh"
+say "  runtime state retained separately: $STATE_DIR"
