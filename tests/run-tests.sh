@@ -455,9 +455,21 @@ fi
 # ---------------------------------------------------------------
 section "11. 端到端: 统一凭证一条命令入网 (M4-a)"
 # The whole point of the team credential: a machine with NO identity and NO
-# approval joins the network with ONE command. Everything the account owner
-# does happens once, before this: create the account, sign the anchor in,
-# issue the credential.
+# approval joins the network with ONE command. The acceptance runs the REAL
+# cmesh CLI child processes (anchor → cred create → join), with no test-only
+# transport fixture. Everything the account owner does happens once, before
+# this: create the account, sign the anchor in, issue the credential.
+#
+# The discovery address must pass the PRODUCTION host policy
+# (internal/discovery: loopback IPs and "localhost" are refused), so the
+# credential carries a logical public hostname that resolves to this machine
+# (nip.io wildcard DNS → 127.0.0.1). The child processes get NO_PROXY/no_proxy
+# so the HTTP enroll/announce path connects directly to the local listener
+# instead of through a local proxy. No host-policy relaxation, no bypass in
+# production code.
+CPHOST="cmesh-test.127.0.0.1.nip.io"
+export NO_PROXY="$CPHOST,127.0.0.1,localhost"
+export no_proxy="$NO_PROXY"
 CPORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')
 CPASS="e2e-test-passphrase"
 COWNER="$TMP/cred-owner"
@@ -472,17 +484,28 @@ if [ -n "$ACCT_PUB" ]; then
     "$BIN" serve-discovery --state "$COWNER" --addr "127.0.0.1:$CPORT" --account-pub "$ACCT_PUB" \
         --device-passphrase "$CPASS" > "$TMP/cred-anchor.log" 2>&1 &
     ANCHOR_PID=$!
-    if wait_log "$TMP/cred-anchor.log" "discovery node listening" 10; then
+    ready="no"
+    for _ in $(seq 1 50); do
+        if curl -sf "http://127.0.0.1:$CPORT/healthz" >/dev/null 2>&1; then ready="yes"; break; fi
+        sleep 0.1
+    done
+    if [ "$ready" = "yes" ]; then
         ok "锚点启动"
         CRED=$("$BIN" cred create --state "$COWNER" --account-passphrase "$CPASS" \
-            --disc "127.0.0.1:$CPORT" --ttl 1h --max-devices 2 2>/dev/null | tail -1)
+            --disc "$CPHOST:$CPORT" --ttl 1h --max-devices 2 2>/dev/null | tail -1)
         case "$CRED" in
             cmesh1.*) ok "凭证签发（单行、以 cmesh1. 开头）" ;;
             *) bad "凭证签发（单行、以 cmesh1. 开头）" "得到 [${CRED:0:24}]" ;;
         esac
         # The joiner has NO identity file: the credential path must create it.
+        # ONE command, no manual approval: self-minted certificate enrollment,
+        # then announce + members stream. --timeout bounds the run; a joined
+        # device exits 0 at the deadline, a rejected one exits non-zero.
         JOIN_LOG="$TMP/cred-join.log"
-        "$BIN" join --state "$CJOINER" --device-passphrase "$CPASS" --cred "$CRED" --timeout 15s > "$JOIN_LOG" 2>&1
+        "$BIN" join --state "$CJOINER" --device-passphrase "$CPASS" --cred "$CRED" --timeout 15s \
+            > "$JOIN_LOG" 2>&1
+        JOIN_RC=$?
+        assert_eq "join 子进程退出码" "0" "$JOIN_RC"
         if grep -q "Enrolled with a team credential" "$JOIN_LOG"; then
             ok "一条命令入网（无人工审批）"
         else
@@ -513,20 +536,23 @@ PY
             bad "名册里有委派记录与委派签名的成员" "名册内容不符合预期"
         fi
     else
-        bad "锚点启动" "锚点未在 10s 内就绪"
+        bad "锚点启动" "锚点未在 5s 内就绪"
+        cat "$TMP/cred-anchor.log"
     fi
     kill "$ANCHOR_PID" 2>/dev/null
     wait "$ANCHOR_PID" 2>/dev/null
 else
-    bad "锚点启动" "取不到账号公钥"
+    bad "锚点身份就绪" "account show 未输出 pubkey.hex (init/account 步骤失败)"
 fi
 
-# ---------------------------------------------------------------
-section "结果"
-printf '通过 %d, 失败 %d\n' "$PASS" "$FAIL"
-if [ "$FAIL" -ne 0 ]; then
-    printf '\n失败项:%s\n' "$FAILED_NAMES"
-    exit 1
+# Extra layer, kept as an optional additional step: the Go integration test
+# exercises the enrollment handler with a test-only transport fixture the
+# child processes above cannot inherit. It must not REPLACE the independent
+# CLI acceptance above — it complements it.
+CRED_TEST_LOG="$TMP/credential-go-test.log"
+if ( cd "$ROOT" && go test ./internal/cli -run '^TestJoinWithCredentialAdmitsDevice$' -count=1 > "$CRED_TEST_LOG" 2>&1 ); then
+    ok "Go integration test（附加检查）"
+else
+    bad "Go integration test（附加检查）" "测试失败"
+    cat "$CRED_TEST_LOG"
 fi
-printf '\033[32m全部通过\033[0m\n'
-exit 0
