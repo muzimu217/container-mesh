@@ -136,23 +136,26 @@ export const MinimalistProbeDashboard: React.FC<MinimalistProbeDashboardProps> =
 
   const selectedDevice = meshData.members.find((m) => m.device_id === selectedDeviceId) || null;
 
-  // Aggregate global bandwidth & traffic across online nodes
-  const totalUpMbps = onlineMembers.reduce(
-    (acc, m) => acc + (telemetryMap[m.device_id]?.netUpMbps || 0),
-    0
-  );
-  const totalDownMbps = onlineMembers.reduce(
-    (acc, m) => acc + (telemetryMap[m.device_id]?.netDownMbps || 0),
-    0
-  );
-  const totalTrafficUpGb = meshData.members.reduce(
-    (acc, m) => acc + (telemetryMap[m.device_id]?.trafficUpGb || 0),
-    0
-  );
-  const totalTrafficDownGb = meshData.members.reduce(
-    (acc, m) => acc + (telemetryMap[m.device_id]?.trafficDownGb || 0),
-    0
-  );
+  const telemetryMembers = meshData.members.filter((m) => {
+    const t = telemetryMap[m.device_id];
+    return t?.netUpMbps != null && t.netDownMbps != null;
+  });
+  const telemetryTrafficMembers = meshData.members.filter((m) => {
+    const t = telemetryMap[m.device_id];
+    return t?.trafficUpGb != null && t.trafficDownGb != null;
+  });
+  const totalUpMbps = telemetryMembers.length === onlineMembers.length
+    ? telemetryMembers.reduce((acc, m) => acc + (telemetryMap[m.device_id]?.netUpMbps ?? 0), 0)
+    : null;
+  const totalDownMbps = telemetryMembers.length === onlineMembers.length
+    ? telemetryMembers.reduce((acc, m) => acc + (telemetryMap[m.device_id]?.netDownMbps ?? 0), 0)
+    : null;
+  const totalTrafficUpGb = telemetryTrafficMembers.length === meshData.members.length
+    ? telemetryTrafficMembers.reduce((acc, m) => acc + (telemetryMap[m.device_id]?.trafficUpGb ?? 0), 0)
+    : null;
+  const totalTrafficDownGb = telemetryTrafficMembers.length === meshData.members.length
+    ? telemetryTrafficMembers.reduce((acc, m) => acc + (telemetryMap[m.device_id]?.trafficDownGb ?? 0), 0)
+    : null;
 
   const filteredMembers = meshData.members.filter((m) => {
     if (selectedZoneId && m.zone_id !== selectedZoneId) return false;
@@ -553,8 +556,8 @@ export const MinimalistProbeDashboard: React.FC<MinimalistProbeDashboardProps> =
                   <span>出站上传</span>
                 </div>
                 <div className={`text-xl font-bold mt-0.5 ${textPrimaryClass}`}>
-                  {totalUpMbps.toFixed(1)}{' '}
-                  <span className={`text-xs font-normal ${textMutedClass}`}>MB/s</span>
+                  {totalUpMbps == null ? NOT_COLLECTED : totalUpMbps.toFixed(1)}{' '}
+                  {totalUpMbps != null && <span className={`text-xs font-normal ${textMutedClass}`}>MB/s</span>}
                 </div>
               </div>
               <div>
@@ -567,8 +570,8 @@ export const MinimalistProbeDashboard: React.FC<MinimalistProbeDashboardProps> =
                   <span>入站下载</span>
                 </div>
                 <div className={`text-xl font-bold mt-0.5 ${textPrimaryClass}`}>
-                  {totalDownMbps.toFixed(1)}{' '}
-                  <span className={`text-xs font-normal ${textMutedClass}`}>MB/s</span>
+                  {totalDownMbps == null ? NOT_COLLECTED : totalDownMbps.toFixed(1)}{' '}
+                  {totalDownMbps != null && <span className={`text-xs font-normal ${textMutedClass}`}>MB/s</span>}
                 </div>
               </div>
             </div>
@@ -591,15 +594,17 @@ export const MinimalistProbeDashboard: React.FC<MinimalistProbeDashboardProps> =
             </div>
             <div className="mt-2 flex items-baseline gap-2 font-mono tabular-nums">
               <span className={`text-2xl font-bold ${textPrimaryClass}`}>
-                {((totalTrafficUpGb + totalTrafficDownGb) / 1024).toFixed(2)} TB
+                {totalTrafficUpGb == null || totalTrafficDownGb == null
+                  ? NOT_COLLECTED
+                  : `${((totalTrafficUpGb + totalTrafficDownGb) / 1024).toFixed(2)} TB`}
               </span>
               <span className={`text-xs ${textMutedClass}`}>周期累计吞吐</span>
             </div>
             <div
               className={`mt-2 text-[11px] font-mono tabular-nums flex items-center justify-between ${textMutedClass}`}
             >
-              <span>↑ 出站 {(totalTrafficUpGb / 1024).toFixed(2)} TB</span>
-              <span>↓ 入站 {(totalTrafficDownGb / 1024).toFixed(2)} TB</span>
+              <span>↑ 出站 {totalTrafficUpGb == null ? NOT_COLLECTED : `${(totalTrafficUpGb / 1024).toFixed(2)} TB`}</span>
+              <span>↓ 入站 {totalTrafficDownGb == null ? NOT_COLLECTED : `${(totalTrafficDownGb / 1024).toFixed(2)} TB`}</span>
             </div>
           </div>
 
