@@ -1,0 +1,22 @@
+[Unit]
+Description=container-mesh discovery relay
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=cmesh
+Group=cmesh
+EnvironmentFile=-/etc/cmesh/discovery.env
+ExecStart=/opt/container-mesh/current/cmesh serve-discovery --state ${CMESH_STATE} --addr ${CMESH_ADDR} --announce ${CMESH_ANNOUNCE}
+Restart=on-failure
+RestartSec=5s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/cmesh
+
+[Install]
+WantedBy=multi-user.target
