@@ -51,7 +51,7 @@ func announceFor(dev *identity.Device, eps []string) MemberAnnounce {
 
 func TestAnnounceValidateAcceptsSignedMember(t *testing.T) {
 	f := newFixture(t, 1)
-	a := announceFor(f.devices[0], []string{"203.0.113.5:7000"})
+	a := announceFor(f.devices[0], []string{"8.8.8.8:7000"})
 	sig := a.Sign(f.devices[0])
 
 	key := deviceKey(t, f, f.devices[0].ID())
@@ -68,7 +68,7 @@ func TestAnnounceRejectsNonMember(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	a := announceFor(outsider, []string{"203.0.113.9:7000"})
+	a := announceFor(outsider, []string{"8.8.4.4:7000"})
 	sig := a.Sign(outsider)
 
 	if err := a.Validate(nil, sig, testNow); err != ErrAnnounceNotMember {
@@ -82,7 +82,7 @@ func TestAnnounceRejectsForgedSignature(t *testing.T) {
 	outsider, _ := identity.Generate()
 
 	// Claim to be the member, sign with the outsider's key.
-	a := announceFor(f.devices[0], []string{"203.0.113.5:7000"})
+	a := announceFor(f.devices[0], []string{"8.8.8.8:7000"})
 	sig := a.Sign(outsider)
 
 	key := deviceKey(t, f, f.devices[0].ID())
@@ -93,7 +93,7 @@ func TestAnnounceRejectsForgedSignature(t *testing.T) {
 
 func TestAnnounceRejectsStaleTimestamp(t *testing.T) {
 	f := newFixture(t, 1)
-	a := announceFor(f.devices[0], []string{"203.0.113.5:7000"})
+	a := announceFor(f.devices[0], []string{"8.8.8.8:7000"})
 	sig := a.Sign(f.devices[0])
 	key := deviceKey(t, f, f.devices[0].ID())
 
@@ -134,11 +134,78 @@ func TestAnnounceRejectsMalformedEndpoints(t *testing.T) {
 		}
 	}
 
-	// Good ones still pass, including IPv6 and private ranges.
-	a := announceFor(f.devices[0], []string{"[2001:db8::1]:7000", "10.0.0.5:7000"})
+	// Good ones still pass, including IPv6. Address policy is covered by the
+	// dedicated matrix below; private addresses are rejected there.
+	a := announceFor(f.devices[0], []string{"[2001:4860:4860::8888]:7000", "8.8.8.8:7000"})
 	sig := a.Sign(f.devices[0])
 	if err := a.Validate(key, sig, testNow); err != nil {
 		t.Fatalf("valid endpoints rejected: %v", err)
+	}
+}
+
+func TestEndpointAddressPolicy(t *testing.T) {
+	f := newFixture(t, 1)
+	key := deviceKey(t, f, f.devices[0].ID())
+
+	tests := []struct {
+		name     string
+		ep       string
+		accepted bool
+	}{
+		{name: "IPv4 loopback", ep: "127.0.0.1:80", accepted: true},
+		{name: "IPv6 loopback", ep: "[::1]:80", accepted: true},
+		{name: "localhost", ep: "localhost:80", accepted: true},
+		{name: "RFC1918 10/8", ep: "10.0.0.1:80", accepted: true},
+		{name: "RFC1918 172.16/12", ep: "172.16.0.1:80", accepted: true},
+		{name: "RFC1918 192.168/16", ep: "192.168.1.1:80", accepted: true},
+		{name: "IPv4 link local", ep: "169.254.1.1:80", accepted: true},
+		{name: "IPv6 link local", ep: "[fe80::1]:80", accepted: true},
+		{name: "IPv4 reserved", ep: "192.0.2.1:80", accepted: true},
+		{name: "IPv6 documentation", ep: "[2001:db8::1]:80", accepted: true},
+
+		{name: "IPv4 public", ep: "8.8.8.8:80", accepted: true},
+		{name: "IPv6 public", ep: "[2001:4860:4860::8888]:80", accepted: true},
+		{name: "hostname without DNS lookup", ep: "mesh.example:80", accepted: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			a := announceFor(f.devices[0], []string{tt.ep})
+			err := a.Validate(key, a.Sign(f.devices[0]), testNow)
+			if (err == nil) != tt.accepted {
+				t.Fatalf("endpoint %q validation error = %v, want accepted = %t", tt.ep, err, tt.accepted)
+			}
+		})
+	}
+}
+
+func TestNormalizeBaseURLAddressPolicy(t *testing.T) {
+	bad := []string{
+		"http://127.0.0.1:8080",
+		"http://[::1]:8080",
+		"http://localhost:8080",
+		"http://10.0.0.1:8080",
+		"http://172.16.0.1:8080",
+		"http://192.168.1.1:8080",
+		"http://169.254.1.1:8080",
+		"http://[fe80::1]:8080",
+		"http://192.0.2.1:8080",
+		"http://[2001:db8::1]:8080",
+	}
+	for _, addr := range bad {
+		if _, err := normalizeBaseURL(addr); err == nil {
+			t.Errorf("normalizeBaseURL(%q) accepted a disallowed address", addr)
+		}
+	}
+
+	good := []string{
+		"http://8.8.8.8:8080",
+		"https://[2001:4860:4860::8888]:443",
+		"https://mesh.example:443",
+	}
+	for _, addr := range good {
+		if _, err := normalizeBaseURL(addr); err != nil {
+			t.Errorf("normalizeBaseURL(%q) rejected a valid address: %v", addr, err)
+		}
 	}
 }
 
@@ -244,7 +311,7 @@ func TestInviteRoundTrip(t *testing.T) {
 	inv := Invite{
 		AccountID:      f.acc.ID(),
 		AccountPub:     f.acc.PublicKey(),
-		DiscoveryAddrs: []string{"203.0.113.10:8080"},
+		DiscoveryAddrs: []string{"8.8.8.8:8080"},
 		IssuedAt:       testNow,
 	}
 	s, err := EncodeInvite(inv)
@@ -261,7 +328,7 @@ func TestInviteRoundTrip(t *testing.T) {
 	if !got.AccountPub.Equal(inv.AccountPub) {
 		t.Fatal("account key changed")
 	}
-	if len(got.DiscoveryAddrs) != 1 || got.DiscoveryAddrs[0] != "203.0.113.10:8080" {
+	if len(got.DiscoveryAddrs) != 1 || got.DiscoveryAddrs[0] != "8.8.8.8:8080" {
 		t.Fatalf("discovery addrs = %v", got.DiscoveryAddrs)
 	}
 }
@@ -298,7 +365,7 @@ func TestInviteAcceptsSchemeDiscoveryAddrs(t *testing.T) {
 	inv := Invite{
 		AccountID:      f.acc.ID(),
 		AccountPub:     f.acc.PublicKey(),
-		DiscoveryAddrs: []string{"https://10.55.0.1:18443", "203.0.113.10:8080"},
+		DiscoveryAddrs: []string{"https://8.8.4.4:18443", "8.8.8.8:8080"},
 		IssuedAt:       testNow,
 	}
 	s, err := EncodeInvite(inv)
@@ -309,14 +376,14 @@ func TestInviteAcceptsSchemeDiscoveryAddrs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("scheme-ed discovery addr rejected: %v", err)
 	}
-	if len(got.DiscoveryAddrs) != 2 || got.DiscoveryAddrs[0] != "https://10.55.0.1:18443" {
+	if len(got.DiscoveryAddrs) != 2 || got.DiscoveryAddrs[0] != "https://8.8.4.4:18443" {
 		t.Fatalf("discovery addrs = %v; scheme must be preserved verbatim", got.DiscoveryAddrs)
 	}
 
 	bad, err := EncodeInvite(Invite{
 		AccountID:      f.acc.ID(),
 		AccountPub:     f.acc.PublicKey(),
-		DiscoveryAddrs: []string{"https://no-port-here"},
+		DiscoveryAddrs: []string{"https://127.0.0.1:80/path"},
 		IssuedAt:       testNow,
 	})
 	if err != nil {

@@ -14,7 +14,10 @@ import (
 	"context"
 	"crypto/ed25519"
 	"encoding/json"
+	"net"
+	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"testing"
@@ -26,7 +29,42 @@ import (
 	"github.com/muzimu217/container-mesh/internal/relay"
 )
 
-// TestJoinWithCredentialAdmitsDevice: a device that has never been signed
+func testDiscoveryURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		panic(err)
+	}
+	u.Scheme = "https"
+	u.Host = net.JoinHostPort("mesh.example", u.Port())
+	return u.String()
+}
+
+type enrollmentRoundTripper func(*http.Request) (*http.Response, error)
+
+func (f enrollmentRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
+}
+
+func testEnrollmentTransport(t *testing.T, target string) http.RoundTripper {
+	t.Helper()
+	targetURL, err := url.Parse(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := http.DefaultTransport
+	return enrollmentRoundTripper(func(r *http.Request) (*http.Response, error) {
+		u := *r.URL
+		if u.Hostname() == "mesh.example" {
+			u.Scheme = targetURL.Scheme
+			u.Host = net.JoinHostPort("127.0.0.1", targetURL.Port())
+		}
+		request := r.Clone(r.Context())
+		request.URL = &u
+		request.Host = u.Host
+		return base.RoundTrip(request)
+	})
+}
+
 // by the account owner joins with a credential, and the anchor's roster
 // knows it.
 func TestJoinWithCredentialAdmitsDevice(t *testing.T) {
@@ -46,10 +84,13 @@ func TestJoinWithCredentialAdmitsDevice(t *testing.T) {
 	defer ts.Close()
 	defer srv.StopDiscovery()
 
-	cred, err := credential.Create(acc, []string{ts.URL}, time.Hour, 5, now)
+	cred, err := credential.Create(acc, []string{testDiscoveryURL(ts.URL)}, time.Hour, 5, now)
 	if err != nil {
 		t.Fatal(err)
 	}
+	targetTransport := http.DefaultTransport
+	http.DefaultTransport = testEnrollmentTransport(t, ts.URL)
+	t.Cleanup(func() { http.DefaultTransport = targetTransport })
 	// The credential must be a single string the member can be handed.
 	credStr, err := credential.Encode(cred)
 	if err != nil {
@@ -153,7 +194,7 @@ func TestCredentialJoinLeavesUsableConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Now().UTC()
-	cred, err := credential.Create(acc, []string{"127.0.0.1:18801"}, time.Hour, 5, now)
+	cred, err := credential.Create(acc, []string{"mesh.example:18801"}, time.Hour, 5, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -192,7 +233,7 @@ func TestCredentialJoinLeavesUsableConfig(t *testing.T) {
 	if got.AccountID != acc.ID() {
 		t.Errorf("rebuilt account = %s, want %s", got.AccountID, acc.ID())
 	}
-	if len(got.DiscoveryAddrs) != 1 || got.DiscoveryAddrs[0] != "127.0.0.1:18801" {
+	if len(got.DiscoveryAddrs) != 1 || got.DiscoveryAddrs[0] != "mesh.example:18801" {
 		t.Errorf("rebuilt discovery addresses = %v, want the credential's own", got.DiscoveryAddrs)
 	}
 	if len(got.AccountPub) != ed25519.PublicKeySize {
@@ -204,7 +245,7 @@ func TestCredentialJoinLeavesUsableConfig(t *testing.T) {
 	raw, err := discovery.EncodeInvite(discovery.Invite{
 		AccountID:      acc.ID(),
 		AccountPub:     acc.PublicKey(),
-		DiscoveryAddrs: []string{"127.0.0.1:18802"},
+		DiscoveryAddrs: []string{"mesh.example:18802"},
 		IssuedAt:       now,
 	})
 	if err != nil {

@@ -99,7 +99,10 @@ func usage(w io.Writer) {
 Usage:
   cmesh status [--state DIR] [--device-passphrase PASS] [--json]
         Show the last verified member view, including offline members,
-        announced endpoints, last_seen and the roster version.
+        announced endpoints, last_seen and the roster version. Use
+        --probe DEVICE_ID for one explicit authenticated direct QUIC probe;
+        without it reachability remains unknown unless a future relay session
+        supplies evidence.
 
   cmesh doctor [--json] [--skip-network]
         Check local capability and outbound-network health. Exit codes match

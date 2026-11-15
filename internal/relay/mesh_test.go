@@ -97,7 +97,7 @@ func TestMeshRegisterRejectsNonMember(t *testing.T) {
 	if _, err := f.acc.IssueCert(stranger, time.Hour); err != nil {
 		t.Fatal(err)
 	}
-	resp, body := postRegister(t, ts, signedAnnounce(stranger, []string{"203.0.113.5:7000"}, time.Now()))
+	resp, body := postRegister(t, ts, signedAnnounce(stranger, []string{"8.8.8.5:7000"}, time.Now()))
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("non-member announce: HTTP %d, want 401 (body: %s)", resp.StatusCode, body)
 	}
@@ -114,7 +114,7 @@ func TestMeshRegisterRejectsBadSignature(t *testing.T) {
 	_, ts, _ := newMeshRelay(t, f.members)
 
 	// Announce as devices[0] but sign with devices[1]'s key.
-	a := discovery.MemberAnnounce{DeviceID: f.devices[0].ID(), Endpoints: []string{"203.0.113.5:7000"}, Timestamp: time.Now()}
+	a := discovery.MemberAnnounce{DeviceID: f.devices[0].ID(), Endpoints: []string{"8.8.8.5:7000"}, Timestamp: time.Now()}
 	req := discovery.RegisterRequest{Announce: a, Sig: a.Sign(f.devices[1])}
 	resp, body := postRegister(t, ts, req)
 	if resp.StatusCode != http.StatusUnauthorized {
@@ -127,7 +127,7 @@ func TestMeshRegisterRejectsStaleTimestamp(t *testing.T) {
 	_, ts, _ := newMeshRelay(t, f.members)
 
 	old := time.Now().Add(-time.Minute)
-	resp, body := postRegister(t, ts, signedAnnounce(f.devices[0], []string{"203.0.113.5:7000"}, old))
+	resp, body := postRegister(t, ts, signedAnnounce(f.devices[0], []string{"8.8.8.5:7000"}, old))
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("stale announce: HTTP %d, want 401 (body: %s)", resp.StatusCode, body)
 	}
@@ -154,7 +154,7 @@ func TestMeshRegisterAcceptsAndUpdatesNode(t *testing.T) {
 	_, ts, node := newMeshRelay(t, f.members)
 	dev := f.devices[0]
 
-	resp, body := postRegister(t, ts, signedAnnounce(dev, []string{"203.0.113.5:7000", "10.0.0.5:7000"}, time.Now()))
+	resp, body := postRegister(t, ts, signedAnnounce(dev, []string{"8.8.8.5:7000", "8.8.8.6:7000"}, time.Now()))
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("valid announce: HTTP %d (body: %s)", resp.StatusCode, body)
 	}
@@ -169,12 +169,12 @@ func TestMeshRegisterAcceptsAndUpdatesNode(t *testing.T) {
 		t.Fatalf("first announce must report changed=true (new endpoints), got %q", body)
 	}
 	got := node.Endpoints(dev.ID())
-	if len(got) != 2 || got[0] != "203.0.113.5:7000" {
+	if len(got) != 2 || got[0] != "8.8.8.5:7000" {
 		t.Fatalf("node endpoints = %v", got)
 	}
 
 	// Heartbeat with identical endpoints: accepted but not worth a push.
-	resp, body = postRegister(t, ts, signedAnnounce(dev, []string{"203.0.113.5:7000", "10.0.0.5:7000"}, time.Now()))
+	resp, body = postRegister(t, ts, signedAnnounce(dev, []string{"8.8.8.5:7000", "8.8.8.6:7000"}, time.Now()))
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("repeat announce: HTTP %d (body: %s)", resp.StatusCode, body)
 	}
@@ -291,7 +291,7 @@ func TestMeshMembersPushesSnapshotAndUpdates(t *testing.T) {
 	}
 
 	// devices[1] announces → the node changes → a push with it ONLINE.
-	resp, body := postRegister(t, ts, signedAnnounce(f.devices[1], []string{"203.0.113.9:7000"}, time.Now()))
+	resp, body := postRegister(t, ts, signedAnnounce(f.devices[1], []string{"8.8.8.9:7000"}, time.Now()))
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("announce: HTTP %d (body %s)", resp.StatusCode, body)
 	}
@@ -300,7 +300,7 @@ func TestMeshMembersPushesSnapshotAndUpdates(t *testing.T) {
 	if !ok || !mv.Online {
 		t.Fatalf("announced member missing or offline in push: %+v", mv)
 	}
-	if len(mv.Endpoints) != 1 || mv.Endpoints[0] != "203.0.113.9:7000" {
+	if len(mv.Endpoints) != 1 || mv.Endpoints[0] != "8.8.8.9:7000" {
 		t.Fatalf("announced endpoints wrong: %v", mv.Endpoints)
 	}
 }
@@ -344,7 +344,7 @@ func TestMeshSweepDropsOfflineFromView(t *testing.T) {
 	f := newMeshFixture(t, 2)
 	_, ts, node := newMeshRelay(t, f.members)
 
-	if resp, _ := postRegister(t, ts, signedAnnounce(f.devices[1], []string{"203.0.113.9:7000"}, time.Now())); resp.StatusCode != 200 {
+	if resp, _ := postRegister(t, ts, signedAnnounce(f.devices[1], []string{"8.8.8.9:7000"}, time.Now())); resp.StatusCode != 200 {
 		t.Fatalf("announce failed: %d", resp.StatusCode)
 	}
 	conn := dialMembers(t, ts, f.devices[0], membersAuthHeaders(f.devices[0]))
@@ -420,7 +420,7 @@ func TestStreamCloseExpiresMemberFast(t *testing.T) {
 
 	// devices[1] announces and opens its members stream (what every client
 	// does in Run).
-	if resp, _ := postRegister(t, ts, signedAnnounce(f.devices[1], []string{"203.0.113.9:7000"}, time.Now())); resp.StatusCode != 200 {
+	if resp, _ := postRegister(t, ts, signedAnnounce(f.devices[1], []string{"8.8.8.9:7000"}, time.Now())); resp.StatusCode != 200 {
 		t.Fatal("announce failed")
 	}
 	victimConn := dialMembers(t, ts, f.devices[1], membersAuthHeaders(f.devices[1]))
@@ -463,7 +463,7 @@ func TestStreamOverlapKeepsOnline(t *testing.T) {
 	f := newMeshFixture(t, 1)
 	_, ts, node := newMeshRelay(t, f.members)
 	dev := f.devices[0]
-	if resp, _ := postRegister(t, ts, signedAnnounce(dev, []string{"203.0.113.5:7000"}, time.Now())); resp.StatusCode != 200 {
+	if resp, _ := postRegister(t, ts, signedAnnounce(dev, []string{"8.8.8.5:7000"}, time.Now())); resp.StatusCode != 200 {
 		t.Fatal("announce failed")
 	}
 	node.AttachStream(dev.ID())
@@ -513,7 +513,7 @@ func TestThrottledConsumerKicked(t *testing.T) {
 
 	go func() {
 		for i := 0; i < 60000; i++ {
-			ep := fmt.Sprintf("203.0.113.%d:%d", 1+i%250, 7000+i%1000)
+			ep := fmt.Sprintf("8.8.8.%d:%d", 1+i%250, 7000+i%1000)
 			node.Register(discovery.MemberAnnounce{
 				DeviceID:  f.devices[2].ID(),
 				Endpoints: []string{ep},
@@ -567,7 +567,7 @@ func TestSlowConsumerKicked(t *testing.T) {
 	// the kick firing in seconds.
 	go func() {
 		for i := 0; i < 60000; i++ {
-			ep := fmt.Sprintf("203.0.113.%d:%d", 1+i%250, 7000+i%1000)
+			ep := fmt.Sprintf("8.8.8.%d:%d", 1+i%250, 7000+i%1000)
 			node.Register(discovery.MemberAnnounce{
 				DeviceID:  f.devices[2].ID(),
 				Endpoints: []string{ep},
@@ -603,7 +603,7 @@ func TestSlowConsumerKicked(t *testing.T) {
 func TestBuildSnapshotOmitsStaleEndpointsOnly(t *testing.T) {
 	f := newMeshFixture(t, 1)
 	_, ts, node := newMeshRelay(t, f.members)
-	if resp, _ := postRegister(t, ts, signedAnnounce(f.devices[0], []string{"203.0.113.5:7000"}, time.Now())); resp.StatusCode != 200 {
+	if resp, _ := postRegister(t, ts, signedAnnounce(f.devices[0], []string{"8.8.8.5:7000"}, time.Now())); resp.StatusCode != 200 {
 		t.Fatal("announce failed")
 	}
 	snap := discovery.BuildSnapshot(f.members, node, time.Now())

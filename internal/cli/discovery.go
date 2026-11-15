@@ -40,6 +40,7 @@ import (
 	"sort"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/muzimu217/container-mesh/internal/credential"
@@ -47,7 +48,29 @@ import (
 	"github.com/muzimu217/container-mesh/internal/identity"
 	"github.com/muzimu217/container-mesh/internal/mesh"
 	"github.com/muzimu217/container-mesh/internal/relay"
+	"github.com/muzimu217/container-mesh/internal/wsconn"
 )
+
+// discoveryClientTransportHook is intentionally nil in production. CLI tests
+// use it to keep a logical discovery origin in invites while routing requests
+// to an in-process listener; the discovery package still validates the logical
+// address before either transport is called.
+type discoveryClientTransport struct {
+	httpClient    *http.Client
+	webSocketDial func(context.Context, wsconn.DialOptions) (*wsconn.Conn, error)
+}
+
+var discoveryClientTransportHook discoveryClientTransport
+
+func withDiscoveryClientTransport(cfg discovery.ClientConfig) discovery.ClientConfig {
+	if discoveryClientTransportHook.httpClient != nil {
+		cfg.HTTPClient = discoveryClientTransportHook.httpClient
+	}
+	if discoveryClientTransportHook.webSocketDial != nil {
+		cfg.WebSocketDial = discoveryClientTransportHook.webSocketDial
+	}
+	return cfg
+}
 
 // randomToken returns a fresh panel token.
 //
@@ -398,14 +421,14 @@ func runJoin(args []string) error {
 		fmt.Fprintf(os.Stderr, "  inbox: %s (inbound files land here)\n", inboxDir)
 	}
 
-	cl, err := discovery.NewClient(discovery.ClientConfig{
+	cl, err := discovery.NewClient(withDiscoveryClientTransport(discovery.ClientConfig{
 		Addrs:      inv.DiscoveryAddrs,
 		Device:     dev,
 		AccountID:  inv.AccountID,
 		AccountPub: []byte(inv.AccountPub),
 		Endpoints:  announced,
 		Logger:     setupLogging(false),
-	})
+	}))
 	if err != nil {
 		return ExitError{Code: 1, Err: err}
 	}
@@ -565,6 +588,13 @@ func runJoin(args []string) error {
 	}
 }
 
+// serveDiscoveryGrace bounds the drain after SIGINT/SIGTERM: the HTTP
+// listener closes immediately, and member streams plus pairing rooms get
+// this long to unwind before the stop gives up on them. The bound keeps a
+// wedged peer from hanging the process stop forever; anything still open at
+// exit dies with the process anyway.
+const serveDiscoveryGrace = 10 * time.Second
+
 // runServeDiscovery implements `cmesh serve-discovery`: the pairing relay and
 // the mesh discovery node in one process. The first machine to do this
 // bootstraps an empty member list containing itself (O-6).
@@ -641,6 +671,16 @@ func runServeDiscovery(args []string) error {
 	}
 
 	relay.SetVersion(Version)
+
+	// Graceful stop: SIGINT (Ctrl-C) and SIGTERM (systemd stop) must end in
+	// a controlled drain — HTTP listener closed, member streams and pairing
+	// rooms unwound, UDP direct-link socket released — and exit 0, so a
+	// systemd restart finds the port free instead of failed-unit residue.
+	// The registration happens BEFORE the listening banner prints: a test or
+	// operator script can treat that banner as the safe-to-signal point.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	scheme := "ws"
 	httpScheme := "http"
 	if *tlsCert != "" {
@@ -681,9 +721,28 @@ func runServeDiscovery(args []string) error {
 	}
 	srv.EnableDiscovery(members)
 
+	// The stop watcher needs the server handle, so it starts here — but the
+	// signal registration above already ran, so a signal that arrived in the
+	// meantime is not lost: ctx is already done, Shutdown arms the flag
+	// ListenAndServe consults when the signal beat the bind, and the process
+	// still exits 0 instead of serving a server nobody can stop.
+	go func() {
+		<-ctx.Done()
+		// Restore default signal handling first: a second SIGTERM while the
+		// drain wedges must kill the process instead of being swallowed by
+		// the very registration this drain waits on.
+		stop()
+		sctx, cancel := context.WithTimeout(context.Background(), serveDiscoveryGrace)
+		defer cancel()
+		if err := srv.Shutdown(sctx); err != nil {
+			fmt.Fprintf(os.Stderr, "serve-discovery: shutdown: %v\n", err)
+		}
+	}()
+
 	// Approval flow: certificates dropped into <state>/certs/ are adopted
 	// automatically, and external edits of members.json are reloaded. One
-	// goroutine owns the live list; see watchApprovals.
+	// goroutine owns the live list; see watchApprovals. It stops with the
+	// same signal context as everything else.
 	certsDir := filepath.Join(dir, "certs")
 	if err := os.MkdirAll(certsDir, 0o700); err != nil {
 		return ExitError{Code: 1, Err: err}
@@ -696,7 +755,7 @@ func runServeDiscovery(args []string) error {
 	// credential. It needs the account key to verify one, so without
 	// --account-pub the endpoint is not installed at all.
 	installEnrollHandler(srv, *membersPath, members, accountPubKey)
-	go watchApprovals(context.Background(), *membersPath, certsDir, members, srv, accountPubKey)
+	go watchApprovals(ctx, *membersPath, certsDir, members, srv, accountPubKey)
 
 	// D-6: announce ourselves so the node is visible (and dialable) in the
 	// member view instead of showing offline forever. The announced address
@@ -778,12 +837,15 @@ func runServeDiscovery(args []string) error {
 		// listener is bound and accepting) — the loop retries at heartbeat
 		// cadence after that, so a transient register failure just waits
 		// for the next tick rather than reading like a fault.
-		go selfAnnounceLoop(context.Background(), selfURL, selfEPS, dev, srv.Ready())
+		go selfAnnounceLoop(ctx, selfURL, selfEPS, dev, srv.Ready())
 	} else if *announce == "" {
 		fmt.Fprintf(os.Stderr, "note: --addr is a wildcard and no --announce given: this node will show as offline\n")
 		fmt.Fprintf(os.Stderr, "  in member views; pass --announce <members-facing-address>:port to make it visible\n")
 	}
 
+	// Blocks until a real error or a graceful stop (Shutdown returns nil
+	// from ListenAndServe) — nil here is what makes the process exit 0 after
+	// SIGTERM/SIGINT instead of landing in systemd's failed state.
 	if err := srv.ListenAndServe(); err != nil {
 		return ExitError{Code: 1, Err: fmt.Errorf("serve-discovery: %w", err)}
 	}

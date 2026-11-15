@@ -42,7 +42,7 @@ func TestEmptyAnnounceKeepsEndpoints(t *testing.T) {
 	_, dev, members, node := d7Fixture(t)
 	now := time.Now()
 
-	if changed := node.Register(MemberAnnounce{DeviceID: dev.ID(), Endpoints: []string{"10.0.0.5:7000"}, Timestamp: now}, now); !changed {
+	if changed := node.Register(MemberAnnounce{DeviceID: dev.ID(), Endpoints: []string{"8.8.8.5:7000"}, Timestamp: now}, now); !changed {
 		t.Fatal("first endpoints announce must count as changed")
 	}
 
@@ -50,7 +50,7 @@ func TestEmptyAnnounceKeepsEndpoints(t *testing.T) {
 	if changed := node.Register(MemberAnnounce{DeviceID: dev.ID(), Timestamp: now.Add(time.Second)}, now.Add(time.Second)); changed {
 		t.Fatal("empty announce must not signal an endpoint change")
 	}
-	if got := node.Endpoints(dev.ID()); len(got) != 1 || got[0] != "10.0.0.5:7000" {
+	if got := node.Endpoints(dev.ID()); len(got) != 1 || got[0] != "8.8.8.5:7000" {
 		t.Fatalf("empty announce wiped endpoints: %v", got)
 	}
 
@@ -60,10 +60,10 @@ func TestEmptyAnnounceKeepsEndpoints(t *testing.T) {
 	}
 
 	// A real endpoint update still applies.
-	if changed := node.Register(MemberAnnounce{DeviceID: dev.ID(), Endpoints: []string{"10.0.0.6:7000"}, Timestamp: now.Add(2 * time.Second)}, now.Add(2*time.Second)); !changed {
+	if changed := node.Register(MemberAnnounce{DeviceID: dev.ID(), Endpoints: []string{"8.8.8.6:7000"}, Timestamp: now.Add(2 * time.Second)}, now.Add(2*time.Second)); !changed {
 		t.Fatal("endpoint change must count as changed")
 	}
-	if got := node.Endpoints(dev.ID()); len(got) != 1 || got[0] != "10.0.0.6:7000" {
+	if got := node.Endpoints(dev.ID()); len(got) != 1 || got[0] != "8.8.8.6:7000" {
 		t.Fatalf("endpoint update lost: %v", got)
 	}
 }
@@ -75,7 +75,7 @@ func TestDetachStreamKeepsEndpoints(t *testing.T) {
 	_, dev, members, node := d7Fixture(t)
 	now := time.Now()
 
-	node.Register(MemberAnnounce{DeviceID: dev.ID(), Endpoints: []string{"10.0.0.5:7000"}, Timestamp: now}, now)
+	node.Register(MemberAnnounce{DeviceID: dev.ID(), Endpoints: []string{"8.8.8.5:7000"}, Timestamp: now}, now)
 	node.AttachStream(dev.ID())
 	node.DetachStream(dev.ID())
 
@@ -83,7 +83,7 @@ func TestDetachStreamKeepsEndpoints(t *testing.T) {
 		t.Fatal("detach must expire reachability")
 	}
 	snap := BuildSnapshot(members, node, now.Add(time.Second))
-	if got := snap.Members[dev.ID()].Endpoints; len(got) != 1 || got[0] != "10.0.0.5:7000" {
+	if got := snap.Members[dev.ID()].Endpoints; len(got) != 1 || got[0] != "8.8.8.5:7000" {
 		t.Fatalf("detach must keep announced endpoints for dial-through: %v", got)
 	}
 }
@@ -120,7 +120,7 @@ func TestRegisterPushesOfflineToOnlineTransition(t *testing.T) {
 	defer unsub()
 
 	now := time.Now()
-	ep := []string{"10.0.0.5:7000"}
+	ep := []string{"8.8.8.5:7000"}
 	node.Register(MemberAnnounce{DeviceID: dev.ID(), Endpoints: ep, Timestamp: now}, now)
 	drainSignal(t, ch, "first announce (endpoints appear)")
 

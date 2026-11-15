@@ -277,13 +277,15 @@ func TestCCObservedInRealTransfer(t *testing.T) {
 	a, b := pair(t, DefaultConfig(), 0.20)
 
 	msg := pad('C', 200)
+	sendErr := make(chan error, 1)
 	go func() {
-		if err := a.Send(msg); err != nil {
-			t.Logf("send: %v", err)
-		}
+		sendErr <- a.Send(msg)
 	}()
 	if _, err := b.Recv(); err != nil {
 		t.Fatalf("recv: %v", err)
+	}
+	if err := <-sendErr; err != nil {
+		t.Fatalf("send: %v", err)
 	}
 
 	// The window is reported live; by the time the message is delivered the

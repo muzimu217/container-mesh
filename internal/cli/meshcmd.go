@@ -93,14 +93,14 @@ func openMeshSessionWithSnapshotTimeout(ctx context.Context, state, passFlag str
 	if len(known) == 0 {
 		known = append([]string(nil), cfg.Endpoints...)
 	}
-	cl, err := discovery.NewClient(discovery.ClientConfig{
+	cl, err := discovery.NewClient(withDiscoveryClientTransport(discovery.ClientConfig{
 		Addrs:      inv.DiscoveryAddrs,
 		Device:     dev,
 		AccountID:  inv.AccountID,
 		AccountPub: []byte(inv.AccountPub),
 		Endpoints:  known,
 		NoAnnounce: len(known) == 0,
-	})
+	}))
 	if err != nil {
 		return nil, err
 	}
@@ -356,7 +356,7 @@ func runMeshPing(args []string) error {
 	pass := fs.String("device-passphrase", "", "passphrase for the device file (for scripting)")
 	count := fs.Int("count", 10, "pings to send (1-1000)")
 	interval := fs.Duration("interval", 200*time.Millisecond, "delay between pings (minimum 100ms)")
-	timeout := fs.Duration("timeout", 20*time.Second, "overall budget including discovery")
+	timeout := fs.Duration("timeout", 0, "overall budget; default covers discovery plus all samples")
 	if err := fs.Parse(args); err != nil {
 		return ExitError{Code: 2, Err: err}
 	}
@@ -369,6 +369,14 @@ func runMeshPing(args []string) error {
 	}
 	if *interval < 100*time.Millisecond {
 		return ExitError{Code: 2, Err: errors.New("mesh ping --interval must be at least 100ms")}
+	}
+	if *timeout <= 0 {
+		// Discovery has its own 15s startup budget. The sampling window must
+		// also fit: count=1000 at the minimum 100ms interval is 99.9s before
+		// the one-second per-reply timeout margin. A fixed 20s default made
+		// the advertised max count stop at roughly 196 packets (oh-no-agent,
+		// c530c7d/1f64cdc retest).
+		*timeout = 15*time.Second + time.Duration(*count-1)*(*interval) + time.Duration(*count)*time.Second
 	}
 	target := identity.DeviceID(fs.Arg(0))
 	if !target.Valid() {

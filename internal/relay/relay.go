@@ -155,6 +155,25 @@ type Server struct {
 
 	limiter *ipLimiter
 
+	// Lifecycle of the HTTP serving stack. srvMu guards the three fields
+	// below. httpSrv is whatever HTTP server the relay is serving on —
+	// registered by HTTPServer(), which ListenAndServe also calls — so
+	// Shutdown reaches the listener whether the caller started the relay
+	// through ListenAndServe or serves the HTTPServer() handle itself (as
+	// tests do).
+	srvMu       sync.Mutex
+	httpSrv     *http.Server
+	shutdownReq bool
+	// maintStop stops the StartMaintenance loop; nil while it is not running.
+	maintStop chan struct{}
+	// live tracks every upgraded pairing WebSocket so Shutdown can close it.
+	// http.Server.Shutdown never sees hijacked sockets, so without this
+	// registry a graceful stop would close the listener yet leave every
+	// parked or paired room socket open until the process exits.
+	// Members-stream sockets are already tracked per device in s.streams
+	// (mesh.go) and closed through the same Shutdown path. Guarded by s.mu.
+	live map[*wsconn.Conn]struct{}
+
 	// Stats. These are counters rather than derived values because the room
 	// map is not a census of activity: an entry is deleted the moment two
 	// peers pair, so len(rooms) counts peers still waiting, not sessions
@@ -260,6 +279,7 @@ func New(cfg Config) *Server {
 		startedAt:      time.Now(),
 		ready:          make(chan struct{}),
 		streams:        make(map[identity.DeviceID]map[*wsconn.Conn]struct{}),
+		live:           make(map[*wsconn.Conn]struct{}),
 	}
 }
 
@@ -303,23 +323,40 @@ func (s *Server) Handler() http.Handler {
 }
 
 // HTTPServer builds an *http.Server so tests can start it on a random port.
+// The built server is also recorded on the relay, so Shutdown stops it no
+// matter whether serving started via ListenAndServe or via this handle.
 func (s *Server) HTTPServer() *http.Server {
-	return &http.Server{
+	hs := &http.Server{
 		Addr:              s.cfg.Addr,
 		Handler:           s.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
+	s.srvMu.Lock()
+	s.httpSrv = hs
+	s.srvMu.Unlock()
+	return hs
 }
 
-// ListenAndServe runs the relay until the process exits.
+// ListenAndServe runs the relay until the process exits or Shutdown is
+// called. When TLSCert and TLSKey are configured it serves WSS directly, so
+// a client can use wss://host/ws with no reverse proxy in between.
 //
-// When TLSCert and TLSKey are configured it serves WSS directly, so a client
-// can use wss://host/ws with no reverse proxy in between.
+// A graceful stop makes it return nil rather than http.ErrServerClosed, so a
+// signal-driven caller exits 0 without special-casing the error.
 func (s *Server) ListenAndServe() error {
 	s.StartMaintenance()
 	ln, err := net.Listen("tcp", s.cfg.Addr)
 	if err != nil {
 		return err
+	}
+	// Register the HTTP server before the shutdown check so a signal racing
+	// this window is still able to stop the listener below.
+	hs := s.HTTPServer()
+	if s.isShutdown() {
+		// A stop arrived before (or while) the socket bound: end cleanly
+		// instead of serving a server whose stop signal is already spent.
+		_ = ln.Close()
+		return nil
 	}
 	// The socket is bound and accepting: announce-goroutines gated on
 	// Ready() may start firing (the first self-announce used to race this
@@ -327,13 +364,121 @@ func (s *Server) ListenAndServe() error {
 	// clean start — netns-probe rounds 10/11 measured 6%→86% refusal rates
 	// across two commits for exactly this race).
 	s.markReady()
-	hs := s.HTTPServer()
 	if s.cfg.TLSCert != "" && s.cfg.TLSKey != "" {
 		s.log.Info("relay listening (TLS)", "addr", s.cfg.Addr, "path", s.cfg.Path)
-		return hs.ServeTLS(ln, s.cfg.TLSCert, s.cfg.TLSKey)
+		err = hs.ServeTLS(ln, s.cfg.TLSCert, s.cfg.TLSKey)
+	} else {
+		s.log.Info("relay listening", "addr", s.cfg.Addr, "path", s.cfg.Path)
+		err = hs.Serve(ln)
 	}
-	s.log.Info("relay listening", "addr", s.cfg.Addr, "path", s.cfg.Path)
-	return hs.Serve(ln)
+	if errors.Is(err, http.ErrServerClosed) {
+		return nil
+	}
+	return err
+}
+
+// isShutdown reports whether Shutdown has been called on this relay.
+func (s *Server) isShutdown() bool {
+	s.srvMu.Lock()
+	defer s.srvMu.Unlock()
+	return s.shutdownReq
+}
+
+// Shutdown gracefully stops the relay.
+//
+// It closes the HTTP listener, waits for plain HTTP handlers to finish
+// (bounded by ctx), then closes every upgraded WebSocket — pairing rooms and
+// members streams alike — because net/http never sees hijacked sockets and
+// would otherwise leave them open past the stop. It returns once the client
+// sockets have actually dropped (still bounded by ctx), so the port can be
+// rebound immediately afterwards and a restarting process finds it free.
+//
+// Calling Shutdown on a relay that never served is a no-op returning nil —
+// but it still arms the shutdown flag, so a ListenAndServe racing a very
+// early signal stops instead of serving a server nobody can stop.
+func (s *Server) Shutdown(ctx context.Context) error {
+	s.srvMu.Lock()
+	s.shutdownReq = true
+	hs := s.httpSrv
+	if s.maintStop != nil {
+		close(s.maintStop)
+		s.maintStop = nil
+	}
+	s.srvMu.Unlock()
+
+	// Stop the discovery sweep loop. Idempotent (StopDiscovery nils its
+	// channel after closing) and a no-op when discovery was never enabled.
+	s.StopDiscovery()
+
+	if hs == nil {
+		return nil
+	}
+	err := hs.Shutdown(ctx)
+
+	// Close what net/http cannot see: every hijacked socket. Pairing conns
+	// are in the s.live registry, members streams in s.streams. Closing each
+	// one makes its handler unwind through its Closed() channel — parked
+	// peers free their rooms, splices tear down, snapshot pushes stop.
+	s.closeHijacked()
+	s.waitConnsGone(ctx)
+	return err
+}
+
+// trackConn registers an upgraded pairing WebSocket in the shutdown
+// registry. The entry is dropped when the socket is gone, which also lets
+// Shutdown wait for live sockets to actually disappear.
+func (s *Server) trackConn(c *wsconn.Conn) {
+	s.mu.Lock()
+	s.live[c] = struct{}{}
+	s.mu.Unlock()
+	go func() {
+		<-c.Closed()
+		s.mu.Lock()
+		delete(s.live, c)
+		s.mu.Unlock()
+	}()
+}
+
+// closeHijacked closes every tracked client socket: the pairing registry
+// plus all members streams (whatever device they belong to).
+func (s *Server) closeHijacked() {
+	s.mu.Lock()
+	conns := make([]*wsconn.Conn, 0, len(s.live))
+	for c := range s.live {
+		conns = append(conns, c)
+	}
+	for _, m := range s.streams {
+		for c := range m {
+			conns = append(conns, c)
+		}
+	}
+	s.mu.Unlock()
+	for _, c := range conns {
+		_ = c.Close()
+	}
+}
+
+// waitConnsGone returns once every tracked socket has dropped (its handler
+// removed it), or when ctx expires.
+func (s *Server) waitConnsGone(ctx context.Context) {
+	t := time.NewTicker(2 * time.Millisecond)
+	defer t.Stop()
+	for {
+		s.mu.Lock()
+		n := len(s.live)
+		for _, m := range s.streams {
+			n += len(m)
+		}
+		s.mu.Unlock()
+		if n == 0 || ctx.Err() != nil {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
 }
 
 // markReady closes the readiness signal exactly once (called from
@@ -352,7 +497,20 @@ func (s *Server) Ready() <-chan struct{} { return s.ready }
 // client address seen and never shrinks, which a remote client can drive by
 // opening connections from many addresses (or, before the trusted-proxy fix,
 // by forging a new address per request).
+//
+// It is idempotent — a second call while the loop runs spawns nothing — and
+// Shutdown stops the loop.
 func (s *Server) StartMaintenance() {
+	s.srvMu.Lock()
+	if s.maintStop != nil || s.shutdownReq {
+		// Already running, or the relay has been told to stop: another loop
+		// would only leak a ticker past Shutdown.
+		s.srvMu.Unlock()
+		return
+	}
+	stop := make(chan struct{})
+	s.maintStop = stop
+	s.srvMu.Unlock()
 	interval := s.cfg.LimiterSweepInterval
 	if interval <= 0 {
 		interval = time.Minute
@@ -360,11 +518,16 @@ func (s *Server) StartMaintenance() {
 	go func() {
 		t := time.NewTicker(interval)
 		defer t.Stop()
-		for range t.C {
-			// Keep entries for a few intervals so an active client is never
-			// forgotten mid-burst.
-			s.limiter.sweep(4 * interval)
-			s.sweepContested()
+		for {
+			select {
+			case <-t.C:
+				// Keep entries for a few intervals so an active client is never
+				// forgotten mid-burst.
+				s.limiter.sweep(4 * interval)
+				s.sweepContested()
+			case <-stop:
+				return
+			}
 		}
 	}()
 }
@@ -422,6 +585,9 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		s.log.Warn("upgrade failed", "err", err)
 		return
 	}
+	// The socket is hijacked: track it so Shutdown can close it (net/http
+	// never sees hijacked connections again).
+	s.trackConn(c)
 	c.EnableLiveness(s.liveness())
 
 	partner, self, err := s.join(r.Context(), roomID, role, c)

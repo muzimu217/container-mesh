@@ -99,7 +99,7 @@ func clientForAccount(t *testing.T, acc *identity.Account) *Client {
 		t.Fatal(err)
 	}
 	cl, err := NewClient(ClientConfig{
-		Addrs:      []string{"127.0.0.1:1"},
+		Addrs:      []string{"8.8.8.8:1"},
 		Device:     dev,
 		AccountID:  acc.ID(),
 		AccountPub: []byte(acc.PublicKey()),

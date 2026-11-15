@@ -12,8 +12,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -25,6 +27,67 @@ import (
 	"github.com/muzimu217/container-mesh/internal/relay"
 	"github.com/muzimu217/container-mesh/internal/wsconn"
 )
+
+func testDiscoveryURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		panic(err)
+	}
+	u.Host = net.JoinHostPort("mesh.example", u.Port())
+	return u.String()
+}
+
+type testTransport struct {
+	base http.RoundTripper
+}
+
+func (t testTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	u := *r.URL
+	if u.Hostname() == "mesh.example" {
+		u.Host = net.JoinHostPort("127.0.0.1", u.Port())
+	}
+	request := r.Clone(r.Context())
+	request.URL = &u
+	request.Host = u.Host
+	return t.base.RoundTrip(request)
+}
+
+func testHTTPClient() *http.Client {
+	return &http.Client{Transport: testTransport{base: http.DefaultTransport}}
+}
+
+func testWebSocketDial(ctx context.Context, opts wsconn.DialOptions) (*wsconn.Conn, error) {
+	u, err := url.Parse(opts.URL)
+	if err != nil {
+		return nil, err
+	}
+	if u.Hostname() == "mesh.example" {
+		u.Host = net.JoinHostPort("127.0.0.1", u.Port())
+	}
+	u.Scheme = "ws"
+	opts.URL = u.String()
+	return wsconn.Dial(ctx, opts)
+}
+
+func testClientConfig(cfg discovery.ClientConfig) discovery.ClientConfig {
+	transport := http.RoundTripper(http.DefaultTransport)
+	if cfg.HTTPClient != nil && cfg.HTTPClient.Transport != nil {
+		transport = cfg.HTTPClient.Transport
+	}
+	client := &http.Client{Transport: testTransport{base: transport}}
+	if cfg.HTTPClient != nil {
+		copy := *cfg.HTTPClient
+		copy.Transport = client.Transport
+		client = &copy
+	}
+	cfg.HTTPClient = client
+	cfg.WebSocketDial = testWebSocketDial
+	return cfg
+}
+
+func newTestClient(cfg discovery.ClientConfig) (*discovery.Client, error) {
+	return discovery.NewClient(testClientConfig(cfg))
+}
 
 type meshStack struct {
 	acc     *identity.Account
@@ -65,8 +128,8 @@ func newStack(t *testing.T, n int) *meshStack {
 
 func (s *meshStack) clientFor(t *testing.T, i int, eps []string) *discovery.Client {
 	t.Helper()
-	cl, err := discovery.NewClient(discovery.ClientConfig{
-		Addrs:      []string{s.ts.URL},
+	cl, err := newTestClient(discovery.ClientConfig{
+		Addrs:      []string{testDiscoveryURL(s.ts.URL)},
 		Device:     s.devices[i],
 		AccountID:  s.acc.ID(),
 		AccountPub: []byte(s.acc.PublicKey()),
@@ -154,7 +217,7 @@ func TestClientReconnectBackoffResetsAfterHealthyStream(t *testing.T) {
 
 func TestClientAnnouncesAndSeesItselfOnline(t *testing.T) {
 	s := newStack(t, 1)
-	cl := s.clientFor(t, 0, []string{"203.0.113.5:7000"})
+	cl := s.clientFor(t, 0, []string{"8.8.8.5:7000"})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -201,8 +264,8 @@ func TestClientRejectsForgedSnapshot(t *testing.T) {
 	fake := fakeMembersServer(t, acc.ID(), push)
 	defer fake.Close()
 
-	cl, err := discovery.NewClient(discovery.ClientConfig{
-		Addrs:      []string{fake.URL},
+	cl, err := newTestClient(discovery.ClientConfig{
+		Addrs:      []string{testDiscoveryURL(fake.URL)},
 		Device:     victim,
 		AccountID:  acc.ID(),
 		AccountPub: []byte(acc.PublicKey()),
@@ -288,8 +351,8 @@ func TestClientKeepsGoodMembersAmongForged(t *testing.T) {
 	fake := fakeMembersServer(t, acc.ID(), push)
 	defer fake.Close()
 
-	cl, _ := discovery.NewClient(discovery.ClientConfig{
-		Addrs:      []string{fake.URL},
+	cl, _ := newTestClient(discovery.ClientConfig{
+		Addrs:      []string{testDiscoveryURL(fake.URL)},
 		Device:     victim,
 		AccountID:  acc.ID(),
 		AccountPub: []byte(acc.PublicKey()),
@@ -303,7 +366,7 @@ func TestClientKeepsGoodMembersAmongForged(t *testing.T) {
 		Version:   1,
 		Members: map[identity.DeviceID]discovery.MemberView{
 			forgerDev.ID(): {Cert: *forgerCert, Online: true, Endpoints: []string{"6.6.6.6:6666"}},
-			honestDev.ID(): {Cert: *honestCert, Online: true, Endpoints: []string{"203.0.113.7:7000"}},
+			honestDev.ID(): {Cert: *honestCert, Online: true, Endpoints: []string{"8.8.8.7:7000"}},
 		},
 	}
 	waitFor(t, 3*time.Second, "mixed snapshot applied", func() bool {
@@ -327,8 +390,8 @@ func TestAnnounceSanitizesErrorBody(t *testing.T) {
 
 	dev, _ := identity.Generate()
 	acc, _ := identity.GenerateAccount()
-	cl, err := discovery.NewClient(discovery.ClientConfig{
-		Addrs:      []string{srv.URL},
+	cl, err := newTestClient(discovery.ClientConfig{
+		Addrs:      []string{testDiscoveryURL(srv.URL)},
 		Device:     dev,
 		AccountID:  acc.ID(),
 		AccountPub: []byte(acc.PublicKey()),
@@ -366,8 +429,8 @@ func TestClientIgnoresVersionRegression(t *testing.T) {
 	fake := fakeMembersServer(t, acc.ID(), push)
 	defer fake.Close()
 
-	cl, _ := discovery.NewClient(discovery.ClientConfig{
-		Addrs:      []string{fake.URL},
+	cl, _ := newTestClient(discovery.ClientConfig{
+		Addrs:      []string{testDiscoveryURL(fake.URL)},
 		Device:     victim,
 		AccountID:  acc.ID(),
 		AccountPub: []byte(acc.PublicKey()),
@@ -410,8 +473,8 @@ func TestClientRejectsWrongAccountSnapshot(t *testing.T) {
 
 	// A node that answers for a DIFFERENT account: the client's account
 	// binding (from its invite) must reject the view outright.
-	cl, err := discovery.NewClient(discovery.ClientConfig{
-		Addrs:      []string{s.ts.URL},
+	cl, err := newTestClient(discovery.ClientConfig{
+		Addrs:      []string{testDiscoveryURL(s.ts.URL)},
 		Device:     s.devices[0],
 		AccountID:  otherAcc.ID(), // claim a different account than the node serves
 		AccountPub: []byte(otherAcc.PublicKey()),
@@ -442,8 +505,8 @@ func TestClientAnnounceSurfacesNotMemberReason(t *testing.T) {
 	}
 	_ = cert // issued but never added: pending approval
 
-	cl, err := discovery.NewClient(discovery.ClientConfig{
-		Addrs:      []string{s.ts.URL},
+	cl, err := newTestClient(discovery.ClientConfig{
+		Addrs:      []string{testDiscoveryURL(s.ts.URL)},
 		Device:     stranger,
 		AccountID:  s.acc.ID(),
 		AccountPub: []byte(s.acc.PublicKey()),
@@ -463,17 +526,17 @@ func TestClientAnnounceSurfacesNotMemberReason(t *testing.T) {
 func TestClientFailsOverAcrossAddresses(t *testing.T) {
 	s := newStack(t, 1)
 	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { http.NotFound(w, r) }))
-	deadURL := dead.URL
+	deadURL := testDiscoveryURL(dead.URL)
 	dead.Close() // port now refused
 
-	cl, err := discovery.NewClient(discovery.ClientConfig{
+	cl, err := newTestClient(discovery.ClientConfig{
 		// Dead first, live second: both announce and stream must land on the
 		// second without the caller caring.
-		Addrs:      []string{deadURL, s.ts.URL},
+		Addrs:      []string{deadURL, testDiscoveryURL(s.ts.URL)},
 		Device:     s.devices[0],
 		AccountID:  s.acc.ID(),
 		AccountPub: []byte(s.acc.PublicKey()),
-		Endpoints:  []string{"203.0.113.5:7000"},
+		Endpoints:  []string{"8.8.8.5:7000"},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -496,7 +559,7 @@ func TestThreeNodesMutualVisibility(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	for i := range clients {
-		clients[i] = s.clientFor(t, i, []string{fmt.Sprintf("203.0.113.%d:7000", i+1)})
+		clients[i] = s.clientFor(t, i, []string{fmt.Sprintf("8.8.8.%d:7000", i+1)})
 		go func(cl *discovery.Client) { _ = cl.Run(ctx) }(clients[i])
 	}
 
@@ -532,12 +595,12 @@ func TestUnapprovedDeviceStaysInvisible(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	scl, err := discovery.NewClient(discovery.ClientConfig{
-		Addrs:      []string{s.ts.URL},
+	scl, err := newTestClient(discovery.ClientConfig{
+		Addrs:      []string{testDiscoveryURL(s.ts.URL)},
 		Device:     stranger,
 		AccountID:  s.acc.ID(),
 		AccountPub: []byte(s.acc.PublicKey()),
-		Endpoints:  []string{"203.0.113.200:7000"},
+		Endpoints:  []string{"8.8.8.200:7000"},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -603,7 +666,7 @@ func TestFirstAnnounceRejectionArmsFastApprovalPoll(t *testing.T) {
 	s := newStack(t, 1)
 
 	// Observer: approved member, stream up before the joiner exists.
-	obsCl := s.clientFor(t, 0, []string{"203.0.113.5:7000"})
+	obsCl := s.clientFor(t, 0, []string{"8.8.8.5:7000"})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go func() { _ = obsCl.Run(ctx) }()
@@ -618,12 +681,12 @@ func TestFirstAnnounceRejectionArmsFastApprovalPoll(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	joinCl, err := discovery.NewClient(discovery.ClientConfig{
-		Addrs:      []string{s.ts.URL},
+	joinCl, err := newTestClient(discovery.ClientConfig{
+		Addrs:      []string{testDiscoveryURL(s.ts.URL)},
 		Device:     stranger,
 		AccountID:  s.acc.ID(),
 		AccountPub: []byte(s.acc.PublicKey()),
-		Endpoints:  []string{"203.0.113.201:7000"},
+		Endpoints:  []string{"8.8.8.201:7000"},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -687,12 +750,12 @@ func TestTransportFailureStillPollsFastBeforeJoin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cl, err := discovery.NewClient(discovery.ClientConfig{
-		Addrs:      []string{srv.URL},
+	cl, err := newTestClient(discovery.ClientConfig{
+		Addrs:      []string{testDiscoveryURL(srv.URL)},
 		Device:     stranger,
 		AccountID:  acc.ID(),
 		AccountPub: []byte(acc.PublicKey()),
-		Endpoints:  []string{"203.0.113.202:7000"},
+		Endpoints:  []string{"8.8.8.202:7000"},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -747,12 +810,12 @@ func TestJoinedAnnounceFailuresKeepHeartbeat(t *testing.T) {
 		return http.DefaultTransport.RoundTrip(r)
 	})}
 
-	cl, err := discovery.NewClient(discovery.ClientConfig{
-		Addrs:      []string{s.ts.URL},
+	cl, err := newTestClient(discovery.ClientConfig{
+		Addrs:      []string{testDiscoveryURL(s.ts.URL)},
 		Device:     s.devices[0],
 		AccountID:  s.acc.ID(),
 		AccountPub: []byte(s.acc.PublicKey()),
-		Endpoints:  []string{"203.0.113.5:7000"},
+		Endpoints:  []string{"8.8.8.5:7000"},
 		Heartbeat:  5 * time.Second,
 		HTTPClient: hc,
 	})
@@ -816,12 +879,12 @@ func TestRateLimitedAnnounceBacksOffBeforeJoin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cl, err := discovery.NewClient(discovery.ClientConfig{
-		Addrs:      []string{srv.URL},
+	cl, err := newTestClient(discovery.ClientConfig{
+		Addrs:      []string{testDiscoveryURL(srv.URL)},
 		Device:     stranger,
 		AccountID:  acc.ID(),
 		AccountPub: []byte(acc.PublicKey()),
-		Endpoints:  []string{"203.0.113.203:7000"},
+		Endpoints:  []string{"8.8.8.203:7000"},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -890,12 +953,12 @@ func TestAnnounceSuccessKicksStreamOutOfBackoff(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cl, err := discovery.NewClient(discovery.ClientConfig{
-		Addrs:      []string{srv.URL},
+	cl, err := newTestClient(discovery.ClientConfig{
+		Addrs:      []string{testDiscoveryURL(srv.URL)},
 		Device:     joiner,
 		AccountID:  acc.ID(),
 		AccountPub: []byte(acc.PublicKey()),
-		Endpoints:  []string{"203.0.113.203:7000"},
+		Endpoints:  []string{"8.8.8.203:7000"},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -967,7 +1030,7 @@ func recoveryMembersServer(t *testing.T, snap discovery.MemberSnapshot, register
 		for conn := range live {
 			conn.Close()
 		}
-	}, srv.URL
+	}, testDiscoveryURL(srv.URL)
 }
 
 // TestStreamRecoveryFiresImmediateAnnounce pins R40-1 (recovery visibility):
@@ -995,19 +1058,19 @@ func TestStreamRecoveryFiresImmediateAnnounce(t *testing.T) {
 		AccountID: acc.ID(),
 		Version:   1,
 		Members: map[identity.DeviceID]discovery.MemberView{
-			self.ID(): {Cert: *cert, Online: true, Endpoints: []string{"203.0.113.204:7000"}},
+			self.ID(): {Cert: *cert, Online: true, Endpoints: []string{"8.8.8.204:7000"}},
 		},
 	}
 
 	var registers int64
 	kill, url := recoveryMembersServer(t, snap, &registers)
 
-	cl, err := discovery.NewClient(discovery.ClientConfig{
+	cl, err := newTestClient(discovery.ClientConfig{
 		Addrs:      []string{url},
 		Device:     self,
 		AccountID:  acc.ID(),
 		AccountPub: []byte(acc.PublicKey()),
-		Endpoints:  []string{"203.0.113.204:7000"},
+		Endpoints:  []string{"8.8.8.204:7000"},
 		// One heartbeat per minute: within this test's window the ticker
 		// CANNOT be what produces the second announce — only the recovery
 		// signal can.
@@ -1023,15 +1086,14 @@ func TestStreamRecoveryFiresImmediateAnnounce(t *testing.T) {
 	waitFor(t, 5*time.Second, "first announce", func() bool { return atomic.LoadInt64(&registers) >= 1 })
 	waitFor(t, 5*time.Second, "stream healthy", func() bool { return cl.Snapshot() != nil })
 
-	// The pre-join fast poll leaves one stale ~3 s tick armed from before
-	// the snapshot flipped us to joined — drain it BEFORE the kill, so the
-	// only announce that can follow the gap is the recovery signal (the
-	// 60 s ticker cannot fire inside a 6 s window). Otherwise the stale
-	// tick masquerades as the recovery announce and the test stays green
-	// unfixed.
-	waitFor(t, 6*time.Second, "pre-join fast tick drained", func() bool {
-		return atomic.LoadInt64(&registers) >= 2
+	waitFor(t, 5*time.Second, "client joined", func() bool {
+		return cl.Joined()
 	})
+	// Record the state after the membership transition. The next register is
+	// the recovery announce; waiting for a second pre-join register here was a
+	// scheduling assertion and made the test flaky once the client joined
+	// before the fast retry ticker fired (kuku-sandbox-01, round 52).
+	beforeKill := atomic.LoadInt64(&registers)
 	time.Sleep(300 * time.Millisecond)
 
 	kill() // stream gap; the server itself stays up
@@ -1039,9 +1101,9 @@ func TestStreamRecoveryFiresImmediateAnnounce(t *testing.T) {
 	// The reconnect (initial backoff ~1 s) verifies a snapshot on its
 	// connection, which must announce out of band — not at the 60 s ticker.
 	waitFor(t, 6*time.Second, "recovery announce fired", func() bool {
-		return atomic.LoadInt64(&registers) >= 3
+		return atomic.LoadInt64(&registers) > beforeKill
 	})
-	if n := atomic.LoadInt64(&registers); n > 4 {
-		t.Fatalf("recovery fired %d announces; want one out-of-band announce, not a storm", n)
+	if n := atomic.LoadInt64(&registers); n > beforeKill+1 {
+		t.Fatalf("recovery fired %d announces after a baseline of %d; want one out-of-band announce, not a storm", n-beforeKill, beforeKill)
 	}
 }

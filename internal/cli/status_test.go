@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/muzimu217/container-mesh/internal/discovery"
 	"github.com/muzimu217/container-mesh/internal/identity"
 )
 
@@ -48,6 +49,39 @@ func TestStatusReportJSONOmitsNeverSeenTimestamp(t *testing.T) {
 	}
 	if strings.Contains(string(blob), "last_seen") {
 		t.Fatalf("status JSON invented a last_seen value: %s", blob)
+	}
+}
+
+func TestStatusProbeMemberJSONCarriesOptionalError(t *testing.T) {
+	report := statusReport{
+		Members: []statusMember{{
+			DeviceID:     identity.DeviceID("member123456789"),
+			Online:       true,
+			Reachability: reachabilityDegraded,
+			ProbeError:   "mesh: no reachable endpoint",
+		}},
+	}
+	blob, err := json.Marshal(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(blob)
+	if !strings.Contains(text, `"reachability":"degraded"`) || !strings.Contains(text, `"probe_error":"mesh: no reachable endpoint"`) {
+		t.Fatalf("probe result missing from status JSON: %s", text)
+	}
+}
+
+func TestStatusWithoutProbeRemainsUnknown(t *testing.T) {
+	if got := statusReachability(discovery.MemberView{}); got != reachabilityUnknown {
+		t.Fatalf("status reachability = %q, want unknown without transport evidence", got)
+	}
+}
+func TestPingDefaultTimeoutCoversMaximumSampleWindow(t *testing.T) {
+	count := 1000
+	interval := 100 * time.Millisecond
+	got := 15*time.Second + time.Duration(count-1)*interval + time.Duration(count)*time.Second
+	if got < 114*time.Second {
+		t.Fatalf("default max-sample timeout = %s, want at least 114s", got)
 	}
 }
 

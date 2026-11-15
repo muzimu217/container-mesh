@@ -16,6 +16,7 @@ import (
 
 	"github.com/muzimu217/container-mesh/internal/discovery"
 	"github.com/muzimu217/container-mesh/internal/identity"
+	"github.com/muzimu217/container-mesh/internal/mesh"
 )
 
 // statusMember is the stable, read-only status contract. It deliberately
@@ -41,6 +42,7 @@ type statusMember struct {
 	Reachability string            `json:"reachability"`
 	Endpoints    []string          `json:"endpoints"`
 	LastSeen     string            `json:"last_seen,omitempty"`
+	ProbeError   string            `json:"probe_error,omitempty"`
 }
 
 type statusReport struct {
@@ -62,13 +64,31 @@ func runStatus(args []string) error {
 	pass := fs.String("device-passphrase", "", "passphrase for the device file (for scripting)")
 	asJSON := fs.Bool("json", false, "emit structured JSON")
 	timeout := fs.Duration("timeout", defaultStatusSnapshotTimeout, "budget for the verified discovery snapshot")
+	probe := fs.String("probe", "", "probe one member with an authenticated direct QUIC ping")
+	probeTimeout := fs.Duration("probe-timeout", 3*time.Second, "budget for the optional transport probe")
 	if err := fs.Parse(args); err != nil {
 		return ExitError{Code: 2, Err: err}
 	}
+	var probeID identity.DeviceID
+	if strings.TrimSpace(*probe) != "" {
+		probeID = identity.DeviceID(strings.TrimSpace(*probe))
+		if !probeID.Valid() {
+			return ExitError{Code: 2, Err: fmt.Errorf("%q is not a valid probe device ID", *probe)}
+		}
+		if *probeTimeout <= 0 {
+			return ExitError{Code: 2, Err: errors.New("status --probe-timeout must be positive")}
+		}
+	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	commandTimeout := *timeout
+	if probeID.Valid() && commandTimeout < *probeTimeout {
+		commandTimeout = *probeTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
 	defer cancel()
-	sess, err := openMeshSessionWithSnapshotTimeout(ctx, *state, *pass, nil, *timeout)
+	snapshotCtx, snapshotCancel := context.WithTimeout(ctx, *timeout)
+	sess, err := openMeshSessionWithSnapshotTimeout(snapshotCtx, *state, *pass, nil, *timeout)
+	snapshotCancel()
 	if err != nil {
 		return ExitError{Code: 1, Err: fmt.Errorf("status: %w", err)}
 	}
@@ -103,7 +123,15 @@ func runStatus(args []string) error {
 		if mv.Online {
 			report.Online++
 		}
+		if id == probeID {
+			probeCtx, probeCancel := context.WithTimeout(ctx, *probeTimeout)
+			row.Reachability, row.ProbeError = probeMember(probeCtx, sess, id)
+			probeCancel()
+		}
 		report.Members = append(report.Members, row)
+	}
+	if probeID.Valid() && !snapContains(snap, probeID) {
+		return ExitError{Code: 1, Err: fmt.Errorf("status --probe: %s is not a member of this network", probeID)}
 	}
 	if *asJSON {
 		b, err := json.MarshalIndent(report, "", "  ")
@@ -128,9 +156,38 @@ func runStatus(args []string) error {
 		if row.LastSeen != "" {
 			extra += " last_seen=" + row.LastSeen
 		}
+		if row.ProbeError != "" {
+			extra += " probe_error=" + row.ProbeError
+		}
 		fmt.Fprintf(os.Stdout, "  %-16s %-7s%s\n", row.DeviceID, state, extra)
 	}
 	return nil
+}
+
+func probeMember(ctx context.Context, sess *meshSession, target identity.DeviceID) (string, string) {
+	eps, err := sess.resolveTarget(ctx, target)
+	if err != nil {
+		return reachabilityDegraded, err.Error()
+	}
+	link, err := mesh.DialDirect(ctx, mesh.DialConfig{
+		Device:    sess.dev,
+		Resolver:  sess.resolver,
+		Target:    target,
+		Endpoints: eps,
+		Kind:      mesh.KindPing,
+	})
+	if err != nil {
+		return reachabilityDegraded, err.Error()
+	}
+	defer link.Close()
+	stats, err := mesh.PingExchangeStats(ctx, link, 1, 0)
+	if err != nil || stats.Received != 1 {
+		if err == nil {
+			err = errors.New("probe received no reply")
+		}
+		return reachabilityDegraded, err.Error()
+	}
+	return reachabilityDirect, ""
 }
 
 // statusReachability reports only what the current discovery snapshot proves.

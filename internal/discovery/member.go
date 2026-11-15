@@ -176,6 +176,62 @@ func validEndpoint(e string) bool {
 	return true
 }
 
+// allowedDiscoveryHost applies the outbound-address policy to a literal IP
+// or hostname used as a discovery server. Hostnames are syntax-checked only;
+// callers that dial them must use an egress policy that revalidates resolved
+// addresses before connecting.
+func allowedDiscoveryHost(host string) bool {
+	if strings.EqualFold(strings.TrimSuffix(host, "."), "localhost") {
+		return false
+	}
+	if ip := net.ParseIP(strings.Trim(host, "[]")); ip != nil {
+		return isPublicRoutableIP(ip)
+	}
+	return true
+}
+
+func isPublicRoutableIP(ip net.IP) bool {
+	return !ip.IsLoopback() && !ip.IsPrivate() && !ip.IsLinkLocalUnicast() &&
+		!ip.IsLinkLocalMulticast() && !ip.IsUnspecified() && !ip.IsMulticast() &&
+		!isReservedIP(ip)
+}
+
+// isReservedIP covers special-use ranges that net.IP does not expose through
+// a single predicate, including TEST-NET, benchmarking, and IPv6 documentation
+// addresses. The ranges are intentionally explicit so the policy stays stable
+// across Go releases.
+func isReservedIP(ip net.IP) bool {
+	reserved := []struct {
+		net  string
+		mask int
+	}{
+		{"0.0.0.0", 32},
+		{"192.0.0.0", 24},
+		{"192.0.2.0", 24},
+		{"198.18.0.0", 15},
+		{"198.51.100.0", 24},
+		{"203.0.113.0", 24},
+		{"240.0.0.0", 4},
+		{"100.64.0.0", 10},
+		{"2001:db8::", 32},
+		{"2001:20::", 28},
+		{"2001:2::", 48},
+	}
+	for _, r := range reserved {
+		base := net.ParseIP(r.net)
+		bits := 128
+		if base.To4() != nil {
+			base = base.To4()
+			bits = 32
+		}
+		netw := net.IPNet{IP: base, Mask: net.CIDRMask(r.mask, bits)}
+		if netw.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
 // Invite is the join token. It carries NO secret: only the account ID (so
 // the joiner knows which network), a discovery node address, and the
 // account public key (so the joiner can verify the certificate it is about
@@ -234,20 +290,15 @@ func DecodeInvite(s string) (Invite, error) {
 			ErrAnnounceBadEndpoint, len(q["disc"]), MaxEndpoints)
 	}
 	for _, a := range q["disc"] {
-		// An optional scheme prefix is allowed so TLS deployments can point
-		// at non-443 https ports; the client's normalizeBaseURL keeps the
-		// explicit scheme. Validation applies to the host:port part —
-		// invite used to emit scheme-ed addrs that join then rejected
-		// (netns-probe round 31, defect F2).
-		bare := a
-		if i := strings.Index(a, "://"); i >= 0 {
-			bare = a[i+3:]
-		}
-		if !validEndpoint(bare) {
+		// Discovery addresses are server origins, so they use the stricter
+		// origin policy applied by the client. Keep the original spelling in
+		// the invite after validating it.
+		if _, err := normalizeBaseURL(a); err != nil {
 			return Invite{}, fmt.Errorf("%w: %q", ErrAnnounceBadEndpoint, a)
 		}
 		inv.DiscoveryAddrs = append(inv.DiscoveryAddrs, a)
 	}
+
 	if len(inv.DiscoveryAddrs) == 0 {
 		return Invite{}, errors.New("discovery: invite has no discovery address")
 	}

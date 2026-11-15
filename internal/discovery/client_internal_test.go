@@ -13,8 +13,10 @@ package discovery
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"sync"
 	"testing"
 	"time"
@@ -22,6 +24,46 @@ import (
 	"github.com/muzimu217/container-mesh/internal/identity"
 	"github.com/muzimu217/container-mesh/internal/wsconn"
 )
+
+func testDiscoveryURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		panic(err)
+	}
+	u.Host = net.JoinHostPort("mesh.example", u.Port())
+	return u.String()
+}
+
+type testDiscoveryTransport struct {
+	base http.RoundTripper
+}
+
+func (t testDiscoveryTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	u := *r.URL
+	if u.Hostname() == "mesh.example" {
+		u.Host = net.JoinHostPort("127.0.0.1", u.Port())
+	}
+	clone := r.Clone(r.Context())
+	clone.URL = &u
+	clone.Host = u.Host
+	return t.base.RoundTrip(clone)
+}
+
+func testDiscoveryHTTPClient() *http.Client {
+	return &http.Client{Transport: testDiscoveryTransport{base: http.DefaultTransport}}
+}
+
+func testDiscoveryWebSocketDial(ctx context.Context, opts wsconn.DialOptions) (*wsconn.Conn, error) {
+	u, err := url.Parse(opts.URL)
+	if err != nil {
+		return nil, err
+	}
+	if u.Hostname() == "mesh.example" {
+		u.Host = net.JoinHostPort("127.0.0.1", u.Port())
+	}
+	opts.URL = u.String()
+	return wsconn.Dial(ctx, opts)
+}
 
 // TestReconnectLadderThenReset drives the client's reconnect behaviour
 // against a server that fails a few times, then succeeds, then drops the
@@ -84,11 +126,13 @@ func TestReconnectLadderThenReset(t *testing.T) {
 	defer srv.Close()
 
 	cl, err := NewClient(ClientConfig{
-		Addrs:      []string{srv.URL},
-		Device:     dev,
-		AccountID:  acc.ID(),
-		AccountPub: []byte(acc.PublicKey()),
-		NoAnnounce: true,
+		Addrs:         []string{testDiscoveryURL(srv.URL)},
+		Device:        dev,
+		AccountID:     acc.ID(),
+		AccountPub:    []byte(acc.PublicKey()),
+		NoAnnounce:    true,
+		HTTPClient:    testDiscoveryHTTPClient(),
+		WebSocketDial: testDiscoveryWebSocketDial,
 	})
 	if err != nil {
 		t.Fatal(err)

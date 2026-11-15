@@ -16,14 +16,19 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/muzimu217/container-mesh/internal/identity"
 	"github.com/muzimu217/container-mesh/internal/relay"
+	"github.com/muzimu217/container-mesh/internal/wsconn"
 )
 
 // captureStdout swaps os.Stdout while fn runs and returns what it printed.
@@ -60,6 +65,44 @@ func freePort(t *testing.T) string {
 	defer l.Close()
 	_, port, _ := net.SplitHostPort(l.Addr().String())
 	return "127.0.0.1:" + port
+}
+
+func meshDiscoveryTestTransport(t *testing.T, target string) discoveryClientTransport {
+	t.Helper()
+	targetURL, err := url.Parse(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := http.DefaultTransport
+	return discoveryClientTransport{
+		httpClient: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			u := *r.URL
+			if u.Hostname() == "mesh.example" {
+				u.Host = net.JoinHostPort("127.0.0.1", targetURL.Port())
+			}
+			request := r.Clone(r.Context())
+			request.URL = &u
+			request.Host = u.Host
+			return base.RoundTrip(request)
+		})},
+		webSocketDial: func(ctx context.Context, opts wsconn.DialOptions) (*wsconn.Conn, error) {
+			u, err := url.Parse(opts.URL)
+			if err != nil {
+				return nil, err
+			}
+			if u.Hostname() == "mesh.example" {
+				u.Host = net.JoinHostPort("127.0.0.1", targetURL.Port())
+			}
+			opts.URL = u.String()
+			return wsconn.Dial(ctx, opts)
+		},
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
 }
 
 func mustRun(t *testing.T, args ...string) string {
@@ -112,9 +155,17 @@ func TestMeshBootstrapApprovalFlow(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 
+	// The invite must carry the public logical origin that production accepts.
+	// Test-only transports route that origin to the in-process listener without
+	// weakening normalizeBaseURL or teaching production code to trust loopback.
+	oldTransport := discoveryClientTransportHook
+	discoveryClientTransportHook = meshDiscoveryTestTransport(t, base)
+	t.Cleanup(func() { discoveryClientTransportHook = oldTransport })
+	logicalDiscAddr := "mesh.example:" + strings.TrimPrefix(discAddr, "127.0.0.1:")
+
 	// --- owner: print an invite for the joiner
 	invite := mustRun(t, "invite", "--state", ownerDir,
-		"--account-passphrase", pass, "--disc", discAddr)
+		"--account-passphrase", pass, "--disc", logicalDiscAddr)
 	if !strings.Contains(invite, "cmesh://join?") {
 		t.Fatalf("invite output missing the join string: %q", invite)
 	}
@@ -354,4 +405,99 @@ func TestEndpointPortZeroResolvesToTheBoundPort(t *testing.T) {
 	if odd[0] != "not-an-address" {
 		t.Errorf("a malformed endpoint was rewritten to %q", odd[0])
 	}
+}
+
+// TestServeDiscoverySIGTERMExitsZero is the process-level acceptance for the
+// graceful stop: serve-discovery runs as a real binary, systemd-style
+// SIGTERM lands on the signal.NotifyContext path, the drain completes, and
+// the process exits 0 with the port immediately reusable — exactly what a
+// `systemctl restart` needs.
+func TestServeDiscoverySIGTERMExitsZero(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("windows signal semantics differ; SIGTERM stop is verified on unix")
+	}
+	ownerDir := filepath.Join(t.TempDir(), "owner")
+	pass := "test-pass-phrase"
+	mustRun(t, "init", "--state", ownerDir, "--passphrase", pass)
+	mustRun(t, "account", "create", "--state", ownerDir, "--passphrase", pass)
+	mustRun(t, "account", "device-add", "--state", ownerDir,
+		"--device-passphrase", pass, "--account-passphrase", pass)
+
+	// The signal path only exists in a real process, so build the binary.
+	bin := filepath.Join(t.TempDir(), "cmesh-under-test")
+	if out, err := exec.Command("go", "build", "-o", bin,
+		"github.com/muzimu217/container-mesh/cmd/cm").CombinedOutput(); err != nil {
+		t.Fatalf("build cm: %v\n%s", err, out)
+	}
+
+	addr := freePort(t)
+	cmd := exec.Command(bin, "serve-discovery", "--state", ownerDir,
+		"--device-passphrase", pass, "--addr", addr)
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Signal only after the HTTP listener actually accepts /healthz:
+	// signaling earlier would race the NotifyContext registration and the
+	// bind, and the test would measure the default signal disposition, not
+	// the graceful path.
+	healthy := false
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		resp, err := http.Get("http://" + addr + "/healthz")
+		if err == nil {
+			resp.Body.Close()
+			healthy = true
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	// Drain stderr in the background so the child never blocks on a full
+	// pipe; Wait must not run before this read side is drained.
+	drainDone := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(io.Discard, stderr)
+		close(drainDone)
+	}()
+	if !healthy {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		<-drainDone
+		t.Fatal("serve-discovery never answered /healthz")
+	}
+
+	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatalf("SIGTERM: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case err := <-done:
+		<-drainDone
+		if err != nil {
+			var ee *exec.ExitError
+			if errors.As(err, &ee) {
+				t.Fatalf("serve-discovery exited %d after SIGTERM (%s), want exit 0",
+					ee.ExitCode(), ee.ProcessState.String())
+			}
+			t.Fatalf("wait: %v", err)
+		}
+	case <-time.After(20 * time.Second):
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		<-drainDone
+		t.Fatal("serve-discovery did not exit within 20s of SIGTERM")
+	}
+
+	// The port is released: bindable again immediately, so a restart unit
+	// does not collide with a lingering listener.
+	l, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatalf("port %s not reusable after clean stop: %v", addr, err)
+	}
+	_ = l.Close()
 }

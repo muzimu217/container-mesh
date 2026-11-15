@@ -83,6 +83,9 @@ type ClientConfig struct {
 	// from DialTimeout). Tests inject fault-injecting transports; callers
 	// behind proxies can pin their own dial behavior.
 	HTTPClient *http.Client
+	// WebSocketDial overrides the members-stream dialer. Tests use it to route
+	// a public discovery origin to an in-process server.
+	WebSocketDial func(context.Context, wsconn.DialOptions) (*wsconn.Conn, error)
 	// Logger receives heartbeat and stream outcomes.
 	Logger *slog.Logger
 }
@@ -419,7 +422,7 @@ func (c *Client) streamOnce(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	conn, err := wsconn.Dial(ctx, wsconn.DialOptions{
+	options := wsconn.DialOptions{
 		URL:         u,
 		DialTimeout: c.cfg.DialTimeout,
 		HandshakeHeader: func() http.Header {
@@ -432,7 +435,13 @@ func (c *Client) streamOnce(ctx context.Context) (bool, error) {
 			return h
 		}(),
 		Liveness: func() *wsconn.Liveness { l := wsconn.DefaultLiveness(); return &l }(),
-	})
+	}
+	var conn *wsconn.Conn
+	if c.cfg.WebSocketDial != nil {
+		conn, err = c.cfg.WebSocketDial(ctx, options)
+	} else {
+		conn, err = wsconn.Dial(ctx, options)
+	}
 	if err != nil {
 		return false, err
 	}
@@ -635,6 +644,14 @@ func normalizeBaseURL(a string) (*url.URL, error) {
 	}
 	if u.Host == "" {
 		return nil, fmt.Errorf("no host")
+	}
+	if host := u.Hostname(); host == "" {
+		return nil, fmt.Errorf("no host")
+	} else if !allowedDiscoveryHost(host) {
+		return nil, fmt.Errorf("disallowed host %q", host)
+	}
+	if u.Port() == "" {
+		return nil, fmt.Errorf("no port")
 	}
 	if u.Path != "" && u.Path != "/" {
 		return nil, fmt.Errorf("unexpected path %q", u.Path)

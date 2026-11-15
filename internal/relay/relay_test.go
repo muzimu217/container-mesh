@@ -479,3 +479,218 @@ func TestParkedPeerDeathIsNoticed(t *testing.T) {
 		t.Errorf("B got %q", got)
 	}
 }
+
+// waitAccept blocks until addr accepts a TCP connection — the relay is bound
+// and serving — or fails the test after a deadline.
+func waitAccept(t *testing.T, addr string) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		c, err := net.DialTimeout("tcp", addr, 100*time.Millisecond)
+		if err == nil {
+			_ = c.Close()
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("%s never accepted a connection", addr)
+}
+
+// reserveTestAddr hands back a free 127.0.0.1 port string.
+func reserveTestAddr(t *testing.T) string {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := l.Addr().String()
+	_ = l.Close()
+	return addr
+}
+
+// TestShutdownStopsServingReleasesPort is the acceptance test for graceful
+// stop: after Shutdown, ListenAndServe returns nil (so a signal-driven
+// caller exits 0), the hijacked pairing socket is closed by the server, and
+// the port can be taken again immediately — including by a fresh relay that
+// serves /healthz on it.
+func TestShutdownStopsServingReleasesPort(t *testing.T) {
+	addr := reserveTestAddr(t)
+
+	cfg := DefaultConfig()
+	cfg.Addr = addr
+	cfg.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := New(cfg)
+
+	errc := make(chan error, 1)
+	go func() { errc <- srv.ListenAndServe() }()
+	waitAccept(t, addr)
+
+	a := dial(t, fmt.Sprintf("ws://%s/ws", addr), "shutdown", "A")
+	t.Cleanup(func() { _ = a.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	select {
+	case err := <-errc:
+		if err != nil {
+			t.Fatalf("ListenAndServe after Shutdown = %v, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("ListenAndServe did not return after Shutdown")
+	}
+
+	// The hijacked socket must not outlive the server: the member/pairing
+	// client sees the connection drop instead of hanging on a dead relay.
+	// A server-initiated close surfaces as a close frame / EOF within
+	// milliseconds, so an error that takes the whole deadline (a timeout)
+	// means the server never closed it.
+	_ = a.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, err := a.Recv()
+	if err == nil {
+		t.Error("pairing socket still delivering after Shutdown; want the server to close it")
+	} else if ne, ok := err.(net.Error); ok && ne.Timeout() {
+		t.Errorf("pairing socket not closed by the server after Shutdown (recv timed out, no close arrived): %v", err)
+	}
+
+	// The port is free again — bindable on its own…
+	l2, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatalf("re-listen on %s after Shutdown: %v", addr, err)
+	}
+	_ = l2.Close()
+
+	// …and serveable: a fresh relay takes the same port and answers.
+	srv2 := New(cfg)
+	errc2 := make(chan error, 1)
+	go func() { errc2 <- srv2.ListenAndServe() }()
+	waitAccept(t, addr)
+	resp, err := http.Get(fmt.Sprintf("http://%s/healthz", addr))
+	if err != nil {
+		t.Fatalf("healthz on restarted relay: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 || strings.TrimSpace(string(body)) != "ok" {
+		t.Errorf("restarted relay healthz: %d %q", resp.StatusCode, body)
+	}
+	sctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel2()
+	if err := srv2.Shutdown(sctx2); err != nil {
+		t.Errorf("second Shutdown: %v", err)
+	}
+	select {
+	case err := <-errc2:
+		if err != nil {
+			t.Errorf("second ListenAndServe = %v, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Error("second ListenAndServe did not return after Shutdown")
+	}
+}
+
+// TestShutdownClosesMembersStream pins the serve-discovery stop path for the
+// member view: /mesh/members is a hijacked WebSocket net/http never sees, so
+// Shutdown must close it explicitly — otherwise a stopped node leaves every
+// member holding an open stream to a dead process until their idle timeout.
+func TestShutdownClosesMembersStream(t *testing.T) {
+	f := newMeshFixture(t, 1)
+	addr := reserveTestAddr(t)
+
+	cfg := DefaultConfig()
+	cfg.Addr = addr
+	cfg.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := New(cfg)
+	srv.EnableDiscovery(f.members)
+
+	errc := make(chan error, 1)
+	go func() { errc <- srv.ListenAndServe() }()
+	waitAccept(t, addr)
+
+	// The stream must be live before the stop: dial with member credentials
+	// and take the initial full-snapshot push.
+	conn, err := wsconn.Dial(context.Background(), wsconn.DialOptions{
+		URL:             fmt.Sprintf("ws://%s/mesh/members", addr),
+		DialTimeout:     3 * time.Second,
+		HandshakeHeader: membersAuthHeaders(f.devices[0]),
+	})
+	if err != nil {
+		t.Fatalf("members dial: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	snap := recvSnapshot(t, conn)
+	if snap == nil || len(snap.Members) != 1 {
+		t.Fatalf("initial snapshot before shutdown: %+v", snap)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	select {
+	case err := <-errc:
+		if err != nil {
+			t.Fatalf("ListenAndServe after Shutdown = %v, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("ListenAndServe did not return after Shutdown")
+	}
+
+	// Same discrimination as the pairing test: a timeout error here means
+	// the server never closed the stream; a close frame / EOF means it did.
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, err = conn.Recv()
+	if err == nil {
+		t.Error("members stream still delivering after Shutdown; want the server to close it")
+	} else if ne, ok := err.(net.Error); ok && ne.Timeout() {
+		t.Errorf("members stream not closed by the server after Shutdown (recv timed out, no close arrived): %v", err)
+	}
+
+	// Port released for a restart.
+	l2, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatalf("re-listen on %s after Shutdown: %v", addr, err)
+	}
+	_ = l2.Close()
+}
+
+// TestShutdownBeforeListenIsACleanNoOp pins the early-signal race: a stop
+// that lands before (or while) the listener binds must still end in
+// ListenAndServe returning nil — never in a server that runs forever with
+// its stop signal already consumed.
+func TestShutdownBeforeListenIsACleanNoOp(t *testing.T) {
+	addr := reserveTestAddr(t)
+
+	cfg := DefaultConfig()
+	cfg.Addr = addr
+	cfg.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := New(cfg)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown before listen: %v, want nil", err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- srv.ListenAndServe() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("ListenAndServe after pre-listen Shutdown = %v, want nil", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("ListenAndServe ignored the pre-listen shutdown and kept serving")
+	}
+
+	// Nothing is left listening on the port.
+	if c, err := net.DialTimeout("tcp", addr, 200*time.Millisecond); err == nil {
+		_ = c.Close()
+		t.Error("port still accepting after pre-listen Shutdown + ListenAndServe returned")
+	}
+}
