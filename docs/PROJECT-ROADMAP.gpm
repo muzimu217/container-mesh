@@ -60,7 +60,7 @@
     {"from":"m5","to":"m6","label":"平台化"}
   ],
   "kpis": {
-    "remoteTip": "1f64cdc",
+    "remoteTip": "6fc00c6",
     "localPendingFiles": 41,
     "hubWatermark": "2026-11-15T03:31:24Z",
     "latestAgentReports": {

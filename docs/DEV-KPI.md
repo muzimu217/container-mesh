@@ -1,6 +1,6 @@
 # container-mesh 开发与平台 KPI 看板
 
-更新时间：2026-11-15 15:20Z。分支：`develop`。远端 tip：`1f64cdc`。Hub 水位：`2026-11-15T04:19:45Z`。本轮水位后 0 条新报告；四 agent 已催办下一 SHA 复测就绪确认（四路 ok:true）。当前 worktree 43 条；quick 43 项全绿（独立 CLI credential 子进程验收）；批次 C 优雅停止三测试落盘 PASS（Shutdown 释放端口/关闭 members 流/listen 前 no-op）；批次 D（mclaw Linux systemd 验收）运行中。
+更新时间：2026-11-15 18:20Z。分支：`develop`。远端 tip：`1f64cdc`。Hub 水位：`2026-11-15T18:17:33Z`。水位后 2 条报告（oh-no/doubao 复测就绪确认，均回信 ok:true）；下一 SHA 复测范围已扩展到 M4 冲刺四批次。当前 worktree 43 条；quick 43 项全绿；批次 C 优雅停止 3 测试 PASS；批次 D（mclaw Linux systemd）运行中。
 
 这张表把代码、可运行产物、安装包、真机验收分开记账。交叉编译通过不等于平台交付完成；设计方案存在也不等于安装包完成。
 

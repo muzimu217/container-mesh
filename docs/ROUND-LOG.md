@@ -413,7 +413,13 @@ init → account create → device-add → serve-discovery（自举 members.json
 - 握手错误不再甩锅给 code（码不一致实际表现为「no partner」）；`--pair-window` 帮助写全真实规则；账号口令旗标两种拼法都接受。
 - 发布件：`tools/mkrelease` 组装发布资产（缺 installer 时**明确失败且不留半成品**——此前会留下裸二进制与截断归档，`gzip -t` 还过）；`cmesh verify` 本地校验下载物；README 全部命令可照抄执行（此前 §2 照抄 0/6 通过、§3 四行里三行报 usage）。
 
-### Round 35（2026-11-15 · M4 冲刺批次 C 落盘 + 四线催办）
+### Round 36（2026-11-15 · 复测就绪确认 + 水位推进）
+
+- 水位 `2026-11-15T04:19:45Z` → **`2026-11-15T18:17:33Z`**。水位后 2 条报告：oh-no `18:10:18Z`、doubao `18:17:33Z`，均为复测就绪确认，无缺陷。
+- oh-no：环境在线（fetch 至 1f64cdc），确认下一 SHA 复测清单——panel 308/令牌三态/假数据归零/B-3 五项含双向性臂/diagnostics 边界/#7 回归基线；限制沿用（无 root/netns、回环等价形态如实标注）。
+- doubao：环境在线，清单对齐；**主动把 M4 冲刺四批次（CLI credential e2e、mkrelease 加固、serve-discovery 优雅停止、Linux 安装/systemd）纳入下轮复测范围**，无 systemd 项将如实申报；headless Chromium 渲染核验可用。
+- 两路回信均 ok:true；kuku/netns 未回复本轮就绪催办，继续观察（连续两轮无响应则广播）。
+- 批次 C/D 代理仍在运行；工作树 43 条，quick 43 项全绿。
 
 - Hub 水位保持 `2026-11-15T04:19:45Z`，水位后新报告 0 条。四 agent 均超 6 小时静默，已发送"下一 SHA 复测就绪确认"具体催办（panel 308/真实名册/假数据归零/B-3 五项/diagnostics 清单），四路均返回 ok:true。
 - 批次 C（serve-discovery 优雅停止）代码落盘：`internal/relay/relay.go`/`relay_test.go` 新增 Shutdown 路径，三个红→绿测试 PASS——`TestShutdownStopsServingReleasesPort`（停止后端口可重绑）、`TestShutdownClosesMembersStream`（members 流受控关闭）、`TestShutdownBeforeListenIsACleanNoOp`（listen 前调用为干净 no-op）。批次代理仍在最终验证，CLI 侧接线由其完成中。

@@ -1,6 +1,6 @@
 # container-mesh 项目总规划与交付口径
 
-更新时间：2026-11-15。当前分支：`develop`。远端 tip：`1f64cdc`。当前 worktree：41 条状态变更。quick e2e：38 个 shell 场景 PASS + credential Go integration PASS；当前口径已更新，不能再引用旧 41/41。最新外部复测：B-3/client→anchor PASS；anchor→纯出站 client 仍为 v1.1 relay 缺口；RSS 资源指标超过 15MB 目标。
+更新时间：2026-11-15。当前分支：`develop`。远端 tip：`6fc00c6`（交互会话已收拢并推送 6 个逻辑提交，身份 muzimu217 双查通过；此前 41 条 worktree 全部进入远端）。门禁：race 18 包全绿、quick e2e 43/43（独立 CLI credential 子进程验收）、交叉编译 linux amd64/arm64 + windows amd64 全过。最新外部复测：B-3/client→anchor PASS；anchor→纯出站 client 仍为 v1.1 relay 缺口；RSS 资源指标超过 15MB 目标。
 
 ## 项目状态口径
 
@@ -28,7 +28,7 @@
 - B-3：凭证设备入网后的 `mesh ping/msg` 配置读取已修复；本地真实二进制验证 ping 5/5、msg delivered 1。
 - e2e 已纳入第 11 节；当前 worktree quick 门禁为 38 个 shell 场景 PASS + credential Go integration PASS。
 
-远端 tip `1f64cdc` 已包含 status/ping/bench、@cat 修复及前序 M4 代码，并已通过 oh-no/doubao/kuku 的对应外部复测；doctor 仍按本地 probe 契约记账。聚合遥测诚信修复与两项 flaky 测试修复仍在本地 worktree，待交互会话放行后推送。
+远端 tip `6fc00c6` 已包含 status/ping/bench、@cat 修复、聚合遥测诚信修复、两项 flaky 测试修复、relay 优雅停止（Shutdown 生命周期）、e2e 凭证段真实 CLI 化、安装器离线回归与 systemd unit 资产。status/ping/bench/@cat 此前已在 `1f64cdc` 通过 oh-no/doubao/kuku 外部复测；`6fc00c6` 的新增面（relay 优雅停止、e2e 43、install 回归、面板 308）待同 SHA 外部复测。
 
 最新外部边界补充：oh-no 在 `1f64cdc` 发现 B-4 候选——`serve-discovery` 锚点 state 没有 `discovery.json`，锚点主动 `mesh ping/msg` 无发起路径；成员→锚点、成员↔成员均 PASS。本轮按状态边界记录，等待产品确认锚点是否必须支持主动成员操作，不以此为回归直接改协议。
 
