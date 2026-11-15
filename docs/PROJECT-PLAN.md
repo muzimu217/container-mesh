@@ -1,6 +1,6 @@
 # container-mesh 项目总规划与交付口径
 
-更新时间：2026-11-14。当前分支：`develop`。待推送 tip：`c530c7d`。
+更新时间：2026-11-15。当前分支：`develop`。远端 tip：`1f64cdc`。当前 worktree：41 条状态变更。quick e2e：38 个 shell 场景 PASS + credential Go integration PASS；当前口径已更新，不能再引用旧 41/41。最新外部复测：B-3/client→anchor PASS；anchor→纯出站 client 仍为 v1.1 relay 缺口；RSS 资源指标超过 15MB 目标。
 
 ## 项目状态口径
 
@@ -26,9 +26,13 @@
 - B-1：委派成员可拨，外部实测双向 10/10。
 - B-2：`--endpoint host:0` 解析为实际监听端口。
 - B-3：凭证设备入网后的 `mesh ping/msg` 配置读取已修复；本地真实二进制验证 ping 5/5、msg delivered 1。
-- e2e 已纳入第 11 节，当前门禁 41/41。
+- e2e 已纳入第 11 节；当前 worktree quick 门禁为 38 个 shell 场景 PASS + credential Go integration PASS。
 
-待推送 tip `c530c7d` 已包含 B-1/B-2 和基础凭证实现；B-3 最终修复与本地面板收口仍在本地批次，推送后派外部复测。
+远端 tip `1f64cdc` 已包含 status/ping/bench、@cat 修复及前序 M4 代码，并已通过 oh-no/doubao/kuku 的对应外部复测；doctor 仍按本地 probe 契约记账。聚合遥测诚信修复与两项 flaky 测试修复仍在本地 worktree，待交互会话放行后推送。
+
+最新外部边界补充：oh-no 在 `1f64cdc` 发现 B-4 候选——`serve-discovery` 锚点 state 没有 `discovery.json`，锚点主动 `mesh ping/msg` 无发起路径；成员→锚点、成员↔成员均 PASS。本轮按状态边界记录，等待产品确认锚点是否必须支持主动成员操作，不以此为回归直接改协议。
+
+性能第二轮最终结果：64KiB bench frame 临时复用在真实 mesh QUIC 64MiB 双向中将累计分配从 328.11MB 降到 54.38MB（-83.4%），峰值 RSS 从 20,768KB 降到 20,032KB（-3.5%），CPU profile 没有稳定收益；relay 64/128MiB 平均 CPU 9.27%/20.34%、峰值 RSS 17,792/17,968KB，仍超过目标。`p2pquic.readLoop` 2MiB profile 分配约 2,086KiB，不能直接池化，必须先定义消息 slice 所有权和 Release 生命周期。当前变体不进入生产代码。
 
 ### M4-B：端口自检与真实驾驶舱
 
@@ -42,7 +46,7 @@
 - 生产面板动作统一改为只读提示；真实操作使用 CLI。
 - 设计规范页中的示例表已标记为示意，假版本号 `v42/v43` 已清除；`spec-state-matrix-06` 用于 DOM 作用域验收。
 
-当前面板本地构建已通过；新的 JS/CSS 构建资产已同步到 `internal/relay/cockpit-dist/`，仍待放行推送。
+M4 硬阻塞复核：真实 Release/checksum/download/安装升级回滚尚无证据；D2 原始计划要求 systemd/卸载，但现有安装器只写单一二进制；worktree panel bundle/status 改动与 `1f64cdc` 不是同一验收对象。M4 收口前必须固化一个候选 SHA，重新跑完整门禁和同 SHA panel/diagnostics 黑盒复测，并在真实 Linux systemd VPS/VM 完成安装、restart、kill 自动拉起、rollback、reboot 恢复。
 
 ### M4-D：二进制、安装器与 README
 
@@ -50,21 +54,29 @@
 - `latest` 别名、归档和 `SHA256SUMS` 逻辑已完成。
 - `packaging/install.sh` 和 `tools/cmesh-install` 已入本地工作树。
 - README 命令级错误已修正：口令旗标、参数顺序、凭证路径、relay 参数和发布件数字。
-- 真实 GitHub Release 资产、签名、升级、卸载仍未验收。
+- Linux headless 代理审计确认：当前 `packaging/install.sh` 与 `tools/cmesh-install` 只下载/校验/写单一二进制，未实现 systemd unit、专用服务用户、journald、卸载保留状态、原子升级/回滚、SIGTERM 优雅停止和重启恢复；`mkrelease` 也未纳入 systemd/卸载资产，且文档声称的 installer release asset 不一定生成。下一步需在真实 Debian/Ubuntu systemd VPS/VM 完成安装、restart、kill 自动拉起、升级失败回滚、reboot 恢复和 send/recv smoke；当前 macOS 只能做脚本/构建检查，不能标 Linux 安装完成。
 
 ### 本地新增运维线
 
-- `cmesh status`：读取已验证 snapshot，输出成员、版本、在线状态、端点、`last_seen` 和保守 reachability。
-- `cmesh mesh ping`：100ms 最小采样间隔、最多 1000 包、丢包统计、p50/p95，direct/degraded/unknown 不伪造。
-- `cmesh bench`：默认每方向 100MB，独立 direct QUIC 测试流，支持 rate 限制，不写业务文件；QUIC 重传计数不可观测时明确输出 `n/a`。
+- `cmesh status`：读取已验证 snapshot，输出成员、版本、在线状态、端点、`last_seen` 和保守 reachability；新增显式 `--probe <deviceID>` 直连 mTLS/QUIC 探针，成功写 `direct`，失败写 `degraded` + `probe_error`，无探针仍为 `unknown`。
+- `cmesh mesh ping`：100ms 最小采样间隔、最多 1000 包、丢包统计、p50/p95，direct/degraded/unknown 不伪造；当前只支持 direct QUIC。
+- `cmesh bench`：默认每方向 100MB，独立 direct QUIC 测试流，支持 rate 限制，不写业务文件；QUIC 重传计数不可观测时明确输出 `n/a`；当前没有 mesh relay bench。
 - `cmesh doctor`：复用现有 probe 能力与退出码。
 - `@cat` 大输出：修复 ACK reader 的 4 KiB stream 截断，新增长输出 QUIC 回归测试。
 
 ## 当前未完成
 
+### 性能研究与优化线
+
+性能研究与功能交付并行推进，不以“等待 relay 实现”为停工理由。每轮由独立代理执行可重复实验，覆盖 direct QUIC、discovery WebSocket、阶段 1 relay send/recv 和未来 mesh relay trunk；记录拓扑、命令、样本数、CPU/RSS、吞吐、RTT、丢包、重连、内存分配、瓶颈假设和优化建议。研究结论按本地上界、模拟 NAT、真实公网分层；访问现有公网服务必须使用授权的 http/https 路径，拒绝本机/私有/保留地址，凭据只读环境变量或密钥服务。性能数字没有实验命令和样本就不进入 KPI。
+
+当前首轮研究结果已归档：macOS M4 loopback 上 direct QUIC 2MiB 单向 137.7–235.2MiB/s；完整 mesh bench 3MiB 双向 10/10、约 75–100MiB/s；阶段 1 relay 在 16/64/128MiB 下平均 CPU 4.75%/9.37%/17.36%、峰值 CPU 8.8%/27.6%/46.8%，峰值 RSS 16,240/17,216/17,264KB。结论是 relay 大负载超过资源目标，mesh bench frame 分配和 `p2pquic.readLoop` buffer 分配是优先 profiling 点；这些是 macOS loopback 结果，不是公网结论。
+
+下一轮性能实验：1) bench frame buffer 复用；2) `p2pquic.readLoop` 受限 buffer pool；3) relay 32/64/128/512KiB 写路径对比；4) Linux/WSS/443/真实 NAT 与公网授权环境复测；5) 分阶段 `/proc` + `smaps_rollup` 峰值 RSS 采样。每项优化必须有前后对照数字和回归测试。
+
 ### M4-C / v1.1：中继路由与增量视图
 
-尚未开始。包括中继选路、路径切换、全受限 S3 自动可达、增量快照和慢消费者协议优化。纯出站 NAT 已实测：客户端主动拨锚点可用，锚点反拨纯出站客户端失败，这是当前中继/路径回退缺口，不能记为凭证缺陷。
+尚未开始。当前阶段 1 `send/recv` relay 使用共享 code + A/B 配对，只能证明配对文件/消息通道，不能作为 mesh device-ID relay。mesh relay trunk 需要独立的成员认证、目标路由、端到端加密、配额和路径回退协议；在该协议和无 UDP endpoint 的独立测试完成前，`mesh ping/bench/msg/file` 不宣称 relay-only。
 
 ### 连接生命周期
 

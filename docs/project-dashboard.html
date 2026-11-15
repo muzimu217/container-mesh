@@ -13,39 +13,126 @@
 <main class="wrap">
 <header class="top">
   <div><div class="eyebrow">container-mesh / daily delivery board</div><h1 class="title">项目进度与路线看板</h1><p class="sub">每天看这里：当前开发完成到哪一步、门禁是否全绿、哪个平台真的能安装运行、下一步由谁推进。状态按代码和测试证据记录。</p></div>
-  <div class="stamp">看板更新<br><strong id="updated">2026-11-14 13:30Z</strong><br>远端 develop<br><strong>c530c7d</strong></div>
+  <div class="stamp">看板更新<br><strong id="updated">2026-11-15 15:20Z</strong><br>远端 develop<br><strong>1f64cdc</strong><br>M4 冲刺<br><strong>A✅ B✅ C落盘 D运行中</strong></div>
 </header>
 <section class="grid kpis">
-  <div class="card kpi"><div class="label">M4 收口</div><div class="value ok">76%</div><div class="label">凭证 / 面板 / 发布件</div></div>
+  <div class="card kpi"><div class="label">M4 收口</div><div class="value warn">未达标</div><div class="label">直连 CLI PASS；mesh relay 未完成</div></div>
+  <div class="card kpi"><div class="label">传输 CLI</div><div class="value ok">直连 PASS</div><div class="label">status/ping/bench；relay-only 未完成</div></div>
   <div class="card kpi"><div class="label">Go 全量测试</div><div class="value ok">PASS</div><div class="label">17 packages</div></div>
   <div class="card kpi"><div class="label">Race detector</div><div class="value ok">PASS</div><div class="label">-race exit 0</div></div>
-  <div class="card kpi"><div class="label">本地 e2e</div><div class="value ok">41/41</div><div class="label">quick suite</div></div>
+  <div class="card kpi"><div class="label">本地 e2e</div><div class="value warn">38 + Go</div><div class="label">shell 38 场景；credential integration PASS</div></div>
   <div class="card kpi"><div class="label">可运行看板</div><div class="value ok">2</div><div class="label">/panel + /panel-lite</div></div>
-  <div class="card kpi"><div class="label">平台安装包</div><div class="value warn">0</div><div class="label">Wails/mobile/NAS/router</div></div>
+  <div class="card kpi"><div class="label">性能研究</div><div class="value info">进行中</div><div class="label">独立代理：QUIC / WS / relay profiling</div></div>
+</section>
+<section class="section" id="milestones">
+  <div class="section-head"><h2>里程碑总图谱</h2><p>全景 6 个 M 级节点：M1–M2 已完成，当前 M3（v1.0 收口 ~80%）；编号对照见本节底部</p></div>
+  <div class="grid three">
+  <article class="card">
+    <div class="section-head" style="margin-bottom:4px"><h3 style="margin:0;font-size:16px">M1 · 传输基座</h3><span class="pill green">完成 · 冻结</span></div>
+    <p class="muted" style="margin:0;font-size:12px">文档口径：阶段 1（R-5.x）· 2026-10 合并 main</p>
+    <div class="progress"><i style="width:100%"></i></div>
+    <div class="checklist" style="margin-top:10px">
+      <div class="check"><b class="ok">✓</b><div><span><strong style="color:var(--text)">会话加密 + 复用</strong> · SPAKE2+AES-256-GCM、yamux 多路复用、记录泵</span></div></div>
+      <div class="check"><b class="ok">✓</b><div><span><strong style="color:var(--text)">relay 配对传输</strong> · send/recv：限流、多 relay 容灾、自动重连</span></div></div>
+      <div class="check"><b class="ok">✓</b><div><span><strong style="color:var(--text)">端口转发</strong> · -L/-R + 默认拒绝白名单</span></div></div>
+      <div class="check"><b class="ok">✓</b><div><span><strong style="color:var(--text)">文件能力</strong> · 断点续传 + sha256；目录权限位逐位保留；回环 539 MiB/s 实测</span></div></div>
+    </div>
+    <p class="muted" style="font-size:12px;margin:10px 0 0"><b>每日进度</b>：已完成，冻结只复用，无每日更新项。</p>
+  </article>
+  <article class="card">
+    <div class="section-head" style="margin-bottom:4px"><h3 style="margin:0;font-size:16px">M2 · 组网核心</h3><span class="pill green">完成 · 已复测</span></div>
+    <p class="muted" style="margin:0;font-size:12px">文档口径：PR-M1 → PR-M2 → PR-M3 + 按名应用首波</p>
+    <div class="progress"><i style="width:100%"></i></div>
+    <div class="checklist" style="margin-top:10px">
+      <div class="check"><b class="ok">✓</b><div><span><strong style="color:var(--text)">PR-M1 身份</strong> · Ed25519 设备密钥、账号签发设备证书、Argon2id 加密存储、可撤销</span></div></div>
+      <div class="check"><b class="ok">✓</b><div><span><strong style="color:var(--text)">PR-M2 发现</strong> · 发现节点/客户端、签名注册订阅、快照逐证书验签、心跳、证书热收编</span></div></div>
+      <div class="check"><b class="ok">✓</b><div><span><strong style="color:var(--text)">PR-M3 直连</strong> · mTLS 设备证书钉扎、mesh ping/dial、QUIC 空闲 10s/保活 3s</span></div></div>
+      <div class="check"><b class="ok">✓</b><div><span><strong style="color:var(--text)">按名应用</strong> · msg / send-to / run 只读动词；邀请审批 init→account→invite→join→authorize</span></div></div>
+    </div>
+    <p class="muted" style="font-size:12px;margin:10px 0 0"><b>每日进度</b>：已完成；netns 真实环境 client→anchor ping 30/30。</p>
+  </article>
+  <article class="card">
+    <div class="section-head" style="margin-bottom:4px"><h3 style="margin:0;font-size:16px">M3 · v1.0 收口 <span style="font-weight:400;color:var(--muted);font-size:12px">当前所在</span></h3><span class="pill yellow">~80% 进行中</span></div>
+    <p class="muted" style="margin:0;font-size:12px">文档口径：里程碑 M4 · 目标 2026-11-15</p>
+    <div class="progress"><i style="width:80%"></i></div>
+    <div class="checklist" style="margin-top:10px">
+      <div class="check"><b class="ok">✓</b><div><span><strong style="color:var(--text)">统一凭证一键入网</strong> · cred create / join --cred；B-1/B-2/B-3 外部复测 PASS</span></div></div>
+      <div class="check"><b class="ok">✓</b><div><span><strong style="color:var(--text)">真实驾驶舱</strong> · /panel + /panel-lite：令牌鉴权、真实名册、假数据归零</span></div></div>
+      <div class="check"><b class="ok">✓</b><div><span><strong style="color:var(--text)">运维命令</strong> · status / mesh ping / bench / doctor（doctor 待独立外部复测）</span></div></div>
+      <div class="check"><b class="warn">!</b><div><span><strong style="color:var(--text)">推送放行</strong> · 本地修复批次全绿，待交互放行推送 develop + 同 SHA 复测</span></div></div>
+      <div class="check"><b class="warn">!</b><div><span><strong style="color:var(--text)">真实 Release</strong> · checksum / 安装 / 升级 / 回滚未验收，README 下载入口还不能承诺</span></div></div>
+      <div class="check"><b class="warn">!</b><div><span><strong style="color:var(--text)">Linux headless</strong> · systemd / 服务用户 / 卸载回滚 / 重启恢复，缺真实 VPS 验收</span></div></div>
+    </div>
+    <p class="muted" style="font-size:12px;margin:10px 0 0"><b>每日进度 11-15</b>：doubao/netns 复测 PASS；anchor→纯出站 client 无 relay 兜底，归 M4。</p>
+  </article>
+  <article class="card">
+    <div class="section-head" style="margin-bottom:4px"><h3 style="margin:0;font-size:16px">M4 · 可靠网</h3><span class="pill purple">未开始</span></div>
+    <p class="muted" style="margin:0;font-size:12px">文档口径：里程碑 M5 / v1.1（＝PR-M4+PR-M5）· 目标 2026-11-19</p>
+    <div class="progress"><i style="width:0%"></i></div>
+    <div class="checklist" style="margin-top:10px">
+      <div class="check"><b class="info">→</b><div><span><strong style="color:var(--text)">mesh relay trunk</strong> · device-ID 路由 + 成员认证——纯出站兜底的前提</span></div></div>
+      <div class="check"><b class="info">→</b><div><span><strong style="color:var(--text)">中继端到端加密</strong> · 抓包无明文；direct-first 路径回退、恢复切回</span></div></div>
+      <div class="check"><b class="info">→</b><div><span><strong style="color:var(--text)">连接生命周期</strong> · LEAVE 优雅下线 ≤3s；撤销切断活跃会话 ≤30s</span></div></div>
+      <div class="check"><b class="info">→</b><div><span><strong style="color:var(--text)">传输与多网</strong> · 组网断点续传（.part+offset+hash）；一机多网 / 多租锚点</span></div></div>
+    </div>
+    <p class="muted" style="font-size:12px;margin:10px 0 0"><b>每日进度</b>：未开工。KPI：直连 p95&lt;5ms、中转&lt;20ms、直连 ≥200MiB/s、中转 ≥50MiB/s、配额 ≤50MiB/s·20 流。</p>
+  </article>
+  <article class="card">
+    <div class="section-head" style="margin-bottom:4px"><h3 style="margin:0;font-size:16px">M5 · 平台生产化</h3><span class="pill purple">未开始</span></div>
+    <p class="muted" style="margin:0;font-size:12px">文档口径：里程碑 M6 · 目标 2026-11-23</p>
+    <div class="progress"><i style="width:0%"></i></div>
+    <div class="checklist" style="margin-top:10px">
+      <div class="check"><b class="info">→</b><div><span><strong style="color:var(--text)">桌面首包</strong> · Wails：Windows/macOS/Linux 安装、托盘、休眠恢复</span></div></div>
+      <div class="check"><b class="info">→</b><div><span><strong style="color:var(--text)">移动首包</strong> · gomobile 最小 binding + Android/iOS 真机一条传输链路</span></div></div>
+      <div class="check"><b class="info">→</b><div><span><strong style="color:var(--text)">设备矩阵</strong> · NAS 厂商矩阵 / OpenWrt 资源与断电恢复；签名分发、升级回滚</span></div></div>
+      <div class="check"><b class="info">→</b><div><span><strong style="color:var(--text)">真实网络验收</strong> · 公网 WAN/NAT、WSS/443、代理环境（C-5）</span></div></div>
+    </div>
+    <p class="muted" style="font-size:12px;margin:10px 0 0"><b>每日进度</b>：未开工；当前各平台安装包数 0。</p>
+  </article>
+  <article class="card">
+    <div class="section-head" style="margin-bottom:4px"><h3 style="margin:0;font-size:16px">M6 · 界面与 ACL</h3><span class="pill purple">未排期</span></div>
+    <p class="muted" style="margin:0;font-size:12px">文档口径：阶段 3 / 阶段 4</p>
+    <div class="progress"><i style="width:0%"></i></div>
+    <div class="checklist" style="margin-top:10px">
+      <div class="check"><b class="info">→</b><div><span><strong style="color:var(--text)">完整图形界面</strong> · R-6.1–R-6.5 桌面/移动全量 UI</span></div></div>
+      <div class="check"><b class="info">→</b><div><span><strong style="color:var(--text)">跨身份 ACL</strong> · 多身份隔离（N-8 明确留给阶段 4）</span></div></div>
+    </div>
+    <p class="muted" style="font-size:12px;margin:10px 0 0"><b>每日进度</b>：未排期；锚点只读面板 /panel 已随 M3 提前交付，不算本阶段范围。</p>
+  </article>
+  </div>
+  <article class="card" style="margin-top:14px">
+    <h3 style="margin:0 0 8px;font-size:14px">编号对照（为什么没有"M1 / M2 里程碑"）</h3>
+    <div class="checklist">
+      <div class="check"><b class="info">i</b><div><span>图谱 M1–M2 对应历史「阶段 1」与「PR-M1→M2→M3」三波：活已干完，但从未设过叫 M1/M2 的里程碑；交付里程碑序号接续 PR 序列，所以文档正典里起点是 M4。</span></div></div>
+      <div class="check"><b class="warn">!</b><div><span>对照关系：图谱 M3＝文档「里程碑 M4」；图谱 M4＝文档「里程碑 M5 / v1.1」（内容＝PR-M4+PR-M5）。陷阱：文档「PR-M4」（中继+加密）≠ 文档「里程碑 M4」——前者的工作已排入图谱 M4。</span></div></div>
+      <div class="check"><b class="info">i</b><div><span>若要把图谱编号全面替换文档正典（PROJECT-PLAN / ROADMAP / M4-PLAN / DEV-KPI），须作为独立文档批次处理；看板先以对照方式展示。</span></div></div>
+    </div>
+  </article>
 </section>
 <section class="grid two section">
   <article class="card"><div class="section-head"><h2>今日状态</h2><p>本地 worktree，待网主放行</p></div><div class="checklist">
     <div class="check"><b class="ok">✓</b><div><strong>驾驶舱已接真实数据</strong><br><span>/api/mesh → /panel，资源内嵌，令牌只走请求头</span></div></div>
     <div class="check"><b class="ok">✓</b><div><strong>真实边界已收口</strong><br><span>假设备、假遥测、假拓扑、模拟离线、浏览器动作假成功已清除</span></div></div>
-    <div class="check"><b class="ok">✓</b><div><strong>凭证链路已本地闭环</strong><br><span>join --cred → enrollment → snapshot delegation → ping/msg</span></div></div>
-    <div class="check"><b class="warn">!</b><div><strong>远端未包含本批修复</strong><br><span>origin/develop 仍为 c530c7d；新改动等交互会话拆分提交后推送</span></div></div>
-    <div class="check"><b class="warn">!</b><div><strong>平台包装仍未完成</strong><br><span>先闭合 Linux headless 安装，再做 Wails 和移动真机最小链路</span></div></div>
+    <div class="check"><b class="warn">!</b><div><strong>纯出站反向仍未完成</strong><br><span>doubao/netns 在 1f64cdc 复测：join --cred、status、ping/msg/send-to/run、client→anchor PASS；anchor→纯出站 client 仍无 mesh relay fallback，归 v1.1 缺口</span></div></div>
+    <div class="check"><b class="warn">!</b><div><strong>本地修复待交互放行</strong><br><span>origin/develop 与 HEAD 均为 1f64cdc；聚合未采集修复、两项 flaky 测试修复、status --probe 和安装/安全整改留在 41 条本地 worktree 状态变更，值守会话不提交</span></div></div>
+    <div class="check"><b class="warn">!</b><div><strong>第二轮优化未直接合入</strong><br><span>bench buffer 复用显著降 alloc，但短测吞吐中位数 41.6→22.0MiB/s；p2pquic 池化存在 slice 所有权风险，先设计 Release 协议和长时/WAN 对照</span></div></div>
   </div></article>
   <article class="card"><div class="section-head"><h2>当前阻塞</h2><p>不是测试红</p></div>
-    <div class="notice card"><strong>网主放行</strong><p class="muted">本地 23 项改动已验证，值守会话不执行 commit/push/merge。</p></div>
-    <div class="notice card"><strong>纯出站反向拨号</strong><p class="muted">真实 NAT：客户端→锚点 10/10；锚点→客户端无 DNAT 且无中继回退，归 v1.1 路由缺口。</p></div>
+    <div class="notice card"><strong>交互会话放行</strong><p class="muted">本地 41 条状态变更已通过当前门禁，值守会话不执行 commit/push/merge。</p></div>
+    <div class="notice card"><strong>M4 安装与发布仍未验收</strong><p class="muted">install.sh/cmesh-install 已有 HTTPS+SHA 校验、版本目录/current symlink、卸载/purge；仍缺 systemd/服务用户/journal/原子升级回滚/重启恢复。真实 Release/checksum/安装升级回滚无证据；macOS 无法替代 Linux systemd VPS/VM。</p></div>
+    <div class="check"><b class="warn">!</b><div><strong>e2e harness 待改造</strong><br><span>生产 URL host policy 已红→绿，discovery/CLI focused tests PASS；quick shell e2e credential 段仍直接使用 loopback URL，3 项失败，需改测试 fixture，不回退安全策略</span></div></div>
     <div class="quote">判断规则：设计完成、能构建、能运行、能安装、真机验收分别记账。</div>
   </article>
 </section>
 <section class="section">
   <div class="section-head"><h2>每日进度</h2><p>每天 17:00 更新；没有开发缺口时如实显示等待对象</p></div>
   <article class="card timeline">
-    <div class="day"><h3>2026-11-14 · 本地开发批次 <span class="pill green">全绿</span></h3><p>新增 status/doctor CLI；清理 Inspector/Minimalist 假动作；修复 @cat 4KiB 截断；建立平台 KPI 表和项目路线图。门禁：test、race、e2e 41/41、交叉编译均通过。</p></div>
-    <div class="day"><h3>2026-11-13/14 · Round 60–67 <span class="pill green">复测闭环</span></h3><p>oh-no/doubao/kuku/netns 复测 c530c7d；B-1/B-2 PASS；真实 NAT 纯出站结论；设计规范页 A1–A5 验收规则；@cat 新缺陷红→绿。</p></div>
-    <div class="day"><h3>2026-11-13 · Round 58–59 <span class="pill blue">已推送基线</span></h3><p>驾驶舱 React 源码与嵌入资源入仓，B-1/B-2 修复、安装器、README 修正、假设备清除。</p></div>
+    <div class="day"><h3>2026-11-14 · 诊断测速与可靠性补强 <span class="pill green">远端 PASS</span></h3><p>1f64cdc：status/ping/bench、面板、B-3、双向性、@cat 均完成外部复测；D-1 聚合未采集假零、恢复可见性和 p2p2 快速重传测试修复已在本地，完整门禁再次全绿，等待交互会话放行。</p></div>
+    <div class="day"><h3>2026-11-15 · NAT / B-3 外部复测 <span class="pill green">PASS + 已知缺口</span></h3><p>doubao 与 netns 在 1f64cdc 确认 join --cred 后 status、mesh ping、msg、send-to、run、bench 全部可用；client→anchor 通过，anchor→纯出站 client 仍无 relay fallback。netns 采样 join 常驻 RSS 15.62–15.80MB，超过 15MB 目标，资源 KPI 未达标。</p></div>
+    <div class="day"><h3>2026-11-15 · 性能第二轮 profiling <span class="pill yellow">分配收益 / 未合入</span></h3><p>64MiB mesh QUIC 临时 frame 复用累计分配 328.11→54.38MB（-83.4%），峰值 RSS 20.768→20.032MB（-3.5%），CPU 无稳定收益；relay 64/128MiB CPU 9.27%/20.34%、RSS 17.792/17.968MB。p2pquic buffer 需先设计 Release 所有权协议，当前不改生产代码。</p></div>
   </article>
 </section>
-<section class="section"><div class="section-head"><h2>路线图</h2><p>绿色=已完成/验证，青色=本地开发，紫色=后续版本</p></div><article class="card route">
+<section class="section"><div class="section-head"><h2>路线图</h2><p>当前阶段（图谱 M3–M5）放大图；全景六节点见上方「里程碑总图谱」。绿色=已完成/验证，青色=本地开发，紫色=后续版本</p></div><article class="card route">
 <svg viewBox="0 0 1050 420" role="img" aria-label="container-mesh M4 M5 M6 路线图">
 <defs><marker id="arrow" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L0,6 L8,3 z" fill="#546d8d"/></marker></defs>
 <path class="edge ready" d="M170 90 C260 90 265 75 350 75"/><path class="edge ready" d="M170 145 C260 145 270 120 350 105"/><path class="edge ready" d="M170 200 C260 200 270 150 350 135"/><path class="edge active" d="M170 255 C265 255 280 190 350 165"/>
@@ -54,7 +141,7 @@
 <g class="node ready"><rect x="30" y="55" width="140" height="52" rx="9"/><text x="48" y="78">M4 v1.0</text><text class="small" x="48" y="96">当前收口</text></g>
 <g class="node ready"><rect x="30" y="125" width="140" height="52" rx="9"/><text x="48" y="148">凭证入网</text><text class="small" x="48" y="166">B-1/B-2/B-3</text></g>
 <g class="node ready"><rect x="30" y="195" width="140" height="52" rx="9"/><text x="48" y="218">真实驾驶舱</text><text class="small" x="48" y="236">/panel + /api/mesh</text></g>
-<g class="node active"><rect x="30" y="265" width="140" height="52" rx="9"/><text x="48" y="288">status/doctor</text><text class="small" x="48" y="306">本地新 KPI</text></g>
+<g class="node active"><rect x="30" y="265" width="140" height="52" rx="9"/><text x="48" y="288">status / probe</text><text class="small" x="48" y="306">direct 证据；relay 未完成</text></g>
 <g class="node ready"><rect x="350" y="90" width="170" height="72" rx="9"/><text x="370" y="118">M4 交付包</text><text class="small" x="370" y="139">面板 + 凭证 + 发布件</text><text class="small" x="370" y="155">待远端放行</text></g>
 <g class="node active"><rect x="350" y="190" width="170" height="72" rx="9"/><text x="370" y="218">M5 可靠传输</text><text class="small" x="370" y="239">LEAVE / 撤销切断</text><text class="small" x="370" y="255">断点续传</text></g>
 <g class="node defer"><rect x="350" y="290" width="170" height="72" rx="9"/><text x="370" y="318">M5 / v1.1 网络</text><text class="small" x="370" y="339">中继路由 + 增量视图</text><text class="small" x="370" y="355">纯出站反向拨号</text></g>
@@ -64,25 +151,30 @@
 </svg><div class="legend"><span class="pill green">已完成/外部验证</span><span class="pill blue">本地待放行</span><span class="pill yellow">下一批开发</span><span class="pill purple">v1.1 延后</span></div>
 </article></section>
 <section class="section"><div class="section-head"><h2>平台 KPI</h2><p>方案、构建、运行、安装、真机验收分开</p></div><article class="card matrix-wrap"><table class="matrix"><thead><tr><th>平台</th><th>设计</th><th>可构建</th><th>可运行</th><th>安装/签名</th><th>真机验收</th><th>下一步</th></tr></thead><tbody>
-<tr><td>Linux headless</td><td class="ok">完成</td><td class="ok">完成</td><td class="ok">完成</td><td class="warn">手工安装</td><td class="warn">待矩阵</td><td>systemd、服务用户、升级回滚</td></tr>
+<tr><td>Linux headless</td><td class="ok">方案</td><td class="ok">二进制</td><td class="warn">CLI/relay 可跑</td><td class="bad">无 systemd 安装闭环</td><td class="bad">未验收</td><td>unit、服务用户、日志、卸载、回滚、reboot smoke</td></tr>
 <tr><td>Windows CLI/桌面</td><td class="ok">方案</td><td class="ok">amd64</td><td class="warn">实机待测</td><td class="bad">无 MSI/签名</td><td class="bad">未验收</td><td>Wails + WebView2 + 安装卸载</td></tr>
 <tr><td>macOS CLI/桌面</td><td class="ok">方案</td><td class="ok">amd64/arm64</td><td class="warn">CLI 可跑</td><td class="bad">无 app/公证</td><td class="bad">未验收</td><td>Wails、Keychain、公证</td></tr>
 <tr><td>Android/iOS</td><td class="ok">gomobile 方案</td><td class="bad">未开始</td><td class="bad">未开始</td><td class="bad">无 APK/IPA</td><td class="bad">未验收</td><td>最小 binding + 真机单链路</td></tr>
 <tr><td>NAS/router</td><td class="warn">方向</td><td class="warn">部分 Linux</td><td class="warn">通用能力</td><td class="bad">无专用包</td><td class="bad">未验收</td><td>确定厂商/架构矩阵</td></tr>
 </tbody></table></article></section>
-<section class="section"><div class="section-head"><h2>门禁与证据</h2><p>当前本地批次</p></div><div class="grid three"><article class="card"><h3>Go CI</h3><div class="evidence">gofmt        PASS
-go vet ./...  PASS
-go build ./... PASS
-go test ./...  PASS
--race         PASS</div></article><article class="card"><h3>端到端</h3><div class="evidence">tests/run-tests.sh --quick
-41 passed / 0 failed
-credential join included
-relay / reconnect included</div></article><article class="card"><h3>真实链路</h3><div class="evidence">B-1 delegated member: PASS
-B-2 endpoint :0: PASS
-B-3 follow-up ping/msg: PASS
-NAT client→anchor: 10/10
-anchor→NAT: v1.1 relay gap</div></article></div></section>
-<section class="section"><div class="section-head"><h2>每日计划与等待项</h2><p>下一次 17:00 更新</p></div><div class="grid two"><article class="card"><h3>下一开发日</h3><ol class="muted"><li>完成 Linux headless systemd/卸载/升级回滚设计与本地测试</li><li>保持 status/doctor 与 cockpit 当前门禁绿</li><li>准备交互会话的逻辑提交拆分和 develop 推送</li><li>推送后派 oh-no：B-3 三步 + 双向性；派 doubao：A1-A5 + 资源/字节差值</li></ol></article><article class="card"><h3>外部等待</h3><div class="checklist"><div class="check"><b class="warn">!</b><div><strong>网主放行</strong><br><span>当前 worktree 改动 23 项，未提交</span></div></div><div class="check"><b class="warn">!</b><div><strong>kuku/netns</strong><br><span>已恢复在线并已报告；后续按新 SHA 复测</span></div></div><div class="check"><b class="info">→</b><div><strong>v1.1</strong><br><span>中继/增量视图，纯出站反向拨号</span></div></div></div></article></div></section>
+<section class="section"><div class="section-head"><h2>门禁与证据</h2><p>当前本地批次</p></div><div class="grid three"><article class="card"><h3>Go CI</h3><div class="evidence">gofmt        PASS · 08:00Z
+go vet ./...  PASS · 08:00Z
+go build ./... PASS · 08:00Z
+go test ./...  PASS · 08:00Z
+-race         PASS · 08:00Z</div></article><article class="card"><h3>端到端</h3><div class="evidence">tests/run-tests.sh --quick
+43 passed / 0 failed
+independent CLI credential join e2e
+graceful shutdown tests: 3/3 PASS
+mkrelease hardening: green
+mclaw systemd acceptance: running</div></article><article class="card"><h3>真实链路</h3><div class="evidence">direct QUIC: 137.7–235.2 MiB/s
+mesh bench: 75–100 MiB/s · 10/10
+WS RecvInto: 6.36–6.49 GB/s
+relay 16/64/128 MiB:
+CPU avg 4.75/9.37/17.36%
+RSS 16.24/17.22/17.26 MB
+公网/WSS/Linux: 未测
+优化: buffer reuse + relay trunk</div></article></div></section>
+<section class="section"><div class="section-head"><h2>每日计划与等待项</h2><p>下一次 17:00 更新</p></div><div class="grid two"><article class="card"><h3>下一开发日</h3><ol class="muted"><li>交互会话放行后，按 fix/test/docs 逻辑拆分提交并先重跑完整本地 CI，再推送 develop</li><li>推送新 SHA 后派 oh-no/kuku：B-3、diagnostics、@cat 与恢复测试复测；派 doubao：D-1、A1-A5 与资源/字节差值</li><li>继续定义 Linux headless systemd/卸载/升级回滚的安装闭环</li><li>保持 status/doctor、bench 与 cockpit 当前门禁绿</li></ol></article><article class="card"><h3>外部等待</h3><div class="checklist"><div class="check"><b class="warn">!</b><div><strong>交互会话放行</strong><br><span>当前 worktree 41 条状态变更，未提交；门禁已按当前 worktree 重跑，值守会话不执行 commit/push/merge</span></div></div><div class="check"><b class="warn">!</b><div><strong>netns-probe</strong><br><span>最新 2026-11-15 03:31Z：B-3/NAT 复测已回报；RSS 15.62–15.80MB 超目标。已回信确认，等待下一步 profiling。</span></div></div><div class="check"><b class="warn">!</b><div><strong>oh-no / kuku</strong><br><span>分别最新 2026-11-14 16:41Z / 17:31Z，均已超过 6 小时；本轮具体催办均返回 ok:true，等待新 SHA 复测。</span></div></div><div class="check"><b class="info">→</b><div><strong>v1.1</strong><br><span>中继/增量视图，纯出站反向拨号</span></div></div></div></article></div></section>
 <footer class="footer">数据来源：当前 develop、本地门禁输出、Hub 报告与 docs/PROJECT-PLAN.md。未采集或未验收的平台不显示为完成。</footer>
 </main>
 <script>

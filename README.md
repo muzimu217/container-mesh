@@ -106,8 +106,9 @@ cmesh join --listen 0.0.0.0:18090 --device-passphrase <口令> <invite-string>
 | 动作 | 命令 | 说明 |
 |---|---|---|
 | 看全网 | `cmesh serve-discovery --panel` | 驾驶舱面板（3D 名册视图、成员名册、四维状态核验）；离线设备**保留在名册里**，不除名。极简版在 `/panel-lite` |
-| 测延迟 | `cmesh mesh ping --device-passphrase <口令> --count 10 --interval 100ms <deviceID>` | QUIC echo RTT，最小 100ms 间隔，最多 1000 包，输出丢包与 p50/p95；非 ICMP |
-| 测吞吐 | `cmesh bench --device-passphrase <口令> --size 100MB --rate 0 <deviceID>` | 独立 direct QUIC 测试流，双向吞吐；不写业务文件，QUIC 重传计数不可观测时明确输出 `n/a` |
+| 看状态 | `cmesh status --json --device-passphrase <口令>` | 读取已验证名册；默认 reachability 为 `unknown`，不会把端点候选当成已拨通。加 `--probe <deviceID>` 才执行一次真实 mTLS/QUIC 直连探针，输出 `direct` 或 `degraded` 与失败原因；当前不伪造 `relay-only` |
+| 测延迟 | `cmesh mesh ping --device-passphrase <口令> --count 10 --interval 100ms <deviceID>` | QUIC echo RTT，最小 100ms 间隔，最多 1000 包，输出丢包与 p50/p95；非 ICMP；当前仅 direct QUIC |
+| 测吞吐 | `cmesh bench --device-passphrase <口令> --size 100MB --rate 0 <deviceID>` | 独立 direct QUIC 测试流，双向吞吐；不写业务文件，QUIC 重传计数不可观测时明确输出 `n/a`；当前无 mesh relay bench |
 | 发消息 | `cmesh msg --device-passphrase <口令> --text "…" <deviceID>` | 对端常驻进程实时打印 |
 | 传文件 | `cmesh send-to --device-passphrase <口令> --file PATH <deviceID>` | 直连流式传输，sha256 校验；**仅常规文件** |
 | 传目录 | `cmesh send --relay ws://<锚点>:18090/ws --code <配对码> --file DIR` / `cmesh recv --relay ws://<锚点>:18090/ws --code <配对码> --out DIR` | 走 relay 配对通道：目录按 tar 打包，权限逐位保留（0700 不会被放宽成 0755） |

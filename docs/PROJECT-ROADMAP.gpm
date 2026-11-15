@@ -1,7 +1,18 @@
 {
   "format": "container-mesh-project-map",
   "version": 1,
-  "updatedAt": "2026-11-14T10:30:00Z",
+  "updatedAt": "2026-11-15T14:52:00Z",
+  "poll": {
+    "hubWatermark": "2026-11-15T03:31:24Z",
+    "newReports": 2,
+    "newReportAgents": ["doubao-cloud-vm-01", "netns-probe"],
+    "repliesDelivered": 2,
+    "nudgeDelivered": 2,
+    "resourceRssKB": "15620-15800",
+    "resourceKpi": "FAIL_OVER_15MB",
+    "performanceResearch": "ROUND22_COMPLETE_OPTIMIZATION_PENDING",
+    "performanceRound2": "ROUND24_COMPLETE_OPTIMIZATION_NOT_MERGED"
+  },
   "title": "container-mesh 路线规划图",
   "statusLegend": {
     "shipped": "已推送并有外部复测",
@@ -13,10 +24,10 @@
   },
   "nodes": [
     {"id":"m4","label":"M4 v1.0 收口","kind":"milestone","status":"ready","target":"2026-11-15","summary":"统一凭证、一键入网、端口自检、驾驶舱、发布件与 README"},
-    {"id":"credential","label":"统一凭证 / 一键入网","kind":"feature","status":"ready","summary":"B-1/B-2 已远端；B-3 本地修复待推送；端到端凭证设备 ping/msg 已验证"},
-    {"id":"panel","label":"真实驾驶舱 / panel","kind":"feature","status":"ready","summary":"React/Vite/Three 内嵌；真实 /api/mesh；假设备与假遥测清除"},
+    {"id":"credential","label":"统一凭证 / 一键入网","kind":"feature","status":"shipped","summary":"B-1/B-2/B-3 已进入 1f64cdc；外部完成凭证设备 ping/msg、双向性复测"},
+    {"id":"panel","label":"真实驾驶舱 / panel","kind":"feature","status":"shipped","summary":"1f64cdc 外部复测 PASS；React/Vite/Three 内嵌、真实 /api/mesh、假设备与假遥测清除"},
     {"id":"release","label":"二进制 / 安装器 / README","kind":"release","status":"ready","summary":"mkrelease、latest 别名、checksum、安装器代码已完成；真实 Release 仍待验收"},
-    {"id":"status","label":"status / doctor CLI","kind":"feature","status":"ready","summary":"本地实现、测试、vet/build 已通过，待随本批推送"},
+    {"id":"status","label":"status / ping / bench CLI","kind":"feature","status":"shipped","summary":"1f64cdc 已推送并通过 oh-no/doubao/kuku 外部复测；JSON/text、ping、bench 门禁全绿；doctor 仍按本地 probe 契约记账"},
     {"id":"cat","label":"远端 @cat 大输出","kind":"bugfix","status":"ready","summary":"修复 ACK reader 4KiB 截断；新增真实 QUIC 红绿测试"},
     {"id":"headless","label":"Linux headless 正式安装","kind":"platform","status":"active","summary":"systemd、服务用户、日志、卸载、升级回滚、重启恢复"},
     {"id":"desktop","label":"Windows/macOS/Linux Wails","kind":"platform","status":"planned","summary":"宿主、WebView、原生文件选择、托盘、休眠恢复、安装包与签名"},
@@ -49,9 +60,16 @@
     {"from":"m5","to":"m6","label":"平台化"}
   ],
   "kpis": {
-    "remoteTip": "c530c7d",
-    "localPendingFiles": 23,
-    "e2eCases": "41/41",
+    "remoteTip": "1f64cdc",
+    "localPendingFiles": 41,
+    "hubWatermark": "2026-11-15T03:31:24Z",
+    "latestAgentReports": {
+      "doubao-cloud-vm-01": "2026-11-15T03:28:12Z",
+      "kuku-sandbox-01": "2026-11-14T17:31:14Z",
+      "netns-probe": "2026-11-15T03:31:24Z",
+      "oh-no-agent": "2026-11-14T16:41:17Z"
+    },
+    "e2eCases": "38 shell + credential Go integration",
     "goRace": "PASS",
     "goVet": "PASS",
     "goBuild": "PASS",

@@ -413,9 +413,132 @@ init → account create → device-add → serve-discovery（自举 members.json
 - 握手错误不再甩锅给 code（码不一致实际表现为「no partner」）；`--pair-window` 帮助写全真实规则；账号口令旗标两种拼法都接受。
 - 发布件：`tools/mkrelease` 组装发布资产（缺 installer 时**明确失败且不留半成品**——此前会留下裸二进制与截断归档，`gzip -t` 还过）；`cmesh verify` 本地校验下载物；README 全部命令可照抄执行（此前 §2 照抄 0/6 通过、§3 四行里三行报 usage）。
 
-**下一轮**：等四线复测（驾驶舱面板 / 权限矩阵 / 一键入网 / mkrelease）→ v1.0 收口（主分支发布合并检查单见 docs/M4-PLAN.md D6：main 与 develop 已分叉，须逐行看过 −498 那侧）→ M5（一机多网 / 多租锚点）
+### Round 35（2026-11-15 · M4 冲刺批次 C 落盘 + 四线催办）
 
-## Round 14（2026-11-14 · 诊断测速 CLI 第一批）
+- Hub 水位保持 `2026-11-15T04:19:45Z`，水位后新报告 0 条。四 agent 均超 6 小时静默，已发送"下一 SHA 复测就绪确认"具体催办（panel 308/真实名册/假数据归零/B-3 五项/diagnostics 清单），四路均返回 ok:true。
+- 批次 C（serve-discovery 优雅停止）代码落盘：`internal/relay/relay.go`/`relay_test.go` 新增 Shutdown 路径，三个红→绿测试 PASS——`TestShutdownStopsServingReleasesPort`（停止后端口可重绑）、`TestShutdownClosesMembersStream`（members 流受控关闭）、`TestShutdownBeforeListenIsACleanNoOp`（listen 前调用为干净 no-op）。批次代理仍在最终验证，CLI 侧接线由其完成中。
+- 批次 D（mclaw Linux systemd 验收）运行中。
+- 工作树 43 条；quick 43 项全绿（批次 A）；mkrelease 加固全绿（批次 B）。
+
+- 用户要求继续推进直到 M4 收口。当前 M4 硬阻塞收敛为：①固化候选 SHA（需交互会话放行 commit/push）；②真实 Release 资产 checksum/download/install/rollback；③Linux headless systemd 真实验收；④独立 CLI credential 黑盒 e2e 口径；⑤serve-discovery SIGTERM 优雅停止；⑥mkrelease 输入/资产加固。
+- 本轮并行派发四批次（均限定文件范围、红→绿、不 commit/push）：
+  - A：tests/run-tests.sh 恢复真实独立 CLI 子进程 credential 一条命令入网验收（逻辑公网 host + NO_PROXY，不放宽生产 host policy）。
+  - B：tools/mkrelease 输入版本/平台校验、latest 别名输入拒绝、LICENSE 与 cwd 解耦（自 --installer 向上搜索、go.mod 截止）、显式 --license、归档逐条内容校验。代理在汇报前被并发上限打断，但实现与红测均已落盘；主会话验证 gofmt/vet 干净、`go test ./tools/mkrelease -count=1` 全绿（含 6 个新加固测试）。
+  - C：internal/relay + internal/cli/discovery 优雅停止（SIGTERM/SIGINT → Shutdown 超时，端口释放可重启），保持 ListenAndServe 兼容。
+  - D：授权主机 mclaw 真实 Linux 验收——构建 1f64cdc、mkrelease 本地组装、自签 CA + 系统信任满足 installer 的 https 要求、独立目录安装、systemd-analyze/enable/restart/kill/自动拉起、healthz smoke；不得干扰现有锚点。
+- relay trunk/E2E/resume/LEAVE/revoke-close 仍归 M5/v1.1，不混入 M4 收口口径。
+
+
+- Hub 水位保持 `2026-11-15T04:19:45Z`，本轮水位后新报告 0 条，agent 最新报告未变化。
+- HEAD/origin/develop=`1f64cdc`，文件级工作树 41 条；无 commit/push/merge。
+- 门禁事实保持：full Go/race/vet/build/交叉编译 PASS；quick 38 shell + credential Go integration PASS；URL host focused/full discovery PASS。
+- 没有新增云端、性能或 relay 数字；Linux systemd、真实 Release/WAN/M5 relay 继续等待外部/实现。
+
+- Hub 水位保持 `2026-11-15T04:19:45Z`，本轮水位后新报告 0 条，四 agent 最新报告未变化。
+- 当前 HEAD/origin/develop=`1f64cdc`，文件级工作树 41 条；无 commit/push/merge。
+- 当前门禁事实保持：full Go/race/vet/build/交叉编译 PASS；quick 38 shell + credential Go integration PASS；URL host focused/full discovery PASS。
+- 本轮没有新增云端、性能或 relay 数字；Linux systemd、真实 Release/WAN/M5 relay 继续等待外部/实现。
+
+- Hub 水位保持 `2026-11-15T04:19:45Z`，本轮水位后新报告 0 条，agent 最新报告未变化。
+- 当前候选 HEAD/origin/develop=`1f64cdc`，文件级工作树 41 条；无 commit/push/merge。
+- 门禁事实保持：full Go/race/vet/build/交叉编译 PASS；quick 38 shell + credential Go integration PASS；URL host focused/full discovery PASS。
+- 当前没有新云端、性能或 relay 数字；继续等待 Linux systemd、真实 Release/WAN/M5 relay 条件，HTML 只更新等待状态。
+
+- Hub 水位保持 `2026-11-15T04:19:45Z`，本轮水位后新报告 0 条；四 agent 最新回报未变化。
+- HEAD/origin/develop=`1f64cdc`，文件级工作树 41 条；无 commit/push/merge。
+- 当前候选门禁和 focused tests 保持 PASS；quick 为 38 shell + credential Go integration。没有新增云端、性能或 relay 数字，继续等待真实 Linux/Release/WAN/M5 条件。
+- 看板只更新当前时间和“等待外部”，不新增虚假开发项。
+
+
+
+- Hub 水位保持 `2026-11-15T04:19:45Z`，最新报告时间未变化，本轮水位后新报告数为 0。
+- HEAD/origin/develop 仍为 `1f64cdc`，文件级工作树 41 条；没有 commit/push/merge。
+- 当前门禁和证据保持：full Go/race/vet/build/交叉编译 PASS；quick 38 shell + credential Go integration PASS；URL host focused/full discovery PASS；真实 Linux/Release/WAN/M5 relay 仍等待外部/实现。
+- HTML/KPI 只更新本轮时间和等待状态，无新开发项，不伪造新实验或 agent 回报。
+
+- Hub 水位保持 `2026-11-15T04:19:45Z`，本轮报告总数最新时间仍为 `04:19:45Z`，水位后新报告数为 0。
+- 当前候选仍为 HEAD/origin `1f64cdc` + 41 条未提交文件级工作树变更；没有 commit/push/merge。
+- 当前门禁事实沿用本轮候选已执行结果：gofmt、vet、build、全量 race、Linux amd64/arm64、Windows amd64 交叉编译 PASS；quick e2e 为 38 shell + credential Go integration PASS，不引用旧 41/41。
+- 无新缺陷、无 issue #8 镜像、无新云端/性能数字；HTML/KPI 记录等待外部和当前 M4/M5 缺口，不造开发项。
+
+- 当前 `develop`/`origin/develop`/HEAD 均为 `1f64cdc`，但工作树实际为 41 条文件级状态变更（`git status --short --untracked-files=all`）；当前 worktree 不是外部可复测固化 SHA。
+- 当前门禁：全量 Go race、vet、build、Linux amd64/arm64、Windows amd64 交叉编译均 PASS；quick e2e 为 38 个 shell 场景 PASS + credential Go integration PASS。不能继续把历史 41/41 记录当作当前 worktree 证据。
+- M4/M5 事实未改变：B-1/B-2/B-3、panel、status/ping/bench、`@cat` 有 `1f64cdc` 外部/云端证据；真实 Release/Linux systemd、mesh relay-only、mesh E2E、resume、LEAVE/revoke-close、平台真机仍未完成。
+- URL host 安全修复与 discovery/CLI focused tests PASS；成员 endpoint 私有语义保留。mclaw loopback/direct 和 netns client→anchor 证据保留，公网/WSS/跨云 NAT/反向纯出站仍未验证。
+
+- 当前候选 worktree 实际 `git status --short --untracked-files=all` 为 41 条状态变更；HEAD/origin/develop 仍为 `1f64cdc`。此前文档中的 18 项统计已过时，已统一改为 41 条。
+- 当前门禁重跑结果：`gofmt -l .`、`go vet ./...`、`go build ./...`、`go test ./... -race -count=1`、Linux amd64/arm64 与 Windows amd64 交叉编译全部 PASS。
+- `bash tests/run-tests.sh --quick` 当前通过 38 个 shell 场景；credential enrollment 由独立 `go test ./internal/cli -run '^TestJoinWithCredentialAdmitsDevice$'` 通过。脚本已不再直接用 loopback URL 绕过生产 host policy，但该重构改变了计数口径，未把它写成旧版 41/41。
+- URL host 安全策略：discovery base URL 拒绝 localhost/环回/私有/保留地址；成员 endpoint 私有语义保留；discovery 全包和 CLI focused tests PASS。
+- 真实云端证据：mclaw loopback/direct 双向业务通过，netns/SNAT client→anchor 通过；公网/WSS/跨云 NAT/anchor→纯出站成功仍未验证。
+
+- 云端 mclaw 验收发现 discovery base URL 可接受 localhost/环回/私有/保留地址，属于真实 URL host 安全缺陷。
+- 修复：`normalizeBaseURL` 增加 host/port 和地址分类拒绝；成员 endpoint 的私有/环回语义保持，因为它们是 mesh/NAT 公告数据。discovery 测试使用逻辑公网 host + HTTP/WebSocket test transport 路由本地 httptest；`go test ./internal/discovery -count=1` PASS；CLI credential/join focused tests PASS。
+- `tests/run-tests.sh --quick` 的独立二进制 credential 段仍直接用 loopback discovery URL，3 项失败；这是测试 harness 与新安全策略冲突，不回退生产策略，不算云端 B-3 回归。下一步应把 shell harness 改成授权测试 host/transport 或使用云端 fixture。
+- 安装代理限定目录测试保持 PASS：installer lifecycle、HTTPS-only fake-curl、mkrelease staging/upgrade tests 通过；真实 Linux systemd/reboot 仍待外部。
+
+- 第二轮代理只读完成，主 worktree 未修改、未 commit/push/merge；环境 macOS arm64 Apple M4、Go 1.27.2，结果保存在 `/tmp/container-mesh-perf/round2/`。
+- 64KiB frame microbench：当前 `readBenchFrame` 69,782B/5 alloc、5.56–5.67µs/op；临时复用读取 4,245B/4 alloc、1.71–1.83µs/op；真实 mesh QUIC 64MiB 双向 profile：累计分配 328.11MB→54.38MB（-83.4%），RSS 20,768→20,032KB（-3.5%），CPU profile 无稳定收益。
+- relay 复测：64MiB 吞吐 253.35MiB/s、峰值 RSS 17,792KB、平均 CPU 9.27%、峰值 27.20%；128MiB 吞吐 272.88MiB/s、峰值 RSS 17,968KB、平均 CPU 20.34%、峰值 44.00%；文件校验和 send/recv 退出码均通过。
+- `p2pquic.readLoop` 2MiB profile 分配约 2,086KiB、峰值 RSS 18,400KB；不能直接 `sync.Pool`，因为 `Recv` 将 slice 所有权交给调用方，池化会有数据覆盖风险。正式优化前需 Release/ownership API、慢消费者/关闭竞态/长时多消息测试。
+- 处置结论：frame buffer 复用是明确 alloc 优化点，但未证明 CPU/吞吐收益，临时变体不合入；公网/WAN/Linux/WSS/丢包/高并发均未验证。
+
+- Hub 水位 `2026-11-15T03:31:24Z` 后新增 oh-no `03:56:03Z` 和 doubao 回执 `04:19:45Z`；两条均无代码修改。
+- oh-no：B-3、diagnostics、@cat、面板全 PASS；B-4 候选为锚点 `serve-discovery` state 没有 `discovery.json`，锚点主动 `mesh ping/msg` 返回 config not found。成员→锚点、成员↔成员均 PASS；本轮按状态边界记录，等待产品确认，不判回归。
+- 处置：oh-no 回信 `ok:true`；kuku 超过 6 小时，具体催办 `ok:true`；无真缺陷、无 issue #8 镜像。
+- 性能第二轮已派发独立代理，目标为 bench frame、p2pquic read buffer、relay 负载前后 profiling；当前等待真实命令、样本和前后数字，未提前写优化完成。
+
+- 独立性能代理完成只读研究，未修改仓库、未 commit/push/merge；环境为 macOS Darwin 24.6 arm64、Apple M4、Go 1.27.2，未访问公网 Hub 或读取 token。
+- 实验命令/结果已保存在 `/tmp/container-mesh-perf/`：direct QUIC `p2pquic` 2MiB 单向 8 次为 137.7–235.2MiB/s；完整 `mesh.RunBench` mTLS/member pinning、3MiB 双向 10/10，每次约 30–40ms，单向折算约 75–100MiB/s；旧 p2p2 无丢包 288–306MB/s、5% 丢包 55–65MB/s。
+- WebSocket：32KiB `SendRecv` 约 1.78GB/s、约 161.5KB/op/32 allocs/op；服务端 `RecvInto` 6.36–6.49GB/s、1–2 allocs/op。discovery httptest loopback 注册+首 snapshot 50 次约 10ms。
+- 旧阶段 1 relay 真实临时 `cmesh relay` + `send/recv`、文件校验均通过：16MiB 135.3MiB/s、峰值 RSS 16,240KB、平均/峰值 CPU 4.75%/8.8%；64MiB 220.2MiB/s、17,216KB、9.37%/27.6%；128MiB 263.9MiB/s、17,264KB、17.36%/46.8%。这些是 macOS loopback，不代表公网/WSS/NAT/Linux。
+- profile 假设：relay CPU 主要在双向 WebSocket read/write 和 syscall；mesh bench `readBenchFrame`/`sendBenchData` 占主要 alloc profile；`p2pquic.readLoop` 每消息 `make([]byte,n)` 是 direct message 分配热点。
+- 优化队列：P0 先完成 mesh relay trunk/direct fallback；P1 bench frame buffer 复用与 p2pquic 受限 buffer pool；P2 relay 32/64/128/512KiB 写路径对比；另做 Linux/WSS/443/真实 NAT 和 `/proc`+`smaps_rollup` 峰值 RSS 对照。未测公网、WSS/443、丢包/延迟注入、bench 峰值 RSS，不写成已完成。
+
+
+
+- 用户要求值守不能停在报告轮询：从本轮起，值守自动化每轮同时运行两条线：Hub/缺陷/门禁主线，以及独立性能研究线。
+- 性能研究代理首轮任务：direct QUIC、discovery WebSocket、阶段 1 relay send/recv、未来 mesh relay trunk；实验必须给出拓扑、真实命令、样本数、CPU/RSS、吞吐、RTT、丢包、重连、分配和优化建议，严格区分 loopback 上界、模拟 NAT 与真实公网授权环境。
+- 访问现有公网服务的安全边界已写入自动化：只允许 http/https；请求前校验 host，拒绝 localhost、环回、私有和保留地址；凭据只从环境变量或密钥服务读取，不写入源码、示例、测试、文档或日志。
+- 当前首轮研究仍在运行，尚无性能数字或优化结论；HTML/KPI 标为“性能研究进行中/等待实验结果”，不伪造完成状态。
+
+- 水位 `2026-11-14T17:31:14Z` 后新增 2 条报告：doubao `2026-11-15T03:28:12Z`、netns `2026-11-15T03:31:24Z`。两份均来自 `1f64cdc`，没有代码修改、没有 commit。
+- doubao：`join --cred`、status、client→anchor `mesh ping` 10/10、成员双向基线均 PASS；iptables DROP 后 anchor/member→纯出站 client 仍 `all endpoint(s) fail`，确认是 mesh relay fallback 缺口，不是回归。
+- netns：真 SNAT/netns 环境确认 B-3 五项 `status/ping/msg/send-to/run` 全部 rc=0，client→anchor `mesh ping` 30/30、p50 0.265ms，bench 20MB/50MB 双向字节完整；anchor→client `network is unreachable`，仍归 v1.1 mesh relay trunk。
+- netns 资源采样：join 常驻进程 20 个 `/proc` 采样点，前 10 秒含一次 50MB bench；VmRSS `15,620–15,800 KB`，超过 15MB 目标；CPU 约 0.34s/20s（约 1.7% 单核时基）。bench 一次性峰值 RSS 未采样，资源 KPI 记为**未达标/待 profiling**，不把空闲 relay 基线代替业务负载。
+- 处置：新报告 2 条，均判 PASS/已知缺口，无真缺陷、无红→绿修复、无 issue #8 镜像；doubao/netns 回信均 `{"ok":true}`。oh-no/kuku 已超过 6 小时，本轮具体催办均 `{"ok":true}`。水位推进到 `2026-11-15T03:31:24Z`。
+
+
+
+- Hub 水位保持 `2026-11-14T17:31:14Z`，本轮读取到的最新时间仍为 `17:31:14Z`，水位后新报告数为 0。
+- 四 agent 最新报告：doubao `17:27:02Z`、kuku `17:31:14Z`、oh-no `16:41:17Z`、netns `09:56:04Z`。按当前 UTC `2026-11-15T03:12:23Z` 计算，netns 已静默约 17 小时，其他三家约 10 小时以上；本轮已向四个 inbox 发送具体复测任务/广播，四路均返回 `{"ok":true}`。下一轮若仍无 netns 回报，提示用户唤醒。
+- 本轮无新开发缺口，无需代码复现、回信或 issue 镜像；看板、DEV-KPI、PROJECT-PLAN 已记录“等待外部”，未修改水位。
+- 当前 HEAD/origin/develop 仍为 `1f64cdc`，工作树 18 项；已有门禁证据仍是 18:53Z 的全绿批次，值守会话不重复跑无代码变化的完整 CI，也不 commit/push/merge。
+
+
+
+- 完成提示词到证据的逐项审计：`status`、`mesh ping`、`bench` 的直连路径、`doctor` 复用 probe、阶段 1 relay `send/recv`、R-3.2～R-3.6、无 UDP endpoint 的 relay 验收、CPU/RSS 资源指标均逐项核对。
+- 新增 `cmesh status --probe <deviceID>`：只在用户显式要求时建立一次真实成员证书 pinning 的 direct QUIC ping；成功输出 `reachability=direct`，失败输出 `reachability=degraded` 和 `probe_error`。默认 status 仍为 800ms snapshot、无 transport 证据时 `unknown`。
+- 旧 relay 路径已确认不能充当 mesh relay：`send/recv` 使用共享 code + A/B room 配对，discovery `/mesh/*` 仍是控制面；没有 device-ID 路由、成员认证 trunk、端到端 relay probe 或 relay bench。纯出站 NAT 的 anchor→client 失败仍归 R-3.2/v1.1 缺口。
+- 资源基线：本机 macOS 上 `go build -trimpath -o /tmp/cmesh-resource-gate ./cmd/cm` 后运行 `cmesh relay --addr 127.0.0.1:0`，5 次 `ps` 采样 RSS 6,256–9,024 KB、CPU 0.0%（启动瞬时 2.1%）；这是空闲 relay 基线，不是 mesh relay 负载 KPI PASS。CPU≤8% / RSS≤15MB 的业务负载验收仍待定义统一拓扑、采样窗口和消息/bench 工作负载。
+- 本轮 CLI/mesh 单测和 `go build ./...` 通过；完整 CI、relay vertical slice 和新 SHA 外部复测仍未完成。
+
+- Hub 水位保持 `2026-11-14T17:31:14Z`；本轮没有晚于水位的新报告。四 agent 最新时间：doubao `17:27:02Z`、kuku `17:31:14Z`、oh-no `16:41:17Z`、netns `09:56:04Z`。netns 距本轮约 9 小时，已发送具体 NAT/新 SHA 催办，Hub 返回 `{"ok":true}`；其他三家未超过 6 小时，不重复催办。
+- `1f64cdc` 外部复测结论保持：status/ping/bench、B-3、面板、双向性和 `@cat` 均 PASS。doubao 报告中的 D-1 聚合未采集假零、kuku 报告涉及的恢复 flaky 测试均已有本地修复；本轮不重复改代码、不扩大旧报告处置范围。
+- 本地门禁于 `2026-11-14T18:53Z` 全绿：`gofmt -l internal/ cmd/ tools/` 无输出、`go vet ./...`、`go build ./...`、`go test ./... -race -count=1`、`bash tests/run-tests.sh --quick`（41/41）、Linux amd64/arm64 与 Windows amd64 交叉构建均 PASS。
+- HTML、DEV-KPI、PROJECT-PLAN、GPM 已同步远端 tip `1f64cdc`、本地待放行 18 项、Hub 水位和 agent 最新报告时间。值守会话不 commit/push/merge；D-1 与两项 flaky 测试修复标为“已就绪待放行”。
+
+（2026-11-14 · diagnostics follow-up）
+
+- oh-no 在 `1f64cdc` 复测发现 `--count 1000 --interval 100ms` 被默认 20s deadline 截在 196/1000；这不是传输失败，而是命令契约冲突：最大包数×最小间隔需要超过默认 timeout。修复：默认 timeout 按 discovery 15s + sample interval window + per-reply timeout 动态计算；显式 `--timeout` 仍由用户控制。新增 CLI 边界测试。
+- doubao 在 `c530c7d` 复测发现聚合层把缺失遥测折成 `0.0 MB/s / 0.00 TB`；修复：任一成员字段缺失时聚合显示 `未采集`，不得把缺失解释成测得零。
+- kuku 报 `TestStreamRecoveryFiresImmediateAnnounce` 5/8 flaky；修复：等待 `Client.Joined()` 和 kill 前 register 基线，再断流，断言 kill 后 register 增量，`-count=20` 全绿。
+
+
+- doubao 在 `c530c7d` 面板复测发现：设备卡片显示 `未采集`，但全局聚合卡片把缺失遥测用 `|| 0` 汇总成 `0.0 MB/s` / `0.00 TB`。修复：聚合只有在成员字段真实存在时才计算；否则显示 `未采集`，不把缺失解释为实测零。
+- kuku 发现 `TestStreamRecoveryFiresImmediateAnnounce` 5/8 复现失败，失败等待「pre-join fast tick drained」；该等待把调度时序当成产品事件。修复：先等待 verified snapshot 使 `Client.Joined()` 为 true，记录 kill 前 register 基线，再断流，断言 kill 后 register 严格增加且最多增加一次。`-count=20` 全绿。
+- netns 纯 NAT 复测：client→anchor 10/10，anchor→纯出站 client 失败；这是无 DNAT/无中继回退的 v1.1 网络缺口，不是凭证入网缺陷。
+
 
 **催办目标**：实现 `status`、ping 采样约束和 `bench`，同时保持不依赖 Cockpit、不抢业务流、不伪造 relay/retransmission 证据。
 
