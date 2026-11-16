@@ -6,6 +6,9 @@ package discovery
 import (
 	"fmt"
 	"net"
+	"net/http"
+	"syscall"
+	"time"
 )
 
 // resolvedAddr is the address a host name resolved to, as the dialer sees
@@ -39,4 +42,29 @@ func EgressPolicy(addr net.Addr) error {
 				"(loopback, private, link-local and reserved ranges are refused)", addr, ip)
 	}
 	return nil
+}
+
+// EgressTransport returns an HTTP transport that applies the outbound
+// address policy to every connection it makes.
+//
+// A caller that reaches a discovery node over HTTP needs the same protection
+// the members stream has. The policy is consulted with the address the host
+// name resolved to, after DNS and before the socket is connected, so a
+// refused address never reaches the network.
+//
+// timeout bounds the dial and the response headers.
+func EgressTransport(timeout time.Duration) *http.Transport {
+	dialer := &net.Dialer{Timeout: timeout, KeepAlive: 30 * time.Second}
+	dialer.Control = func(_, address string, _ syscall.RawConn) error {
+		host, _, err := net.SplitHostPort(address)
+		if err != nil {
+			return fmt.Errorf("discovery: egress policy: cannot parse %q: %w", address, err)
+		}
+		return EgressPolicy(&resolvedAddr{addr: address, host: host})
+	}
+	return &http.Transport{
+		DialContext:           dialer.DialContext,
+		TLSHandshakeTimeout:   timeout,
+		ResponseHeaderTimeout: timeout,
+	}
 }

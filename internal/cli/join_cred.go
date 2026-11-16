@@ -31,6 +31,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/muzimu217/container-mesh/internal/cmeshtest"
 	"github.com/muzimu217/container-mesh/internal/credential"
 	"github.com/muzimu217/container-mesh/internal/discovery"
 	"github.com/muzimu217/container-mesh/internal/identity"
@@ -45,7 +46,18 @@ const enrollTimeout = 60 * time.Second
 // The credential carries the seed addresses, so the joiner knows where to
 // go: one string is enough. Every address is tried in turn; the first node
 // that accepts the device wins.
+//
+// The client is built with the outbound address policy, because the
+// credential's discovery addresses are the same operator-supplied origin
+// the members stream and the register request use, and all three must be
+// held to the same rule.
 func enrollWithCredential(ctx context.Context, cred *credential.Credential, dev *identity.Device) error {
+	return enrollWithCredentialUsing(ctx, cred, dev, nil)
+}
+
+// enrollWithCredentialUsing is enrollWithCredential with an injectable
+// transport, so a test can point the request at an in-process server.
+func enrollWithCredentialUsing(ctx context.Context, cred *credential.Credential, dev *identity.Device, transport http.RoundTripper) error {
 	pub, err := cred.PublicPart()
 	if err != nil {
 		return err
@@ -72,6 +84,18 @@ func enrollWithCredential(ctx context.Context, cred *credential.Credential, dev 
 	}
 
 	client := &http.Client{Timeout: enrollTimeout}
+	switch {
+	case transport != nil:
+		client.Transport = transport
+	case cmeshtest.Enabled:
+		// A binary built for the end-to-end suite talks to a listener on
+		// 127.0.0.1, which the egress policy refuses by design. The release
+		// build, the CI build and a plain `go build ./cmd/cm` never set the
+		// tag, so the shipped binary has no such escape.
+		client.Transport = &http.Transport{ResponseHeaderTimeout: enrollTimeout}
+	default:
+		client.Transport = discovery.EgressTransport(enrollTimeout)
+	}
 	var lastErr error
 	for _, addr := range cred.Public.DiscoveryAddrs {
 		base, err := discovery.NormalizeDiscoveryURL(addr)

@@ -88,9 +88,6 @@ func TestJoinWithCredentialAdmitsDevice(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	targetTransport := http.DefaultTransport
-	http.DefaultTransport = testEnrollmentTransport(t, ts.URL)
-	t.Cleanup(func() { http.DefaultTransport = targetTransport })
 	// The credential must be a single string the member can be handed.
 	credStr, err := credential.Encode(cred)
 	if err != nil {
@@ -120,7 +117,13 @@ func TestJoinWithCredentialAdmitsDevice(t *testing.T) {
 	}
 
 	// The client half: mint and enroll.
-	if err := enrollWithCredential(context.Background(), cred, dev); err != nil {
+	//
+	// The transport is injected rather than http.DefaultTransport being
+	// swapped: the enrollment request now goes through a transport that
+	// carries the outbound address policy, so it no longer picks up the
+	// default transport.
+	if err := enrollWithCredentialUsing(context.Background(), cred, dev,
+		testEnrollmentTransport(t, ts.URL)); err != nil {
 		t.Fatalf("enrollment failed: %v", err)
 	}
 
