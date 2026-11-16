@@ -91,7 +91,13 @@ BIN="$TMP/cmesh"
 
 # ---------------------------------------------------------------
 section "0. 构建"
-if ( cd "$ROOT" && go build -o "$BIN" ./cmd/cm ); then
+# The cmeshtest tag compiles the outbound-address policy out of the binary.
+# The end-to-end suite needs that: it runs the whole product against a
+# listener on 127.0.0.1 through the logical name
+# cmesh-test.127.0.0.1.nip.io, which the policy refuses by design. The
+# release build and the CI build never set this tag, so the shipped binary
+# has no such escape.
+if ( cd "$ROOT" && go build -tags cmeshtest -o "$BIN" ./cmd/cm ); then
     ok "go build"
 else
     bad "go build" "编译失败"

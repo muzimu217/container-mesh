@@ -62,6 +62,10 @@ func testDiscoveryWebSocketDial(ctx context.Context, opts wsconn.DialOptions) (*
 		u.Host = net.JoinHostPort("127.0.0.1", u.Port())
 	}
 	opts.URL = u.String()
+	// This fixture deliberately redirects a logical host name to loopback,
+	// which is what the egress policy refuses. The production path keeps the
+	// policy; a test that opts into a loopback destination drops it here.
+	opts.EgressPolicy = nil
 	return wsconn.Dial(ctx, opts)
 }
 

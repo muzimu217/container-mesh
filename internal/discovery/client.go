@@ -86,6 +86,22 @@ type ClientConfig struct {
 	// WebSocketDial overrides the members-stream dialer. Tests use it to route
 	// a public discovery origin to an in-process server.
 	WebSocketDial func(context.Context, wsconn.DialOptions) (*wsconn.Conn, error)
+	// EgressPolicy overrides the outbound address policy for the members
+	// stream. nil means the default policy (EgressPolicy): a discovery
+	// origin that resolves to a loopback, private or reserved address is
+	// refused.
+	//
+	// A caller sets this to a different function when it wants a stricter
+	// or a differently-scoped policy.
+	EgressPolicy func(net.Addr) error
+	// AllowLocalDiscovery turns the outbound address policy off for the
+	// members stream. It exists for a harness that runs the product
+	// against a listener on 127.0.0.1, and it is deliberately a separate
+	// switch rather than a nil EgressPolicy so that "no policy" and "the
+	// default policy" cannot be confused.
+	//
+	// Production never sets it.
+	AllowLocalDiscovery bool
 	// Logger receives heartbeat and stream outcomes.
 	Logger *slog.Logger
 }
@@ -167,6 +183,22 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		c.httpc = &http.Client{Timeout: cfg.DialTimeout}
 	}
 	return c, nil
+}
+
+// egressPolicy returns the outbound address policy for the members stream.
+//
+// The default refuses a resolved loopback, private or reserved address. A
+// caller that set EgressPolicy explicitly gets what it asked for. A caller
+// that set AllowLocalDiscovery gets no check at all, which is what a local
+// test harness needs.
+func (c *Client) egressPolicy() func(net.Addr) error {
+	if c.cfg.AllowLocalDiscovery {
+		return nil
+	}
+	if c.cfg.EgressPolicy != nil {
+		return c.cfg.EgressPolicy
+	}
+	return EgressPolicy
 }
 
 // Updates returns a channel that receives a signal whenever the member view
@@ -435,6 +467,11 @@ func (c *Client) streamOnce(ctx context.Context) (bool, error) {
 			return h
 		}(),
 		Liveness: func() *wsconn.Liveness { l := wsconn.DefaultLiveness(); return &l }(),
+		// The host check upstream can only judge a literal address. This is
+		// the second half: the address the name resolved to, checked just
+		// before the socket is connected. Without it a name pointing at a
+		// loopback or private address walks straight through the policy.
+		EgressPolicy: c.egressPolicy(),
 	}
 	var conn *wsconn.Conn
 	if c.cfg.WebSocketDial != nil {

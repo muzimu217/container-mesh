@@ -43,6 +43,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/muzimu217/container-mesh/internal/cmeshtest"
 	"github.com/muzimu217/container-mesh/internal/credential"
 	"github.com/muzimu217/container-mesh/internal/discovery"
 	"github.com/muzimu217/container-mesh/internal/identity"
@@ -70,6 +71,20 @@ func withDiscoveryClientTransport(cfg discovery.ClientConfig) discovery.ClientCo
 		cfg.WebSocketDial = discoveryClientTransportHook.webSocketDial
 	}
 	return cfg
+}
+
+// discoveryEgressPolicy is the outbound address policy for discovery
+// connections: a name that resolves to a loopback, private or reserved
+// address is refused, because the discovery origin is an operator-supplied
+// value and pointing it at the host's own network is an SSRF shape.
+//
+// A binary built with the cmeshtest tag drops the policy. The end-to-end
+// suite needs it: it runs the whole product against a listener on
+// 127.0.0.1 through the logical name cmesh-test.127.0.0.1.nip.io. The
+// release build, the CI build and a plain `go build ./cmd/cm` never set the
+// tag, so the shipped binary has no such escape.
+func discoveryAllowLocal() bool {
+	return cmeshtest.Enabled
 }
 
 // randomToken returns a fresh panel token.
@@ -422,12 +437,13 @@ func runJoin(args []string) error {
 	}
 
 	cl, err := discovery.NewClient(withDiscoveryClientTransport(discovery.ClientConfig{
-		Addrs:      inv.DiscoveryAddrs,
-		Device:     dev,
-		AccountID:  inv.AccountID,
-		AccountPub: []byte(inv.AccountPub),
-		Endpoints:  announced,
-		Logger:     setupLogging(false),
+		Addrs:               inv.DiscoveryAddrs,
+		Device:              dev,
+		AccountID:           inv.AccountID,
+		AccountPub:          []byte(inv.AccountPub),
+		Endpoints:           announced,
+		AllowLocalDiscovery: discoveryAllowLocal(),
+		Logger:              setupLogging(false),
 	}))
 	if err != nil {
 		return ExitError{Code: 1, Err: err}

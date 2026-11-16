@@ -30,6 +30,7 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -89,20 +90,64 @@ type DialOptions struct {
 	// Liveness enables keepalive on this connection. Recommended for anything
 	// long-lived; leave nil only in tests that manage deadlines by hand.
 	Liveness *Liveness
+	// EgressPolicy, when set, is consulted with the address the host name
+	// actually resolved to, after DNS and before the connection is made.
+	//
+	// This is the second half of the outbound-address policy. A host check on
+	// the URL can only judge a literal address; a name passes on syntax
+	// alone, so without this the policy would be bypassable by pointing a
+	// name at a loopback or private address. The check runs on the resolved
+	// address, which is the only place the answer is knowable.
+	//
+	// Leave nil for the stage-1 relay, whose endpoint is often a private
+	// address on the operator's own network by design.
+	EgressPolicy func(net.Addr) error
+}
+
+// resolvedAddr is the address a host name resolved to, as the dialer sees
+// it: the numeric address plus the original host name.
+type resolvedAddr struct {
+	addr string
+	host string
+}
+
+func (a *resolvedAddr) Network() string { return "tcp" }
+func (a *resolvedAddr) String() string  { return a.addr }
+
+func (a *resolvedAddr) IP() net.IP {
+	host, _, err := net.SplitHostPort(a.addr)
+	if err != nil {
+		host = a.addr
+	}
+	return net.ParseIP(host)
 }
 
 // Dial opens a client connection.
 func Dial(ctx context.Context, opts DialOptions) (*Conn, error) {
+	dialer := &net.Dialer{
+		Timeout:   opts.DialTimeout,
+		KeepAlive: 30 * time.Second,
+	}
+	if opts.EgressPolicy != nil {
+		// Control runs in the dialer goroutine after the address is
+		// resolved and before the socket is connected, so a refused address
+		// never reaches the network.
+		policy := opts.EgressPolicy
+		dialer.Control = func(_ string, address string, _ syscall.RawConn) error {
+			host, _, err := net.SplitHostPort(address)
+			if err != nil {
+				return fmt.Errorf("wsconn: egress policy: cannot parse %q: %w", address, err)
+			}
+			return policy(&resolvedAddr{addr: address, host: host})
+		}
+	}
 	d := websocket.Dialer{
 		HandshakeTimeout: opts.DialTimeout,
 		ReadBufferSize:   64 << 10,
 		WriteBufferSize:  64 << 10,
 		// TCP keepalive keeps NAT mappings warm and turns some silent
 		// blackholes into errors minutes earlier than WS pings would.
-		NetDial: (&net.Dialer{
-			Timeout:   opts.DialTimeout,
-			KeepAlive: 30 * time.Second,
-		}).Dial,
+		NetDial: dialer.Dial,
 	}
 	ws, resp, err := d.DialContext(ctx, opts.URL, opts.HandshakeHeader)
 	if err != nil {

@@ -94,12 +94,13 @@ func openMeshSessionWithSnapshotTimeout(ctx context.Context, state, passFlag str
 		known = append([]string(nil), cfg.Endpoints...)
 	}
 	cl, err := discovery.NewClient(withDiscoveryClientTransport(discovery.ClientConfig{
-		Addrs:      inv.DiscoveryAddrs,
-		Device:     dev,
-		AccountID:  inv.AccountID,
-		AccountPub: []byte(inv.AccountPub),
-		Endpoints:  known,
-		NoAnnounce: len(known) == 0,
+		Addrs:               inv.DiscoveryAddrs,
+		Device:              dev,
+		AccountID:           inv.AccountID,
+		AccountPub:          []byte(inv.AccountPub),
+		Endpoints:           known,
+		NoAnnounce:          len(known) == 0,
+		AllowLocalDiscovery: discoveryAllowLocal(),
 	}))
 	if err != nil {
 		return nil, err
