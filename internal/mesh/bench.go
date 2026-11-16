@@ -12,8 +12,6 @@ import (
 	"fmt"
 	"io"
 	"time"
-
-	"github.com/quic-go/quic-go"
 )
 
 // BenchConfig describes one bidirectional direct-link benchmark. Size applies
@@ -61,7 +59,7 @@ func RunBench(ctx context.Context, cfg DialConfig, bench BenchConfig) (BenchStat
 		return BenchStats{}, err
 	}
 	cfg.Kind = KindBench
-	link, err := DialDirect(ctx, cfg)
+	link, _, err := dialViaPicker(ctx, cfg)
 	if err != nil {
 		return BenchStats{}, err
 	}
@@ -74,10 +72,10 @@ func RunBench(ctx context.Context, cfg DialConfig, bench BenchConfig) (BenchStat
 	if err != nil {
 		return BenchStats{}, err
 	}
-	if _, err := fmt.Fprintf(link.Stream(), "%s\n", req); err != nil {
+	if _, err := fmt.Fprintf(link.Session(), "%s\n", req); err != nil {
 		return BenchStats{}, fmt.Errorf("mesh: send bench request: %w", err)
 	}
-	_ = link.Stream().SetReadDeadline(time.Now().Add(10 * time.Second))
+	_ = link.Session().SetReadDeadline(time.Now().Add(10 * time.Second))
 	ack, err := readLine(link.br, MaxHelloBytes)
 	if err != nil {
 		return BenchStats{}, fmt.Errorf("mesh: read bench ack: %w", err)
@@ -85,9 +83,9 @@ func RunBench(ctx context.Context, cfg DialConfig, bench BenchConfig) (BenchStat
 	if string(ack) != "ok" {
 		return BenchStats{}, fmt.Errorf("mesh: bench refused: %s", ack)
 	}
-	_ = link.Stream().SetReadDeadline(time.Time{})
+	_ = link.Session().SetReadDeadline(time.Time{})
 
-	return runBenchStream(ctx, link.Stream(), link.br, bench)
+	return runBenchStream(ctx, link.Session(), link.br, bench)
 }
 
 func validateBenchConfig(cfg BenchConfig) error {
@@ -100,7 +98,7 @@ func validateBenchConfig(cfg BenchConfig) error {
 	return nil
 }
 
-func receiveBench(br *bufio.Reader, st *quic.Stream) error {
+func receiveBench(br *bufio.Reader, st Session) error {
 	line, err := readLine(br, MaxHelloBytes)
 	if err != nil {
 		return fmt.Errorf("mesh: bench request: %w", err)
@@ -124,7 +122,7 @@ func receiveBench(br *bufio.Reader, st *quic.Stream) error {
 // runBenchStream has one writer goroutine and one reader goroutine by role.
 // Each endpoint writes only its own direction, so the bidirectional QUIC
 // stream cannot interleave frames within a direction.
-func runBenchStream(ctx context.Context, st *quic.Stream, br *bufio.Reader, cfg BenchConfig) (BenchStats, error) {
+func runBenchStream(ctx context.Context, st Session, br *bufio.Reader, cfg BenchConfig) (BenchStats, error) {
 	started := time.Now()
 	sendDone := make(chan error, 1)
 	go func() { sendDone <- sendBenchData(ctx, st, cfg) }()
@@ -277,7 +275,7 @@ func (r *benchFrameReader) next(br *bufio.Reader) ([]byte, error) {
 	return body, nil
 }
 
-func sendBenchData(ctx context.Context, st *quic.Stream, cfg BenchConfig) error {
+func sendBenchData(ctx context.Context, st Session, cfg BenchConfig) error {
 	payload := make([]byte, benchFrameMax)
 	writer := &benchFrameWriter{}
 	var sent int64

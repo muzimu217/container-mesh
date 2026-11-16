@@ -33,8 +33,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/quic-go/quic-go"
 )
 
 // Run session constants.
@@ -88,7 +86,7 @@ func readRunFrame(br *bufio.Reader) (byte, []byte, error) {
 
 // receiveRun dispatches a built-in verb. The peer identity is stamped into
 // every log-worthy surface by the caller; verbs themselves are read-only.
-func receiveRun(br *bufio.Reader, st *quic.Stream, cfg ListenerConfig) error {
+func receiveRun(br *bufio.Reader, st Session, cfg ListenerConfig) error {
 	line, err := readLine(br, maxRunArgv)
 	if err != nil {
 		return err
@@ -208,7 +206,7 @@ func SendRun(ctx context.Context, cfg DialConfig, verb string, args []string) (i
 		return 2, fmt.Errorf("mesh: run takes built-in verbs (@info @disk @mem @cat @ls), got %q", verb)
 	}
 	cfg.Kind = KindRun
-	link, err := DialDirect(ctx, cfg)
+	link, _, err := dialViaPicker(ctx, cfg)
 	if err != nil {
 		return 2, err
 	}
@@ -218,7 +216,7 @@ func SendRun(ctx context.Context, cfg DialConfig, verb string, args []string) (i
 	if err != nil {
 		return 2, err
 	}
-	if _, err := fmt.Fprintf(link.Stream(), "%s\n", req); err != nil {
+	if _, err := fmt.Fprintf(link.Session(), "%s\n", req); err != nil {
 		return 2, fmt.Errorf("mesh: send request: %w", err)
 	}
 

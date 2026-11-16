@@ -471,7 +471,18 @@ func (l *Listener) handle(conn *quic.Conn) {
 // serveStream reads the hello, checks freshness and intent, answers ok, and
 // dispatches. The TLS handshake has already authenticated the peer (device
 // certificate pinned to the member view); the hello only carries intent.
+//
+// The transport-specific part (the QUIC stream) stops at this function:
+// everything below it works on a Session, so the same session body serves
+// a direct link and a relayed link.
 func (l *Listener) serveStream(peerID identity.DeviceID, st *quic.Stream) error {
+	return l.serveSession(peerID, quicSession{st: st})
+}
+
+// serveSession is the transport-agnostic session entry point: it reads the
+// hello, checks freshness and intent, answers ok, and dispatches to the
+// handler for the session kind.
+func (l *Listener) serveSession(peerID identity.DeviceID, st Session) error {
 	// One buffered reader for hello AND session body. The hello's length
 	// bound comes from readLine's cap — NOT from a LimitReader here: a cap
 	// on the reader would truncate every session body (an 8 MB file died
@@ -499,24 +510,35 @@ func (l *Listener) serveStream(peerID identity.DeviceID, st *quic.Stream) error 
 	}
 	_ = st.SetReadDeadline(time.Time{})
 
-	switch h.Kind {
+	return serveSession(h.Kind, peerID, br, st, l.cfg)
+}
+
+// serveSession dispatches an established session to the handler for its
+// kind. It is the ONE place where a kind is mapped to a handler, so a new
+// kind cannot be half-implemented, and it is transport-agnostic: the
+// handlers below only ever see a Session.
+//
+// The caller has already read the hello and answered "ok"; br is the
+// buffered reader positioned right after the hello.
+func serveSession(kind string, peerID identity.DeviceID, br *bufio.Reader, st Session, cfg ListenerConfig) error {
+	switch kind {
 	case KindPing:
 		return echoPings(br, st)
 	case KindDial:
 		return echoDuplex(br, st)
 	case KindMsg:
-		return receiveMsgs(peerID, br, st, l.cfg.OnMessage)
+		return receiveMsgs(peerID, br, st, cfg.OnMessage)
 	case KindFile:
-		return receiveFile(peerID, br, st, l.cfg)
+		return receiveFile(peerID, br, st, cfg)
 	case KindRun:
-		return receiveRun(br, st, l.cfg)
+		return receiveRun(br, st, cfg)
 	case KindBench:
 		return receiveBench(br, st)
 		// KindExec (arbitrary remote commands) is pending: the implementation
 		// is gated on the operator adjusting the code-scanner rule that blocks
 		// os/exec writes. Built-in verbs above cover remote diagnosis today.
 	default:
-		return fmt.Errorf("mesh: unknown hello kind %q", h.Kind)
+		return fmt.Errorf("mesh: unknown hello kind %q", kind)
 	}
 }
 
@@ -525,7 +547,7 @@ func (l *Listener) serveStream(peerID identity.DeviceID, st *quic.Stream) error 
 // connection until every frame has been CONSUMED (not just delivered to the
 // kernel) — a connection close races the receiver's reads and can discard
 // the tail (observed in tests as silently dropped messages).
-func receiveMsgs(from identity.DeviceID, br *bufio.Reader, st *quic.Stream, onMsg func(identity.DeviceID, string)) error {
+func receiveMsgs(from identity.DeviceID, br *bufio.Reader, st Session, onMsg func(identity.DeviceID, string)) error {
 	for {
 		frame, err := readFrame(br, MaxMsgBytes)
 		if err != nil {
@@ -543,7 +565,7 @@ func receiveMsgs(from identity.DeviceID, br *bufio.Reader, st *quic.Stream, onMs
 
 // receiveFile reads one FileHeader line, streams the body to InboxDir,
 // verifies sha256, and answers "ok\n" (or an error line the sender shows).
-func receiveFile(from identity.DeviceID, br *bufio.Reader, st *quic.Stream, cfg ListenerConfig) error {
+func receiveFile(from identity.DeviceID, br *bufio.Reader, st Session, cfg ListenerConfig) error {
 	line, err := readLine(br, MaxHelloBytes)
 	if err != nil {
 		return err
@@ -606,7 +628,7 @@ func receiveFile(from identity.DeviceID, br *bufio.Reader, st *quic.Stream, cfg 
 }
 
 // echoPings answers ping records verbatim until the dialer hangs up.
-func echoPings(br *bufio.Reader, st *quic.Stream) error {
+func echoPings(br *bufio.Reader, st Session) error {
 	buf := make([]byte, pingRecordSize)
 	for {
 		_ = st.SetReadDeadline(time.Now().Add(30 * time.Second))
@@ -622,7 +644,7 @@ func echoPings(br *bufio.Reader, st *quic.Stream) error {
 // echoDuplex echoes raw bytes until EOF. PR-M3's dial is an interactive
 // transport-validation channel; PR-M4 replaces this handler with the e2e
 // layer and real services (forward, send-to).
-func echoDuplex(br *bufio.Reader, st *quic.Stream) error {
+func echoDuplex(br *bufio.Reader, st Session) error {
 	buf := make([]byte, 16<<10)
 	for {
 		n, rerr := br.Read(buf)
@@ -653,6 +675,10 @@ type DialConfig struct {
 	HandshakeTimeout time.Duration
 	// Kind is the session kind: "ping" or "dial" (empty = "dial").
 	Kind string
+	// Picker chooses the path (direct first, then relay candidates) the
+	// session is established over. Nil = the session is always direct,
+	// which is byte-for-byte today's behaviour.
+	Picker PathPicker
 }
 
 // DialDirect brings up a mutually-authenticated direct link, trying the
@@ -665,7 +691,10 @@ func DialDirect(ctx context.Context, cfg DialConfig) (*Link, error) {
 		cfg.Kind = KindDial
 	}
 	if len(cfg.Endpoints) == 0 {
-		return nil, fmt.Errorf("mesh: %s has no reachable endpoints in the current view", cfg.Target)
+		// No endpoint in the member view = no path. Not an auth problem:
+		// the credentials were never exercised, and a relay might still
+		// reach the target.
+		return nil, fmt.Errorf("%w: mesh: %s has no reachable endpoints in the current view", ErrNoRoute, cfg.Target)
 	}
 	if cfg.HandshakeTimeout <= 0 {
 		cfg.HandshakeTimeout = 10 * time.Second
@@ -681,7 +710,12 @@ func DialDirect(ctx context.Context, cfg DialConfig) (*Link, error) {
 	}
 	wantKey, err := cfg.Resolver.KeyFor(cfg.Target)
 	if err != nil {
-		return nil, err
+		// The target is not a (current) member: the resolver could not
+		// produce a key to pin. That is an auth-class failure — the
+		// credentials are the problem, not the network — so the path
+		// layer must not retry it over a relay. The original text
+		// ("... is not a member") stays in the chain for the operator.
+		return nil, fmt.Errorf("%w: %w", ErrAuth, err)
 	}
 	cert, err := cfg.Device.TLSCertificate()
 	if err != nil {
@@ -712,10 +746,49 @@ func DialDirect(ctx context.Context, cfg DialConfig) (*Link, error) {
 		if err == nil {
 			return link, nil
 		}
-		lastErr = err
+		// Classify here, once per endpoint: the class travels up through
+		// the aggregate below, so errors.Is on the outer error still
+		// reaches the sentinel.
+		classified := classifyDialError(err)
+		lastErr = preferDialError(lastErr, classified)
 	}
 	return nil, fmt.Errorf("mesh: all %d endpoint(s) for %s failed: %w",
 		len(cfg.Endpoints), cfg.Target, lastErr)
+}
+
+// preferDialError picks the failure the caller should see when several
+// endpoints were tried.
+//
+// A VERDICT (the peer answered and rejected us — an auth failure or a
+// refusal) beats a NETWORK FACT (nobody answered). The distinction is not
+// cosmetic: the path layer decides whether another path may be tried from
+// the class, and "the peer rejected us" must not be erased by "the next
+// endpoint did not answer" — otherwise the same rejected credentials
+// would be presented over a relay.
+//
+// Without this rule the dial would keep the LAST error, and the verdict
+// would depend on the endpoint order — the same member would be
+// classified differently on two machines.
+func preferDialError(current, candidate error) error {
+	if candidate == nil {
+		return current
+	}
+	if current == nil {
+		return candidate
+	}
+	if isDialVerdict(candidate) {
+		return candidate
+	}
+	if isDialVerdict(current) {
+		return current
+	}
+	return candidate
+}
+
+// isDialVerdict reports whether err is a verdict rather than a network
+// fact: the peer was reached and rejected the session.
+func isDialVerdict(err error) bool {
+	return errors.Is(err, ErrAuth) || errors.Is(err, ErrRefused)
 }
 
 // dialOne attempts a single endpoint.
@@ -727,7 +800,23 @@ func DialDirect(ctx context.Context, cfg DialConfig) (*Link, error) {
 // made every attempt after a failure run on a closed socket and fail with
 // "use of closed network connection", which made the multi-endpoint
 // fallback unreachable.
+//
+// The returned error is CLASSIFIED (see classifyDialError). This is
+// load-bearing: quic.Dial returns a nil error when the peer rejects our
+// certificate — the rejection only arrives once the handshake is running,
+// so it surfaces at the hello write or the ack read, wrapped in a
+// quic.TransportError carrying a TLS alert. Classifying here (rather than
+// only at the aggregate in DialDirect) means the class is attached to the
+// error that actually carries the evidence.
 func dialOne(ctx context.Context, addr *net.UDPAddr, cfg DialConfig, tlsCfg *tls.Config) (*Link, error) {
+	link, err := dialOneRaw(ctx, addr, cfg, tlsCfg)
+	if err != nil {
+		return nil, classifyDialError(err)
+	}
+	return link, nil
+}
+
+func dialOneRaw(ctx context.Context, addr *net.UDPAddr, cfg DialConfig, tlsCfg *tls.Config) (*Link, error) {
 	udp, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
 	if err != nil {
 		return nil, fmt.Errorf("mesh: local udp bind: %w", err)
@@ -760,17 +849,23 @@ func dialOne(ctx context.Context, addr *net.UDPAddr, cfg DialConfig, tlsCfg *tls
 		return nil, fmt.Errorf("read ack: %w", err)
 	}
 	if !bytes.Equal(bytes.TrimSpace(ackLine), []byte("ok")) {
-		return nil, fmt.Errorf("listener refused: %s", ackLine)
+		// The peer WAS reached and declined. Mark it as a refusal so the
+		// classifier can tell "said no" apart from "nobody answered".
+		return nil, newRefused("listener refused: %s", ackLine)
 	}
 	_ = st.SetReadDeadline(time.Time{})
-	return &Link{qc: qc, st: st, br: br}, nil
+	return &Link{qc: qc, st: st, sess: quicSession{st: st}, br: br}, nil
 }
 
 // Link is an established, mutually-authenticated direct link.
 type Link struct {
 	qc *quic.Conn
 	st *quic.Stream
-	br *bufio.Reader
+	// sess is the transport-agnostic view of the same stream. The
+	// business layer uses it, so the business code never names a QUIC
+	// type and a relayed session can be dropped in unchanged.
+	sess Session
+	br   *bufio.Reader
 }
 
 // SendMsg delivers short text messages to a member. Frames are
@@ -789,22 +884,22 @@ func SendMsg(ctx context.Context, cfg DialConfig, texts []string) error {
 		}
 	}
 	cfg.Kind = KindMsg
-	link, err := DialDirect(ctx, cfg)
+	link, _, err := dialViaPicker(ctx, cfg)
 	if err != nil {
 		return err
 	}
 	defer link.Close()
 	for _, t := range texts {
-		if err := writeFrame(link.Stream(), []byte(t)); err != nil {
+		if err := writeFrame(link.Session(), []byte(t)); err != nil {
 			return fmt.Errorf("mesh: send message: %w", err)
 		}
 	}
 	// Half-close (FIN after the frames), then wait for the receiver's done
 	// ack — only then is tearing the connection safe.
-	if err := link.Stream().Close(); err != nil {
+	if err := link.Session().Close(); err != nil {
 		return fmt.Errorf("mesh: close send side: %w", err)
 	}
-	_ = link.Stream().SetReadDeadline(time.Now().Add(10 * time.Second))
+	_ = link.Session().SetReadDeadline(time.Now().Add(10 * time.Second))
 	ack, err := readLine(link.br, 16)
 	if err != nil {
 		return fmt.Errorf("mesh: await delivery ack: %w", err)
@@ -846,7 +941,7 @@ func SendFile(ctx context.Context, cfg DialConfig, path string) (FileHeader, err
 	}
 
 	cfg.Kind = KindFile
-	link, err := DialDirect(ctx, cfg)
+	link, _, err := dialViaPicker(ctx, cfg)
 	if err != nil {
 		return h, err
 	}
@@ -856,23 +951,23 @@ func SendFile(ctx context.Context, cfg DialConfig, path string) (FileHeader, err
 	if err != nil {
 		return h, err
 	}
-	if _, err := fmt.Fprintf(link.Stream(), "%s\n", hdr); err != nil {
+	if _, err := fmt.Fprintf(link.Session(), "%s\n", hdr); err != nil {
 		return h, fmt.Errorf("mesh: send header: %w", err)
 	}
 	// Receiver answers ok before taking bytes (its inbox may be unset or
 	// the file over its cap — cheaper to learn now than after 8 GB).
-	_ = link.Stream().SetReadDeadline(time.Now().Add(15 * time.Second))
+	_ = link.Session().SetReadDeadline(time.Now().Add(15 * time.Second))
 	if ack, err := readLine(link.br, MaxHelloBytes); err != nil {
 		return h, fmt.Errorf("mesh: read file ack: %w", err)
 	} else if !bytes.HasPrefix(ack, []byte("ok")) {
 		return h, fmt.Errorf("mesh: receiver refused: %s", ack)
 	}
-	_ = link.Stream().SetReadDeadline(time.Time{})
+	_ = link.Session().SetReadDeadline(time.Time{})
 
-	if err := sendFileBody(ctx, link.Stream(), f, h.Size); err != nil {
+	if err := sendFileBody(ctx, link.Session(), f, h.Size); err != nil {
 		return h, fmt.Errorf("mesh: send body: %w", err)
 	}
-	_ = link.Stream().SetReadDeadline(time.Now().Add(30 * time.Second))
+	_ = link.Session().SetReadDeadline(time.Now().Add(30 * time.Second))
 	verdict, err := readLine(link.br, MaxHelloBytes)
 	if err != nil {
 		return h, fmt.Errorf("mesh: read verdict: %w", err)
@@ -888,7 +983,7 @@ func SendFile(ctx context.Context, cfg DialConfig, path string) (FileHeader, err
 // write for the whole file.
 const fileChunkSize = 1 << 20
 
-func sendFileBody(ctx context.Context, st *quic.Stream, f *os.File, size int64) error {
+func sendFileBody(ctx context.Context, st Session, f *os.File, size int64) error {
 	buf := make([]byte, fileChunkSize)
 	remaining := size
 	for remaining > 0 {
@@ -916,7 +1011,16 @@ func sendFileBody(ctx context.Context, st *quic.Stream, f *os.File, size int64) 
 
 // Stream exposes the raw duplex stream (one pipe, positioned after the
 // handshake). PR-M4 wraps it in the e2e layer.
+//
+// It is kept for the existing callers (the CLI's interactive dial, the
+// tests). New business code should use Session instead: it says nothing
+// about the transport, so the same code runs over a relayed link.
 func (l *Link) Stream() *quic.Stream { return l.st }
+
+// Session exposes the transport-agnostic view of the link. The business
+// layer writes and reads through this, so it never learns whether the
+// bytes travelled directly or through a relay.
+func (l *Link) Session() Session { return l.sess }
 
 // Reader exposes the buffered reader positioned after the handshake.
 func (l *Link) Reader() *bufio.Reader { return l.br }
@@ -975,7 +1079,7 @@ func PingExchangeStats(ctx context.Context, l *Link, count int, interval time.Du
 		}
 		binary.BigEndian.PutUint64(buf[0:], uint64(i))
 		binary.BigEndian.PutUint64(buf[8:], uint64(time.Now().UnixNano()))
-		if _, err := l.st.Write(buf); err != nil {
+		if _, err := l.sess.Write(buf); err != nil {
 			return stats, err
 		}
 		stats.Sent++
@@ -984,7 +1088,7 @@ func PingExchangeStats(ctx context.Context, l *Link, count int, interval time.Du
 		if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
 			deadline = ctxDeadline
 		}
-		_ = l.st.SetReadDeadline(deadline)
+		_ = l.sess.SetReadDeadline(deadline)
 		for {
 			if _, err := io.ReadFull(l.br, buf); err != nil {
 				var netErr net.Error
@@ -1008,7 +1112,7 @@ func PingExchangeStats(ctx context.Context, l *Link, count int, interval time.Du
 			break
 		}
 	}
-	_ = l.st.SetReadDeadline(time.Time{})
+	_ = l.sess.SetReadDeadline(time.Time{})
 	return stats, nil
 }
 
