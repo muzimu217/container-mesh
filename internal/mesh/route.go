@@ -110,9 +110,10 @@ func tryPaths(ctx context.Context, cfg DialConfig, paths []Path, dial pathDialer
 		return nil, Path{}, fmt.Errorf("%w: mesh: no path to %s", ErrNoRoute, cfg.Target)
 	}
 	var lastErr error
+	var lastPath Path
 	for _, p := range paths {
 		if err := ctx.Err(); err != nil {
-			return nil, Path{}, err
+			return nil, lastPath, err
 		}
 		link, err := dial(ctx, cfg, p)
 		if err == nil {
@@ -120,13 +121,17 @@ func tryPaths(ctx context.Context, cfg DialConfig, paths []Path, dial pathDialer
 		}
 		classified := classifyDialError(err)
 		lastErr = classified
+		// Remember which path failed, so the caller can report it. The CLI
+		// says which path it took, and "the relay did not work either" is
+		// only meaningful with the path in hand.
+		lastPath = p
 		if errors.Is(classified, ErrAuth) || errors.Is(classified, ErrRefused) {
 			// A rejection is a decision, not a network fault. Do not
 			// present the same credentials to another path.
 			return nil, p, classified
 		}
 	}
-	return nil, Path{}, lastErr
+	return nil, lastPath, lastErr
 }
 
 // dialViaPicker establishes a session, letting the configured picker
@@ -140,6 +145,15 @@ func dialViaPicker(ctx context.Context, cfg DialConfig) (*Link, PathKind, error)
 	if cfg.Picker == nil {
 		link, err := DialDirect(ctx, cfg)
 		return link, PathDirect, err
+	}
+	// The membership check comes BEFORE the picker is asked. The picker
+	// hands the target's identity to a relay, and a device that is not a
+	// member — a revoked one, or one that was never a member — must not
+	// have its identity sent anywhere. DialDirect makes this check
+	// internally; here it has to happen first, because the picker runs
+	// before DialDirect would.
+	if _, err := cfg.Resolver.KeyFor(cfg.Target); err != nil {
+		return nil, PathDirect, fmt.Errorf("%w: %w", ErrAuth, err)
 	}
 	paths, err := cfg.Picker.Pick(ctx, cfg.Target, cfg.Kind)
 	if err != nil {
@@ -166,7 +180,10 @@ func dialPath(ctx context.Context, cfg DialConfig, p Path) (*Link, error) {
 		}
 		return DialDirect(ctx, cfg)
 	case PathRelay:
-		return nil, fmt.Errorf("%w: mesh: relay paths are not available yet", ErrNoRoute)
+		// Not "no route". The relay trunk does not exist yet, so trying
+		// another path cannot help either, and ErrNoRoute would tell the
+		// caller to keep walking a list. This class stops the walk.
+		return nil, fmt.Errorf("%w: mesh: relay paths are not available yet", ErrSessionClosed)
 	default:
 		return nil, fmt.Errorf("%w: mesh: unknown path kind %q", ErrNoRoute, p.Kind)
 	}
