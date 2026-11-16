@@ -1118,3 +1118,32 @@ t=20s  RSS=7,888 KB
 `/tmp/rc1-release/release/` —— **20 个资产**（版本化二进制 6 + tar.gz 6 + latest 别名 6 + install.sh + SHA256SUMS），SHA256SUMS **19/19 与实际文件一一对应、无悬空行**（对照：线上 rc1 是 15 行清单对 10 个资产，**7 行悬空**）。**已识别需补传的 11 项**。**未上传**（发布动作需网主放行）。
 
 **本轮推送**：`3a8a2bd` fix(mkrelease) → `f085507` fix(discovery) 端点上限 → `b59fe9b`/`a8cf5c8`/`17ba9ba` PR-1 三笔。
+
+### Round 55（2026-11-16 · 值守：oh-no 两条发现 + 一条上报的核实与修复）
+
+**oh-no 对 `9631276` 的复测（全项 PASS）**
+- **出口策略负向**：**register HTTP 路径**与 **members WS 路径**都被拦（生产二进制，无 cmeshtest tag），报错可读明确（`egress policy: 127.0.0.1:18093 resolved to 127.0.0.1, which is not a public address`），**连接根本未建立**。oh-no 结论：「两条出口路径都被策略拦截，SSRF 面全关」。
+- **正向对照**（cmeshtest 标签二进制，如实标注）：join → authorize → 2 成员在线 → `mesh ping` 5/5 p50 0.831ms p95 1.453ms link=direct。
+- **bench 字节完整性**：4096 / 1MB / 8MB / 32MB + 对抗尺寸 65535 / 65537 / 1048577 / 33554431 **双向 sent==received 全部精确相等**，无跨帧残留。
+- **oh-no 回答了派单里的问题**：「无运行时开关」——全仓无任何 CLI flag / 环境变量可关策略，唯一出口是 `cmeshtest` build tag；正式复测一律改用真实公网 IP，若必须回环则用 `-tags cmeshtest` 重编译**并在报告里标注**。他另建议「未来可加显式 env 开关（如 `CMESH_ALLOW_LOCAL=1`，默认关），比 build tag 可发现性更好」——**仅供评估，非缺陷**，本轮未采纳（build tag 已在出货二进制里被 `go tool nm` 证明不存在，开 env 开关反而多一条可被误用的路径）。
+
+**★ oh-no 报的候选小缺陷 → 本会话核实并修复（`6f351af`）**
+- **现象**：`bench` 一次性命令后出现 `announce failed; ... malformed endpoint "127.0.0.1:0"`。
+- **本会话定位**：announce 侧**确实**会解析 `--endpoint 127.0.0.1:0`（`internal/cli/discovery.go:423` 的 `resolvePortZeroEndpoints`），但**保存到配置文件的是原始列表**（`discovery.go:483` 的 `[]string(eps)`，而不是解析后的 `announced`）→ 之后每个一次性命令（bench / mesh ping / msg / send-to）都读这个文件并 announce `:0`，**discovery 判为 malformed → 成员在所有人视图里短暂离线**。**announce 与配置文件读的是两个不同的列表**，这是根因。
+- **修复**：配置文件现在存**解析后**的列表。
+- **红→绿**：在既有 join 端到端测试（`TestMeshBootstrapApprovalFlow`）上加断言——owner 用 `--listen 127.0.0.1:0 --endpoint 127.0.0.1:0` 入网，读回配置文件检查是否还带 `:0`。修复前红（`the owner's saved endpoint "127.0.0.1:0" still carries port zero`），修复后绿。
+- **★ 复核发现的测试陷阱**：第一版测试**直接测 helper**（`endpointsToSave`），复核时被判为**假绿**——helper 本身没错，**接线**才是缺陷；把 helper 改回原样测试仍然绿。**已改为走真实 join 路径**（这正是 test-discipline #27/#28 的同一族：验证装置必须先证明它测的是被测物）。
+
+**oh-no 的一项如实申报（不是缺陷）**：他的环境**无公网锚点**（无入站路径），所以「register 负向在真公网 IP 正向下」这条**未测**。
+
+**四线静默时长与催办**
+| agent | 最后报告 | 静默 | 处置 |
+|---|---|---|---|
+| oh-no-agent | 18:05:35Z | 1.6h | fresh，不催（但其新发现已修并回灌） |
+| doubao-cloud-vm-01 | 17:21:13Z | 2.3h | fresh，不催 |
+| kuku-sandbox-01 | 13:50:31Z | 5.9h | 未超时，派了新 SHA 复测项 |
+| netns-probe | 12:52:42Z | **6.8h** | **超 6h → 具体催办**（第二轮）；并把资源 KPI 的**口径分歧**写进了催办单 |
+
+**netns 催办单里的关键内容**：它上一轮报的「RSS 20 点全平 75,268 KB、KPI 未达标」，与本会话本地实测的「稳定 7.7–9.7 MB、达标」是**两个相位**（pre-GC vs post-GC）。催办单里给了它**本地实测的 150 秒序列**（`25,968 → 25,952 → 7,712 → 7,888 → …`）与 gctrace 佐证（`gc 2 @120.282s (65->65->0 MB)`），要求它**分开报两段**：① 前 15 秒 ② 15 秒之后的 20 点，判定按 post-GC 稳态。
+
+**本轮推送**：`6f351af` fix(cli)（保存解析后的端点）。
