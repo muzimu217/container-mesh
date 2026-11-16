@@ -1072,3 +1072,49 @@ t=20s  RSS=7,888 KB
 - **doubao（`9631276`）**：register 路径**独立复测 PASS** —— 127.0.0.1 listener 存活且 curl 直连 200（证明可达）的前提下，register 现在**在 HTTP 拨号阶段被拒**（对照上轮同形态 register 真实连通收到 501）；私网名同样被拒；**公网正向照常工作**（join → show-pub → account authorize 三步审批，2 成员在线，`mesh ping` 5/5 p50 0.305ms link=direct）。**环境备注**：该 VM 公网 IP 又迁移 `9.100.127.194 → 9.96.254.67`。
 
 **本轮推送**：`44b9a8f` fix(cli)（enroll 路径补策略）→ `2fa76ef` docs（审计与第三条路径）。
+
+### Round 54（2026-11-16 · 值守：PR-1 落地 + 两个放大器修复 + 成员回环拨号实测）
+
+**★ 成员端点回环拨号：机制实测确认（`/tmp/loopback-dial-round53.md`）**
+
+实测代理在**纯净 `git archive` 树**上复现了审计代理的推断：**恶意 discovery 节点的快照让客户端每次拨号向 `127.0.0.1` 发出 10 个 QUIC Initial 包**（裸 UDP 监听器计数，3 次复现）。**但审计代理给的推断数字被实测更正**：
+
+| 审计的推断 | 实测 |
+|---|---|
+| 每端点 10s，16 端点 = 160s | **每端点 5s**（quic-go 的 `DefaultHandshakeIdleTimeout` 先触发）→ 16 端点 = **80s** |
+| 快照路径也有限制 | **没有**：`MaxEndpoints=16` 只在 announce 路径强制，**实测 500 个端点的快照全收** → **放大器无界** |
+| 可做内网端口扫描 | **不是**：quic-go 用**无连接** UDP socket，ICMP port-unreachable 被静默丢弃，**开/关端口的错误文本与耗时完全相同** |
+| （未提） | **调用方 context 不约束端点循环** → 产品自己的 `status --probe --probe-timeout 3s` **实测跑到 5.12s** |
+| （未提） | 包的**源地址是 `127.0.0.1`** → 本地服务看到的是「可信本地客户端」，比审计推断的**更难发现** |
+
+**两个放大器本轮已修**
+- `f085507` fix(discovery)：**快照路径补 `MaxEndpoints` 上限**（快照校验时截断）。红→绿：去掉上限后测试红（"the snapshot kept 160 endpoints, want at most 16"），恢复后绿。
+- `17ba9ba` fix(mesh)：**握手 context 改为派生自调用方**（原为 `context.Background()`）。红→绿：还原后测试红（**40.02s**，调用方 deadline 900ms 完全无效），恢复后绿（0.91s）。
+
+**★ 决定性边界发现：一刀切禁 loopback 会砸产品**
+`join --listen 127.0.0.1:0` 会把 `endpoints=127.0.0.1:59214` 写进成员视图，真实 `cmesh mesh ping` **3/3 成功**（p50 0.363ms）；实测代理的原型让 **11 个既有 `internal/mesh` 测试变红**。→ **成员端点不能套 egress policy**（私网成员是合法且核心的产品形态）。
+
+**建议的边界（具体，非"看情况"）**：拒 loopback/unspecified/reserved/link-local/multicast/broadcast；**放行私网**（10/8、172.16/12、192.168/16）与 **CGNAT 100.64/10**（成员在运营商 NAT 后是常态——注：`isReservedIP` **误列了 CGNAT**）。**loopback 本身**建议用「**短握手预算 + 排在最后 + 数量上限**」而非静态封禁（同机合法 peer 4ms 应答、可证明区分）。**修法落点**：`internal/mesh/direct.go` 的 `DialDirect`（不是 `verifySnapshot`——信任校验时不该解析主机名；也不是 `wsconn`——那是 TCP/WS 传输，成员端点走 QUIC/UDP）。
+
+**★ 测试方法学（重要）**：规则必须判**解析后**的地址——`localhost`、`2130706433`（十进制）、`0x7f000001`（十六进制）、`017700000001`（八进制）**都能通过 `net.ParseIP`/语法检查**却真的打到 loopback（实测每个 10 个包）。红断言应在**计数器**上：`the client sent 10 datagram(s) to the loopback address 127.0.0.1:57357` → 绿是 `count == 0`，**用裸 UDP 监听器**（不是 httptest，见本项目已知的假绿坑）。
+
+**★ PR-1「路径选择的骨架」已施工完成（3 笔）**
+
+| 提交 | 内容 |
+|---|---|
+| `b59fe9b` | **feat(mesh)**: 错误分类 sentinel —— 6 个 sentinel + `classifyDialError`，**覆盖 quic-go「Dial 返回 nil、错误在 read ack 阶段才浮现为 remote CRYPTO_ERROR」**；原字符串全部保留（`"not a member"` 与 `ErrAuth` 并存） |
+| `a8cf5c8` | **refactor(mesh)**: Session 抽象（**11 处** `*quic.Stream` 签名重写）+ PathPicker + RelayCandidates |
+| `17ba9ba` | **fix(mesh)**: 调用方 deadline 约束端点循环 |
+
+**PR-1 不含任何 relay 能力**，只让「relay 能插进来」在结构上成立。
+- **PathPicker 的关键设计**：`Picker == nil` 时**直接调 `DialDirect`、不合成路径列表** → 没有第二条代码路径需要同步维护（本会话已复核 `route.go:140-142`）。签名是 `Pick(...) ([]Path, error)` 而非单路径——因为**直连是否可达只有试了才知道**，picker 无法预判，由 path 层遍历与回退。
+- **施工代理另发现一个计划未预见的真缺陷并已修**：多端点拨号原本只保留**最后一个**错误 → 第一个端点的冒充者（`ErrAuth`）会被第二个死端口（`ErrUnreachable`）**抹掉**。这在路径层是致命的（path 层看到 "unreachable" 就会换路重试**同一组被拒绝的凭证**，正是 N2 要防的事）。引入 `preferDialError`：**判定优先于网络事实**，且**与端点顺序无关**（否则同一成员在两台机器上分类不同）。本会话已复核 `direct.go:759-791`。
+- **红→绿证据**：每项都先写测试看红，红的原因与要修的点匹配（不是编译错）。两条**反向证明**都做了：注释掉 crypto 分支 → `TestClassifyAuthFailure` 转红；去掉 `sort.Slice` → `TestRelayCandidatesAreDeterministic` 20 次跑出 6 次红。PROBE-F/G 也端到端复现了。
+
+**★ mkrelease 的归档目录名 bug（本会话在本地重建 rc1 发布件时发现）**
+本地构建完整的 6 平台 rc1 发布件（**20 个资产**，SHA256SUMS 19/19 完全一致）时发现：Windows 归档解出来的顶层目录是 `cmesh-v1.0.0-windows-amd64.exe.d`——**`.exe` 被当成了目录名的一部分**。根因：`writeArchive` 的 `base := binary + ".d"`。目录是按**平台**命名的，不该带可执行后缀。已修（`3a8a2bd`）：新增 `archiveDirName()`，目录名去 `.exe`、归档内的二进制保留原名。**旧测试把这个 bug 写进了断言**（`binary + ".d/"`），已改为从同一条规则推导，并补了一条锁住 6 个平台目录名的测试。
+
+**★ 本地已备好完整 rc1 发布件**
+`/tmp/rc1-release/release/` —— **20 个资产**（版本化二进制 6 + tar.gz 6 + latest 别名 6 + install.sh + SHA256SUMS），SHA256SUMS **19/19 与实际文件一一对应、无悬空行**（对照：线上 rc1 是 15 行清单对 10 个资产，**7 行悬空**）。**已识别需补传的 11 项**。**未上传**（发布动作需网主放行）。
+
+**本轮推送**：`3a8a2bd` fix(mkrelease) → `f085507` fix(discovery) 端点上限 → `b59fe9b`/`a8cf5c8`/`17ba9ba` PR-1 三笔。

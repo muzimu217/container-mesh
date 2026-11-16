@@ -13,7 +13,7 @@
 <main class="wrap">
 <header class="top">
   <div><div class="eyebrow">container-mesh / daily delivery board</div><h1 class="title">项目进度与路线看板</h1><p class="sub">每天看这里：当前开发完成到哪一步、门禁是否全绿、哪个平台真的能安装运行、下一步由谁推进。状态按代码和测试证据记录。</p></div>
-  <div class="stamp">看板更新<br><strong id="updated">2026-11-16 16:40Z</strong><br>远端 develop<br><strong>9631276</strong><br>出口策略两条路径齐<br><strong>四家全回 · 无一超 6h</strong></div>
+  <div class="stamp">看板更新<br><strong id="updated">2026-11-16 11:30Z</strong><br>远端 develop<br><strong>17ba9ba</strong><br>PR-1 已落地 + 两放大器已修<br><strong>rc1 20 资产已备好待上传</strong></div>
 </header>
 <section class="grid kpis">
   <div class="card kpi"><div class="label">M4 收口</div><div class="value warn">未达标</div><div class="label">直连 CLI PASS；mesh relay 未完成</div></div>
@@ -112,7 +112,10 @@
 <section class="grid two section">
   <article class="card"><div class="section-head"><h2>今日状态</h2><p>本地 worktree，待网主放行</p></div><div class="checklist">
     <div class="check"><b class="ok">✓</b><div><strong>中继干道施工计划已就绪（可开工）</strong><br><span>7 项前置件 → <strong>两个可独立验证的 PR</strong>：PR-1 = 路径选择骨架（sentinel + PathPicker + 候选 + Session 抽象，<strong>不含 relay 能力</strong>，只把业务层从 *quic.Stream 解耦）；PR-2 = 中转干道。规划代理还<strong>更正了设计稿 7 处</strong>：路由表 v1.1 不做、forward 的 tokenBucket 未导出且是 streams/sec 不是字节配额、加第二个 ALPN 会改变现网协商、9 个 *quic.Stream 硬编码签名必须先抽接口</span></div></div>
-    <div class="check"><b class="ok">✓</b><div><strong>出口策略：全路径审计完成，第三条路径已补</strong><br><span>审计代理枚举全仓出站路径：真正缺策略的只剩 2 条。<strong>enroll 的 HTTP POST 已补</strong>（同一个 origin 的第三条路径，前两条是 register 与 members WS）；<strong>mesh direct QUIC 那条待实测</strong>（成员端点来自远端快照，节点"不可信"——但私网成员是合法核心形态，不能套 egress policy，已派实测代理取证后再定）</span></div></div>
+    <div class="check"><b class="ok">✓</b><div><strong>PR-1 路径选择骨架已施工（3 笔，已推）</strong><br><span><strong>不含 relay 能力</strong>，只让 relay 能插进来：6 个错误 sentinel（覆盖 quic-go「Dial 返回 nil、错误到 read ack 才浮现」）+ PathPicker（<code>Picker==nil</code> 直接走原路径，无第二条代码路径）+ RelayCandidates（纯排序）+ Session 抽象（11 处 *quic.Stream 重写）。施工代理另修一个计划未预见的缺陷：多端点只保留最后一个错误 → 冒充者的 ErrAuth 被死端口抹掉</span></div></div>
+    <div class="check"><b class="ok">✓</b><div><strong>成员回环拨号：机制已实测确认，两个放大器已修</strong><br><span>恶意 discovery 节点的快照能让客户端<strong>每次拨号向 127.0.0.1 发 10 个 QUIC Initial 包</strong>（裸 UDP 监听器计数，3 次复现）。已修：① 快照路径<strong>补 MaxEndpoints 上限</strong>（实测 500 个端点全收）② <strong>握手 context 改为派生自调用方</strong>（原来 status --probe --probe-timeout 3s 实测跑到 5.12s）。<strong>但一刀切禁 loopback 会砸产品</strong>——join --listen 127.0.0.1:0 是合法拓扑，ping 3/3 成功，边界规则待定</span></div></div>
+    <div class="check"><b class="ok">✓</b><div><strong>完整 rc1 发布件已在本地备好（20 资产，未上传）</strong><br><span><code>/tmp/rc1-release/release/</code>：6 平台二进制 + 6 个 tar.gz + 6 个 latest 别名 + install.sh + SHA256SUMS，<strong>清单与文件一一对应无悬空行</strong>（线上 rc1 是 15 行清单对 10 个资产、7 行悬空）。顺带修了 mkrelease 的归档目录名 bug：Windows 解出的是 <code>...windows-amd64.exe.d</code>，已改为目录名不带 .exe</span></div></div>
+    <div class="check"><b class="warn">!</b><div><strong>出口策略：全路径审计完成，第三条路径已补</strong><br><span>审计代理枚举全仓出站路径：真正缺策略的只剩 2 条。<strong>enroll 的 HTTP POST 已补</strong>（同一个 origin 的第三条路径，前两条是 register 与 members WS）；<strong>mesh direct QUIC 那条边界待定</strong>——成员端点来自远端快照，节点"不可信"，但私网成员是合法核心形态，不能套 egress policy</span></div></div>
     <div class="check"><b class="ok">✓</b><div><strong>出口策略两条路径都补齐（红→绿）</strong><br><span>doubao 独立实测：回环/私网名字<strong>被拒</strong>、真实公网 IP <strong>照常工作</strong>（ping 5/5 p50 0.312ms）、生产二进制无逃生口（go tool nm 确认）。但 doubao 指出 <strong>register 的 HTTP 路径未被覆盖</strong>（裸 http.Client）→ 已补 <code>httpTransport()</code>，同一 origin 两条路径现在一致</span></div></div>
     <div class="check"><b class="ok">✓</b><div><strong>出口地址策略（安全缺口）</strong><br><span>策略原本只实现一半：拒绝字面 loopback/私网 IP，但<strong>解析后的地址无人复核</strong>——裸 net.Dialer 让「解析到回环的主机名」直连（kuku 实测穿透成功）。现经 Dialer.Control 在 <strong>DNS 后、连接前</strong>复核。逃生口用 build tag 隔离，出货二进制无此路径</span></div></div>
     <div class="check"><b class="ok">✓</b><div><strong>relay 读缓冲复用（性能缺陷，红→绿）</strong><br><span>前向循环读的是<strong>自己的</strong> buf，从未看到 RecvInto 内部的扩容 → 每条 &gt;64KiB 消息重付 64→128→256→512KiB 分配拷贝链。实测 relay 消息平均 493KiB（常态）；makeslicecopy 占 relay CPU 23.73% → 修复后 4.88%，CPU 中位 <strong>−71%</strong></span></div></div>
