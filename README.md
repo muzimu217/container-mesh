@@ -23,17 +23,33 @@
 
 发布页提供各平台静态二进制与 SHA256SUMS 校验清单。安装三步（下载 → 校验 → 落盘）：
 
+> **当前只有 prerelease `v1.0.0-rc1`**（仓库里没有正式 release）。
+> 所以下面用**版本化地址**——`releases/latest/download/...` 只有在存在正式
+> release 时才可用，现在指过去是 404。
+> **darwin/amd64 与 windows 资产尚未上传**，linux/amd64、linux/arm64、
+> darwin/arm64 可用；下文按你的平台选对应文件名。
+
 ```bash
-# ① 下载（按你的系统与架构选一个；linux-arm64 / darwin-arm64 / windows-amd64 同理）
-curl -fsSLO https://github.com/muzimu217/container-mesh/releases/latest/download/cmesh-latest-linux-amd64
-curl -fsSLO https://github.com/muzimu217/container-mesh/releases/latest/download/SHA256SUMS
+# ① 下载（按你的系统与架构选一个）
+#    linux/amd64
+curl -fsSLO https://github.com/muzimu217/container-mesh/releases/download/v1.0.0-rc1/cmesh-v1.0.0-rc1-linux-amd64
+#    linux/arm64
+curl -fsSLO https://github.com/muzimu217/container-mesh/releases/download/v1.0.0-rc1/cmesh-v1.0.0-rc1-linux-arm64
+#    darwin/arm64
+curl -fsSLO https://github.com/muzimu217/container-mesh/releases/download/v1.0.0-rc1/cmesh-v1.0.0-rc1-darwin-arm64
+curl -fsSLO https://github.com/muzimu217/container-mesh/releases/download/v1.0.0-rc1/SHA256SUMS
 
 # ② 校验完整性——不匹配就不要装
 sha256sum -c SHA256SUMS --ignore-missing
 
 # ③ 安装到 PATH 上的目录
-install -m 0755 cmesh-latest-linux-amd64 ~/.local/bin/cmesh
+install -m 0755 cmesh-v1.0.0-rc1-linux-amd64 ~/.local/bin/cmesh
 ```
+
+> `--ignore-missing` 是必要的：当前 `SHA256SUMS` 里还列着几个**尚未上传**的
+> 文件（darwin/amd64、windows 等），没有它这一条校验会直接报错中断。
+> 但也请注意——它同时意味着「清单里有、实际没有」不会被发现。请确认你
+> 下载的那一行在校验输出里显示为 `OK`。
 
 也可以自行构建（无 CGO、单静态二进制）：
 
@@ -41,8 +57,8 @@ install -m 0755 cmesh-latest-linux-amd64 ~/.local/bin/cmesh
 go build -o cmesh ./cmd/cm
 ```
 
-发布件覆盖 linux/amd64、linux/arm64、darwin/amd64、darwin/arm64、windows/amd64；
-组装命令见 `tools/mkrelease`：
+发布件覆盖 linux/amd64、linux/arm64、darwin/amd64、darwin/arm64、windows/amd64、
+windows/arm64；组装命令见 `tools/mkrelease`：
 
 ```bash
 go run ./tools/mkrelease --in dist/bin --out dist/release --version v1.0.0
@@ -51,12 +67,18 @@ go run ./tools/mkrelease --in dist/bin --out dist/release --version v1.0.0
 ```
 
 产物：各平台二进制 + 同名 `.tar.gz`（内含二进制、installer、LICENSE）+ `install.sh`
-+ `SHA256SUMS`（覆盖除自身以外的全部 16 个文件，可用 `shasum -a 256 -c SHA256SUMS` 校验）。
++ `SHA256SUMS`（覆盖除自身以外的全部产物，可用 `shasum -a 256 -c SHA256SUMS` 校验）。
+
+> **Windows 资产带 `.exe` 后缀**：`cmesh-v1.0.0-windows-amd64.exe`。
+> `mkrelease` 与 `packaging/install.sh` 都按这个约定工作，Windows 的 `latest`
+> 别名是 `cmesh-latest-windows-amd64.exe`。
 
 > **`cmesh-latest-<os>-<arch>` 是发布时的别名**：`mkrelease` 除了版本化文件名
 > （`cmesh-v1.0.0-linux-amd64`），还会为每个平台产出一份 `cmesh-latest-<os>-<arch>`
 > 副本——GitHub 的 `releases/latest/download/<name>` 只认名字里带 `latest` 的资产，
-> 有了这个副本，上面的默认地址就能直取。发布时把 `dist/release/` 整个目录上传即可。
+> 有了这个副本，等正式 release 发布后 `latest` 地址就能直取。
+> **注意**：该地址只在**存在非 prerelease 的正式 release** 时才可用；
+> 当前只有 prerelease `v1.0.0-rc1`，所以 §1 走的是版本化地址。
 
 
 ## 2. 三步组网
