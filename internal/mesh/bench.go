@@ -133,12 +133,13 @@ func runBenchStream(ctx context.Context, st *quic.Stream, br *bufio.Reader, cfg 
 	var remote *benchWireStats
 	peerEnded := false
 	resultSent := false
+	reader := &benchFrameReader{}
 	for remote == nil {
 		if err := ctx.Err(); err != nil {
 			return BenchStats{}, err
 		}
 		_ = st.SetReadDeadline(time.Now().Add(time.Second))
-		body, err := readBenchFrame(br)
+		body, err := reader.next(br)
 		if err != nil {
 			if ne, ok := err.(netError); ok && ne.Timeout() {
 				continue
@@ -184,7 +185,8 @@ func runBenchStream(ctx context.Context, st *quic.Stream, br *bufio.Reader, cfg 
 			if err != nil {
 				return BenchStats{}, err
 			}
-			if err := writeBenchFrame(st, append([]byte{benchTagStats}, wire...)); err != nil {
+			writer := &benchFrameWriter{}
+			if err := writer.writeData(st, benchTagStats, wire); err != nil {
 				return BenchStats{}, fmt.Errorf("mesh: send bench stats: %w", err)
 			}
 			resultSent = true
@@ -206,8 +208,78 @@ type netError interface {
 	Timeout() bool
 }
 
+// benchFrameWriter serializes length-prefixed bench frames through one
+// reusable buffer. A large transfer used to allocate a fresh frame buffer per
+// 64 KiB on the send path, which dominated the allocation profile; the writer
+// keeps one buffer for the whole stream.
+//
+// The buffer is owned by a single writer goroutine. runBenchStream starts
+// exactly one sender per stream, so no synchronisation is needed.
+type benchFrameWriter struct {
+	buf []byte
+}
+
+// writeData emits one data frame carrying a tag byte followed by payload.
+func (w *benchFrameWriter) writeData(st io.Writer, tag byte, payload []byte) error {
+	bodyLen := 1 + len(payload)
+	if bodyLen > benchFrameMax+1 {
+		return errors.New("mesh: bench frame too large")
+	}
+	need := 4 + bodyLen
+	if cap(w.buf) < need {
+		w.buf = make([]byte, need)
+	}
+	frame := w.buf[:need]
+	binary.BigEndian.PutUint32(frame[:4], uint32(bodyLen))
+	frame[4] = tag
+	copy(frame[5:], payload)
+	return writeFull(st, frame)
+}
+
+// writeControl emits one control frame whose body is a single tag byte.
+func (w *benchFrameWriter) writeControl(st io.Writer, tag byte) error {
+	bodyLen := 1
+	need := 4 + bodyLen
+	if cap(w.buf) < need {
+		w.buf = make([]byte, need)
+	}
+	frame := w.buf[:need]
+	binary.BigEndian.PutUint32(frame[:4], uint32(bodyLen))
+	frame[4] = tag
+	return writeFull(st, frame)
+}
+
+// benchFrameReader reads length-prefixed bench frames into one reusable
+// buffer. The returned slice is only valid until the next read, so callers
+// must consume it before reading again.
+type benchFrameReader struct {
+	buf []byte
+}
+
+// next reads one frame body. The returned slice aliases the reader's buffer
+// and is invalidated by the following call.
+func (r *benchFrameReader) next(br *bufio.Reader) ([]byte, error) {
+	var header [4]byte
+	if _, err := io.ReadFull(br, header[:]); err != nil {
+		return nil, err
+	}
+	n := binary.BigEndian.Uint32(header[:])
+	if n == 0 || n > benchFrameMax+1 {
+		return nil, errors.New("mesh: invalid bench frame size")
+	}
+	if cap(r.buf) < int(n) {
+		r.buf = make([]byte, n)
+	}
+	body := r.buf[:n]
+	if _, err := io.ReadFull(br, body); err != nil {
+		return nil, err
+	}
+	return body, nil
+}
+
 func sendBenchData(ctx context.Context, st *quic.Stream, cfg BenchConfig) error {
 	payload := make([]byte, benchFrameMax)
+	writer := &benchFrameWriter{}
 	var sent int64
 	started := time.Now()
 	for sent < cfg.Size {
@@ -224,12 +296,12 @@ func sendBenchData(ctx context.Context, st *quic.Stream, cfg BenchConfig) error 
 				return err
 			}
 		}
-		if err := writeBenchFrame(st, append([]byte{benchTagData}, payload[:n]...)); err != nil {
+		if err := writer.writeData(st, benchTagData, payload[:n]); err != nil {
 			return err
 		}
 		sent += n
 	}
-	return writeBenchFrame(st, []byte{benchTagEnd})
+	return writer.writeControl(st, benchTagEnd)
 }
 
 func waitBenchUntil(ctx context.Context, when time.Time) error {
@@ -246,34 +318,6 @@ func waitBenchUntil(ctx context.Context, when time.Time) error {
 		case <-t.C:
 		}
 	}
-}
-
-func writeBenchFrame(w io.Writer, body []byte) error {
-	if len(body) > benchFrameMax+1 {
-		return errors.New("mesh: bench frame too large")
-	}
-	var header [4]byte
-	binary.BigEndian.PutUint32(header[:], uint32(len(body)))
-	if err := writeFull(w, header[:]); err != nil {
-		return err
-	}
-	return writeFull(w, body)
-}
-
-func readBenchFrame(br *bufio.Reader) ([]byte, error) {
-	var header [4]byte
-	if _, err := io.ReadFull(br, header[:]); err != nil {
-		return nil, err
-	}
-	n := binary.BigEndian.Uint32(header[:])
-	if n == 0 || n > benchFrameMax+1 {
-		return nil, errors.New("mesh: invalid bench frame size")
-	}
-	body := make([]byte, n)
-	if _, err := io.ReadFull(br, body); err != nil {
-		return nil, err
-	}
-	return body, nil
 }
 
 func writeFull(w io.Writer, p []byte) error {
