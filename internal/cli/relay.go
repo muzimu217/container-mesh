@@ -4,9 +4,13 @@
 package cli
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/muzimu217/container-mesh/internal/relay"
 )
@@ -43,6 +47,16 @@ func runRelay(args []string) error {
 	// Let the dashboard report the same version string `cmesh version` prints.
 	relay.SetVersion(Version)
 
+	// Graceful stop: SIGTERM (systemd stop) and SIGINT (Ctrl-C) must end in a
+	// controlled drain — the HTTP listener closed and pairing rooms unwound —
+	// and exit 0, so a systemd restart finds the port free. Signal
+	// registration happens BEFORE ListenAndServe: a signal that beats the
+	// bind is not lost (kuku round 55 measured a hard 143 exit / 6ms kill
+	// because this command never wired the Shutdown path that
+	// serve-discovery already had).
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	srv := relay.New(relay.Config{
 		Addr:        *addr,
 		Path:        *path,
@@ -52,6 +66,17 @@ func runRelay(args []string) error {
 		TLSKey:      *tlsKey,
 		Logger:      logger,
 	})
+	go func() {
+		<-ctx.Done()
+		// Restore default handling first: a second signal while the drain
+		// wedges must still kill the process.
+		stop()
+		sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(sctx); err != nil {
+			fmt.Fprintf(os.Stderr, "relay: shutdown: %v\n", err)
+		}
+	}()
 	if err := srv.ListenAndServe(); err != nil {
 		return fmt.Errorf("relay: %w", err)
 	}
