@@ -642,6 +642,17 @@ func (c *Client) verifySnapshot(snap *MemberSnapshot) error {
 					kept = append(kept, e)
 				}
 			}
+			// The endpoint count is capped here as well as on the announce
+			// path. Without it, a node that is not trusted to be honest
+			// could put hundreds of endpoints in one snapshot, and every
+			// one of them would be dialled in turn: the dial cost grows
+			// with the list, and each attempt costs a handshake timeout.
+			// The measurement behind this: a snapshot with 500 endpoints
+			// was accepted whole, and a probe with a three second budget
+			// ran for over five seconds.
+			if len(kept) > MaxEndpoints {
+				kept = kept[:MaxEndpoints]
+			}
 			mv.Endpoints = kept
 			snap.Members[id] = mv
 		}
