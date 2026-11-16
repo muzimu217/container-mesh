@@ -982,3 +982,32 @@ t=20s  RSS=7,888 KB
 4. **失败如实记**：本轮授权云复测线**两次失败**（第一次模型空转、第二次 API 网络断开），第三次重派才启动——**失败就是失败**，不能当已覆盖。
 5. **推翻自己时明写"更正"**：错的是哪句、正确的是什么、谁推翻的；保留错误的原记录，别悄悄改掉。
 6. **只在聊天里说不算数**：结论必须落到 DEV-KPI（数字与判定）、ROUND-LOG（过程与证据）、看板 HTML（用户每天看的入口）。
+
+### Round 52（2026-11-16 · 值守：doubao 出口策略复测 → 发现 register 路径未覆盖 → 补齐）
+
+**Hub 处置**
+- 水位推进：`14:31:10Z` → **`16:24:39Z`**。水位后 1 条 agent 报告（doubao）。
+- **四线静默时长**：oh-no 1.8h / kuku 2.5h / netns 3.5h / doubao 刚回报 —— **全部 fresh，无一超 6h**，本轮**不催办**。
+- **doubao 对 `6c97741` 的复测**：
+  - `packaging/install_test.sh` 在 linux/amd64 独立复跑 **rc=0**，CI 接线仍在（`ci.yml:59`）。**PASS**。
+  - **出口策略 linux 实测三例**：**A.** join 指向解析到**回环**的名字（`127.0.0.1.nip.io`）→ **被拒**（rc=1，报 `egress policy: 127.0.0.1:39711 resolved to 127.0.0.1, which is not a public address`）；**B.** 指向解析到**私网**的名字（`10.0.0.1.nip.io`）→ **被拒**；**C.** 正向对照，指向**真实公网 IP** → **照常工作**（`mesh ping` 5/5、p50 0.312ms、link=direct）→ **公网路径无回归**。**A/B/C 全 PASS**。
+  - **逃生口隔离实测**：`go tool nm | grep -c cmeshtest = 0`（生产二进制无逃生口）；带 tag 构建时断言按设计红；默认构建绿。
+  - 环境事实：该 VM 公网 IP 已迁移 `9.106.227.17 → 9.100.127.194`（旧地址 bind 失败才暴露）。
+
+**★ doubao 的观察项 → 本会话核实并修复：register HTTP 路径未被策略覆盖**
+
+- **doubao 的发现**：members **WS 流**被策略拦截，但 `announce`/register 的 **HTTP POST**（`client.go` 的 `&http.Client{Timeout:…}`）**没有 EgressPolicy 接线** → 本地起 127.0.0.1 listener 后，join 指向 `127.0.0.1.nip.io` 时 register **真实连通**（listener 返回 `HTTP 501: Unsupported method ('POST')`）→ **同一个 origin 的两条路径，一条被拒一条可达，SSRF 面只关了一半**。
+- **本会话独立核实**：读 `internal/discovery/client.go` 确认 `c.httpc = &http.Client{Timeout: cfg.DialTimeout}` 无任何 dial 约束；读 `client.go:254` 的 `c.httpc.Do(req)` 确认 register 走的就是它。**doubao 说得对**。
+- **修复**：`client.go` 新增 `httpTransport()` —— 给 register 配一个带 `net.Dialer.Control` 的 `http.Transport`，在同一策略下按**解析后地址**判定，连接根本不会建立。
+- **红→绿**：新增 `TestRegisterRefusesPrivateResolvedAddress`。**测试设计上有两个坑，都写进了注释**：
+  1. 最初用 `httptest.Server` → 它会在测试看到连接**之前**就拒掉不认识的方法 → **假绿**；改用**裸 listener**。
+  2. 最初没排除本地代理 → 代理替 origin 应答（返回 HTTP 503），测试**根本看不到连接**；改用 `t.Setenv("NO_PROXY", origin)`。
+  - 修复前红：`the register request reached a loopback address: the egress policy is not applied on the HTTP path`；修复后绿。
+
+**方法学教训（本轮新增，重要）**：**「测试通过」不等于「测到了被测物」**。本轮连续两次踩到同一类坑——第一次是 `httptest.Server` 的行为吞掉了信号，第二次是代理替被测方应答。两次的共同点是：**测试断言的是"客户端没报错"，而不是"请求没到达对方"**。正确做法是**用裸 listener 直接观测"有没有连接到达"**，并**把被测 origin 从代理里排除**。这与既有的「红测三规则」（语义删除才叫变异 / 红文必须匹配预期失败原因 / 恢复同一次运行内绿）是同一族问题：**验证装置本身要先证明它在测被测物**。
+
+**本轮派发**
+- **出口策略全路径覆盖审计**（只读）：枚举全仓所有出站连接路径，判定各自是否受策略约束；专项审 `internal/mesh/direct.go` 的 `DialDirect`（成员视图里的端点来自**远端快照**）与「成员私有地址是合法语义」是否冲突；给出必须修/建议修/有意不修的分级清单。
+- **中继干道前置件施工计划**（只读 + /tmp 测试骨架）：把上一轮的 7 项前置件变成可排期计划（改动、依赖、工时、风险、红绿测法），划两个 PR，给出前 3 条反向用例的测试代码骨架。
+
+**本轮推送**：`9631276` fix(discovery)（register 路径补策略）。

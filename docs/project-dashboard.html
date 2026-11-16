@@ -13,7 +13,7 @@
 <main class="wrap">
 <header class="top">
   <div><div class="eyebrow">container-mesh / daily delivery board</div><h1 class="title">项目进度与路线看板</h1><p class="sub">每天看这里：当前开发完成到哪一步、门禁是否全绿、哪个平台真的能安装运行、下一步由谁推进。状态按代码和测试证据记录。</p></div>
-  <div class="stamp">看板更新<br><strong id="updated">2026-11-16 15:10Z</strong><br>远端 develop<br><strong>75a8ff7</strong><br>安全缺口已补 + relay CPU −71%<br><strong>资源 KPI 达标</strong></div>
+  <div class="stamp">看板更新<br><strong id="updated">2026-11-16 16:40Z</strong><br>远端 develop<br><strong>9631276</strong><br>出口策略两条路径齐<br><strong>四家全回 · 无一超 6h</strong></div>
 </header>
 <section class="grid kpis">
   <div class="card kpi"><div class="label">M4 收口</div><div class="value warn">未达标</div><div class="label">直连 CLI PASS；mesh relay 未完成</div></div>
@@ -111,7 +111,8 @@
 </section>
 <section class="grid two section">
   <article class="card"><div class="section-head"><h2>今日状态</h2><p>本地 worktree，待网主放行</p></div><div class="checklist">
-    <div class="check"><b class="ok">✓</b><div><strong>出口地址策略补齐（安全缺口，红→绿）</strong><br><span>策略原本只实现一半：拒绝字面 loopback/私网 IP，但<strong>解析后的地址无人复核</strong>——裸 net.Dialer 让「解析到回环的主机名」直连（kuku 实测穿透成功）。发现地址是运维提供的值 → SSRF 形态。现经 Dialer.Control 在 <strong>DNS 后、连接前</strong>复核。逃生口用 build tag 隔离，出货二进制无此路径（go tool nm 已确认）</span></div></div>
+    <div class="check"><b class="ok">✓</b><div><strong>出口策略两条路径都补齐（红→绿）</strong><br><span>doubao 独立实测：回环/私网名字<strong>被拒</strong>、真实公网 IP <strong>照常工作</strong>（ping 5/5 p50 0.312ms）、生产二进制无逃生口（go tool nm 确认）。但 doubao 指出 <strong>register 的 HTTP 路径未被覆盖</strong>（裸 http.Client）→ 已补 <code>httpTransport()</code>，同一 origin 两条路径现在一致</span></div></div>
+    <div class="check"><b class="ok">✓</b><div><strong>出口地址策略（安全缺口）</strong><br><span>策略原本只实现一半：拒绝字面 loopback/私网 IP，但<strong>解析后的地址无人复核</strong>——裸 net.Dialer 让「解析到回环的主机名」直连（kuku 实测穿透成功）。现经 Dialer.Control 在 <strong>DNS 后、连接前</strong>复核。逃生口用 build tag 隔离，出货二进制无此路径</span></div></div>
     <div class="check"><b class="ok">✓</b><div><strong>relay 读缓冲复用（性能缺陷，红→绿）</strong><br><span>前向循环读的是<strong>自己的</strong> buf，从未看到 RecvInto 内部的扩容 → 每条 &gt;64KiB 消息重付 64→128→256→512KiB 分配拷贝链。实测 relay 消息平均 493KiB（常态）；makeslicecopy 占 relay CPU 23.73% → 修复后 4.88%，CPU 中位 <strong>−71%</strong></span></div></div>
     <div class="check"><b class="ok">✓</b><div><strong>systemd unit 五处缺口已修</strong><br><span>上一轮说「仓库内无 systemd unit」是错的——<code>packaging/systemd/</code> 存在。但 ExecStart 缺 <code>--account-pub</code>（→ 入网端点根本不挂载）、EnvironmentFile 的 <code>-</code> 前缀让变量全空静默回落 ~/.cmesh、无 StateDirectory/TimeoutStopSec。已补齐</span></div></div>
     <div class="check"><b class="ok">✓</b><div><strong>kuku 回归：三项指定任务全过</strong><br><span>relay SIGTERM exit 0 三轮（端口 0.1ms 内可重绑）、serve-discovery exit 0 五轮、e2e 退出码契约（绿 rc=0 / 刻意失败 rc=1）。原样 e2e rc=1 是沙箱 seccomp 拦 mkfifo 致，判环境限制</span></div></div>
@@ -127,7 +128,7 @@
   <article class="card"><div class="section-head"><h2>当前阻塞</h2><p>不是测试红</p></div>
     <div class="notice card"><strong>交互会话放行</strong><p class="muted">本轮已推送 develop 5 次（7a66f5e → d206c14 → 47cff18 → 3ca269e → 75a8ff7），共 12 笔提交；每次推送前完整门禁全绿，远端 CI 每轮均 success。</p></div>
     <div class="notice card"><strong>M4 尚未收口</strong><p class="muted">四个门禁中 ①② 已达成，③ 同 SHA 外部复测四家全回（oh-no/kuku/netns/doubao 均 PASS）、④ 发布资产未达成（10/20）。Linux systemd 真机 16/17 PASS（仅 reboot 待授权）；systemd unit 五处缺口已修。</p></div>
-    <div class="check"><b class="ok">✓</b><div><strong>四家 agent 全部回报且全项 PASS</strong><br><span>kuku 三项指定任务全过（relay SIGTERM exit 0 三轮 / serve-discovery exit 0 五轮 / e2e 退出码契约）；netns 入网 0.565s、ping 30/30；doubao Windows 三层失败链；oh-no bench 字节完整性 + F-1 A/B</span></div></div>
+    <div class="check"><b class="ok">✓</b><div><strong>四家 agent 全部回报且全项 PASS</strong><br><span>kuku 三项指定任务全过（relay SIGTERM exit 0 三轮 / serve-discovery exit 0 五轮 / e2e 退出码契约）；netns 入网 0.565s、ping 30/30；doubao 出口策略三例（回环被拒/私网被拒/公网照常）+ install 回归 rc=0；oh-no bench 字节完整性 + F-1 A/B。<strong>四线静默均 &lt; 6h，本轮不催办</strong></span></div></div>
     <div class="check"><b class="warn">!</b><div><strong>reboot 恢复验收缺外部条件</strong><br><span>仓库内无任何 reboot 脚本，已写出最小可执行清单；需网主授权重启 175.24.139.148 或提供可重启 disposable VM</span></div></div>
     <div class="quote">判断规则：设计完成、能构建、能运行、能安装、真机验收分别记账。</div>
   </article>
