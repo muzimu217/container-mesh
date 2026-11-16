@@ -689,3 +689,11 @@ init → account create → device-add → serve-discovery（自举 members.json
   3. `test(e2e): restore result summary and exit-code contract` — tests/run-tests.sh
   4. `docs: sync watch rounds 38-46 status` — docs/DEV-KPI.md、docs/ROUND-LOG.md、docs/project-dashboard.html
 - 每笔提交前建议重跑对应范围测试；推送后公告新 SHA，doubao（linux 离线回归复跑）、kuku（relay SIGTERM 退出码 0 验收）即刻复跑。
+
+### Round 47（2026-11-16 · 交互会话放行：修复批推送 77c14b5）
+
+- 用户明确放行推送并授权全权执行；同时要求停止两个长时间运行代理——已分别要求其停止改动并汇报终态：serve-discovery 优雅停止代理确认其改动早已进入 HEAD（磁盘与实现一致，含变异检查证据），mclaw 验收代理确认远端已清理干净（unit/CA/用户/实验目录全删，长期锚点未受影响）。
+- **推送前门禁全绿**：gofmt/vet/build PASS；`go test ./... -race -count=1` 18 包全 ok；`tests/run-tests.sh --quick` 通过 43/失败 0；Linux amd64/arm64 + Windows amd64 交叉构建 PASS。
+- **4 笔拆分提交并推送 develop**：`18404f1` fix(relay) K-1 / `537a107` fix(packaging) F-1 / `7c493ab` test(e2e) 退出码契约 / `77c14b5` docs。`180b31c..77c14b5`。身份 muzimu217。推送首次因代理 TLS 失败（SSL_ERROR_SYSCALL），按既有规避方式重试成功。
+- **复测派单**：四路 inbox 公告 77c14b5 与各自复测项，全部 ok:true。issue #8 mirror=comment-6911892755。
+- M4 剩余：四 agent 同 SHA 复测回报；reboot 验收待授权；darwin/windows 归档上传完成。
