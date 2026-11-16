@@ -12,6 +12,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net"
@@ -255,8 +256,12 @@ func TestMeshBootstrapApprovalFlow(t *testing.T) {
 	ownerJoined := make(chan struct{})
 	go func() {
 		defer close(ownerJoined)
+		// The endpoint carries port zero on purpose: it means "use whatever
+		// --listen bound", and the announcement resolves it. The saved
+		// configuration must carry the resolved port, not the zero.
 		if err := Run([]string{"join", "--state", ownerDir, "--device-passphrase", pass,
-			"--listen", "127.0.0.1:0", "--timeout", "15s", strings.TrimSpace(invite)}); err != nil {
+			"--listen", "127.0.0.1:0", "--endpoint", "127.0.0.1:0",
+			"--timeout", "15s", strings.TrimSpace(invite)}); err != nil {
 			t.Errorf("owner join --listen: %v", err)
 		}
 	}()
@@ -267,6 +272,26 @@ func TestMeshBootstrapApprovalFlow(t *testing.T) {
 	// the goroutine while leaving 3-4× margin over legs 3-4.
 	t.Cleanup(func() { <-ownerJoined })
 	time.Sleep(1500 * time.Millisecond) // owner announces; endpoints propagate
+
+	// The owner's configuration must carry the RESOLVED endpoint, not the
+	// raw flag list. The owner joined with "--listen 127.0.0.1:0", so the
+	// announcement resolves the zero against the bound port. The file used
+	// to keep the zero, and every later one-shot command announces that
+	// file — and the discovery node rejects a zero port as malformed, which
+	// takes the member offline in everyone's view for the duration of a
+	// bench or a ping (oh-no-agent, round 51: 'announce failed: malformed
+	// endpoint "127.0.0.1:0"').
+	ownerCfg, err := loadDiscoveryConfig(t, ownerDir)
+	if err != nil {
+		t.Fatalf("read the owner's configuration: %v", err)
+	}
+	for _, e := range ownerCfg.Endpoints {
+		if strings.HasSuffix(e, ":0") {
+			t.Fatalf("the owner's saved endpoint %q still carries port zero: "+
+				"every later one-shot command announces it and the discovery "+
+				"node rejects it as malformed", e)
+		}
+	}
 
 	pingOut := captureStdout(t, func() {
 		if err := Run([]string{"mesh", "ping", "--state", joinerDir, "--device-passphrase", pass,
@@ -309,6 +334,20 @@ func loadJoinerDevice(t *testing.T, dir, pass string) identity.DeviceID {
 		t.Fatal(err)
 	}
 	return dev.ID()
+}
+
+// loadDiscoveryConfig reads back the configuration a join wrote.
+func loadDiscoveryConfig(t *testing.T, dir string) (discoveryConfig, error) {
+	t.Helper()
+	blob, err := os.ReadFile(filepath.Join(dir, "discovery.json"))
+	if err != nil {
+		return discoveryConfig{}, err
+	}
+	var cfg discoveryConfig
+	if err := json.Unmarshal(blob, &cfg); err != nil {
+		return discoveryConfig{}, err
+	}
+	return cfg, nil
 }
 
 // TestServeDiscoveryTLSHalfConfigRejected pins the F11 fix: one TLS flag

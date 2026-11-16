@@ -277,6 +277,27 @@ func saveDiscoveryConfig(dir string, cfg discoveryConfig) (string, error) {
 	return path, os.WriteFile(path, b, 0o600)
 }
 
+// endpointsToSave returns the endpoint list to write into the device's
+// configuration file.
+//
+// It takes the RESOLVED list, not the raw --endpoint flags. An endpoint
+// whose port is zero means "use whatever --listen bound", and the announce
+// already resolves it against the listener. Saving the raw list would keep
+// the zero, and every later one-shot command reads that file and announces
+// it — and the discovery node rejects a zero port as a malformed endpoint,
+// which takes the member offline in everyone's view for the duration of a
+// bench or a ping.
+func endpointsToSave(resolved []string) []string {
+	out := make([]string, 0, len(resolved))
+	for _, e := range resolved {
+		if e == "" {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
 // runJoin implements `cmesh join <invite>`: announce until the membership
 // approval lands, then show the network. With --once it exits after joining;
 // otherwise it keeps announcing and printing topology changes until
@@ -480,7 +501,7 @@ func runJoin(args []string) error {
 		AccountID:      string(inv.AccountID),
 		AccountPub:     inv.AccountPub,
 		DiscoveryAddrs: inv.DiscoveryAddrs,
-		Endpoints:      []string(eps),
+		Endpoints:      endpointsToSave(announced),
 		SavedAt:        time.Now(),
 	})
 	if err != nil {
