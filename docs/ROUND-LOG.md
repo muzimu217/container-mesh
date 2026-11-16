@@ -1041,7 +1041,34 @@ t=20s  RSS=7,888 KB
 
 **本轮派发**
 - 出口策略全路径审计（**已完成**）
-- 中继干道前置件施工计划（运行中）
+- 中继干道前置件施工计划（**已完成**）
 - **成员端点回环拨号实测**（运行中）——把 M-2 从代码推理变成实测数字
+- **PR-1「路径选择骨架」实现**（**运行中，已授权改代码**）——文件范围严格限定 `internal/mesh/`，禁止 commit/push/merge，禁止降门禁
 
-**本轮推送**：`44b9a8f` fix(cli)（enroll 路径补策略）。
+### Round 53 续 · 施工计划落地 + 外部复核（2026-11-16 · 值守）
+
+**中继干道施工计划（`/tmp/trunk-plan-round52.md`，只读规划代理产出）**
+
+把上一轮设计稿的 7 项前置件变成**可排期、可验证、可分 PR** 的施工表：逐项给改动清单（文件:行号）、依赖、工时、风险、红→绿测法；并划成**两个可独立验证的 PR**：
+- **PR-1 = 路径选择的骨架**（①错误分类 sentinel + ②PathPicker + ③' RelayCandidates + ⑤-1 Session 抽象）：**不含 relay 能力**，只把业务层从硬编码的 `*quic.Stream` 解耦 → 好处是 PR-2 只需"加一条路"而不必"改所有签名"，两个 PR 的回归面各自清晰。
+- **PR-2 = 中转干道**（④e2e SIGMA + ⑤-2 干道协议 + ⑤-3 配额 + ⑤-4 push-open 限定 ping/msg + ⑥CLI 接线）。
+
+**规划代理复核后更正了设计稿的 7 处**（这就是「子代理不照单全收」的价值）：
+
+| # | 设计稿的说法 | 复核判定 | 证据 |
+|---|---|---|---|
+| I-1 | ③ 设备 ID 路由表 + `FrameMeshRoute` | **v1.1 不做** | 1 跳中转**无环路场景** → split-horizon/`MaxHops` 无对象；需求 `REQUIREMENTS.md:233` 明写择优选路归 **R-3.3**；设计稿自己的缺口 G2 已承认 v1.1 可以完全不用。**拆一个 2h 的 `RelayCandidates` 就够** |
+| I-2 | ⑤ 配额"**直接复用** `forward` 的 tokenBucket" | **不成立** | `tokenBucket` 是**未导出**的（`forward/limits.go:26/37/58`）→ 跨包不可用；且它的单位是 **streams/sec**（`:82` `MaxStreamsPerSec`，`:98` 默认 50），而 P-7 要的是 **50 MiB/s 字节配额**。→ v1.1 在 mesh 内自写字节桶（~50 行）。**本会话已独立复核此条属实** |
+| I-3 | ④ e2e 加第二个 ALPN | 需要，但**风险被低估** | `NextProtos`（`direct.go:275`）改成两个后，**现网所有 direct 连接的协商结果可能改变** → PR 里必须显式断言 direct 仍是 `container-mesh-direct/1` |
+| I-4 | ⑤ 抽 `serveSession` | 方向对，**漏了前提** | 业务函数有 **9 个 `*quic.Stream` 硬编码签名**（`direct.go:474/528/546/609/625/891`、`exec.go:91`、`bench.go:103/127/280`）→ 不先抽 Session 接口，**relay 路径根本接不进业务代码**。设计稿漏算这 8h |
+| I-5 | ⑤ 检查 from/to **同一账号** | v1.1 可简化 | `MemberSnapshot.AccountID` 是账号级的，但 `MemberResolver` 只暴露 `KeyFor(id)`，**无账号维度** → 需新增接口；v1.1 用「同一张成员视图」近似并在 ⑥ 记一笔 |
+| I-6 | 复用 `internal/wire` 的帧机制 | **部分成立** | mesh 现有帧是**自有 4 字节长度前缀**（`direct.go:142`/`:153`），与 wire 的 10 字节头（`wire/frame.go:140`）**完全不同** → 建议干道**控制消息**用 wire 帧、**业务载荷**继续用 mesh 帧（须与 direct 路径逐字节同构）。wire 无内部依赖 → **不成环** ✅ |
+| I-7 | ⑤ push-open 要做 pull + push 两种 | **不能砍，但必须限定范围** | `PM-REVIEW.md:28` 把它标为 v1.1 缺口，而 `meshcmd.go:164` 今天对零端点目标直接报错 → v1.1 的 push-open **只做 ping/msg 级别**，文件传输推到 v1.2 |
+
+另独立验证了一条有利事实：**SIGMA 的密码学原语无需新依赖** —— `crypto/ecdh`（X25519，Go 1.20+）+ `crypto/hkdf`（Go 1.24）+ `crypto/ed25519` + AES-GCM 在 /tmp 独立编译跑通；`go.mod` 是 `go 1.24.0`、CI 用 `go-version: '1.24'` → 可用（但必须保证 CI 的 1.24 是真 1.24.x，已列入风险）。
+
+**外部复核（本轮两份回报，全部 PASS）**
+- **oh-no（`6c97741`）**：bench 字节完整性**全项 PASS** —— 4095/4096/4097/65535/65537/1048576/33554431/33554432 **双向 sent == received 精确相等**、跨帧残留（同进程 3 轮 32MiB 无残留）、交替大小轮换无丢字节。**出口策略在生产二进制上确实工作**：`join --cred` 指向 `127.0.0.1.nip.io` 被拒且报错可读明确。逃生口隔离成立（`go tool nm` 生产二进制 cmeshtest 命中 0）。**如实申报**：公网正向臂**未达成**（环境无公网锚点，无入站路径）。另注明 `retransmissions=n/a` 是因为性能代理的 `Retransmissions` 实现**尚在 /tmp 副本、未入仓**。
+- **doubao（`9631276`）**：register 路径**独立复测 PASS** —— 127.0.0.1 listener 存活且 curl 直连 200（证明可达）的前提下，register 现在**在 HTTP 拨号阶段被拒**（对照上轮同形态 register 真实连通收到 501）；私网名同样被拒；**公网正向照常工作**（join → show-pub → account authorize 三步审批，2 成员在线，`mesh ping` 5/5 p50 0.305ms link=direct）。**环境备注**：该 VM 公网 IP 又迁移 `9.100.127.194 → 9.96.254.67`。
+
+**本轮推送**：`44b9a8f` fix(cli)（enroll 路径补策略）→ `2fa76ef` docs（审计与第三条路径）。
