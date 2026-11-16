@@ -159,6 +159,18 @@ replace_link() {
 }
 cp "$tmpdir/$asset_base" "$stage/cmesh"
 chmod 0755 "$stage/cmesh"
+# The staging directory came from mktemp -d, which creates it 0700 so
+# nothing else can read the half-written install. That mode travels with
+# the directory when it is renamed into place, so the committed version
+# directory would be 0700 — and only its owner could enter it. The
+# systemd unit runs the node as an unprivileged "cmesh" user and executes
+# the binary out of the managed install root, so a 0700 version
+# directory means an officially installed binary cannot be run by the
+# service that is supposed to run it.
+#
+# The binary itself is already 0755; the directory around it is what has
+# to stay traversable.
+chmod 0755 "$stage"
 dest="$INSTALL_DIR/versions/$VERSION"
 if [ -e "$dest" ] || [ -L "$dest" ]; then
     old=$(mktemp -d "$INSTALL_DIR/versions/.cmesh-old.XXXXXX")

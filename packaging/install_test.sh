@@ -73,6 +73,18 @@ assert_link "$install_root/cmesh" current/cmesh
 cmp "$TMP/releases/latest/download/$fixture_asset" "$install_root/current/cmesh"
 test -x "$install_root/current/cmesh"
 
+# The committed version directory must be traversable by someone who does
+# not own it. The staging directory comes from mktemp -d, which creates it
+# 0700, and that mode used to travel with it into the committed
+# directory — so the systemd unit's unprivileged "cmesh" user could not
+# enter it and could not execute an officially installed binary.
+version_dir="$install_root/versions/latest"
+mode=$(ls -ld "$version_dir" | cut -c1-10)
+# "drwx------" means owner-only: nobody but the owner can enter it.
+case "$mode" in
+    d???------) printf 'the version directory mode is %s: an unprivileged service user cannot traverse into it\n' "$mode" >&2; exit 1 ;;
+esac
+
 mkdir -p "$TMP/state"
 printf 'state must survive\n' > "$TMP/state/identity.enc"
 CMESH_INSTALL="$install_root" CMESH_STATE="$TMP/state" sh "$ROOT/packaging/install.sh" --uninstall
