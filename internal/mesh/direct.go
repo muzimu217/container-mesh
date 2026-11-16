@@ -821,7 +821,19 @@ func dialOneRaw(ctx context.Context, addr *net.UDPAddr, cfg DialConfig, tlsCfg *
 	if err != nil {
 		return nil, fmt.Errorf("mesh: local udp bind: %w", err)
 	}
-	cctx, cancel := context.WithTimeout(context.Background(), cfg.HandshakeTimeout)
+	// The handshake context derives from the caller's, so a caller that
+	// bounds its own budget is not overrun by the endpoint loop.
+	//
+	// It used to be context.Background(), which meant the endpoint loop
+	// was bounded only by HandshakeTimeout per attempt: a member view with
+	// many unreachable endpoints made the whole dial take as long as the
+	// number of endpoints times the per-attempt timeout, regardless of what
+	// the caller asked for. The product's own `status --probe --probe-timeout
+	// 3s` was measured running 5.12 s.
+	//
+	// The per-attempt timeout still applies on top: whichever is shorter
+	// wins.
+	cctx, cancel := context.WithTimeout(ctx, cfg.HandshakeTimeout)
 	defer cancel()
 	qc, err := quic.Dial(cctx, udp, addr, tlsCfg, quicConfig())
 	if err != nil {
