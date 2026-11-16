@@ -619,3 +619,73 @@ init → account create → device-add → serve-discovery（自举 members.json
 - **认账**：B 篡改用例 FAIL 为测试脚本设计错误（篡改本地旧文件而非下载源，安装器重新下载远端资产当然通过）——产品门禁证据=A 项 SHA256 一致+离线回归 fixture 篡改路径；不算产品缺陷，不悄悄改绿。
 - **未验收（如实）**：reboot 恢复（需重启生产服务器，待网主授权或另找 VM）；darwin/windows 归档资产后台上传中（10/17 已上）。
 - **派发**：hub channel+4 inbox 五路 ok:true（任务书同 SHA=6f07562）；issue #8 mirror=comment-6900352297。systemd/Release 项在任务书中标注环境阻塞（容器 agent 不可测）。
+
+### Round 38（2026-11-15 · 值守：复测报告回灌 + F-1 修复）
+
+- 水位推进：`18:17:33Z` → **`20:26:52Z`**。水位后 4 条消息：协调者任务书（@6f07562）、oh-no 6fc00c6 复测报告、doubao 6f07562 复测报告、协调者双硬阻塞验收公告。
+- **oh-no（6fc00c6）全项 PASS**：面板黑盒（308/no-store/令牌三态/假数据归零/离线保留）、B-3 五动词含凭证→凭证双向臂（10/10）、B-4 边界、`@cat` 六档、diagnostics 含 `--count 1000` 全跑（1000/1000）。操作坑登记：`cred create` 无 `-state` 绑定全局账号。
+- **doubao（6f07562）**：panel 线全 PASS（3D 数量==members、A1–A5、D-1「未采集」修复渲染核验）；mkrelease 正反跑 PASS；**发现 F-1**：`packaging/install_test.sh` fixture 硬编码 darwin-arm64，linux/amd64 必 rc=1（测试装置缺陷，产品本体经仓库外同构 harness 7/7 验证无恙）。
+- **F-1 已修复（worktree 待推送）**：fixture 按 uname 解析 os/arch（与安装器同逻辑），macOS darwin/arm64 复测绿；待推送后 doubao 在 linux 复跑确认。
+- 回信：oh-no/doubao 确认 ok:true；kuku/netns 具体催办（任务书项：e2e 43 场景+优雅停止 / NAT 方向性+RSS 基线）ok:true。issue #8 镜像：comment-6901190655。
+- **M4 剩余**：kuku/netns 复测回报；reboot 验收（待授权）；F-1+run-tests.sh 结果段推送（worktree 就绪待放行）；darwin/windows 归档上传完成。
+
+### Round 39（2026-11-15 · 值守：F-1 推送状态确认 + kuku/netns 广播）
+
+- 水位推进：`20:26:52Z` → **`21:18:15Z`**。水位后 1 条：doubao F-1 复跑回报（@180b31c）。
+- **doubao 证实**：F-1 修复（install_test.sh 按 uname 生成 fixture）与 run-tests.sh 结果段**均仍在值守 worktree，未推送**——180b31c 为 docs 提交，install_test.sh 最后改动仍是 6fc00c6；linux/amd64 复跑 rc=1 与预期一致，产品本体 7/7 结论不变。修复推送后我将公告，doubao 即刻复跑确认。
+- 广播：kuku（超 28h）/netns（超 18h）连续多轮无响应，已按规则向两 inbox 广播待办明细（kuku：43 场景+优雅停止三项；netns：NAT 方向性+RSS 基线对照），并提示网主唤醒。三路投递均 ok:true。
+- 水位 → `21:18:15Z`。
+
+### Round 40（2026-11-15 · 值守：静默等待轮）
+
+- 水位保持 `21:18:15Z`，水位后新报告 0 条；远端 tip 仍为 `180b31c`，两笔修复（F-1 + 结果段）仍在 worktree 待放行。
+- kuku/netns 广播后暂无响应，继续等待；doubao 待新 SHA 公告后复跑离线回归；oh-no 报告已闭环。
+- 无新开发项、无新实验；看板只更新等待状态。
+
+### Round 41（2026-11-15 · 值守：静默等待轮 · 二次提示唤醒）
+
+- 水位保持 `21:18:15Z`，水位后新报告 0 条；远端 tip 仍 `180b31c`，两笔修复（F-1 + 结果段）仍在 worktree 待放行。
+- kuku（超 30h）/netns（超 20h）：广播后连续第二轮无响应，按规则再次提示网主手动唤醒或确认失联结案改派。
+- doubao 待新 SHA 公告后复跑；oh-no 已闭环；无新实验。看板只更新等待状态。
+
+### Round 42（2026-11-15 · 值守：静默等待轮）
+
+- 水位保持 `21:18:15Z`，水位后新报告 0 条；远端 tip 仍 `180b31c`，两笔修复仍在 worktree 待放行。
+- kuku/netns 连续第三轮无响应（已广播+两次提示网主）；doubao 待推送公告；oh-no 闭环。无新实验，看板只更新等待状态。
+
+### Round 43（2026-11-15 · 值守：静默等待轮）
+
+- 水位保持 `21:18:15Z`，水位后新报告 0 条；远端 tip 仍 `180b31c`，两笔修复（F-1 + 结果段）仍在 worktree 待放行。
+- kuku/netns 连续第四轮无响应（待网主唤醒或失联结案）；doubao 待推送公告；oh-no 闭环；无新实验。看板只更新等待状态。
+
+### Round 44（2026-11-16 · 值守：netns 第五十四轮复测回灌）
+
+- 水位推进：`21:18:15Z` → **`2026-11-16T02:13:52Z`**。水位后 1 条：netns-probe 第五十四轮（@6f07562）。
+- 结果：ENROLL 0.26s（名册 v3 无人工审批）；client→anchor `mesh ping` 30/30（p50 0.319ms p95 0.458ms，link=direct）；anchor→纯出站 client 反向 `network is unreachable`——R-3.2 边界第三轮同形，不判缺陷。
+- **RSS 五段采样新观测**：50MB bench 期间爬升至 ~139MB 峰值后 GC 回落，稳定态 15,992–16,296KB——**超 15MB 目标，维持「未达标」口径**；与上轮 15.62–15.80MB 基线同量级、无数量级回归（上轮采样窗口在爬升前，口径差异已写明，不作回归证据）。代理未做 heap profile，不判泄漏，分配剖析留给评审决定。
+- **测试适配说明（将写入测试文档）**：生产 host policy 拒绝私网 IP 字面量，netns/私网拓扑须用逻辑主机名（/etc/hosts + nip.io 形态）才能入网——这是按设计的正确行为，不是缺陷。
+- 吞吐仅上界参考（veth/bridge）：20MB 191.66MiB/s、50MB 94.88–147.29MiB/s，`retransmissions=n/a`。
+- 回信 netns ok:true；水位 → `02:13:52Z`。
+
+### Round 45（2026-11-16 · 值守：kuku 第五十五轮回灌 + K-1 修复）
+
+- 水位推进：`02:13:52Z` → **`02:54:19Z`**。水位后 1 条：kuku 第五十五轮（@6f07562），恢复在线。
+- **kuku 复测结果**：回环绑定 PASS（0100007F:46A0）、审批→可拨 1.22s、ping 10/10（p50 0.265ms）、多行中文消息 105 字节逐字节一致（补上第 51 轮证据缺口）、1MiB send-to 双端 sha256 一致、run 四动词 rc=0、名册保留离线成员；43 场景 42✓/1✗（mkfifo EPERM 前提不成立作废；SUITE_EXIT=0 与已知结果段缺失一致）。
+- **发现 K-1（真实缺陷候选，已确认并修复）**：`cmesh relay` SIGTERM 未接线优雅停止——退出码 143、6ms 硬死、活跃会话 close 1006、无 shutdown 日志；库层 relay.Server.Shutdown 已实现有测试但 CLI 未接线。kuku 定位准确到 internal/cli/relay.go:55 仅 ListenAndServe。
+- **K-1 修复（worktree 待推送）**：runRelay 按 discovery.go 同款 signal.NotifyContext(SIGINT,SIGTERM)+srv.Shutdown(10s) 接线，信号注册先于 ListenAndServe。本机红→绿：修复前 exit=143，修复后 SIGTERM **exit=0**。gofmt/vet 干净，cli+relay 全测 PASS。
+- **观察项采纳**：invite 生成侧未拦截 host policy 会拒的地址——挂档改进项。
+- 回信 kuku ok:true；水位 → `02:54:19Z`。
+- **M4 剩余**：两笔修复+K-1 三项推送（worktree 就绪待放行）；doubao/kuku 推送后复跑确认；reboot 验收待授权；darwin/windows 归档上传中。
+
+### Round 46（2026-11-16 · 值守：全量门禁复核 + 推送前就绪）
+
+- 用户曾放行推送但随即中断本轮；按值守规则本轮不执行 commit/push/merge，改为完成推送前全部准备，标「已就绪待放行」。
+- 清理意外构建产物 `cm`（工作树根目录遗留）。
+- 全量门禁复核（当前 worktree）：`gofmt -l .` 无输出、`go vet ./...` PASS、`go build ./...` PASS、`go test ./... -race -count=1` 18 包全 ok、`bash tests/run-tests.sh --quick` **通过 43, 失败 0**（rc=0，含恢复后的结果段）、Linux amd64/arm64 + Windows amd64 交叉构建 PASS。
+- 提交身份本地配置核对：muzimu217 / 1278844978@qq.com ✓。
+- **建议提交拆分（4 笔，供交互会话执行；.atomcode/ 与临时产物不入库）**：
+  1. `fix(relay): wire SIGTERM/SIGINT graceful shutdown into cmesh relay` — internal/cli/relay.go（K-1，kuku round 55 发现）
+  2. `fix(packaging): resolve installer test fixture platform via uname` — packaging/install_test.sh（F-1，doubao linux rc=1 实测）
+  3. `test(e2e): restore result summary and exit-code contract` — tests/run-tests.sh
+  4. `docs: sync watch rounds 38-46 status` — docs/DEV-KPI.md、docs/ROUND-LOG.md、docs/project-dashboard.html
+- 每笔提交前建议重跑对应范围测试；推送后公告新 SHA，doubao（linux 离线回归复跑）、kuku（relay SIGTERM 退出码 0 验收）即刻复跑。

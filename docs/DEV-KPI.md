@@ -1,6 +1,6 @@
 # container-mesh 开发与平台 KPI 看板
 
-更新时间：2026-11-15 18:40Z。分支：`develop`。远端 tip：**`6fc00c6`**（6 笔 M4 冲刺提交已推送：host policy/status --probe/优雅停止、panel 308、systemd+mkrelease 加固、整改文档、独立 CLI credential e2e、installer 回归）。Hub 水位：`2026-11-15T18:17:33Z`。复测已派四 agent（含 6fc00c6 e2e 退出码缺结果段的事项申报）。worktree 仅余看板文档与一处待推送修复：tests/run-tests.sh 结果汇总段恢复（43 项全绿 rc=0 已验证）。
+更新时间：2026-11-16 03:30Z。分支：`develop`。远端 tip：**`180b31c`**。**prerelease v1.0.0-rc1 已创建**（17 资产，linux 链路完整）；**Linux systemd 真机验收 16/17 PASS**（仅 reboot 待授权）。复测矩阵四线全部回灌：oh-no 6fc00c6 全项 PASS；netns 入网 0.26s/ping 30/30/RSS 稳定态 ~16MB（超 15MB 未达标维持）；kuku 回环零回退 + 发现 K-1；doubao panel/mkrelease PASS + F-1。**推送就绪**：当前 worktree 全量门禁复核全绿（fmt/vet/build/race 18 包/quick 43/0/交叉编译），拆分方案 4 笔已写入 ROUND-LOG Round 46，身份 muzimu217 ✓——待交互会话执行 commit/push，值守会话不提交。水位：`2026-11-16T02:54:19Z`。
 
 这张表把代码、可运行产物、安装包、真机验收分开记账。交叉编译通过不等于平台交付完成；设计方案存在也不等于安装包完成。
 
@@ -15,7 +15,7 @@
 | 凭证设备后续命令 B-3 | **已在 `1f64cdc` 外部复测** | `discovery.json` 保存派生字段；oh-no：join 后 ping/msg/send-to/run 与凭证→凭证双向 ping 全部 PASS |
 | `--endpoint :0` B-2 | **已完成并在 `1f64cdc` 复测** | 绑定端口替换纯函数 + 回归测试；外部端口自检和直连通过 |
 | 端口自检 | **已完成** | TCP/UDP 同端口提示、回环绑定提示、可执行动作 |
-| Linux headless 安装闭环 | **本地代码完成，真实 Linux 验收运行中（批次 D）** | install.sh/cmesh-install 已实现 HTTPS+SHA 校验、版本目录/current symlink、卸载/保留状态/purge、mkrelease 加固；批次 D 正在授权 mclaw 执行真实安装+systemd（verify/enable/restart/kill/reboot）验收；SIGTERM 优雅停止由批次 C 实现中 |
+| Linux headless 安装闭环 | **真机验收 16/17 PASS（仅 reboot 待授权）** | install.sh/cmesh-install：HTTPS+SHA 校验、版本目录/current symlink、卸载/保留状态/purge、mkrelease 加固均落盘；175 服务器 systemd 真机验收：启动/healthz/kill-9 自动拉起/SIGTERM 优雅停止/端口释放/升级回退/卸载全 PASS；F-1（离线回归 fixture 平台缺陷）已修复待推送 |
 | 真实 Release / M4 安装验收 | **已在 v1.0.0-rc1 真资产 + 175 systemd VPS 验收（16/17，reboot 除外）** | prerelease `v1.0.0-rc1`（不占 latest 正式位）：安装器真实下载/SHA256 一致/版本化落盘 ✓；systemd 启动/healthz/kill-9 自动拉起(新 PID)/SIGTERM 优雅停止/端口释放 ✓；重装替换轮换+current 回滚 ✓；卸载保留状态 ✓。B 项篡改用例为脚本设计错误（篡改本地旧文件而非下载源），产品门禁由 A 项 SHA256 一致 + 离线回归覆盖，不构成缺陷。**未验收**：reboot 恢复（需重启生产服务器，待网主授权或另找可重启 VM）；darwin/windows 归档资产后台上传中 |
 | systemd 前置与安全 | **示例未闭合，真实环境未验收** | unit 需 cmesh 用户/组、identity/account/members/account-pub 和非交互 secret；空口令可能 EOF，缺 account-pub 会降级证书验证；macOS 无法替代 systemd VPS/VM |
 | 性能观测补全 | **待补独立 bench/relay 观测** | 当前 direct bench 未稳定记录 Duration/MiB/s/CPU/alloc；relay status 无 per-session RTT/吞吐；下一步只补测试观测，不先改协议 |
