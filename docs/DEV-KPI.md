@@ -1,6 +1,6 @@
 # container-mesh 开发与平台 KPI 看板
 
-更新时间：2026-11-16 03:30Z。分支：`develop`。远端 tip：**`180b31c`**。**prerelease v1.0.0-rc1 已创建**（17 资产，linux 链路完整）；**Linux systemd 真机验收 16/17 PASS**（仅 reboot 待授权）。复测矩阵四线全部回灌：oh-no 6fc00c6 全项 PASS；netns 入网 0.26s/ping 30/30/RSS 稳定态 ~16MB（超 15MB 未达标维持）；kuku 回环零回退 + 发现 K-1；doubao panel/mkrelease PASS + F-1。**推送就绪**：当前 worktree 全量门禁复核全绿（fmt/vet/build/race 18 包/quick 43/0/交叉编译），拆分方案 4 笔已写入 ROUND-LOG Round 46，身份 muzimu217 ✓——待交互会话执行 commit/push，值守会话不提交。水位：`2026-11-16T02:54:19Z`。
+更新时间：2026-11-16 03:55Z。分支：`develop`。远端 tip：**`12d22c5`**（修复批 `77c14b5` + Round 47 文档）。**本批已推送**：K-1（cmesh relay SIGTERM 优雅停止，143→exit 0）、F-1（安装回归 fixture 按 uname 解析平台）、e2e 结果汇总与退出码契约、状态文档同步。推送前门禁全绿（fmt/vet/build/race 18 包/quick 43-0/交叉编译）。四 agent 复测已派单（四路 ok:true）。prerelease v1.0.0-rc1 已在；Linux systemd 16/17 PASS（仅 reboot 待授权）。水位：`2026-11-16T02:54:19Z`。
 
 这张表把代码、可运行产物、安装包、真机验收分开记账。交叉编译通过不等于平台交付完成；设计方案存在也不等于安装包完成。
 
