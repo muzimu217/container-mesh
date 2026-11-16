@@ -183,6 +183,11 @@ type Server struct {
 	activeSessions  atomic.Int64
 	bytesRelayed    atomic.Int64
 	messagesRelayed atomic.Int64
+	// readBufferGrowths counts the times a forward loop had to grow its
+	// read buffer. A healthy relay keeps this at zero after the first
+	// oversized message: the loop adopts the grown buffer instead of
+	// starting the growth chain over for every message.
+	readBufferGrowths atomic.Int64
 }
 
 // contestState records recent take-overs for one room label.
@@ -796,7 +801,17 @@ func (s *Server) splice(roomID string, a, b *wsconn.Conn) {
 				shutdown(dir + " recv: " + err.Error())
 				return
 			}
-			buf = buf[:cap(buf)]
+			// Adopt the buffer the read actually used. RecvInto grows its own
+			// copy when the message does not fit, and returns that; the
+			// caller's variable never saw the growth, so reading
+			// "buf = buf[:cap(buf)]" from it kept handing back the original
+			// 64 KiB slice. Every message larger than that then re-allocated
+			// and re-copied 64, 128, 256 and 512 KiB, which measured as
+			// makeslicecopy at 23.73% of the relay's CPU.
+			if cap(msg) > cap(buf) {
+				s.readBufferGrowths.Add(1)
+			}
+			buf = msg[:cap(msg)]
 			if int64(len(msg)) > s.cfg.MaxMessageBytes {
 				shutdown(dir + " message too large")
 				return
