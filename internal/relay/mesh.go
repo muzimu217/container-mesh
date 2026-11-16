@@ -570,7 +570,19 @@ func (s *Server) streamMeshMembers(ctx context.Context, conn *wsconn.Conn, id id
 	}
 	for {
 		select {
-		case <-ch:
+		case _, ok := <-ch:
+			// A closed subscription means this stream was orphaned: the
+			// device opened a newer members stream and Subscribe closed the
+			// old channel. A closed channel is always ready to receive, so
+			// without checking ok the receive branch would be taken
+			// immediately and forever, and this loop would push a full
+			// snapshot as fast as the socket could write one. Measured on a
+			// real anchor: one one-shot command under a member's identity
+			// turned that member's push rate from 158 B/15 s into
+			// 15.8 MB/15 s (1.05 MB/s), with no upper bound.
+			if !ok {
+				return
+			}
 			// Push with coalescing: a deep queue defers this push and
 			// retries shortly, so the fresh state lands promptly instead of
 			// behind stale snapshots.
