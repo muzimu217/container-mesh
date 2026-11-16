@@ -308,6 +308,19 @@ func copyFile(src, dst string, mode os.FileMode) error {
 	return out.Close()
 }
 
+// archiveDirName is the top-level directory inside an archive.
+//
+// The archives extract to a directory named after the platform and
+// architecture, with a ".d" suffix: "cmesh-v1.0.0-linux-amd64" extracts to
+// "cmesh-v1.0.0-linux-amd64.d".
+//
+// The executable suffix is NOT part of it. A Windows binary used to produce
+// "cmesh-v1.0.0-windows-amd64.exe.d", a directory whose name ends in the
+// executable suffix and reads like a file name rather than a directory.
+func archiveDirName(binary string) string {
+	return strings.TrimSuffix(binary, ".exe") + ".d"
+}
+
 // writeArchive packs the binary, the installer and the licence. licensePath
 // may be empty, in which case the archive ships no licence.
 func writeArchive(dst, dir, binary, licensePath string) error {
@@ -321,7 +334,7 @@ func writeArchive(dst, dir, binary, licensePath string) error {
 	tw := tar.NewWriter(gz)
 	defer tw.Close()
 
-	base := binary + ".d"
+	base := archiveDirName(binary)
 	add := func(name, srcPath string, mode int64) error {
 		info, err := os.Stat(srcPath)
 		if err != nil {

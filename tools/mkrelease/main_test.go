@@ -357,10 +357,14 @@ func TestAssembleArchivesAreListable(t *testing.T) {
 	for _, binary := range []string{"cmesh-v1.0.0-linux-amd64", "cmesh-v1.0.0-windows-amd64.exe"} {
 		archive := filepath.Join(out, binary+".tar.gz")
 		files := readArchive(t, archive)
+		// The directory is named after the platform and architecture; the
+		// executable suffix is not part of it. The binary inside keeps its
+		// own name.
+		dir := archiveDirName(binary)
 		want := map[string]string{
-			binary + ".d/" + binary:  "fake binary",
-			binary + ".d/install.sh": "#!/bin/sh\n",
-			binary + ".d/LICENSE":    "fake licence\n",
+			dir + "/" + binary:  "fake binary",
+			dir + "/install.sh": "#!/bin/sh\n",
+			dir + "/LICENSE":    "fake licence\n",
 		}
 		got, wantNames := sortedKeys(files), sortedKeys(want)
 		if strings.Join(got, ",") != strings.Join(wantNames, ",") {
