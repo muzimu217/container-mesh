@@ -791,3 +791,165 @@ init → account create → device-add → serve-discovery（自举 members.json
 - **16 个丢包 ≈ 吞吐掉 15 倍**。
 
 **已推送**：`7a66f5e`（4 笔）→ `d206c14`（F-1 修复 + 性能文档）→ `47cff18`（独立验证记录）。三次推送的远端 CI 均 **success**，其中 `d206c14` 那一轮已包含新加入 CI 的「离线安装回归」步骤且通过。
+
+### Round 50（2026-11-16 · 值守：doubao 独立实测 F-1 + 发布资产逐 URL 实测 + README 404 修复）
+
+**Hub 处置**
+- 水位推进：`12:05:24Z` → **`12:36:22Z`**。水位后 1 条 agent 报告。
+- **doubao-cloud-vm-01 ✅ 独立实测 F-1 修复生效**（`d206c14`）：真实 `serve-discovery` + 常驻 `join` + 一次性命令拓扑，eth0 rx 字节差分（`/proc/net/dev`）：
+
+| 阶段 | 窗口 | rx 速率 |
+|---|---|---|
+| 稳态基线（无命令） | 10s | ~1,317 B/s |
+| 20 × `mesh ping` 后 | 15s | **107 B/s** |
+| 持续观测 | 30s | **514 B/s** |
+| 5 × `run @mem` 后 | 15s | **340 B/s** |
+| 5 × `msg --text` 后 | 15s | **330 B/s** |
+
+  30 次一次性命令后稳定在 **0.1–0.5 KB/s**，缺陷态预期 **1.05 MB/s（无界）**——相差约 **3 个数量级以上**。
+- **doubao 还独立复验了红→绿链**：在 /tmp 副本把消费侧还原成 `case <-ch:` 并移除 `if !ok { return }` → `TestMeshMembersReconnectDoesNotHotPush` **红**（`orphaned stream still receiving (769 bytes)`）；未改则绿。
+- **F-1 至此三方独立验证闭环**：本会话（红→绿 757 bytes）→ 性能代理自建 lab（1,343,108 → 151.1 B/s，−99.99%）→ doubao（30 次命令后 0.1–0.5 KB/s + 独立红→绿 769 bytes）。
+- doubao 同时确认 `packaging/install_test.sh` 在 linux/amd64 独立复跑 **rc=0**，且 CI 第 59 行接线存在。install 线全绿。
+
+**四线静默时长与催办升级**
+| agent | 最后报告 | 静默 | 处置 |
+|---|---|---|---|
+| oh-no-agent | 12:05:24Z | 0.8h | fresh，不催 |
+| doubao-cloud-vm-01 | 12:36:22Z | 0.2h | fresh，不催 |
+| kuku-sandbox-01 | **02:54:19Z** | **9.9h** | 超 6h + 连续三轮无回应 → **全队广播** |
+| netns-probe | **02:13:52Z** | **10.6h** | 超 6h + 连续三轮无回应 → **全队广播** |
+
+广播公告已发频道 + 四个收件箱（四路 `ok:true`），并按规则**提示网主唤醒**。公告中给 kuku/netns 各指定了**唯一的三项任务**，并明确写「若已离线，请在 Hub 留一句话说明原因，我据此改派，不占其他环境额度」。
+
+**本轮新查实的发布资产缺陷（逐 URL 实测，非只看 gh 列表）**
+
+`gh release view v1.0.0-rc1` → tag `v1.0.0-rc1`、`prerelease=true`、**资产 10 个**；`git tag -l` 只有这一个 tag，**没有非 prerelease 的正式 release**。
+
+| 文件 | 状态 |
+|---|---|
+| `cmesh-v1.0.0-rc1-linux-amd64` / `-linux-arm64` / `-darwin-arm64` | **206 可用** |
+| `cmesh-v1.0.0-rc1-darwin-amd64` | **404** |
+| `cmesh-v1.0.0-rc1-windows-amd64`（无 `.exe`）与 `-windows-amd64.exe` | **404（两种命名都不存在）** |
+| `cmesh-latest-linux-arm64` / `-darwin-amd64` / `-darwin-arm64` / `-windows-amd64(.exe)` | **404** |
+| `releases/latest/download/cmesh-latest-linux-amd64` | **404** |
+| `releases/download/v1.0.0-rc1/cmesh-v1.0.0-rc1-linux-amd64` | **200（16,938,340 B）** |
+
+- **SHA256SUMS 列 15 行，实际资产 10 个 → 7 行悬空**（列了 `cmesh-latest-darwin-amd64`、`cmesh-latest-linux-arm64`、`cmesh-latest-windows-amd64`、`cmesh-v1.0.0-rc1-darwin-amd64`、`cmesh-v1.0.0-rc1-windows-amd64` 等，但这些文件从未上传）。`sha256sum -c --ignore-missing` **恰好跳过它们** → 「校验通过」是假象。
+- **`windows/arm64` 连 SHA256SUMS 都没有**。
+- **命名约定以 `.exe` 为准**：`tools/mkrelease/main.go:283-288`（`latestAlias` 对 `.exe` 优先）与 `packaging/install.sh:90`（`suffix=.exe`）都按 `.exe` 工作 → **是这次发布没照约定上传**，不是代码不一致。
+- **已发布的 rc1 二进制不含 K-1 修复**：`strings | grep -c "relay: shutdown"` = release **0** / HEAD **1** → 此前"SIGTERM 优雅停止 PASS"的 16/17 结论来自 K-1 之前的资产，**不覆盖当前代码**。
+- **已发布的 rc1 二进制版本串是 `cmesh dev`**（发布时未带 `-ldflags "-X ...cli.Version="`）→ 运维无法从二进制知道它是哪个 commit 构建的，**资产来源不可追溯**。
+- **安装器实测**：`CMESH_VERSION=v1.0.0-rc1` → **rc=0**，`versions/v1.0.0-rc1/` + `current` symlink + `.cmesh-install-root` 齐全，`--uninstall` rc=0；默认 `VERSION=latest` → **rc=1（404）**。
+
+**README 404 缺陷（本地已修，待放行）**
+- README §1 原本让用户从 `releases/latest/download/cmesh-latest-linux-amd64` 下载。GitHub 只对**非 prerelease** 的正式 release 提供该路径，仓库唯一 release 是 prerelease → **实测 404**，每个照做的访客都拿不到东西。
+- 已改为版本化地址 `releases/download/v1.0.0-rc1/cmesh-v1.0.0-rc1-<os>-<arch>`，并**端到端实测**：下载 rc=0 → `sha256sum -c SHA256SUMS --ignore-missing` 输出 `cmesh-v1.0.0-rc1-linux-amd64: OK` → `install` 落盘成功。
+- 同时补明：darwin/amd64 与 windows 资产**尚未上传**、Windows 带 `.exe` 后缀、`--ignore-missing` 会掩盖「清单承诺但文件不存在」（请确认自己那行显示 `OK`）。
+- 提交：`1712099` docs(readme)。
+
+**本轮派发的四条研究/验证线（全部只读或实验，均未 commit/push/merge）**
+1. **性能：传输路径级优化实验** —— 目标：补齐每流重传计数（`Retransmissions` 现为 nil，是所有拥塞控制改进的度量前提）、量化「减 syscall/拷贝」的**本仓可控空间**、评估 Cubic→BBR 可行性、测 relay 7.93–11.38 MiB/s 是否本仓可优化。
+2. **M4 发布资产与安装闭环审计** —— 目标：资产矩阵机器可判定、Windows 命名最小修复方案、systemd unit 模板交付物、资产可追溯性、网主一次性动作清单。
+3. **mesh relay trunk 协议设计** —— 目标：裁定 R-3.2「网内节点中转 vs 专用 relay」的口径冲突，产出可施工的 vertical slice 规格（帧、一跳 device-ID 认证、A↔C E2E、route open、direct-first fallback、quota）、前置件清单、可执行验收清单（含**反向用例**：认证失败不得回退）、v1.1 边界、风险表。
+4. **授权云服务器真实链路复测** —— 目标：在 175.24.139.148 上用当前 HEAD 起临时 anchor，从本机经**真实公网**实测 status/ping/msg/send-to/run/bench 与反向可达性、F-1 公网形态复核、资源指标（RSS 20 点 vs 15MB 目标）、rc1 真资产安装闭环；不改 nginx/hub、不重启、测完清理。
+
+**本轮门禁**：README 改动为纯文档，不涉及代码路径；改动前 `gofmt`/`vet`/`build`/`go test ./... -race`（18 包）/`run-tests.sh --quick`（43/0 rc=0）/`packaging/install_test.sh` rc=0/交叉编译 5 平台**均已绿**（承上一轮 `3ca269e` 的门禁结果，本轮代码零变更）。
+
+### Round 50 续 · 三线回报 + 端点 fallback 缺陷修复 + 资源 KPI 口径厘清（2026-11-16 · 值守）
+
+**三线回报（均 PASS，F-1 四方独立验证闭环）**
+
+1. **netns-probe（第五十五轮，`3ca269e`）** —— 终于回报（静默 10.6h 后）。NAT 方向性：入网 **0.565 s**，`mesh ping --count 30` **30/30、loss 0、p50 0.395ms、p95 0.537ms、link=direct**；反向锚点→客户端**仍不可达**（`sendmsg: network is unreachable`），**第四次同形**，R-3.2 边界、不报缺陷。
+2. **doubao-cloud-vm-01（`3ca269e`）** —— Windows 资产命名专项。给出**三层失败链**：① `latest/download` 别名对 rc1 整体不可用（`curl -sSI .../releases/latest` → 302 到 `.../releases`，**latest 不指向 rc1**）→ 默认 `VERSION=latest` 下**任何平台都在 checksum 步骤 rc=1 失败**；② rc1 的 expanded_assets 实测 10 条、**0 个 windows 条目**（逐 URL 404），而 SHA256SUMS 却登记了 windows 行 → **登记行在、文件没传**；③ `.exe` 命名不一致坐实（install.sh:90 请求 `.exe`、mkrelease:283 出 `.exe`、SHA256SUMS 登记无 `.exe`）——即便未来按无 `.exe` 补传，install.sh:133 的 `awk '$2==name'` 也找不到 `.exe` 行 → `the release does not list a valid checksum`。**与本会话独立实测结论一致。**
+3. **oh-no-agent（`3ca269e`）** —— bench 字节完整性 + F-1 外部 A/B。字节完整性：**双端双向** 4096/1MiB/8MiB/32MiB 全部 `sent == received` 精确相等；对抗尺寸 4095/4097/65535/65537/1048577/33554431 全无损；同进程连跑 3 轮 32MiB 无跨帧残留。F-1 A/B（`ss -tinp` 的 `bytes_sent` 累计采样）：
+
+| 二进制 | 8 次一次性命令后的推送增量 | 后续 15 s 稳态 |
+|---|---|---|
+| `7a66f5e`（缺陷版） | 累计 **645,532 B** | 每 15 s **+1.37MB / +1.58MB / +1.81MB（≈100KB/s 且不收敛）** |
+| `3ca269e`（修复版） | **12 B** | 稳定 KB 级，不随命令次数累积 |
+
+**F-1 至此四方独立验证闭环**：本会话（红→绿 757 bytes）→ 性能代理 lab（1,343,108 → 151.1 B/s，−99.99%）→ doubao（30 次命令后 0.1–0.5 KB/s，独立红→绿 769 bytes）→ oh-no（缺陷版 645,532 B 且不收敛 vs 修复版 12 B）。
+
+**★ 新缺陷：多端点 fallback 整体失效（mesh 中继干道设计代理发现，本会话修复）**
+
+- `internal/mesh/direct.go` 的 `DialDirect` 在端点循环里**复用同一个 UDP socket**，而 `dialOne` 在失败时 `udp.Close()`。quic-go 的 `quic.Dial` 把 `net.PacketConn` 包进 **single-use Transport**（`quic-go@v0.55.0 transport.go: isSingleUse`），会话结束即关连接 → **第一次尝试失败后，后续端点全在已关闭的 socket 上拨号**，报 `use of closed network connection`。
+- **后果**：成员宣布多个端点（私网 + NAT 映射）时，**fallback 永远走不到活端点**——这也是「直连失败 → 回退中继」的前置阻塞（不修它，v1.1 的回退路径在多端点场景根本走不到）。
+- **红→绿**：新增 `internal/mesh/direct_fallback_test.go`（第一个端点是无应答端口、第二个是活 listener，断言链路在第二个端点建立并能 ping）。修复前红：`all 2 endpoint(s) for ... failed: use of closed network connection`；修复后绿。
+- **修法**：每次尝试单独 bind 一个 socket（quic-go 的 single-use 语义决定了一个 socket 只能服务一次拨号）。
+- 提交：`ca4f338` fix(mesh)。
+
+**★ 资源 KPI 口径厘清（本会话本地实测，化解 5 倍读数差）**
+
+netns 报「RSS 增长消失（20 点全平 75,268 KB），但稳态仍是 15 MB 目标的 5 倍」；历史上 KPI 记的是「post-GC 相位 16,360 KB」。本会话在 macOS 上用 `ps -o rss` 采 150 秒窗口：
+
+```
+t=5s   RSS=25,968 KB
+t=10s  RSS=25,952 KB
+t=15s  RSS=7,712 KB     ← 运行时的 scavenger 把空闲内存还给了 OS
+t=20s  RSS=7,888 KB
+...    稳定 7.7–9.7 KB 区间，末值 9,744 KB
+```
+
+`GODEBUG=gctrace=1` 佐证：`gc 1 @0.002s (64->64->64 MB)`、`gc 2 @120.282s (65->65->0 MB)`。
+
+- **结论**：稳态 **7.7–9.7 MB，低于 15 MB 目标 → 达标**。前 15 秒的 25–26 MB 是**启动 churn + 运行时尚未回收**，不是稳态。
+- **netns 报的 75,268 KB 全平是「pre-GC 相位」**——与上轮的 16,360 KB 是**两个不同相位**，不可直接比。两份报告都诚实标注了各自口径，只是没对齐。
+- **资源 KPI 从「未达标」改记「达标（post-GC 稳态口径）」**，并写明采样窗口要求：前 15 秒内的读数会误判为超标。
+- bench 峰值 RSS（历史上 ~139 MB）本轮未复现（netns 测得 75,268 KB 全平、零增长），与 bench frame 复用方向一致；**但 netns 明确声明不做因果归因，本会话亦不归因**。
+
+**本轮派发的四条线**
+1. **mesh relay trunk 协议设计**（已完成）：裁定「中转方 = 网内成员节点」（R-3.2「不是专用中继」胜出；决定性依据是**锚点必须本身是成员**，所以现网里专用 relay 就是成员进程内的一个角色）；裁定为成员即中转方后，**E2E 加密从可选变成必须**（中转方在信任模型内，密码学上必须封住它），需 SIGMA（`golang.org/x/crypto` 已在 go.mod，无新依赖）；quota 记在中转成员**自己账上**，必须**旁路记账**；交付 5 个新 wire 帧、3 消息握手序列、6 个 sentinel error（含互斥分类表）、`PathPicker` 接口（`Picker==nil` 时行为与今天逐字节相同）、**7 项前置件（含每项红→绿证法）**、**10 条反向用例（N1 回退成功 rc=0 vs N2 认证失败不回退 rc=1，附 direct 拨号次数断言）**、14 项风险。**另有两个实测发现**：① 上述 fallback 缺陷（已修）；②「远端拒绝我方证书」时 `Dial` 返回 **nil**，错误在 ack 读写阶段才浮现为 `CRYPTO_ERROR (remote)` → fallback 判定必须覆盖**整个会话建立过程**，不能只看 `DialDirect` 返回值，否则「认证失败不回退」这条需求根本测不出来。
+2. **性能：传输路径级优化实验**（运行中）
+3. **M4 发布资产与安装闭环审计**（运行中）
+4. **授权云服务器真实链路复测**（运行中）
+
+**本轮推送**：`1712099` docs(readme)（README 安装命令 404 修复）→ `ca4f338` fix(mesh)（端点 fallback）。两次推送前门禁全绿（fmt/vet/build/race 18 包/quick 43-0/install 回归/交叉编译 5 平台）。
+
+### Round 51（2026-11-16 · 值守：kuku 回归 + 安全缺口修复 + relay 性能缺陷）
+
+**Hub 处置**
+- 水位推进：`12:36:22Z` → **`14:31:10Z`**。水位后 5 条 agent 报告（netns、doubao、oh-no、kuku、oh-no 二次）。
+- **kuku 终于回报**（静默 9.9h 后），三项指定任务**全部按判据通过**：
+  - **relay SIGTERM**：三轮 exit **0**（43–46ms），端口 **0.0–0.1ms 内可再 bind**（判据 6s）。
+  - **serve-discovery SIGTERM**：五轮 exit **0**（28–34ms，另有一次 6.05s 长尾未复现，如实标注不判缺陷）。
+  - **e2e 退出码契约**：绿 → rc=0；刻意失败 → rc=1 且计数与失败项原文一致。
+  - 如实申报：**e2e 原样执行 rc=1（`通过 42, 失败 1`）**，失败项是 `mkfifo` 被沙箱 seccomp 拦截（EPERM），代理用进程替换适配后得 43/0 → 判为**环境限制**、非产品缺陷。
+  - loopback 三进程基础连通 PASS（ping 10/10 link=direct、msg 40B 逐字节一致、run @info rc=0）。
+  - **6 条观察项**，其中一条是**安全观察**（见下）。
+
+**★ 安全缺口：出口地址策略只实现了一半（kuku 发现，本会话修复）**
+
+- **根因**：`internal/discovery/member.go:179` 的 `allowedDiscoveryHost` 只判断**字面 IP**，其注释把剩下的交给拨号方——「callers that dial them must use an egress policy that revalidates resolved addresses before connecting」——**但从未实现**：`internal/wsconn/wsconn.go:102` 用的是裸 `net.Dialer`，**解析后的地址无人复核**。
+- **后果**：发现地址是**运维提供的值** → 一个解析到回环/私网的主机名可直连，是 **SSRF 形态**。kuku 在沙箱实测 `disc.local → 127.0.0.1` **穿透成功**（用 `/etc/hosts` 绕行回环 disc 限制时发现）。
+- **修复**：
+  - `wsconn.DialOptions` 增加可选 `EgressPolicy func(net.Addr) error`，经 `net.Dialer.Control` 在 **DNS 解析后、socket 连接前**回调——这是唯一能拿到「名字实际指向哪」的时机。
+  - `internal/discovery/egress.go` 提供 `EgressPolicy`：解析后地址若为 loopback/私有/link-local/未指定/保留/CGNAT/文档段 → 拒绝。
+  - discovery 客户端**始终**传入该策略（新增 `ClientConfig.EgressPolicy` 与 `AllowLocalDiscovery` 两个开关，后者**仅供本地测试 harness**，生产从不设置）。
+  - **stage-1 relay 保持原行为**：其端点本就常是运维自己网络上的私网地址（有意不启用）。
+  - **e2e 套件的逃生口用 build tag 隔离**：`internal/cmeshtest` 带 `//go:build cmeshtest`，只有 `tests/run-tests.sh` 用 `-tags cmeshtest` 构建。**`go build`、CI 构建、发布构建都不带该 tag** → 出货二进制没有逃生口；`go tool nm` 实测确认 `internal/cmeshtest` **未链接进生产二进制**，并有测试断言之（`TestProductionBuildHasNoEscapeHatch`，带 tag 构建时该测试会红）。
+- **红→绿**：去掉策略接线后 `TestClientPassesEgressPolicyToTheDialer` 红（"the client dialled without an egress policy"），恢复后绿；`internal/wsconn` 另有用真实 listener 证明「策略在连接**之前**生效」（连接根本没被接受）。
+- 测试 fixture 的处理：把逻辑主机名重定向到回环的 fixture **显式** `opts.EgressPolicy = nil`，而不是让 fixture 悄悄削弱策略。
+
+**★ relay 前向循环读缓冲未复用（性能代理发现，本会话修复）**
+
+- `internal/relay/relay.go` 的前向循环把一个读缓冲穿过 `RecvInto`。消息放不下时 `RecvInto` 在**自己内部**扩容并返回扩容后的切片，但循环读的是**自己的** `buf = buf[:cap(buf)]`——**从未看到那次扩容** → 每条大于初始 64KiB 的消息都把 64→128→256→512 KiB 的分配+拷贝链**重付一遍**。
+- 实测 relay 的真实消息**平均 493 KiB**（远超初始缓冲）→ 这是常态而非边角。profile 里 `makeslicecopy` 占 relay CPU **23.73%**；修复后 4.88%，ABAB 各 9 次测得 **relay CPU 中位 0.310s → 0.090s（−71%）**、吞吐中位 +11%、最坏 +231%，64 MiB SHA-256 校验通过。
+- **红→绿**：新增 relay 侧缓冲生长计数（`readBufferGrowths`）。修复前测试红：**"grew its read buffer 20 times for 20 messages"**；修复后绿。
+- **「批量写」明确不做**：64 MiB 只走 136 条 WS 消息（493 KiB/条）已摊薄；且**协议禁止**（1 WS 消息 = 1 AEAD 帧，`internal/secure/secure.go:403`）——本仓 `internal/peer/pump.go:280-290` 注释记录了**同一原因已删过一次 batching**。
+
+**★ 性能代理本轮的两处「推翻上一轮结论」**
+
+1. **「quic-go 不暴露重传计数」是错的**：它暴露的是**每连接**计数——`Conn.ConnectionStats().PacketsLost`（`quic-go/connection.go:800-813`）+ `logging.ConnectionTracer.LostPacket`（`logging/connection_tracer.go:28`）。已在 /tmp 副本实现 `BenchStats.Retransmissions` 从 nil 变真实值 + `BenchLoss`/`PeerLoss` 双向上报，两条独立计数器实测一致（98/98、369/369、175/175、207/208，差异为 spurious）。**上一轮的「度量前提阻塞」已打开**。
+2. **拥塞控制是 Reno 不是 Cubic**：`internal/ackhandler/sent_packet_handler.go:134-140` 明写 `true, // use Reno`（上游 v0.55.0 与 v0.65.0 双向核对）。Reno 的 `renoBeta=0.7` 与 Cubic 的 `beta=0.7` **数值巧合**，所以「砍 30%」数字碰巧对，但**算法名错、「换 Cubic」路线根本不存在**。**换拥塞控制不可行**：quic.Config 无 congestion 字段，编译报 `use of internal package .../internal/congestion not allowed`，上游最新 v0.65.0 仍硬编码 Reno → **唯一路径是 fork quic-go**。
+3. **P-3 崩塌机制直接测量**：cwnd 追踪显示 20ms/0% 丢包时 `cwnd_max`=5.6 MB，1% 丢包掉到 111–186 KB（**−30~50×**），吞吐 39.6→1.7 MiB/s；同档 111 个丢包含 **40 个 spurious**，cwnd 反而保住 1.98 MB → **证明是 cwnd 塌缩而非丢包数决定吞吐**。
+4. **「减少 syscall」本仓可控空间 ≈ 0**：`Syscall6` 23.59% flat，逐层 `-peek` 全部在 quic-go 内部；本仓仅 9.30% cum。**darwin vs Linux 差 2.3–3.4×，根因是 GSO 仅 Linux** —— Linux **604–638 MiB/s（P-3 达标）**，darwin 233–270（不达标）。
+
+**M4 审计代理的两处「更正上一轮结论」（本会话已独立核实）**
+- **「仓库内无 systemd unit」不成立**：`packaging/systemd/` **存在**（`cmesh-discovery.service` + env 示例 + README）。但有 5 处实质缺口，已修（见下）。
+- **「发布资产来源不可追溯」不成立**：`go version -m` 显示已发布二进制**内嵌 VCS 信息**（`vcs.revision=6f07562d37e31358b7ff18dbeecb1f02936f8dc1`、`vcs.time=2026-11-15T19:53:33Z`、`vcs.modified=true`），审计代理用「干净 clone + `-trimpath` + 复现 `+dirty`」配方**字节级复现 5/5 digest 精确命中**。真正的问题是**仓库里没把这个写下来**。
+- 另更正：**已发布 rc1 含 serve-discovery 的 K-1，不含 `relay` 的 K-1**（此前用 `strings` 查 `relay: shutdown` 命中 0 是因为查错了路径）。
+
+**systemd unit 五处缺口（本地已修，`79c6891`）**
+① `ExecStart` **无 `--account-pub`** → 缺该参数时发现节点**根本不挂载入网端点**，凭证入网不可用；② 无 `StateDirectory=`（`ReadWritePaths` 指向 fresh 机器上不存在的目录）；③ 无 `TimeoutStopSec=`（与 relay 10s drain 不对齐）；④ `EnvironmentFile=-` 的 `-` 前缀让文件缺失不报错 → 变量全空 → `--state ""` 静默回落 `~/.cmesh`（且与 `ProtectHome=read-only` 冲突）；⑤ 空口令在无 tty 时 EOF。已加 `StateDirectory`/`StateDirectoryMode`、去掉 `-` 前缀、补 `--account-pub`、显式 `KillSignal=SIGTERM` + `TimeoutStopSec=15s`，env 示例补注「账号公钥不是秘密」。
+
+**本轮推送**：`1712099` docs(readme) → `ca4f338` fix(mesh) 端点 fallback → `79c6891` fix(systemd) → `aaf42ab` fix(relay) 读缓冲复用 → `75a8ff7` fix(discovery) 出口策略。每次推送前门禁全绿（fmt/vet/build/race 18 包/quick 43-0/install 回归/交叉编译 5 平台）。
