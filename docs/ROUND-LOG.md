@@ -1183,3 +1183,47 @@ t=20s  RSS=7,888 KB
 2. **授权云真实链路**（175.24.139.148 + 162.14.97.79）：join/status/ping/msg/send-to/run/bench/panel 全链路 + **下线时延用面板 online 计数** + RSS 15 秒后 20 点 + rc1 真资产安装闭环（并记录 rc1 与当前 HEAD 的差异）。
 3. **Linux headless 安装闭环**：systemd unit 五处修复的**真机复测**（重点：补 `--account-pub` 后**凭证入网可用**、`EnvironmentFile` 缺失应当**启动失败**、`StateDirectory` 生效、优雅停止 exit 0）+ 升级回滚与状态保留 + 日志可观测 + 与上一轮 16/17 对照。
 4. **mesh 中继干道 PR-2 前置**：**落定 G11**（push-open 的 B 侧连接生命周期）并写出可直接进 `docs/decisions.md` 的草稿；PR-2 逐项清单（干道协议 / 字节配额 / push-open 限定 ping+msg / CLI 接线 / e2e SIGMA）；前 3 条反向用例的骨架**在 /tmp 副本里跑出真实红/绿**（证明骨架有效）。
+
+### Round 57（2026-11-16 · 值守：四条代理回报 → 修 5 个真缺陷 + 落定 G11）
+
+**★ Linux headless 安装闭环复测代理（真机 175.24.139.148，OpenCloudOS 9.4）—— systemd 五处修复全部 PASS**
+
+| # | 修复 | 证据 |
+|---|---|---|
+| 1 | 补 `--account-pub` | 进程 cmdline 带着它；`/mesh/enroll` 返回 **403（已挂载）** vs 旧 unit 的 404；**跨机 `join --cred` rc=0**，enrolled + approved |
+| 2 | 去掉 `EnvironmentFile=-` 的 `-` | env 缺失 → `START_RC=1`、`Result=resources`、journal `Failed to load environment files` |
+| 3 | `StateDirectory` + mode | 全新机器上 `/var/lib/cmesh mode=750 owner=cmesh:cmesh` **自动创建** |
+| 4 | `KillSignal`/`TimeoutStopSec` | `kill -TERM` → **`ExecMainStatus=0`（不是 143）**，端口释放、无残留 |
+| 5 | env 示例补注 | 与 `cmesh account show` 输出一致 |
+
+**A/B 对照（代理自做）**：旧 unit → enroll **404** "enrollment is not enabled on this node"、`join` 失败 `unreadable answer (HTTP 404)`；新 unit → enroll 403、`join` rc=0、roster v3 持久化。**凭证入网路径在旧 unit 上是真的死的。**
+**mesh ping 5/5、0% loss、link=direct**（真 QUIC + 证书钉扎；跨云 UDP 被两边安全组全封——175 上 tcpdump 抓到 0 个来自 162 的包，故走 UDP-over-TCP 隧道，RTT 214ms 是隧道开销不是产品）。
+另验证：双版本安装 + `current` 轮转、`--uninstall` 保留状态、`--purge` 删状态、状态跨服务重启存活、enable/disable、非 root journald 日志。**清理已确认**（175 上 unit/目录/用户全删，nginx 与 cmesh-hub 仍是原 PID 的 active）。
+
+**★ 该代理抓到的新阻塞缺陷（已修）：安装器的版本目录是 0700**
+暂存目录来自 `mktemp -d`（0700，防半成品被读），**模式跟着目录一起 `mv` 进位** → 提交后的 `versions/<v>/` 也是 0700，**只有属主能进**。二进制本身已 0755，**窄的是外层目录**。而 systemd unit 以 `User=cmesh` 运行并从托管安装根执行二进制 → **官方安装出来的二进制服务用户执行不了**（`runuser -u cmesh -- .../current/cmesh version` → Permission denied）。**unit 的 `User=` 与安装器的目录模式互相矛盾。** 已修（`82ed647`）：提交前把暂存目录放宽到 0755。
+**红→绿**：回归测试断言提交后版本目录权限——**第一版断言的模式写错了（长度不对），对坏掉的安装器仍判绿**（本项目已知的假绿坑），已重写并验证它**对旧安装器确实失败**（`the version directory mode is drwx------`）。
+
+**★ PR-2 前置代理：G11 已裁定 + 抓到 PR-1 自带的三处缺陷**
+
+**G11 裁定**：**push-open 的 B 侧连接生命周期 = C 主动连 B；v1.1 的 B 就是锚点本身；注册复用已存在的 `/mesh/members` 常驻流。**
+- pull-open 在纯出站场景**物理上不存在**（C 没有端点可连，`internal/cli/meshcmd.go:164` 今天的报错原文）。
+- push-open 所需的连接 **C 已经在连**——每个成员已有到锚点的常驻长连接（`internal/relay/mesh.go:181`/`:400`），锚点**已经记着谁连着它**（`:405-411` 的 `s.streams[id]`，`KickStream` 就在用）。
+- B=锚点是**范围裁剪不是语义变更**，不违反 R-3.2（锚点自己 init+account+device-add，不新增部署单元）。
+- 否决：pull-open（覆盖不了 V10）、混合（R-3.3 是 P1 → 非确定性选择，违反 R-3.2）、经专用锚点（违反 R-3.2）。
+- 交付 `docs/decisions.md` 草稿（建议编号 **D73**）在 `/tmp/trunk-pr2-decision-draft.md`。
+
+**抓到 PR-1 自带的三处真实语义缺陷（已修，`5b5995f`）**：**F-1** 中继路径返回 `ErrNoRoute`（该类读作"试下一条"，但中继干道不存在，再试无用）→ 改为回退规则**会停下的类**；**F-2** `tryPaths` 全失败时返回**空 Path**，调用方无法报告试过哪条（CLI 的 `link=` 依赖它）→ 改为记住并返回；**F-3**（最重）**成员资格检查在 picker 之后**——picker 被问"要连谁"时还不知道对方是不是成员，而 picker 会把目标身份交给中继 → **已撤销设备的身份会被发给第三方成员** → 成员检查**前移**，失败归 auth 类。三条各有独立测试，修复前全红。
+**这三条印证了「PR-1 也要被复核」**：代理写的代码同样带着缺陷，主代理的复核不是形式。
+
+**★ 性能代理：本轮把上一轮说"被阻塞"的事做成了**
+- **每流丢包计数已实现**（`internal/mesh/lossstat.go` 新增 248 行）：关键发现是 **`ConnectionStats` 在任何时刻都可读**（是一组 `atomic.Uint64` 计数器，不是关连接时冻结的值）→ 不需要 close/wait  dance。两条独立计数器（`ConnectionStats` vs `Tracer`）在 **31/32 次**运行中一致，唯一的差异是**路径 MTU 探测包**——它到得了 tracer 但到不了拥塞控制器。
+- **计数器就是真正的限制器**：`throughput ≈ cwnd_mean/RTT` 在 **16/16** 次 20ms 丢包实验中成立（中位比 0.936）。
+- **Task 2「本仓可控空间」实测 ≈1%，不是 0**：把写侧拷贝整个去掉（V3：repo copies 0 字节）→ **CPU −0.71%、吞吐 +0.24%（噪音级）**。`Syscall6` 27.32% / AEAD 10.17% / `memmove` 7.68% **全在 quic-go + 内核里**，本仓没有 API 能碰到。**传输路径级优化必须落到上游或换传输。**
+- **Task 3「Cubic 是空结果」并给出了为什么**：quic-go 的 Cubic 丢包响应与 Reno **逐字节相同**（`c.beta() = (1-1+0.7)/1 = 0.7` == `renoBeta`），只有增长阶段不同。**30 次配对交错实测：成对胜率 49.9%**（50% = 无差别）。**阳性对照**（fork 里把 `beta` 0.7→0.95）：崩塌率 **75%→17%**、吞吐 **10.97→24.83 MiB/s**——证明 fork 是活的、Cubic 分支确实在执行、**丢包响应因子才是真正的杠杆**。fork 成本是 **1 行**，但改 `beta` 不是合法算法。**「在 `internal/mesh` 实现拥塞控制」不可能**：没有每包 ACK 时钟、拿不到 cwnd 写权限、状态全在 quic-go 内部。
+- **Task 4：relay 已不再是瓶颈，接收端才是**。relay CPU **8–15%**（profile 采样只占 1.60%）、tx 放大 1.002×、**记录大小不是杠杆**（32K/128K/512K 都 ≈10%）。**接收端 CPU 43–59%**，是 relay 的 4–6 倍。下一刀该切接收端（候选已列出但**未测**）。
+- **诚实缺口**：真实公网未达成（无授权端点）；**没测真 BBR**（`beta=0.95` 只是对照，**不能落地**）；relay 修复前后的 A/B 样本点太少，**独立复现不了上一轮的 −71%**（该结论**未被推翻**）；`Retransmissions` 这个字段名说的是"重传"但值其实是**丢包数**——落地时值得改名。
+
+**本轮推送**：`5b5995f` fix(mesh)（路径层三处缺陷）→ `82ed647` fix(packaging)（版本目录 0700）。
+
+**一轮内的一个模式**：本轮共修 **5 个真缺陷**，其中 **3 个来自复核刚落的 PR-1**、**1 个来自真机安装复测**、**1 个来自外部测试者的现象定位**——**没有一个是主代理自己写代码时发现的**。这正是多代理模式的收益所在。
