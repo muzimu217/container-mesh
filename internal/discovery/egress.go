@@ -8,6 +8,16 @@ import (
 	"net"
 )
 
+// resolvedAddr is the address a host name resolved to, as the dialer sees
+// it: the numeric address plus the original host name.
+type resolvedAddr struct {
+	addr string
+	host string
+}
+
+func (a *resolvedAddr) Network() string { return "tcp" }
+func (a *resolvedAddr) String() string  { return a.addr }
+
 // EgressPolicy decides whether a resolved address may be connected to.
 //
 // The host check in allowedDiscoveryHost can only judge a literal address.

@@ -35,6 +35,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/muzimu217/container-mesh/internal/identity"
@@ -180,9 +181,40 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	if cfg.HTTPClient != nil {
 		c.httpc = cfg.HTTPClient
 	} else {
-		c.httpc = &http.Client{Timeout: cfg.DialTimeout}
+		c.httpc = &http.Client{Timeout: cfg.DialTimeout, Transport: c.httpTransport()}
 	}
 	return c, nil
+}
+
+// httpTransport returns the transport for the register requests, with the
+// outbound address policy applied.
+//
+// The register request is an HTTP POST to the discovery origin, and it is
+// the same shape as the members stream: an operator-supplied origin that
+// must not be allowed to reach the host's own loopback or private network.
+// The members stream carries the policy; without it here the register path
+// was still able to reach a loopback address, which the external tester
+// confirmed with a listener that received the request.
+//
+// The check runs on the resolved address, inside the dialer, so the
+// connection is never made.
+func (c *Client) httpTransport() *http.Transport {
+	policy := c.egressPolicy()
+	dialer := &net.Dialer{Timeout: c.cfg.DialTimeout, KeepAlive: 30 * time.Second}
+	if policy != nil {
+		dialer.Control = func(_, address string, _ syscall.RawConn) error {
+			host, _, err := net.SplitHostPort(address)
+			if err != nil {
+				return fmt.Errorf("discovery: egress policy: cannot parse %q: %w", address, err)
+			}
+			return policy(&resolvedAddr{addr: address, host: host})
+		}
+	}
+	return &http.Transport{
+		DialContext:           dialer.DialContext,
+		TLSHandshakeTimeout:   c.cfg.DialTimeout,
+		ResponseHeaderTimeout: c.cfg.DialTimeout,
+	}
 }
 
 // egressPolicy returns the outbound address policy for the members stream.
