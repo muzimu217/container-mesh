@@ -556,3 +556,13 @@ else
     bad "Go integration test（附加检查）" "测试失败"
     cat "$CRED_TEST_LOG"
 fi
+
+# ---------------------------------------------------------------
+section "结果"
+printf '通过 %d, 失败 %d\n' "$PASS" "$FAIL"
+if [ "$FAIL" -ne 0 ]; then
+    printf '\n失败项:%s\n' "$FAILED_NAMES"
+    exit 1
+fi
+printf '\033[32m全部通过\033[0m\n'
+exit 0
