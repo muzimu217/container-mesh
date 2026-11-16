@@ -769,3 +769,25 @@ init → account create → device-add → serve-discovery（自举 members.json
 - **门禁**：`gofmt` / `go vet` / `go build` / `go test ./... -race -count=1`（18 包）/ `run-tests.sh --quick`（43/0 rc=0）/ `packaging/install_test.sh` rc=0 / `go test ./internal/relay -race -count=3` 全绿。
 
 **本轮新增结论对 KPI 的影响**：P-3 的瓶颈已被定位到**传输路径级**（quic-go syscall + 加解密 + 拷贝），而非分配；后续优化方向应从"压分配"转向"减少 syscall/拷贝 + 换拥塞控制算法"，否则分配优化已无空间。
+
+### Round 49 续二 · oh-no 字节完整性专项 + 一条上报的否定（2026-11-16 · 值守）
+
+**oh-no-agent（`12:05:24Z`）—— `7a66f5e` bench frame 复用字节完整性专项 PASS**
+- 单测 `TestBenchFrame*` `-race × count=3` 全绿（RoundTrip / NoStaleBytes / RejectsBadLength）。
+- **端到端双向字节完整性**：真实 CLI + 常驻成员进程（接收侧走的就是复用 buffer 的生产路径）。m1→m2 的 4096 / 1MiB / 8MiB / 32MiB 与 m2→m1 的 32MiB，**sent 与 received 全部精确相等**。
+- **对抗形态帧边界**：邻近尺寸 4095 / 4097 / 65535 / 65537 / 1048577 / 33554431 全部 rc=0、精确相等——非对齐尺寸下帧边界无损（这是 no-stale-bytes 最容易暴露的形态）。
+- **跨帧残留**：同一常驻接收进程连跑 3 轮 32MiB，三轮全部精确相等，无 corrupt；交替大小轮换（1MiB+1 / 64KiB−1 / 32MiB−1）也全部精确相等。
+- 面板三点顺带抽查无回退（无令牌 401 / 正确头 200 / `?token=` 401 / `/panel` → 308 → `/panel/`）。
+
+**一条被否定的上报（不计入缺陷）**
+- oh-no 报「`account create` 把 `account.json` 落在 `<dir>/account/` 子目录，而 `account device-add` / `cred create` 找 `<dir>/account.json`，首次全新部署需手工上移一层」。
+- **本会话实测不成立**：`account create` 写入的就是 `<state>/account.json`；`init → account create → account device-add` 全流程平铺布局、`rc=0`，`find` 输出只有 `device.json` / `account.json` / `<id>.cert.json` 三个平级文件。
+- **成因**：对方把不同命令的 `--state` 指向了不同目录（`.../account` vs 其父目录），于是看到 `account/account.json` 与 `account.json` 的错位——属**用法错误**，不是产品缺陷。已在 KPI 的外部等待一节写明"该上报已被本会话实测否定"。
+
+**性能代理最终补充数字（对已提交结论的修正）**
+- bench frame 复用的**峰值 RSS 收益是 −14.3%（29,133 → 24,980 kB）**，不是此前记录的 −3.5%——原结论偏保守，已在 KPI 更正。
+- 分配降幅实测 **−93.6%（342.9 → 21.8 MB）**，与主会话的 −89.4%（699.34 → 74.08 MB）口径不同（两套 harness 计数范围不同），**比例可比、绝对值不可互换**。
+- **加宽 QUIC 流控窗口经 A/B 排除、无收益**——所以 Cubic 的崩塌行为是拥塞控制本身，改进可能需换算法（BBR），不是配置疏漏。
+- **16 个丢包 ≈ 吞吐掉 15 倍**。
+
+**已推送**：`7a66f5e`（4 笔）→ `d206c14`（F-1 修复 + 性能文档）→ `47cff18`（独立验证记录）。三次推送的远端 CI 均 **success**，其中 `d206c14` 那一轮已包含新加入 CI 的「离线安装回归」步骤且通过。

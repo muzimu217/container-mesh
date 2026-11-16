@@ -1,6 +1,6 @@
 # container-mesh 项目总规划与交付口径
 
-更新时间：2026-11-16。当前分支：`develop`。远端 tip：`8c84e73`。本轮（Round 49）在本地 worktree 新增开发：**①** P-3 bench frame 复用（32MiB 双向累计分配 699.34MB → 74.08MB，−89.4%，吞吐未变）；**②** `cmesh relay` 优雅停止自动化覆盖（红→绿已证）；**③** `packaging/install_test.sh` 接入 CI（F-1 连续逃逸两次的根因）；**④** `MESH-DESIGN.md` §1.2 文档偏差修正（4 个被当作已有文件的路径实际不存在）；**⑤** `.gitignore` 补 `*.test`/`*.prof`；**⑥** mesh 握手超时测试 flaky 缓解（5s→10s，与生产一致）。push 前门禁全绿：fmt/vet/build/race 18 包/quick 43-0/install 回归 rc=0/交叉编译 5 平台。最新外部复测：oh-no 在 `8c84e73` 全项 PASS 无回退；kuku 与 netns 连续两轮无回应，本轮已升级为广播催办。RSS 资源指标仍超过 15MB 目标；P-3 直连 ≥200 MiB/s 未达标（回环实测 71–113 MiB/s）。
+更新时间：2026-11-16。当前分支：`develop`。远端 tip：`47cff18`。本轮（Round 49）共推送 **7 笔**提交、3 次推送（`7a66f5e` → `d206c14` → `47cff18`），远端 CI 三轮均 success。内容：**①** P-3 bench frame 复用（32MiB 双向累计分配 699.34MB → 74.08MB，−89.4%，吞吐未变；oh-no 字节完整性专项 PASS）；**②** **F-1 discovery 热推送缺陷修复**（`close(old)` 使旧订阅 channel 永远可读 → 旧流"推快照→立即再推"热循环，1,343,108 B/s → **151.1 B/s，−99.99%**，红→绿已证并经独立 lab 验证）；**③** `cmesh relay` 优雅停止自动化覆盖（红→绿已证）；**④** `packaging/install_test.sh` 接入 CI（F-1 连续逃逸两次的根因）；**⑤** `MESH-DESIGN.md` §1.2 文档偏差修正（4 个被当作已有文件的路径实际不存在）；**⑥** `.gitignore` 补 `*.test`/`*.prof`；**⑦** mesh 握手超时测试 flaky 缓解（5s→10s，与生产一致）。门禁全绿：fmt/vet/build/race 18 包/quick 43-0/install 回归 rc=0/交叉编译 5 平台。外部复测：oh-no 三轮全项 PASS 无回退；kuku 与 netns 连续两轮无回应，已升级为广播催办并再次派单。**P-3 直连 ≥200 MiB/s 未达标**——瓶颈已定位到传输路径级（quic-go syscall 18.18% + 加解密 9.48% + 拷贝；分配只占采样 1.4%），下一步从"压分配"转向"减少 syscall/拷贝 + 替代 Cubic 的拥塞控制"。RSS 资源指标仍超过 15MB 目标。
 
 ## 项目状态口径
 

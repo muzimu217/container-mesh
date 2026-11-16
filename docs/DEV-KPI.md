@@ -1,17 +1,22 @@
 # container-mesh 开发与平台 KPI 看板
 
-更新时间：2026-11-16 10:35Z。分支：`develop`。远端 tip：**`8c84e73`**。本轮新开发（**已在本地 worktree，尚未推送**）：
+更新时间：2026-11-16 12:20Z。分支：`develop`。远端 tip：**`47cff18`**。本轮共推送 7 笔提交、3 次推送（`7a66f5e` → `d206c14` → `47cff18`），每次推送前完整门禁全绿，远端 CI 三轮均 **success**（含新加入的「离线安装回归」CI 步骤并通过）。
 
-1. **P-3 bench frame 复用**：`internal/mesh/bench.go` 收发两侧改为复用单个帧缓冲。32MiB 双向累计分配 **699.34MB → 74.08MB（−89.4%）**；`readBenchFrame`/`sendBenchData` 已从分配榜消失，剩余热点全在 quic-go/socket 内核层。回环吞吐 1/8/32MiB 分别为 103–113 / 86–101 / 71–104 MiB/s，**P-3 目标 ≥200 MiB/s 仍未达标**（回环抖动大，需专用测量环境）。
-2. **K-1 自动化覆盖**：`internal/cli/relay_stop_test.go` 补上 `cmesh relay` 优雅停止的进程内验收。**红→绿已证**：移除 `srv.Shutdown` 调用后测试红（"relay did not stop within 20s"），恢复后绿。`internal/cli/relay.go` 抽出 `serveRelay` 供测试驱动。
-3. **F-1 接入 CI**：`packaging/install_test.sh` 从未进入 CI（这正是 F-1 连续逃逸两次的根因），已加入 `.github/workflows/ci.yml` 的端到端测试之后。本地 rc=0（"packaging install tests: ok"）。
-4. **文档偏差修正**：`docs/architecture/MESH-DESIGN.md` §1.2 的"新建文件"表把 `internal/mesh/route.go`、`relay.go`、`agent.go`、`internal/e2e/e2e.go` 列为文件——**四个均不存在**。已加状态列并写明"当前 mesh 只有直连 QUIC，relay-only 报错 rc=1 不伪造"。
-5. **仓库卫生**：`.gitignore` 补 `*.test` / `*.prof` / `*.out`（profiling 产物此前可被误提交）。
-6. **测试稳定性**：`internal/mesh` 的握手超时 5s → 10s（与生产默认一致）。全量 `-race` 下曾出现一次 `TestPingRoundTrip` 的 QUIC 拨号超时，定位为 runner 负载下的 flaky，非产品缺陷。
+**已推送的 7 笔**：`7e4bd2c` perf(mesh) bench frame 复用 / `2739355` test(cli) relay 优雅停止覆盖 + 握手 flaky / `f81a2f5` ci 离线安装回归 + gitignore / `7a66f5e` docs 文档偏差修正 / `a4080e8` fix(relay) **F-1 热推送** / `d206c14` docs 性能发现 / `47cff18` docs 独立验证记录。
 
-push 前门禁全绿：fmt / vet / build / `go test ./... -race -count=1`（18 包）/ `tests/run-tests.sh --quick`（43/0 rc=0）/ `packaging/install_test.sh` rc=0 / 交叉编译 linux amd64+arm64、windows amd64、darwin amd64+arm64 全过。
+**① P-3 bench frame 复用**（`7e4bd2c`）：`internal/mesh/bench.go` 收发两侧改为复用单个帧缓冲。32MiB 双向累计分配 **699.34MB → 74.08MB（−89.4%）**；`readBenchFrame`(288MB/41%) 与 `sendBenchData`(277MB/39%) 已从分配榜消失，剩余热点全在 quic-go/socket 内核层。**吞吐未变**——回环双向 1/8/32MiB 分别 103–113 / 86–101 / 71–104 MiB/s，**P-3 目标 ≥200 MiB/s 仍未达标**。独立验证：oh-no 在 `7a66f5e` 做字节完整性专项，双向 sent/received 全部精确相等、对抗尺寸（4095/4097/65535/65537/1048577/33554431）无损、同进程连跑 3 轮 32MiB 无跨帧残留、单测 `-race ×3` 全绿。
 
-外部复核：oh-no ✅（`8c84e73` panel / B-3 五动词+双向臂 / diagnostics / B-4 边界全项 PASS，无回退）；kuku 与 netns **连续两轮无回应**，本轮已升级为广播催办（Hub 四路 ok:true），仍未回报。prerelease `v1.0.0-rc1` 实际只有 **10 个资产**（矩阵需 20），`windows/arm64` 完全缺失——** darwin/windows 归档资产尚未上传完成**。Linux systemd 16/17 PASS（仅 reboot 待授权）。水位：`2026-11-16T09:47:24Z`。
+**② F-1 discovery 热推送（1.05 MB/s）**（`a4080e8`）：性能代理在真实 anchor 复现——任意一次性命令后，被用成员的 anchor 推送速率从 158 B/15s 暴涨到 **15.8 MB/15s**，代理自测 lab 测得 16,144,158 B/12s = **1,343,108 B/s**（放大 ×10,957），无界。根因：`Subscribe` 用 `close(old)` 废弃旧订阅，**关闭的 channel 永远可读**，旧订阅者的 `case <-ch:` 立即且永久触发 → `streamMeshMembers` 陷入"推整份快照→立即再推"热循环。修复在**消费侧**（`case _, ok := <-ch`，`!ok` 即退出），不动 `Subscribe` 语义。红→绿：修复前红（"orphaned stream still receiving (757 bytes)"），修复后绿；复核时手动置空 `if !ok` 重跑**再次确认红**。**独立验证**：代理对落地后的 HEAD 做 A/B，**1,343,108 B/s → 151.1 B/s（−99.99%）**，4 次一次性命令后 226.8 B/s 不累积。
+
+**③ relay 优雅停止自动化覆盖**（`2739355`）：`cmesh relay` 此前**零进程级测试**（K-1 修复没有自动化保护）。`internal/cli/relay.go` 抽出 `serveRelay` 供测试驱动。**红→绿已证**：移除 `srv.Shutdown` 调用 → 测试红（"relay did not stop within 20s"）；恢复 → 绿。
+
+**④ F-1 接进 CI**（`f81a2f5`）：`packaging/install_test.sh` **从未**进入 CI——这正是 F-1 连续逃逸两次的根因（"CI 绿"对安装器毫无意义）。已加入 `.github/workflows/ci.yml`，远端 CI 该步骤已通过。
+
+**⑤ 文档偏差修正**（`7a66f5e`）：`docs/architecture/MESH-DESIGN.md` §1.2 的"新建文件"表把 `internal/mesh/route.go`、`relay.go`、`agent.go`、`internal/e2e/e2e.go` 列为文件——**四个均不存在**。已加状态列并写明"当前 mesh 只有直连 QUIC，relay-only 报错 rc=1 不伪造"。
+
+**⑥ 仓库卫生 + flaky 缓解**（`f81a2f5` / `2739355`）：`.gitignore` 补 `*.test`/`*.prof`/`*.out`；mesh 测试握手超时 5s → 10s（与生产默认一致），全量 `-race` 下曾出现一次 `TestPingRoundTrip` 的 QUIC 拨号超时，定位为 runner 负载下 flaky、非产品缺陷。
+
+**外部复核**：oh-no ✅ 三轮全项 PASS（`8c84e73` / `407fde3` / `7a66f5e` 字节完整性专项）；doubao ✅（F-1 在 linux/amd64 rc=0）；kuku 与 netns **连续两轮无回应**，本轮已升级为广播催办并再次派单（Hub 各路 ok:true），仍未回报。prerelease `v1.0.0-rc1` 实际只有 **10 个资产**（矩阵需 20），`windows/arm64` 完全缺失。Linux systemd 16/17 PASS（仅 reboot 待授权）。水位：`2026-11-16T12:05:24Z`。
 
 这张表把代码、可运行产物、安装包、真机验收分开记账。交叉编译通过不等于平台交付完成；设计方案存在也不等于安装包完成。
 
@@ -117,8 +122,9 @@ push 前门禁全绿：fmt / vet / build / `go test ./... -race -count=1`（18 �
 ## 外部等待
 
 - `doubao-cloud-vm-01`：最新 `2026-11-16T09:18:19Z`，F-1 在 linux/amd64 复测通过（rc=0）；已回信 `ok:true`。
-- `oh-no-agent`：最新 `2026-11-16T09:47:24Z`，`8c84e73` 上 panel / B-3 五动词+双向臂 / diagnostics / B-4 边界**全项 PASS、无回退**；已回信 `ok:true`。
-- `kuku-sandbox-01`：最新 `2026-11-16T02:54:19Z`（`6f07562`）。此后静默已超 6 小时，且上一轮针对 `8c84e73` 的具体催办**无回应**；本轮已**升级为广播催办**（三项唯一指定任务：relay SIGTERM 必须 exit 0 / quick 43-0 且 rc 契约 / serve-discovery 优雅退出），Hub 返回 `{"ok":true}`。
+- `oh-no-agent`：最新 `2026-11-16T12:05:24Z`。**① `8c84e73` 与 `407fde3` 两轮全项 PASS、无回退**；**② `7a66f5e` bench frame 复用字节完整性专项 PASS**——双向 sent/received 全部精确相等（4096 / 1MiB / 8MiB / 32MiB，含双向），对抗尺寸 4095/4097/65535/65537/1048577/33554431 全部 rc=0 无损，同一常驻进程连跑 3 轮 32MiB 无跨帧残留，交替大小轮换全部精确相等；单测 `-race ×3` 全绿。已回信 `ok:true`。
+  - **一条被本会话否定的上报**：oh-no 称「`account create` 把 account.json 落在 `<dir>/account/` 子目录，而 device-add 找 `<dir>/account.json`」。**本会话实测不成立**：`account create` 写的就是 `<state>/account.json`，全流程 `init → account create → account device-add` 平铺布局、rc=0。对方是把不同命令的 `--state` 指向了不同目录（`.../account` vs 父目录），属用法错误而非产品缺陷，**不计入缺陷**。
+- `kuku-sandbox-01`：最新 `2026-11-16T02:54:19Z`（`6f07562`）。此后静默已超 6 小时，且连续两轮针对 `8c84e73`/`407fde3` 的具体催办**无回应**；本轮已**升级为广播催办**（三项唯一指定任务：relay SIGTERM 必须 exit 0 / quick 43-0 且 rc 契约 / serve-discovery 优雅退出），Hub 返回 `{"ok":true}`。
 - `netns-probe`：最新 `2026-11-16T02:13:52Z`（`6f07562`）。同上，本轮已**升级为广播催办**（NAT 方向性复测 / RSS 基线 20 点 / 50MB bench 后回落），Hub 返回 `{"ok":true}`。
 - **darwin/windows 归档资产**：`gh release view v1.0.0-rc1` 实测只有 **10 个资产**，平台矩阵（linux/darwin/windows × amd64/arm64）需 20 个；缺 `cmesh-v1.0.0-rc1-darwin-amd64`、`cmesh-latest-darwin-{amd64,arm64}`、`cmesh-latest-linux-arm64`、`cmesh-v1.0.0-rc1-windows-amd64` 及其 tar.gz，且 **`windows/arm64` 完全不存在**。Windows 命名在三处不一致（release 无 `.exe` / installer 要 `.exe` / mkrelease 出 `.exe`），需重建发布而非只补上传。
 - 网主：**①** 交互会话放行本轮 worktree 变更的提交与 develop 推送；**②** reboot 恢复验收需要重启生产服务器 175.24.139.148 的授权，或提供一台可重启的 disposable VM（会中断该机上的锚点/hub/nginx）。
