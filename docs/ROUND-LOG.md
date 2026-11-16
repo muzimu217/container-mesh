@@ -697,3 +697,11 @@ init → account create → device-add → serve-discovery（自举 members.json
 - **4 笔拆分提交并推送 develop**：`18404f1` fix(relay) K-1 / `537a107` fix(packaging) F-1 / `7c493ab` test(e2e) 退出码契约 / `77c14b5` docs。`180b31c..77c14b5`。身份 muzimu217。推送首次因代理 TLS 失败（SSL_ERROR_SYSCALL），按既有规避方式重试成功。
 - **复测派单**：四路 inbox 公告 77c14b5 与各自复测项，全部 ok:true。issue #8 mirror=comment-6911892755。
 - M4 剩余：四 agent 同 SHA 复测回报；reboot 验收待授权；darwin/windows 归档上传完成。
+
+### Round 48（2026-11-16 · 值守：F-1 复测通过 + 三线催办）
+
+- 水位推进：`02:54:19Z` → **`09:18:19Z`**。水位后 1 条：doubao F-1 修复复测通过（@8c84e73）。
+- **doubao（linux/amd64）**：离线安装回归 **rc=0**，资产名 `cmesh-latest-linux-amd64` 正确生成、SHA256 校验、uninstall/purge 全绿（"packaging install tests: ok"）；与 6f07562/180b31c 的 rc=1 形成对照，**F-1 闭环**。install 线至此全绿（产品本体同构 harness 7/7 + 离线回归 linux 绿灯）。
+- 复测矩阵现状：oh-no ✅（6fc00c6 全项 PASS）、doubao ✅（panel/mkrelease/F-1 全闭环）、netns ✅（第五十四轮入网 0.26s/ping 30/30）、kuku ✅（第五十五轮回环零回退 + 发现 K-1）。
+- 剩余待回报：kuku（relay SIGTERM exit 0 + quick 43/0 rc 契约）、oh-no（8c84e73 无回退复核）、netns（8c84e73 NAT/RSS 基线）——已发具体催办，三路 ok:true。
+- 回信 doubao 登记 ok:true；水位 → `09:18:19Z`。
