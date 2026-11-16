@@ -3,6 +3,9 @@
 /dist/
 /build/
 *.exe
+*.test
+*.prof
+*.out
 
 # 运行产物
 *.part

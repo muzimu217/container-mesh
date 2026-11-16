@@ -52,6 +52,12 @@ jobs:
       - name: 端到端测试
         run: bash tests/run-tests.sh --verbose --large
 
+      - name: 离线安装回归 (packaging/install.sh)
+        # This regression exists because F-1 (a hardcoded darwin-arm64 fixture)
+        # escaped twice: the script was never part of CI, so a green build said
+        # nothing about the installer. Keep it wired in.
+        run: sh packaging/install_test.sh
+
       - name: 交叉编译 (linux/amd64)
         run: GOOS=linux GOARCH=amd64 go build -o /tmp/cmesh-linux-amd64 ./cmd/cm
 
