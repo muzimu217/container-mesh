@@ -33,7 +33,7 @@ type directFixture struct {
 	members *identity.MemberList
 }
 
-func newDirectFixture(t *testing.T) *directFixture {
+func newDirectFixture(t testing.TB) *directFixture {
 	t.Helper()
 	acc, err := identity.GenerateAccount()
 	if err != nil {
@@ -74,12 +74,17 @@ func startListener(t *testing.T, f *directFixture) *Listener {
 func dialTo(t *testing.T, f *directFixture, eps []string, kind string) *Link {
 	t.Helper()
 	link, err := DialDirect(context.Background(), DialConfig{
-		Device:           f.bob,
-		Resolver:         MemberListAdapter{List: f.members},
-		Target:           f.aline.ID(),
-		Endpoints:        eps,
-		Kind:             kind,
-		HandshakeTimeout: 5 * time.Second,
+		Device:    f.bob,
+		Resolver:  MemberListAdapter{List: f.members},
+		Target:    f.aline.ID(),
+		Endpoints: eps,
+		Kind:      kind,
+		// The same default the production path uses. A tighter deadline here
+		// buys no extra coverage but does make the test flaky: under the
+		// full-suite -race load the QUIC handshake can take longer than 5 s
+		// on a loaded CI runner, and the test then failed with
+		// "context deadline exceeded" with no product defect behind it.
+		HandshakeTimeout: 10 * time.Second,
 	})
 	if err != nil {
 		t.Fatal(err)

@@ -67,6 +67,23 @@ func freePort(t *testing.T) string {
 	return "127.0.0.1:" + port
 }
 
+// buildCLIBinary compiles the real command binary into a temporary path.
+// Signal handling only exists in a real process, so the graceful-stop
+// acceptance tests must run the actual executable rather than the in-process
+// command functions.
+//
+// The build is invoked with an argument list and no shell, so no part of the
+// path or the module name is ever interpreted as a shell command.
+func buildCLIBinary(t *testing.T) string {
+	t.Helper()
+	bin := filepath.Join(t.TempDir(), "cmesh-under-test")
+	cmd := exec.Command("go", "build", "-o", bin, "github.com/muzimu217/container-mesh/cmd/cm")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("build cm: %v\n%s", err, out)
+	}
+	return bin
+}
+
 func meshDiscoveryTestTransport(t *testing.T, target string) discoveryClientTransport {
 	t.Helper()
 	targetURL, err := url.Parse(target)
@@ -424,11 +441,7 @@ func TestServeDiscoverySIGTERMExitsZero(t *testing.T) {
 		"--device-passphrase", pass, "--account-passphrase", pass)
 
 	// The signal path only exists in a real process, so build the binary.
-	bin := filepath.Join(t.TempDir(), "cmesh-under-test")
-	if out, err := exec.Command("go", "build", "-o", bin,
-		"github.com/muzimu217/container-mesh/cmd/cm").CombinedOutput(); err != nil {
-		t.Fatalf("build cm: %v\n%s", err, out)
-	}
+	bin := buildCLIBinary(t)
 
 	addr := freePort(t)
 	cmd := exec.Command(bin, "serve-discovery", "--state", ownerDir,

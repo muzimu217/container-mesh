@@ -57,7 +57,7 @@ func runRelay(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	srv := relay.New(relay.Config{
+	return serveRelay(ctx, stop, relay.Config{
 		Addr:        *addr,
 		Path:        *path,
 		PairTimeout: *pairTimeout,
@@ -66,6 +66,21 @@ func runRelay(args []string) error {
 		TLSKey:      *tlsKey,
 		Logger:      logger,
 	})
+}
+
+// serveRelay runs the relay until ctx is cancelled, then drains it and
+// returns nil.
+//
+// It is separate from runRelay so the graceful-stop wiring can be tested in
+// process: the defect this path guards against was that the command never
+// called relay.Server.Shutdown, so a SIGTERM ended in a hard 143 exit and
+// the port stayed bound. Testing the wiring here keeps the assertion on the
+// real drain behaviour instead of on signal-delivery timing.
+//
+// stop restores default signal handling so a second signal during a stuck
+// drain still kills the process.
+func serveRelay(ctx context.Context, stop context.CancelFunc, cfg relay.Config) error {
+	srv := relay.New(cfg)
 	go func() {
 		<-ctx.Done()
 		// Restore default handling first: a second signal while the drain
