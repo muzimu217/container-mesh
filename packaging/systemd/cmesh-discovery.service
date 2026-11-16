@@ -7,10 +7,34 @@ After=network-online.target
 Type=simple
 User=cmesh
 Group=cmesh
-EnvironmentFile=-/etc/cmesh/discovery.env
-ExecStart=/opt/container-mesh/current/cmesh serve-discovery --state ${CMESH_STATE} --addr ${CMESH_ADDR} --announce ${CMESH_ANNOUNCE}
+
+# The environment file is NOT optional. The leading "-" would let systemd
+# start the unit with every variable empty, and the empty ${CMESH_STATE}
+# then reaches the CLI as an empty --state, which silently falls back to
+# ~/.cmesh -- a path the hardening below makes read-only, and the wrong
+# place for the node's state anyway. A missing file must fail loudly.
+EnvironmentFile=/etc/cmesh/discovery.env
+
+# StateDirectory creates /var/lib/cmesh with the right owner and mode, so
+# ReadWritePaths below has something to point at on a fresh machine.
+StateDirectory=cmesh
+StateDirectoryMode=0750
+
+# ${CMESH_ADDR} / ${CMESH_ANNOUNCE} / ${CMESH_STATE} come from the
+# environment file. ${CMESH_ACCOUNT_PUB} is not optional in practice:
+# without --account-pub the node does not mount the enrollment endpoint at
+# all, so a member cannot join with a team credential.
+ExecStart=/opt/container-mesh/current/cmesh serve-discovery --state ${CMESH_STATE} --addr ${CMESH_ADDR} --announce ${CMESH_ANNOUNCE} --account-pub ${CMESH_ACCOUNT_PUB}
+
 Restart=on-failure
 RestartSec=5s
+
+# The relay drains on SIGTERM: the HTTP listener closes and pairing rooms
+# unwind before the process exits. Allow that drain to finish instead of
+# being killed mid-way, and make the stop signal explicit.
+KillSignal=SIGTERM
+TimeoutStopSec=15s
+
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
