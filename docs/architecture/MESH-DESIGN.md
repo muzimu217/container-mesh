@@ -67,20 +67,28 @@ cmd/cm
 
 ### 1.2 新建文件
 
-| 文件 | 职责 | 预估行数（生产/测试） |
-|---|---|---|
-| `internal/identity/identity.go` | 密钥对生成/加载/存储、deviceID 派生 | 200 / 180 |
-| `internal/identity/account.go` | 账号密钥、设备证书签发与验证、撤销列表 | 250 / 220 |
-| `internal/discovery/member.go` | 成员记录、序列化、验证 | 150 / 130 |
-| `internal/discovery/node.go` | 发现节点服务端（成员注册、心跳、广播） | 300 / 280 |
-| `internal/discovery/client.go` | 客户端（注册、心跳、接收广播） | 200 / 180 |
-| `internal/mesh/route.go` | 路由表、距离向量、防环、选路 | 300 / 280 |
-| `internal/mesh/relay.go` | 中转转发、配额执行 | 250 / 220 |
-| `internal/mesh/agent.go` | 节点主循环：维护连接、响应拓扑变化 | 300 / 280 |
-| `internal/e2e/e2e.go` | 端到端加密：X25519 ECDH + AES-GCM 封装 | 250 / 230 |
-| `internal/cli/mesh.go` | `init` / `join` / `status` / `dial` / `serve-discovery` | 350 / 250 |
+**状态列说明**：`已落地` = 文件存在且被代码引用；`未开始` = 规划中的文件，当前仓库中不存在。
+审阅时必须按此列核对，不得把规划当成已有实现。
+
+| 文件 | 职责 | 预估行数（生产/测试） | 状态（2026-11-16 核对） |
+|---|---|---|---|
+| `internal/identity/identity.go` | 密钥对生成/加载/存储、deviceID 派生 | 200 / 180 | 已落地（文件名已变为 `device.go`） |
+| `internal/identity/account.go` | 账号密钥、设备证书签发与验证、撤销列表 | 250 / 220 | 已落地 |
+| `internal/discovery/member.go` | 成员记录、序列化、验证 | 150 / 130 | 已落地 |
+| `internal/discovery/node.go` | 发现节点服务端（成员注册、心跳、广播） | 300 / 280 | 已落地（实现分布在 `discovery.go`） |
+| `internal/discovery/client.go` | 客户端（注册、心跳、接收广播） | 200 / 180 | 已落地 |
+| `internal/mesh/route.go` | 路由表、距离向量、防环、选路 | 300 / 280 | **未开始** |
+| `internal/mesh/relay.go` | 中转转发、配额执行 | 250 / 220 | **未开始** |
+| `internal/mesh/agent.go` | 节点主循环：维护连接、响应拓扑变化 | 300 / 280 | **未开始** |
+| `internal/e2e/e2e.go` | 端到端加密：X25519 ECDH + AES-GCM 封装 | 250 / 230 | **未开始** |
+| `internal/cli/mesh.go` | `init` / `join` / `status` / `dial` / `serve-discovery` | 350 / 250 | 已落地（命令分文件：`meshcmd.go`、`discovery.go`、`status.go`） |
 
 合计约 2,550 生产 / 2,260 测试。（DESIGN.md 写 1,900 是不含 CLI 的核心库。）
+
+**中继干道现状（2026-11-16 核对）**：`internal/mesh` 当前**只有直连 QUIC**（`direct.go`），
+`mesh ping/bench/msg/send-to/run` 全部走 direct，relay-only 时报错退出 rc=1，不伪造链路。
+上表中 `route.go` / `relay.go` / `agent.go` / `internal/e2e` 四个文件**均不存在**。
+任何"已支持 mesh 中继"的表述都与代码事实不符。
 
 ### 1.3 既有包的改动
 

@@ -705,3 +705,36 @@ init → account create → device-add → serve-discovery（自举 members.json
 - 复测矩阵现状：oh-no ✅（6fc00c6 全项 PASS）、doubao ✅（panel/mkrelease/F-1 全闭环）、netns ✅（第五十四轮入网 0.26s/ping 30/30）、kuku ✅（第五十五轮回环零回退 + 发现 K-1）。
 - 剩余待回报：kuku（relay SIGTERM exit 0 + quick 43/0 rc 契约）、oh-no（8c84e73 无回退复核）、netns（8c84e73 NAT/RSS 基线）——已发具体催办，三路 ok:true。
 - 回信 doubao 登记 ok:true；水位 → `09:18:19Z`。
+
+### Round 49（2026-11-16 · 值守：oh-no 全项 PASS + 本地开发批次 + 广播催办）
+
+**Hub 处置**
+- 水位推进：`09:18:19Z` → **`09:47:24Z`**。水位后 1 条：oh-no 对 `8c84e73` 的复核。
+- **oh-no-agent ✅**：`8c84e73` 上 panel / B-3 五动词+双向臂 / diagnostics / B-4 边界**全项 PASS，无回退**。面板黑盒 401/401/200/401/308/no-store 全部符合，离线成员保留名册并带 `last_seen`，下线跟随 0.10s、恢复 0.61s；B-3 双向臂（凭证↔凭证 10/10 p50 1.069ms、凭证→锚点 10/10 p50 0.306ms）link=direct；`status` 无 probe 时 `reachability=unknown` 不伪造；`@cat` 4095/4096/4097/65536/1048576B 字节精确、远端退出码透传 rc=1 正确。回信 ok:true。
+- **kuku / netns 升级为广播催办**：两者最后报告分别为 `02:54:19Z` / `02:13:52Z`（均为 `6f07562`），静默均超 6 小时，且上一轮针对 `8c84e73` 的具体催办**无任何回应**——连续两轮无响应，触发广播。已发四路公告（Hub 四路 ok:true），各自指定唯一任务项：
+  - kuku：① relay SIGTERM 必须 exit 0（非 143/1006）② quick 末尾必须 `通过 N, 失败 0` rc=0，且故意制造失败时 rc=1 ③ serve-discovery SIGTERM 优雅退出。
+  - netns：① `407fde3` NAT 方向性复测（正向必须通、反向结论必须明确写出）② RSS 基线 20 点 min/max/均值与 15MB 目标对比 ③ 50MB bench 后回落采样。
+  - 公告同时声明"缺一项就写缺哪一项，不要整份不报"，避免空报。
+
+**本轮本地开发（全部留在 worktree，未推送）**
+1. **P-3 bench frame 复用**（`internal/mesh/bench.go`）：收发两侧改用复用帧缓冲。32MiB 双向累计分配 **699.34MB → 74.08MB（−89.4%）**；`readBenchFrame`(288MB/41%) 与 `sendBenchData`(277MB/39%) 退出分配榜，剩余全在 quic-go/socket 内核层。**吞吐未变**——回环 1MiB 103–113、8MiB 86–101、32MiB 71–104 MiB/s，P-3 ≥200 MiB/s **仍未达标**，瓶颈不在分配而在传输路径。新增 `bench_frame_test.go`（帧字节等价、复用 buffer 无残留字节、坏长度拒绝）与 `bench_perf_test.go`（可重复口径）。
+2. **K-1 自动化覆盖**（`internal/cli/relay_stop_test.go`）：`cmesh relay` 优雅停止此前**零进程级测试**。`internal/cli/relay.go` 抽出 `serveRelay` 供测试驱动。**红→绿已证**：移除 `srv.Shutdown` 调用 → 测试红（"relay did not stop within 20s of the stop signal"）；恢复 → 绿。
+3. **F-1 接入 CI**（`.github/workflows/ci.yml`）：`packaging/install_test.sh` **从未**进入 CI——这正是 F-1 连续逃逸两次的根因（"CI 绿"对安装器毫无意义）。已加入，本地 rc=0。
+4. **文档偏差修正**（`docs/architecture/MESH-DESIGN.md`）：§1.2"新建文件"表把 `internal/mesh/route.go`、`relay.go`、`agent.go`、`internal/e2e/e2e.go` 列为文件——**四者均不存在**（已逐一 `ls` 核对）。已加状态列并写明"当前 mesh 只有直连 QUIC，relay-only 报错 rc=1 不伪造"。
+5. **仓库卫生**（`.gitignore`）：补 `*.test` / `*.prof` / `*.out`。本轮 profiling 产出的 12MB `mesh.test` 二进制此前可被误提交，已清理。
+6. **测试 flaky 缓解**（`internal/mesh/direct_test.go`）：全量 `-race` 下出现一次 `TestPingRoundTrip` 的 QUIC 拨号超时（`context deadline exceeded`）。定位为 runner 负载下握手超过测试自设 5s 截止，非产品缺陷；改为与生产一致的 10s，随后 `internal/mesh` 连跑 6 次 `-race` 全绿、全量 `-race` 再跑 3 次全绿。
+
+**四线研究代理（并行派发，全部只读、无 commit/push/merge）**
+- **协议审计**（`/tmp/relay-protocol-audit-round49.md`）：确认 `mesh ping/bench/msg/send-to/run` **100% 只走 direct QUIC**，relay-only 报错 rc=1 不伪造；stage-1 与 mesh relay **无代码复用**；`--p2p` 是 stage-1 的 relay→direct 升级而非 direct→relay 回退。发现四类关键件全缺：路径选择接口、错误分类（无 sentinel error）、device-ID 路由表、E2E 层（走 relay 则 B 看到明文）。共 19 条文档-代码不一致（D-1..D-19）。
+- **架构测绘**（`/tmp/arch-map-round49.md`）：19 个 Go 包，依赖图 DAG 仅两个零依赖基座（`internal/identity` 扇入 18、`internal/wire` 扇入 11）；**两条业务链完全不相交**，仅共享 `internal/identity`。CLI 命令注册表在 `internal/cli/cli.go:41-93`。发现 5 个缺陷：`--p2p-legacy` 死开关（解析后从未传给 `NodeConfig`，`internal/p2p` 约 1100 行不可达）、`internal/p2p2` 4710 生产行零生产导入、`KindExec` 白名单无实现、relay SIGTERM 无进程级测试（本轮已补）、`install_test.sh` 未接 CI（本轮已补）。
+- **M4 门禁审计**（`/tmp/m4-audit-round49.md`）：**M4 未收口**，四个门禁中①代码+本地门禁绿 ✅ ②修复进 develop ✅ ③同 SHA 外部复测 ⚠️部分 ④发布资产 ⚠️部分。两个外部条件确认仍缺：reboot 恢复（仓库内**无任何 reboot 脚本**，已写出最小可执行清单 steps 0–5）与 darwin/windows 归档（`gh release view` 实测 **10 个资产**，矩阵需 20，`windows/arm64` 完全不存在且不在 SHA256SUMS 中）。另发现 Windows 命名三处不一致（release 无 `.exe` / installer 要 `.exe` / mkrelease 出 `.exe`）、`releases/latest/download/...` 404（无正式 release）、**已发布的 rc1 二进制不含 K-1 修复**（`strings` 比对）、发布资产来源不可追溯。
+- **性能研究代理**：本轮仍在运行，报告未产出（`/tmp/perf-agent-round49.md` 尚不存在）。已知结论以本会话实测为准。
+
+**门禁（推送前，全绿）**
+- `gofmt -l internal/ cmd/ tools/` 无输出；`go vet ./...` PASS；`go build ./...` PASS
+- `go test ./... -race -count=1` PASS（18 包）
+- `bash tests/run-tests.sh --quick` → `通过 43, 失败 0`，rc=0
+- `sh packaging/install_test.sh` → rc=0（"packaging install tests: ok"）
+- 交叉编译 PASS：linux/amd64、linux/arm64、windows/amd64、darwin/amd64、darwin/arm64
+
+**M4 现状**：未收口。剩余外部条件三项——① kuku/netns 对同一 SHA 的复核（已广播催办，未回）② darwin/windows 归档资产重建上传（实测缺 10 个，`windows/arm64` 全缺）③ reboot 恢复验收（需网主授权重启生产服务器或提供可重启 disposable VM）。

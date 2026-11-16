@@ -13,16 +13,16 @@
 <main class="wrap">
 <header class="top">
   <div><div class="eyebrow">container-mesh / daily delivery board</div><h1 class="title">项目进度与路线看板</h1><p class="sub">每天看这里：当前开发完成到哪一步、门禁是否全绿、哪个平台真的能安装运行、下一步由谁推进。状态按代码和测试证据记录。</p></div>
-  <div class="stamp">看板更新<br><strong id="updated">2026-11-16 09:25Z</strong><br>远端 develop<br><strong>8c84e73</strong><br>F-1 复测<br><strong>linux rc=0 全绿</strong></div>
+  <div class="stamp">看板更新<br><strong id="updated">2026-11-16 10:35Z</strong><br>远端 develop<br><strong>8c84e73</strong><br>本轮本地批次<br><strong>分配 −89.4% · 门禁全绿</strong></div>
 </header>
 <section class="grid kpis">
   <div class="card kpi"><div class="label">M4 收口</div><div class="value warn">未达标</div><div class="label">直连 CLI PASS；mesh relay 未完成</div></div>
   <div class="card kpi"><div class="label">传输 CLI</div><div class="value ok">直连 PASS</div><div class="label">status/ping/bench；relay-only 未完成</div></div>
-  <div class="card kpi"><div class="label">Go 全量测试</div><div class="value ok">PASS</div><div class="label">17 packages</div></div>
-  <div class="card kpi"><div class="label">Race detector</div><div class="value ok">PASS</div><div class="label">-race exit 0</div></div>
-  <div class="card kpi"><div class="label">本地 e2e</div><div class="value ok">43/43</div><div class="label">独立 CLI credential 验收</div></div>
+  <div class="card kpi"><div class="label">Go 全量测试</div><div class="value ok">PASS</div><div class="label">18 packages</div></div>
+  <div class="card kpi"><div class="label">Race detector</div><div class="value ok">PASS</div><div class="label">-race exit 0 · 10:30Z</div></div>
+  <div class="card kpi"><div class="label">本地 e2e</div><div class="value ok">43/43</div><div class="label">rc=0 · 含退出码契约</div></div>
   <div class="card kpi"><div class="label">可运行看板</div><div class="value ok">2</div><div class="label">/panel + /panel-lite</div></div>
-  <div class="card kpi"><div class="label">性能研究</div><div class="value info">进行中</div><div class="label">独立代理：QUIC / WS / relay profiling</div></div>
+  <div class="card kpi"><div class="label">性能研究</div><div class="value info">进行中</div><div class="label">分配 −89.4% · 吞吐未达标</div></div>
 </section>
 <section class="section" id="milestones">
   <div class="section-head"><h2>里程碑总图谱</h2><p>全景 6 个 M 级节点：M1–M2 已完成，当前 M3（v1.0 收口 ~80%）；编号对照见本节底部</p></div>
@@ -59,11 +59,11 @@
       <div class="check"><b class="ok">✓</b><div><span><strong style="color:var(--text)">统一凭证一键入网</strong> · cred create / join --cred；B-1/B-2/B-3 外部复测 PASS</span></div></div>
       <div class="check"><b class="ok">✓</b><div><span><strong style="color:var(--text)">真实驾驶舱</strong> · /panel + /panel-lite：令牌鉴权、真实名册、假数据归零</span></div></div>
       <div class="check"><b class="ok">✓</b><div><span><strong style="color:var(--text)">运维命令</strong> · status / mesh ping / bench / doctor（doctor 待独立外部复测）</span></div></div>
-      <div class="check"><b class="warn">!</b><div><span><strong style="color:var(--text)">推送放行</strong> · 本地修复批次全绿，待交互放行推送 develop + 同 SHA 复测</span></div></div>
-      <div class="check"><b class="warn">!</b><div><span><strong style="color:var(--text)">真实 Release</strong> · checksum / 安装 / 升级 / 回滚未验收，README 下载入口还不能承诺</span></div></div>
-      <div class="check"><b class="warn">!</b><div><span><strong style="color:var(--text)">Linux headless</strong> · systemd / 服务用户 / 卸载回滚 / 重启恢复，缺真实 VPS 验收</span></div></div>
+      <div class="check"><b class="warn">!</b><div><span><strong style="color:var(--text)">推送放行</strong> · 本轮批次全绿，待交互放行推送 develop + 同 SHA 复测</span></div></div>
+      <div class="check"><b class="warn">!</b><div><span><strong style="color:var(--text)">真实 Release</strong> · rc1 实测仅 10/20 资产，windows/arm64 全缺，命名三处不一致，需重建发布</span></div></div>
+      <div class="check"><b class="warn">!</b><div><span><strong style="color:var(--text)">Linux headless</strong> · systemd 真机 16/17 PASS；仅 reboot 恢复待网主授权</span></div></div>
     </div>
-    <p class="muted" style="font-size:12px;margin:10px 0 0"><b>每日进度 11-15</b>：doubao/netns 复测 PASS；anchor→纯出站 client 无 relay 兜底，归 M4。</p>
+    <p class="muted" style="font-size:12px;margin:10px 0 0"><b>每日进度 11-16</b>：oh-no 对 8c84e73 全项 PASS 无回退；kuku/netns 连续两轮无回应已广播催办；本轮本地完成 bench frame 复用（分配 −89.4%）、relay 优雅停止自动化（红→绿）、install_test 进 CI。</p>
   </article>
   <article class="card">
     <div class="section-head" style="margin-bottom:4px"><h3 style="margin:0;font-size:16px">M4 · 可靠网</h3><span class="pill purple">未开始</span></div>
@@ -111,16 +111,18 @@
 </section>
 <section class="grid two section">
   <article class="card"><div class="section-head"><h2>今日状态</h2><p>本地 worktree，待网主放行</p></div><div class="checklist">
-    <div class="check"><b class="ok">✓</b><div><strong>驾驶舱已接真实数据</strong><br><span>/api/mesh → /panel，资源内嵌，令牌只走请求头</span></div></div>
-    <div class="check"><b class="ok">✓</b><div><strong>真实边界已收口</strong><br><span>假设备、假遥测、假拓扑、模拟离线、浏览器动作假成功已清除</span></div></div>
-    <div class="check"><b class="warn">!</b><div><strong>纯出站反向仍未完成</strong><br><span>doubao/netns 在 1f64cdc 复测：join --cred、status、ping/msg/send-to/run、client→anchor PASS；anchor→纯出站 client 仍无 mesh relay fallback，归 v1.1 缺口</span></div></div>
-    <div class="check"><b class="warn">!</b><div><strong>本地修复待交互放行</strong><br><span>origin/develop 与 HEAD 均为 1f64cdc；聚合未采集修复、两项 flaky 测试修复、status --probe 和安装/安全整改留在 41 条本地 worktree 状态变更，值守会话不提交</span></div></div>
-    <div class="check"><b class="warn">!</b><div><strong>第二轮优化未直接合入</strong><br><span>bench buffer 复用显著降 alloc，但短测吞吐中位数 41.6→22.0MiB/s；p2pquic 池化存在 slice 所有权风险，先设计 Release 协议和长时/WAN 对照</span></div></div>
+    <div class="check"><b class="ok">✓</b><div><strong>oh-no 对 8c84e73 全项 PASS</strong><br><span>面板 401/200/308/no-store、B-3 五动词+双向臂、diagnostics、B-4 边界全绿，无回退</span></div></div>
+    <div class="check"><b class="ok">✓</b><div><strong>本轮本地开发已落地</strong><br><span>bench frame 复用：32MiB 双向累计分配 699.34MB → 74.08MB（−89.4%），剩余全在 quic-go 内核层</span></div></div>
+    <div class="check"><b class="ok">✓</b><div><strong>两处「CI 绿但其实没测」已补</strong><br><span>packaging/install_test.sh 从未进 CI（F-1 逃逸两次的根因）；cmesh relay 优雅停止零进程级测试 — 本轮均已补，红→绿已证</span></div></div>
+    <div class="check"><b class="warn">!</b><div><strong>P-3 直连 ≥200 MiB/s 未达标</strong><br><span>回环实测 1MiB 103–113、8MiB 86–101、32MiB 71–104 MiB/s。分配降了但吞吐没变——瓶颈不在分配。当前口径握手时间混入，离散度大，不能作达标证据</span></div></div>
+    <div class="check"><b class="warn">!</b><div><strong>发布资产远未齐</strong><br><span>gh 实测 v1.0.0-rc1 只有 10 个资产，矩阵需 20；windows/arm64 完全缺失。Windows 命名三处不一致，需重建发布而非补上传</span></div></div>
+    <div class="check"><b class="warn">!</b><div><strong>纯出站反向仍未完成</strong><br><span>mesh ping/bench/msg/send-to/run 100% 只走 direct QUIC，relay-only 报错 rc=1 不伪造；设备 ID 中继干道属 v1.1</span></div></div>
   </div></article>
   <article class="card"><div class="section-head"><h2>当前阻塞</h2><p>不是测试红</p></div>
-    <div class="notice card"><strong>交互会话放行</strong><p class="muted">本地 41 条状态变更已通过当前门禁，值守会话不执行 commit/push/merge。</p></div>
-    <div class="notice card"><strong>M4 安装与发布仍未验收</strong><p class="muted">install.sh/cmesh-install 已有 HTTPS+SHA 校验、版本目录/current symlink、卸载/purge；仍缺 systemd/服务用户/journal/原子升级回滚/重启恢复。真实 Release/checksum/安装升级回滚无证据；macOS 无法替代 Linux systemd VPS/VM。</p></div>
-    <div class="check"><b class="warn">!</b><div><strong>e2e harness 待改造</strong><br><span>生产 URL host policy 已红→绿，discovery/CLI focused tests PASS；quick shell e2e credential 段仍直接使用 loopback URL，3 项失败，需改测试 fixture，不回退安全策略</span></div></div>
+    <div class="notice card"><strong>交互会话放行</strong><p class="muted">本轮 7 改 + 3 新增文件已通过完整门禁（fmt/vet/build/race 18 包/quick 43-0/install 回归/5 平台交叉编译），值守会话不执行 commit/push/merge。</p></div>
+    <div class="notice card"><strong>M4 尚未收口</strong><p class="muted">四个门禁中 ①② 已达成，③ 同 SHA 外部复测部分、④ 发布资产部分。Linux systemd 真机 16/17 PASS（仅 reboot 待授权）。</p></div>
+    <div class="check"><b class="warn">!</b><div><strong>kuku / netns 连续两轮无回应</strong><br><span>最后报告 02:54Z / 02:13Z（均为 6f07562），上一轮具体催办无回应，本轮已升级为广播催办并指定唯一任务项</span></div></div>
+    <div class="check"><b class="warn">!</b><div><strong>reboot 恢复验收缺外部条件</strong><br><span>仓库内无任何 reboot 脚本，已写出最小可执行清单；需网主授权重启 175.24.139.148 或提供可重启 disposable VM</span></div></div>
     <div class="quote">判断规则：设计完成、能构建、能运行、能安装、真机验收分别记账。</div>
   </article>
 </section>
@@ -130,6 +132,8 @@
     <div class="day"><h3>2026-11-14 · 诊断测速与可靠性补强 <span class="pill green">远端 PASS</span></h3><p>1f64cdc：status/ping/bench、面板、B-3、双向性、@cat 均完成外部复测；D-1 聚合未采集假零、恢复可见性和 p2p2 快速重传测试修复已在本地，完整门禁再次全绿，等待交互会话放行。</p></div>
     <div class="day"><h3>2026-11-15 · NAT / B-3 外部复测 <span class="pill green">PASS + 已知缺口</span></h3><p>doubao 与 netns 在 1f64cdc 确认 join --cred 后 status、mesh ping、msg、send-to、run、bench 全部可用；client→anchor 通过，anchor→纯出站 client 仍无 relay fallback。netns 采样 join 常驻 RSS 15.62–15.80MB，超过 15MB 目标，资源 KPI 未达标。</p></div>
     <div class="day"><h3>2026-11-15 · 性能第二轮 profiling <span class="pill yellow">分配收益 / 未合入</span></h3><p>64MiB mesh QUIC 临时 frame 复用累计分配 328.11→54.38MB（-83.4%），峰值 RSS 20.768→20.032MB（-3.5%），CPU 无稳定收益；relay 64/128MiB CPU 9.27%/20.34%、RSS 17.792/17.968MB。p2pquic buffer 需先设计 Release 所有权协议，当前不改生产代码。</p></div>
+    <div class="day"><h3>2026-11-16 · 性能第三轮 + CI 补洞 <span class="pill blue">本地待放行</span></h3><p>bench frame 复用正式落地生产代码：32MiB 双向累计分配 699.34→74.08MB（−89.4%），剩余热点全在 quic-go 内核层；但吞吐未变，回环 71–113 MiB/s，P-3 ≥200 MiB/s 仍未达标。同时补上两处「CI 绿却没测」的洞：install_test.sh 进 CI、relay 优雅停止进自动化（红→绿已证）。</p></div>
+    <div class="day"><h3>2026-11-16 · 外部复测与文档校正 <span class="pill green">PASS / 已修正</span></h3><p>oh-no 对 8c84e73 全项 PASS 无回退；kuku/netns 连续两轮无回应，已升级为广播催办。MESH-DESIGN §1.2 把 4 个不存在的文件当作已有文件列出，已加状态列写明当前 mesh 只有直连 QUIC。</p></div>
   </article>
 </section>
 <section class="section"><div class="section-head"><h2>路线图</h2><p>当前阶段（图谱 M3–M5）放大图；全景六节点见上方「里程碑总图谱」。绿色=已完成/验证，青色=本地开发，紫色=后续版本</p></div><article class="card route">
@@ -151,30 +155,33 @@
 </svg><div class="legend"><span class="pill green">已完成/外部验证</span><span class="pill blue">本地待放行</span><span class="pill yellow">下一批开发</span><span class="pill purple">v1.1 延后</span></div>
 </article></section>
 <section class="section"><div class="section-head"><h2>平台 KPI</h2><p>方案、构建、运行、安装、真机验收分开</p></div><article class="card matrix-wrap"><table class="matrix"><thead><tr><th>平台</th><th>设计</th><th>可构建</th><th>可运行</th><th>安装/签名</th><th>真机验收</th><th>下一步</th></tr></thead><tbody>
-<tr><td>Linux headless</td><td class="ok">方案</td><td class="ok">二进制</td><td class="warn">CLI/relay 可跑</td><td class="bad">无 systemd 安装闭环</td><td class="bad">未验收</td><td>unit、服务用户、日志、卸载、回滚、reboot smoke</td></tr>
-<tr><td>Windows CLI/桌面</td><td class="ok">方案</td><td class="ok">amd64</td><td class="warn">实机待测</td><td class="bad">无 MSI/签名</td><td class="bad">未验收</td><td>Wails + WebView2 + 安装卸载</td></tr>
-<tr><td>macOS CLI/桌面</td><td class="ok">方案</td><td class="ok">amd64/arm64</td><td class="warn">CLI 可跑</td><td class="bad">无 app/公证</td><td class="bad">未验收</td><td>Wails、Keychain、公证</td></tr>
+<tr><td>Linux headless</td><td class="ok">方案</td><td class="ok">二进制</td><td class="ok">CLI/relay 可跑</td><td class="warn">手工安装器可用</td><td class="warn">systemd 16/17 PASS</td><td>reboot 恢复验收（待授权）+ darwin/windows 资产重建</td></tr>
+<tr><td>Windows CLI/桌面</td><td class="ok">方案</td><td class="ok">amd64</td><td class="warn">实机待测</td><td class="bad">无 MSI/签名</td><td class="bad">未验收</td><td>rc1 缺 windows 资产且命名不一致，需重建发布；再 Wails + WebView2</td></tr>
+<tr><td>macOS CLI/桌面</td><td class="ok">方案</td><td class="ok">amd64/arm64</td><td class="warn">CLI 可跑</td><td class="bad">无 app/公证</td><td class="bad">未验收</td><td>rc1 缺 darwin-amd64 与 latest 别名；再 Wails、Keychain、公证</td></tr>
 <tr><td>Android/iOS</td><td class="ok">gomobile 方案</td><td class="bad">未开始</td><td class="bad">未开始</td><td class="bad">无 APK/IPA</td><td class="bad">未验收</td><td>最小 binding + 真机单链路</td></tr>
 <tr><td>NAS/router</td><td class="warn">方向</td><td class="warn">部分 Linux</td><td class="warn">通用能力</td><td class="bad">无专用包</td><td class="bad">未验收</td><td>确定厂商/架构矩阵</td></tr>
 </tbody></table></article></section>
-<section class="section"><div class="section-head"><h2>门禁与证据</h2><p>当前本地批次</p></div><div class="grid three"><article class="card"><h3>Go CI</h3><div class="evidence">gofmt        PASS · 08:00Z
-go vet ./...  PASS · 08:00Z
-go build ./... PASS · 08:00Z
-go test ./...  PASS · 08:00Z
--race         PASS · 08:00Z</div></article><article class="card"><h3>端到端</h3><div class="evidence">tests/run-tests.sh --quick
-43 passed / 0 failed
-independent CLI credential join e2e
-graceful shutdown tests: 3/3 PASS
-mkrelease hardening: green
-mclaw systemd acceptance: running</div></article><article class="card"><h3>真实链路</h3><div class="evidence">direct QUIC: 137.7–235.2 MiB/s
-mesh bench: 75–100 MiB/s · 10/10
-WS RecvInto: 6.36–6.49 GB/s
+<section class="section"><div class="section-head"><h2>门禁与证据</h2><p>当前本地批次 · 2026-11-16 10:30Z</p></div><div class="grid three"><article class="card"><h3>Go CI</h3><div class="evidence">gofmt        PASS · 10:30Z
+go vet ./...  PASS · 10:30Z
+go build ./... PASS · 10:30Z
+go test ./...  PASS · 10:30Z
+-race (18 包) PASS · 10:30Z</div></article><article class="card"><h3>端到端与安装</h3><div class="evidence">tests/run-tests.sh --quick
+通过 43, 失败 0 · rc=0
+packaging/install_test.sh rc=0
+relay SIGTERM: 红→绿已证
+交叉编译 5 平台全过
+mclaw systemd: 16/17 PASS</div></article><article class="card"><h3>性能（本轮实测）</h3><div class="evidence">bench frame 复用:
+32MiB 分配 699.34→74.08MB
+(−89.4%)，热点已入内核层
+直连吞吐（回环，双向）:
+1MiB 103–113 MiB/s
+8MiB 86–101 MiB/s
+32MiB 71–104 MiB/s
+P-3 ≥200: 未达标
 relay 16/64/128 MiB:
 CPU avg 4.75/9.37/17.36%
-RSS 16.24/17.22/17.26 MB
-公网/WSS/Linux: 未测
-优化: buffer reuse + relay trunk</div></article></div></section>
-<section class="section"><div class="section-head"><h2>每日计划与等待项</h2><p>下一次 17:00 更新</p></div><div class="grid two"><article class="card"><h3>下一开发日</h3><ol class="muted"><li>交互会话放行后，按 fix/test/docs 逻辑拆分提交并先重跑完整本地 CI，再推送 develop</li><li>推送新 SHA 后派 oh-no/kuku：B-3、diagnostics、@cat 与恢复测试复测；派 doubao：D-1、A1-A5 与资源/字节差值</li><li>继续定义 Linux headless systemd/卸载/升级回滚的安装闭环</li><li>保持 status/doctor、bench 与 cockpit 当前门禁绿</li></ol></article><article class="card"><h3>外部等待</h3><div class="checklist"><div class="check"><b class="warn">!</b><div><strong>交互会话放行</strong><br><span>当前 worktree 41 条状态变更，未提交；门禁已按当前 worktree 重跑，值守会话不执行 commit/push/merge</span></div></div><div class="check"><b class="warn">!</b><div><strong>netns-probe</strong><br><span>最新 2026-11-15 03:31Z：B-3/NAT 复测已回报；RSS 15.62–15.80MB 超目标。已回信确认，等待下一步 profiling。</span></div></div><div class="check"><b class="warn">!</b><div><strong>oh-no / kuku</strong><br><span>分别最新 2026-11-14 16:41Z / 17:31Z，均已超过 6 小时；本轮具体催办均返回 ok:true，等待新 SHA 复测。</span></div></div><div class="check"><b class="info">→</b><div><strong>v1.1</strong><br><span>中继/增量视图，纯出站反向拨号</span></div></div></div></article></div></section>
+公网/WSS/Linux: 未测</div></article></div></section>
+<section class="section"><div class="section-head"><h2>每日计划与等待项</h2><p>下一次 17:00 更新</p></div><div class="grid two"><article class="card"><h3>下一开发日</h3><ol class="muted"><li>交互会话放行后，按 perf / test / ci / docs 逻辑拆分提交并先重跑完整本地 CI，再推送 develop</li><li>推送新 SHA 后派 kuku（relay SIGTERM exit 0 + quick rc 契约）、netns（NAT 方向性 + RSS 基线）、oh-no（无回退）复测</li><li>P-3 达标口径改造：分离握手与传输时间，固定监听器后再判吞吐，避免用高离散度数字下结论</li><li>relay 双向压测补 per-session 吞吐/RTT 观测；p2pquic 池化先定 ownership/Release 生命周期</li></ol></article><article class="card"><h3>外部等待</h3><div class="checklist"><div class="check"><b class="warn">!</b><div><strong>交互会话放行</strong><br><span>本轮 7 改 + 3 新增文件，门禁已按当前 worktree 全绿，值守会话不执行 commit/push/merge</span></div></div><div class="check"><b class="warn">!</b><div><strong>kuku / netns 广播催办中</strong><br><span>分别最后 02:54Z / 02:13Z（6f07562），连续两轮无回应；本轮已发四路公告并指定唯一任务项，Hub 四路 ok:true</span></div></div><div class="check"><b class="warn">!</b><div><strong>发布资产重建</strong><br><span>rc1 实测 10/20 资产，windows/arm64 全缺；Windows 命名三处不一致，需重建发布</span></div></div><div class="check"><b class="warn">!</b><div><strong>reboot 验收</strong><br><span>需网主授权重启生产服务器或提供可重启 disposable VM</span></div></div><div class="check"><b class="info">→</b><div><strong>v1.1</strong><br><span>中继干道 / 增量视图 / 纯出站反向拨号</span></div></div></div></article></div></section>
 <footer class="footer">数据来源：当前 develop、本地门禁输出、Hub 报告与 docs/PROJECT-PLAN.md。未采集或未验收的平台不显示为完成。</footer>
 </main>
 <script>

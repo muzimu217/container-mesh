@@ -1,6 +1,6 @@
 # container-mesh 项目总规划与交付口径
 
-更新时间：2026-11-15。当前分支：`develop`。远端 tip：`6fc00c6`（交互会话已收拢并推送 6 个逻辑提交，身份 muzimu217 双查通过；此前 41 条 worktree 全部进入远端）。门禁：race 18 包全绿、quick e2e 43/43（独立 CLI credential 子进程验收）、交叉编译 linux amd64/arm64 + windows amd64 全过。最新外部复测：B-3/client→anchor PASS；anchor→纯出站 client 仍为 v1.1 relay 缺口；RSS 资源指标超过 15MB 目标。
+更新时间：2026-11-16。当前分支：`develop`。远端 tip：`8c84e73`。本轮（Round 49）在本地 worktree 新增开发：**①** P-3 bench frame 复用（32MiB 双向累计分配 699.34MB → 74.08MB，−89.4%，吞吐未变）；**②** `cmesh relay` 优雅停止自动化覆盖（红→绿已证）；**③** `packaging/install_test.sh` 接入 CI（F-1 连续逃逸两次的根因）；**④** `MESH-DESIGN.md` §1.2 文档偏差修正（4 个被当作已有文件的路径实际不存在）；**⑤** `.gitignore` 补 `*.test`/`*.prof`；**⑥** mesh 握手超时测试 flaky 缓解（5s→10s，与生产一致）。push 前门禁全绿：fmt/vet/build/race 18 包/quick 43-0/install 回归 rc=0/交叉编译 5 平台。最新外部复测：oh-no 在 `8c84e73` 全项 PASS 无回退；kuku 与 netns 连续两轮无回应，本轮已升级为广播催办。RSS 资源指标仍超过 15MB 目标；P-3 直连 ≥200 MiB/s 未达标（回环实测 71–113 MiB/s）。
 
 ## 项目状态口径
 
@@ -32,7 +32,9 @@
 
 最新外部边界补充：oh-no 在 `1f64cdc` 发现 B-4 候选——`serve-discovery` 锚点 state 没有 `discovery.json`，锚点主动 `mesh ping/msg` 无发起路径；成员→锚点、成员↔成员均 PASS。本轮按状态边界记录，等待产品确认锚点是否必须支持主动成员操作，不以此为回归直接改协议。
 
-性能第二轮最终结果：64KiB bench frame 临时复用在真实 mesh QUIC 64MiB 双向中将累计分配从 328.11MB 降到 54.38MB（-83.4%），峰值 RSS 从 20,768KB 降到 20,032KB（-3.5%），CPU profile 没有稳定收益；relay 64/128MiB 平均 CPU 9.27%/20.34%、峰值 RSS 17,792/17,968KB，仍超过目标。`p2pquic.readLoop` 2MiB profile 分配约 2,086KiB，不能直接池化，必须先定义消息 slice 所有权和 Release 生命周期。当前变体不进入生产代码。
+性能第二轮最终结果：64KiB bench frame 临时复用在真实 mesh QUIC 64MiB 双向中将累计分配从 328.11MB 降到 54.38MB（-83.4%），峰值 RSS 从 20,768KB 降到 20,032KB（-3.5%），CPU profile 没有稳定收益；relay 64/128MiB 平均 CPU 9.27%/20.34%、峰值 RSS 17,792/17,968KB，仍超过目标。`p2pquic.readLoop` 2MiB profile 分配约 2,086KiB，不能直接池化，必须先定义消息 slice 所有权和 Release 生命周期。该轮为临时变体，未进入生产代码。
+
+**性能第三轮（Round 49，本地 worktree）**：P1 第一项 bench frame buffer 复用已**正式落地** `internal/mesh/bench.go`（收发两侧各复用一个帧缓冲）。32MiB 双向累计分配 **699.34MB → 74.08MB（−89.4%）**，`readBenchFrame`/`sendBenchData` 退出分配榜前 10，剩余 74MB 全部在 quic-go/socket 内核层。**吞吐没有变化**：回环 1MiB 103–113、8MiB 86–101、32MiB 71–104 MiB/s，P-3 的 ≥200 MiB/s 仍未达标——瓶颈不在分配而在传输路径本身。新增 `BenchmarkRunBenchDirect` 作为可重复口径，但当前每次迭代新建 listener、握手时间混入，离散度大，**不能作为达标证据**；下一步需分离握手与传输时间再判。
 
 ### M4-B：端口自检与真实驾驶舱
 
