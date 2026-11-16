@@ -1011,3 +1011,37 @@ t=20s  RSS=7,888 KB
 - **中继干道前置件施工计划**（只读 + /tmp 测试骨架）：把上一轮的 7 项前置件变成可排期计划（改动、依赖、工时、风险、红绿测法），划两个 PR，给出前 3 条反向用例的测试代码骨架。
 
 **本轮推送**：`9631276` fix(discovery)（register 路径补策略）。
+
+### Round 53（2026-11-16 · 值守：出口策略全路径审计 → 第三条路径补齐 → 第四条待实测）
+
+**审计代理回报（只读，全仓出站路径枚举）**
+
+真正缺策略的出口路径只有 **2 条**：
+
+| 编号 | 路径 | 状态 |
+|---|---|---|
+| **M-1** | **enroll 的 HTTP POST**（`internal/cli/join_cred.go:89`，裸 `&http.Client{}`） | **已修**（见下）——这是上一轮"漏了 register"模式的**重演**：同一个 discovery origin 的**第三条路径** |
+| **M-2** | **mesh direct QUIC 拨号**（`internal/mesh/direct.go:737`），端点来自远端快照 | **待实测**（已派实测代理，**不凭代码阅读改代码**） |
+
+**有意不修的 6 条**（附理由，避免把合法形态堵死）：stage-1 relay（`internal/cli/node.go:309`；运维自己指定 + 私网合法 + SPAKE2 已防 MITM）、stage-1 打洞（已配对对端，无新增能力）、self-announce（目标是本机自己）、probe（诊断用途）、cmesh-install（独立工具）、forward 拨号（**已有更强策略**：allow-list + 钉住 IP 防 rebinding，套 egress 反而降低安全性）。
+
+**M-1 修复（本地完成，红→绿已证，`44b9a8f`）**
+- enroll 走的是 `client := &http.Client{Timeout: enrollTimeout}`（`join_cred.go:74`）——无任何 dial 约束；而它连的 `cred.Public.DiscoveryAddrs` **就是同一个运维提供的 discovery origin**。字面检查有（`NormalizeDiscoveryURL`），**解析后检查缺**。
+- 改为 `discovery.EgressTransport(enrollTimeout)`，与 register / members WS 流**共用同一实现**（实现从 `internal/discovery` 导出）。
+- `enrollWithCredential` 拆出可注入 transport 的 `enrollWithCredentialUsing`；原测试靠**替换全局 `http.DefaultTransport`** 指向进程内 server——现已改为注入，**那个全局替换本身也是隐患，已删除**（审计代理提前指出了这条会红，核对属实）。
+- **红→绿**：去掉策略后测试红（`the enrollment request reached a loopback address: the egress policy is not applied on the enroll path`），恢复后绿。
+
+**M-2 的专项判断（先讲清威胁模型，再等数据）**
+- discovery 节点的信任模型明写 **"trusted to be online, not to be honest"**（`internal/discovery/client.go:602`）→ 它说出来的地址是**不可信输入**。
+- `internal/discovery/member.go` 的 `validEndpoint`（`:147-177`）只拦**语法**（长度、端口范围、scheme/path、控制字符、空 local-part），**完全不拦 loopback**。
+- `internal/mesh/direct.go:677-681` 只拒 wildcard `0.0.0.0`，**不拒 loopback**。
+- **但成员端点不能套 egress policy**——私网成员地址是**合法且核心**的产品形态（受限容器、私网设备），套上去会砸掉产品。审计代理的判断是：应该套一个**语义不同**的策略——**拒 loopback/保留段，放行私网**。
+- **审计代理明确说「M-2 的核心前提未实测」**，只做了代码路径分析。本会话据此**不凭代码阅读下结论**，已派实测代理：用一个**恶意 discovery 节点**把成员端点写成 `127.0.0.1:<本地监听端口>`，观察**客户端是否真的向 loopback 发出 QUIC 包**（裸 UDP 监听器计数），并量化挂起时长与端口扫描可行性。
+- **测试方法学对齐本项目刚踩的坑**：断言必须是「**对端没收到连接**」，不是「客户端没报错」。
+
+**本轮派发**
+- 出口策略全路径审计（**已完成**）
+- 中继干道前置件施工计划（运行中）
+- **成员端点回环拨号实测**（运行中）——把 M-2 从代码推理变成实测数字
+
+**本轮推送**：`44b9a8f` fix(cli)（enroll 路径补策略）。

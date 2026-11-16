@@ -111,6 +111,7 @@
 </section>
 <section class="grid two section">
   <article class="card"><div class="section-head"><h2>今日状态</h2><p>本地 worktree，待网主放行</p></div><div class="checklist">
+    <div class="check"><b class="ok">✓</b><div><strong>出口策略：全路径审计完成，第三条路径已补</strong><br><span>审计代理枚举全仓出站路径：真正缺策略的只剩 2 条。<strong>enroll 的 HTTP POST 已补</strong>（同一个 origin 的第三条路径，前两条是 register 与 members WS）；<strong>mesh direct QUIC 那条待实测</strong>（成员端点来自远端快照，节点"不可信"——但私网成员是合法核心形态，不能套 egress policy，已派实测代理取证后再定）</span></div></div>
     <div class="check"><b class="ok">✓</b><div><strong>出口策略两条路径都补齐（红→绿）</strong><br><span>doubao 独立实测：回环/私网名字<strong>被拒</strong>、真实公网 IP <strong>照常工作</strong>（ping 5/5 p50 0.312ms）、生产二进制无逃生口（go tool nm 确认）。但 doubao 指出 <strong>register 的 HTTP 路径未被覆盖</strong>（裸 http.Client）→ 已补 <code>httpTransport()</code>，同一 origin 两条路径现在一致</span></div></div>
     <div class="check"><b class="ok">✓</b><div><strong>出口地址策略（安全缺口）</strong><br><span>策略原本只实现一半：拒绝字面 loopback/私网 IP，但<strong>解析后的地址无人复核</strong>——裸 net.Dialer 让「解析到回环的主机名」直连（kuku 实测穿透成功）。现经 Dialer.Control 在 <strong>DNS 后、连接前</strong>复核。逃生口用 build tag 隔离，出货二进制无此路径</span></div></div>
     <div class="check"><b class="ok">✓</b><div><strong>relay 读缓冲复用（性能缺陷，红→绿）</strong><br><span>前向循环读的是<strong>自己的</strong> buf，从未看到 RecvInto 内部的扩容 → 每条 &gt;64KiB 消息重付 64→128→256→512KiB 分配拷贝链。实测 relay 消息平均 493KiB（常态）；makeslicecopy 占 relay CPU 23.73% → 修复后 4.88%，CPU 中位 <strong>−71%</strong></span></div></div>
