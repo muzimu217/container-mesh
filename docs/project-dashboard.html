@@ -111,10 +111,12 @@
 </section>
 <section class="grid two section">
   <article class="card"><div class="section-head"><h2>今日状态</h2><p>本地 worktree，待网主放行</p></div><div class="checklist">
-    <div class="check"><b class="ok">✓</b><div><strong>oh-no 对 8c84e73 全项 PASS</strong><br><span>面板 401/200/308/no-store、B-3 五动词+双向臂、diagnostics、B-4 边界全绿，无回退</span></div></div>
+    <div class="check"><b class="ok">✓</b><div><strong>oh-no 对 8c84e73 / 407fde3 全项 PASS</strong><br><span>面板 401/200/308/no-store、B-3 五动词+双向臂、diagnostics、B-4 边界全绿，无回退</span></div></div>
     <div class="check"><b class="ok">✓</b><div><strong>本轮本地开发已落地</strong><br><span>bench frame 复用：32MiB 双向累计分配 699.34MB → 74.08MB（−89.4%），剩余全在 quic-go 内核层</span></div></div>
+    <div class="check"><b class="ok">✓</b><div><strong>F-1 热推送缺陷已修（红→绿）</strong><br><span>旧订阅 channel 被 close 后永远可读 → 旧流「推快照→立即再推」热循环，实测 1.05 MB/s 无界。消费侧改为检查 ok 后退出；修复前红（757 bytes）、修复后绿</span></div></div>
     <div class="check"><b class="ok">✓</b><div><strong>两处「CI 绿但其实没测」已补</strong><br><span>packaging/install_test.sh 从未进 CI（F-1 逃逸两次的根因）；cmesh relay 优雅停止零进程级测试 — 本轮均已补，红→绿已证</span></div></div>
-    <div class="check"><b class="warn">!</b><div><strong>P-3 直连 ≥200 MiB/s 未达标</strong><br><span>回环实测 1MiB 103–113、8MiB 86–101、32MiB 71–104 MiB/s。分配降了但吞吐没变——瓶颈不在分配。当前口径握手时间混入，离散度大，不能作达标证据</span></div></div>
+    <div class="check"><b class="warn">!</b><div><strong>P-3 直连 ≥200 MiB/s 未达标</strong><br><span>分配降 89% 但吞吐没动——已定位：分配只占采样 1.4%，真正瓶颈是 quic-go syscall 18.18% + 加解密 9.48% + 拷贝。可优化的项目代码只占 profile 小头，需传输路径级改造</span></div></div>
+    <div class="check"><b class="warn">!</b><div><strong>WAN 丢包下吞吐崩塌（模拟）</strong><br><span>netns + netem：0.1% 丢包 + 20ms 延迟 → 16.9→5.6 MiB/s；0.5% 丢包 → 1.2 MiB/s（−93%）。quic-go 用 Cubic，beta=0.7 每次丢包砍 cwnd 30%</span></div></div>
     <div class="check"><b class="warn">!</b><div><strong>发布资产远未齐</strong><br><span>gh 实测 v1.0.0-rc1 只有 10 个资产，矩阵需 20；windows/arm64 完全缺失。Windows 命名三处不一致，需重建发布而非补上传</span></div></div>
     <div class="check"><b class="warn">!</b><div><strong>纯出站反向仍未完成</strong><br><span>mesh ping/bench/msg/send-to/run 100% 只走 direct QUIC，relay-only 报错 rc=1 不伪造；设备 ID 中继干道属 v1.1</span></div></div>
   </div></article>
@@ -134,6 +136,7 @@
     <div class="day"><h3>2026-11-15 · 性能第二轮 profiling <span class="pill yellow">分配收益 / 未合入</span></h3><p>64MiB mesh QUIC 临时 frame 复用累计分配 328.11→54.38MB（-83.4%），峰值 RSS 20.768→20.032MB（-3.5%），CPU 无稳定收益；relay 64/128MiB CPU 9.27%/20.34%、RSS 17.792/17.968MB。p2pquic buffer 需先设计 Release 所有权协议，当前不改生产代码。</p></div>
     <div class="day"><h3>2026-11-16 · 性能第三轮 + CI 补洞 <span class="pill blue">本地待放行</span></h3><p>bench frame 复用正式落地生产代码：32MiB 双向累计分配 699.34→74.08MB（−89.4%），剩余热点全在 quic-go 内核层；但吞吐未变，回环 71–113 MiB/s，P-3 ≥200 MiB/s 仍未达标。同时补上两处「CI 绿却没测」的洞：install_test.sh 进 CI、relay 优雅停止进自动化（红→绿已证）。</p></div>
     <div class="day"><h3>2026-11-16 · 外部复测与文档校正 <span class="pill green">PASS / 已修正</span></h3><p>oh-no 对 8c84e73 全项 PASS 无回退；kuku/netns 连续两轮无回应，已升级为广播催办。MESH-DESIGN §1.2 把 4 个不存在的文件当作已有文件列出，已加状态列写明当前 mesh 只有直连 QUIC。</p></div>
+    <div class="day"><h3>2026-11-16 · 性能代理回报 + F-1 热推送修复 <span class="pill blue">本地待放行</span></h3><p>性能代理定位 7 项发现。最重的一项是真缺陷：旧订阅 channel 被 close 后永远可读，旧流陷入「推快照→立即再推」热循环，实测 1.05 MB/s 无界——已修（消费侧检查 ok），红→绿已证。同时定位了 P-3 吞吐不动的真正原因（分配只占采样 1.4%，瓶颈在 quic-go syscall 与拷贝），以及 WAN 丢包下 Cubic 的崩塌效应（0.5% 丢包 → 1.2 MiB/s）。</p></div>
   </article>
 </section>
 <section class="section"><div class="section-head"><h2>路线图</h2><p>当前阶段（图谱 M3–M5）放大图；全景六节点见上方「里程碑总图谱」。绿色=已完成/验证，青色=本地开发，紫色=后续版本</p></div><article class="card route">
@@ -177,10 +180,12 @@ mclaw systemd: 16/17 PASS</div></article><article class="card"><h3>性能（本�
 1MiB 103–113 MiB/s
 8MiB 86–101 MiB/s
 32MiB 71–104 MiB/s
-P-3 ≥200: 未达标
-relay 16/64/128 MiB:
-CPU avg 4.75/9.37/17.36%
-公网/WSS/Linux: 未测</div></article></div></section>
+P-3 ≥200: 未稳定达标
+瓶颈定位: syscall 18.18%
++ 加解密 9.48% + 拷贝
+relay 64MiB: 7.93–11.38 MiB/s
+relay CPU: 27–47% 单核
+公网/WSS: 未测</div></article></div></section>
 <section class="section"><div class="section-head"><h2>每日计划与等待项</h2><p>下一次 17:00 更新</p></div><div class="grid two"><article class="card"><h3>下一开发日</h3><ol class="muted"><li>交互会话放行后，按 perf / test / ci / docs 逻辑拆分提交并先重跑完整本地 CI，再推送 develop</li><li>推送新 SHA 后派 kuku（relay SIGTERM exit 0 + quick rc 契约）、netns（NAT 方向性 + RSS 基线）、oh-no（无回退）复测</li><li>P-3 达标口径改造：分离握手与传输时间，固定监听器后再判吞吐，避免用高离散度数字下结论</li><li>relay 双向压测补 per-session 吞吐/RTT 观测；p2pquic 池化先定 ownership/Release 生命周期</li></ol></article><article class="card"><h3>外部等待</h3><div class="checklist"><div class="check"><b class="warn">!</b><div><strong>交互会话放行</strong><br><span>本轮 7 改 + 3 新增文件，门禁已按当前 worktree 全绿，值守会话不执行 commit/push/merge</span></div></div><div class="check"><b class="warn">!</b><div><strong>kuku / netns 广播催办中</strong><br><span>分别最后 02:54Z / 02:13Z（6f07562），连续两轮无回应；本轮已发四路公告并指定唯一任务项，Hub 四路 ok:true</span></div></div><div class="check"><b class="warn">!</b><div><strong>发布资产重建</strong><br><span>rc1 实测 10/20 资产，windows/arm64 全缺；Windows 命名三处不一致，需重建发布</span></div></div><div class="check"><b class="warn">!</b><div><strong>reboot 验收</strong><br><span>需网主授权重启生产服务器或提供可重启 disposable VM</span></div></div><div class="check"><b class="info">→</b><div><strong>v1.1</strong><br><span>中继干道 / 增量视图 / 纯出站反向拨号</span></div></div></div></article></div></section>
 <footer class="footer">数据来源：当前 develop、本地门禁输出、Hub 报告与 docs/PROJECT-PLAN.md。未采集或未验收的平台不显示为完成。</footer>
 </main>

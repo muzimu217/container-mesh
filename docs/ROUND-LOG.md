@@ -738,3 +738,30 @@ init → account create → device-add → serve-discovery（自举 members.json
 - 交叉编译 PASS：linux/amd64、linux/arm64、windows/amd64、darwin/amd64、darwin/arm64
 
 **M4 现状**：未收口。剩余外部条件三项——① kuku/netns 对同一 SHA 的复核（已广播催办，未回）② darwin/windows 归档资产重建上传（实测缺 10 个，`windows/arm64` 全缺）③ reboot 恢复验收（需网主授权重启生产服务器或提供可重启 disposable VM）。
+
+### Round 49 续 · 性能代理回报 + F-1 新缺陷修复（2026-11-16 · 值守）
+
+**性能研究代理完整报告已产出**：`/tmp/perf-agent-round49.md`（45 KB），A/B 证据在 `/tmp/cmperf/`。代理全程只读，未改仓库、未 commit/push/merge。关键发现：
+
+| # | 发现 | 证据 | 边界 |
+|---|---|---|---|
+| **F1** | **discovery 成员流热推送缺陷**：任意一次性命令后，被用成员的 anchor 推送速率从 **158 B/15s → 15.8 MB/15s（1.05 MB/s）且无界** | 已复现、已定位到行 | Docker bridge（真实进程/WS/证书钉扎） |
+| **F2** | **direct QUIC 在真实 WAN 条件下吞吐崩塌**：0.1% 丢包 + 20ms 延迟 → 16.9 → 5.6 MiB/s（−67%）；0.5% 丢包 → **1.2 MiB/s（−93%）**。机制是 quic-go 用 **Cubic**（`internal/ackhandler/sent_packet_handler.go:134`），`beta=0.7` 每次丢包砍 cwnd 30% | netns + netem，3 次重复 | **模拟 WAN**，非公网 |
+| **F3** | bench frame 复用结论**独立复现**，幅度更大：342.9MB → 21.8MB（−93.6%），峰值 RSS 29,133kB → 24,980kB（−14.3%） | 同机同 session A/B，交替顺序 | 回环上界 |
+| **F4** | **回答"分配降了吞吐为什么不动"**：分配本身只占采样的 **1.4%**（`makeslice` 0.11s）；真正瓶颈是 `Syscall6` **18.18% flat**、`gcmAesDec/Enc` 9.48%、`memmove` 8.83%、`futex` 4.74%，`readBenchFrame` cum 11.99%（`io.ReadFull` 占 87.9% = 内核→用户拷贝）。**可优化的项目代码只占 profile 的小头** | pprof 火焰图（256MiB×4，2.29s，331% CPU） | 回环上界 |
+| **F5** | **stage-1 relay 是当前最重的组件**：64MiB 端到端 7.93–11.38 MiB/s，relay CPU **27.0%–47.0% 单核**，峰值 RSS 16.0–17.3MB，tx 放大 1.002× | 真实 relay + SPAKE2 + 64MiB 传输，3 次 | Docker bridge |
+| **F6** | **P-3 在任何条件下都未稳定达标**：回环 136.8–297.0 MiB/s（均值 227.7，**sd ≈ 80**）；netns WAN 下 1.06–1.15 MiB/s | 见报告数字表 | 回环上界 + 模拟 WAN |
+| **F7** | `p2pquic.readLoop` 的 `make([]byte,n)` **确认无法直接池化**：`wire.DecodeFrameBytes` 把 `Payload` 别名到解密 buffer，`peer.byteQueue.Put` 再拷贝，别名链上还有 `p.sec.OpenFrame(msg)` 持有原 slice | 代码追踪 + 分配实测 3.01 MiB/消息 | 回环 |
+
+**F-1 缺陷修复（本地完成，红→绿已证）**
+
+- **根因**：`internal/discovery/node.go:199` 的 `Subscribe` 用 `close(old)` 废弃旧订阅。**关闭的 channel 永远可读**——旧订阅者的 `case <-ch:` 立即且永久触发，于是 `internal/relay/mesh.go` 的 `streamMeshMembers` 陷入"推整份快照→立即再推"的热循环，只影响被取代的那条旧流。
+- **修复位置**：选在**消费侧**而非改 `Subscribe` 语义——`case _, ok := <-ch`，`!ok` 即退出（旧流已被新流取代，应静默退出）。`Subscribe` 的"关闭旧 channel"契约不变，`TestSubscribeSecondClosesFirst` 仍然成立。
+- **红→绿**：新增 `internal/relay/mesh_reconnect_test.go`。
+  - 修复前**红**：`orphaned stream still receiving (757 bytes): the old subscription channel was closed instead of being signalled, so it spins`
+  - 修复后**绿**：旧流在 500ms 内读不到任何字节；活跃流正常收到推送。
+  - 复核时手动把 `if !ok { return }` 改成空实现重跑，**再次确认红**（757 bytes），恢复后绿——红绿链完整。
+- **同类缺陷排查**：全仓 `close(` 扫描，`node.go:199` 是**唯一**的"关闭订阅 channel"用法；其余 `close(done/stop/gone)` 均为"关闭即终止"语义，消费者 `case <-done:` 天然只触发一次，不构成热循环。
+- **门禁**：`gofmt` / `go vet` / `go build` / `go test ./... -race -count=1`（18 包）/ `run-tests.sh --quick`（43/0 rc=0）/ `packaging/install_test.sh` rc=0 / `go test ./internal/relay -race -count=3` 全绿。
+
+**本轮新增结论对 KPI 的影响**：P-3 的瓶颈已被定位到**传输路径级**（quic-go syscall + 加解密 + 拷贝），而非分配；后续优化方向应从"压分配"转向"减少 syscall/拷贝 + 换拥塞控制算法"，否则分配优化已无空间。
