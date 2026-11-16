@@ -1147,3 +1147,39 @@ t=20s  RSS=7,888 KB
 **netns 催办单里的关键内容**：它上一轮报的「RSS 20 点全平 75,268 KB、KPI 未达标」，与本会话本地实测的「稳定 7.7–9.7 MB、达标」是**两个相位**（pre-GC vs post-GC）。催办单里给了它**本地实测的 150 秒序列**（`25,968 → 25,952 → 7,712 → 7,888 → …`）与 gctrace 佐证（`gc 2 @120.282s (65->65->0 MB)`），要求它**分开报两段**：① 前 15 秒 ② 15 秒之后的 20 点，判定按 post-GC 稳态。
 
 **本轮推送**：`6f351af` fix(cli)（保存解析后的端点）。
+
+### Round 56（2026-11-16 · 值守：oh-no 一条候选观察的复核 + 全队广播）
+
+**Hub 处置**：水位推进 `16:24:39Z` → **`20:25:42Z`**（注：上一轮处理了 oh-no 的 18:05:35Z 报告但漏推进水位，本轮已补正）。回信 oh-no / doubao 各一次，均 `{"ok":true}`。
+
+**oh-no 对 `9cc946e` 的复测（PASS 项摘要）**
+- **出口策略负向（生产二进制）三条出口全关**：字面回环 invite 被解析层拒（`bad invite: discovery: malformed endpoint`）、解析到回环的主机名被 **register HTTP + members WS** 同拒、**enroll 路径**同拒（`could not enroll at the discovery node: disallowed host "127.0.0.1"`）。
+- **B-3 五动词 + 双向臂**全过（ping 10/10 p50 0.306ms、msg、send-to 1MB 双端 SHA-256 一致、run @info、status 保留 offline 成员、无 probe 时 `reachability=unknown` 不伪造、参数校验 `--count 1001` / `--interval 50ms` 均拒）。
+- **bench 字节完整性**全过；**`6f351af` 修复确认**——全程 **0 次** `malformed endpoint "127.0.0.1:0"`，名册端点为解析后真实端口。
+- **面板黑盒**全过（308→no-store、令牌三态、假数据 7 项 0 命中、离线成员保留 `last_seen`、恢复 ≤8.1s）。
+
+**doubao 对 `9cc946e` 的复测**：install_test rc=0；**register 与 enroll 两条 HTTP 路径**负向均被拒、公网正向照常（cred 线 `join --cred` rc=0）；`go tool nm | grep -c cmeshtest = 0`。环境事实：公网 IP 又迁移到 `9.115.146.237`。
+
+**★ oh-no 报的候选观察「凭证成员 kill -9 检出 70–90s」→ 值守实测复核：不是回归**
+
+- oh-no 报：凭证入网（委派证书）成员 kill -9 后，面板 `summary.online` 保持 3 超过 60s、约 70–90s 才翻 2/3，而此前口径是 0.1–1.1s。他自己列了两个形态差异：凭证成员 + 锚点收到重复 enroll（roster v4/v7 重入册），并**明确说"未改代码、只报现象"**。
+- **值守本地实测（用面板 online 计数做判据）**：**HEAD `9cc946e` → 0.1s**、**历史 SHA `1f64cdc` → 0.2s**——**两者一致**，快速离线路径（members 流断开 → `DetachStream` → 立即撤销可达性）完好。**另按他描述的完整形态复测**（凭证入网 + 重复 enroll 导致 roster v3→v4 重载）：仍是 **0.2s**。
+- **根因是判据用错，不是产品缺陷**：anchor 默认日志级别是 **Warn**（`internal/cli/logging.go:38`），而 `mesh register` 是 **Info**、fast-offline 路径**完全不打日志**（`DetachStream` 只改状态不 log）。**值守第一次探针就踩了这个坑**：盯日志里的 `"dropped offline members"` 会误得「检测不到」，因为那是 **Sweep** 路径（15s 一次）而不是快速路径。**已写进派单**：下线时延一律用**面板 online 计数**判。
+- **结论：判为环境/测量口径问题，不改代码。**（既有测试 `TestStreamCloseExpiresMemberFast`（`internal/relay/mesh_test.go:417`）本就钉着这条路径：去掉 `AttachStream`/`DetachStream` 配对该测试会红。）
+
+**★ 四线静默与全队广播**
+
+| agent | 最后报告 | 静默 | 处置 |
+|---|---|---|---|
+| oh-no-agent | 20:25:42Z | 0.4h | fresh，不催 |
+| doubao-cloud-vm-01 | 20:22:19Z | 0.5h | fresh，不催 |
+| kuku-sandbox-01 | 13:50:31Z | **7.0h** | **全队广播 + 请网主唤醒** |
+| netns-probe | 12:52:42Z | **8.0h** | **全队广播 + 请网主唤醒** |
+
+广播单（频道 + 四收件箱全 `ok:true`）里点名请网主唤醒这两位，并给各自**唯一指定任务**：kuku = relay 大文件转发字节一致性 + 三项回归；netns = **RSS 分开报两段**（附本地实测序列 `25,968 → 25,952 → 7,712 → 7,888 → …` 与 gctrace 佐证 `gc 2 @120.282s (65->65->0 MB)`）+ NAT 方向性 + bench 回落。同时把「下线时延用面板 online 计数判」写进全队公告。
+
+**本轮派发的四条线**
+1. **性能**：把「每流重传/丢包计数」落地为可测量（上一轮说「quic-go 不暴露」是**错的**——暴露的是**每连接**计数）；量化「减少 syscall/拷贝」的真实上限（逐层 `-peek` 后本仓可控空间 ≈ ?）；评估 fork quic-go 的可行性边界与替代路径；relay 读缓冲修复后的**吞吐**剩余空间。
+2. **授权云真实链路**（175.24.139.148 + 162.14.97.79）：join/status/ping/msg/send-to/run/bench/panel 全链路 + **下线时延用面板 online 计数** + RSS 15 秒后 20 点 + rc1 真资产安装闭环（并记录 rc1 与当前 HEAD 的差异）。
+3. **Linux headless 安装闭环**：systemd unit 五处修复的**真机复测**（重点：补 `--account-pub` 后**凭证入网可用**、`EnvironmentFile` 缺失应当**启动失败**、`StateDirectory` 生效、优雅停止 exit 0）+ 升级回滚与状态保留 + 日志可观测 + 与上一轮 16/17 对照。
+4. **mesh 中继干道 PR-2 前置**：**落定 G11**（push-open 的 B 侧连接生命周期）并写出可直接进 `docs/decisions.md` 的草稿；PR-2 逐项清单（干道协议 / 字节配额 / push-open 限定 ping+msg / CLI 接线 / e2e SIGMA）；前 3 条反向用例的骨架**在 /tmp 副本里跑出真实红/绿**（证明骨架有效）。
