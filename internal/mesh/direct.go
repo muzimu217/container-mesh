@@ -701,10 +701,6 @@ func DialDirect(ctx context.Context, cfg DialConfig) (*Link, error) {
 		return nil, err
 	}
 
-	udp, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
-	if err != nil {
-		return nil, fmt.Errorf("mesh: local udp bind: %w", err)
-	}
 	var lastErr error
 	for _, ep := range cfg.Endpoints {
 		addr, err := net.ResolveUDPAddr("udp", ep)
@@ -712,18 +708,30 @@ func DialDirect(ctx context.Context, cfg DialConfig) (*Link, error) {
 			lastErr = fmt.Errorf("bad endpoint %q in the member view", ep)
 			continue
 		}
-		link, err := dialOne(ctx, udp, addr, cfg, tlsCfg)
+		link, err := dialOne(ctx, addr, cfg, tlsCfg)
 		if err == nil {
 			return link, nil
 		}
 		lastErr = err
 	}
-	_ = udp.Close()
 	return nil, fmt.Errorf("mesh: all %d endpoint(s) for %s failed: %w",
 		len(cfg.Endpoints), cfg.Target, lastErr)
 }
 
-func dialOne(ctx context.Context, udp net.PacketConn, addr *net.UDPAddr, cfg DialConfig, tlsCfg *tls.Config) (*Link, error) {
+// dialOne attempts a single endpoint.
+//
+// Each attempt needs its own UDP socket. quic.Dial wraps the net.PacketConn
+// in a single-use Transport, and that Transport closes the connection when
+// the QUIC session ends (quic-go transport.go: isSingleUse). So one socket
+// serves exactly one attempt: sharing a socket across the endpoint loop
+// made every attempt after a failure run on a closed socket and fail with
+// "use of closed network connection", which made the multi-endpoint
+// fallback unreachable.
+func dialOne(ctx context.Context, addr *net.UDPAddr, cfg DialConfig, tlsCfg *tls.Config) (*Link, error) {
+	udp, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	if err != nil {
+		return nil, fmt.Errorf("mesh: local udp bind: %w", err)
+	}
 	cctx, cancel := context.WithTimeout(context.Background(), cfg.HandshakeTimeout)
 	defer cancel()
 	qc, err := quic.Dial(cctx, udp, addr, tlsCfg, quicConfig())
