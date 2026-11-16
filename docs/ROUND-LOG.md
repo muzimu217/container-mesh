@@ -762,6 +762,10 @@ init → account create → device-add → serve-discovery（自举 members.json
   - 修复后**绿**：旧流在 500ms 内读不到任何字节；活跃流正常收到推送。
   - 复核时手动把 `if !ok { return }` 改成空实现重跑，**再次确认红**（757 bytes），恢复后绿——红绿链完整。
 - **同类缺陷排查**：全仓 `close(` 扫描，`node.go:199` 是**唯一**的"关闭订阅 channel"用法；其余 `close(done/stop/gone)` 均为"关闭即终止"语义，消费者 `case <-done:` 天然只触发一次，不构成热循环。
+- **外部独立验证（性能代理自己的 lab，非本会话自测）**：代理用独立 Docker lab 复现缺陷，并对**落地后的 HEAD** 做了 A/B 对照：
+  - base（缺陷版）：一次性命令后 **16,144,158 B / 12s = 1,343,108 B/s**（相对干净态 122.6 B/s 放大 **×10,957**）
+  - fix（落地版 `a4080e8`）：一次性命令后 **1,816 B / 12s = 151.1 B/s**，4 次后 226.8 B/s **不累积**
+  - **−99.99%**，缺陷闭合。
 - **门禁**：`gofmt` / `go vet` / `go build` / `go test ./... -race -count=1`（18 包）/ `run-tests.sh --quick`（43/0 rc=0）/ `packaging/install_test.sh` rc=0 / `go test ./internal/relay -race -count=3` 全绿。
 
 **本轮新增结论对 KPI 的影响**：P-3 的瓶颈已被定位到**传输路径级**（quic-go syscall + 加解密 + 拷贝），而非分配；后续优化方向应从"压分配"转向"减少 syscall/拷贝 + 换拥塞控制算法"，否则分配优化已无空间。
