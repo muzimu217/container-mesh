@@ -13,7 +13,7 @@
 <main class="wrap">
 <header class="top">
   <div><div class="eyebrow">container-mesh / daily delivery board</div><h1 class="title">项目进度与路线看板</h1><p class="sub">每天看这里：当前开发完成到哪一步、门禁是否全绿、哪个平台真的能安装运行、下一步由谁推进。状态按代码和测试证据记录。</p></div>
-  <div class="stamp">看板更新<br><strong id="updated">2026-11-16 15:10Z</strong><br>远端 develop<br><strong>82ed647</strong><br>systemd 真机全 PASS · 5 个缺陷已修<br><strong>G11 已裁定 · 丢包计数已落地</strong></div>
+  <div class="stamp">看板更新<br><strong id="updated">2026-11-16 20:35Z</strong><br>远端 develop<br><strong>19f2735</strong><br>systemd 真机逐条 PASS · 5 缺陷已修<br><strong>四家全超 6h 已催办</strong></div>
 </header>
 <section class="grid kpis">
   <div class="card kpi"><div class="label">M4 收口</div><div class="value warn">未达标</div><div class="label">直连 CLI PASS；mesh relay 未完成</div></div>
@@ -144,7 +144,7 @@
   </div></article>
   <article class="card"><div class="section-head"><h2>当前阻塞</h2><p>不是测试红</p></div>
     <div class="notice card"><strong>交互会话放行</strong><p class="muted">本轮已推送 develop 5 次（7a66f5e → d206c14 → 47cff18 → 3ca269e → 75a8ff7），共 12 笔提交；每次推送前完整门禁全绿，远端 CI 每轮均 success。</p></div>
-    <div class="notice card"><strong>M4 尚未收口</strong><p class="muted">四个门禁中 ①② 已达成，③ 同 SHA 外部复测四家全回（oh-no/kuku/netns/doubao 均 PASS）、④ 发布资产未达成（10/20）。Linux systemd 真机 16/17 PASS（仅 reboot 待授权）；systemd unit 五处缺口已修。</p></div>
+    <div class="notice card"><strong>M4 尚未收口</strong><p class="muted">四个门禁中 ①② 已达成，③ 同 SHA 外部复测四家均有回报（最新一轮同 SHA 复测未回）、④ 发布资产未达成（10/20，但**完整发布件已在本地备好**，只差上传放行）。**Linux systemd 五处修复已在真机逐条验收 PASS**（含凭证入网路径的 A/B 对照），仅 reboot 待授权。</p></div>
     <div class="check"><b class="ok">✓</b><div><strong>四家 agent 全部回报且全项 PASS</strong><br><span>kuku 三项指定任务全过（relay SIGTERM exit 0 三轮 / serve-discovery exit 0 五轮 / e2e 退出码契约）；netns 入网 0.565s、ping 30/30；doubao 出口策略三例（回环被拒/私网被拒/公网照常）+ install 回归 rc=0；oh-no bench 字节完整性 + F-1 A/B。<strong>四线静默均 &lt; 6h，本轮不催办</strong></span></div></div>
     <div class="check"><b class="warn">!</b><div><strong>reboot 恢复验收缺外部条件</strong><br><span>仓库内无任何 reboot 脚本，已写出最小可执行清单；需网主授权重启 175.24.139.148 或提供可重启 disposable VM</span></div></div>
     <div class="quote">判断规则：设计完成、能构建、能运行、能安装、真机验收分别记账。</div>
@@ -182,7 +182,7 @@
 </svg><div class="legend"><span class="pill green">已完成/外部验证</span><span class="pill blue">本地待放行</span><span class="pill yellow">下一批开发</span><span class="pill purple">v1.1 延后</span></div>
 </article></section>
 <section class="section"><div class="section-head"><h2>平台 KPI</h2><p>方案、构建、运行、安装、真机验收分开</p></div><article class="card matrix-wrap"><table class="matrix"><thead><tr><th>平台</th><th>设计</th><th>可构建</th><th>可运行</th><th>安装/签名</th><th>真机验收</th><th>下一步</th></tr></thead><tbody>
-<tr><td>Linux headless</td><td class="ok">方案</td><td class="ok">二进制</td><td class="ok">CLI/relay 可跑</td><td class="warn">手工安装器可用</td><td class="warn">systemd 16/17 PASS</td><td>reboot 恢复验收（待授权）+ darwin/windows 资产重建</td></tr>
+<tr><td>Linux headless</td><td class="ok">方案</td><td class="ok">二进制</td><td class="ok">CLI/relay 可跑</td><td class="ok">安装器 + systemd 均可用</td><td class="warn">systemd 真机逐条 PASS</td><td>reboot 恢复验收（待授权）+ 跨云 UDP（安全组全封）</td></tr>
 <tr><td>Windows CLI/桌面</td><td class="ok">方案</td><td class="ok">amd64/arm64</td><td class="warn">实机待测</td><td class="bad">rc1 资产 404</td><td class="bad">未验收</td><td>rc1 缺 windows-amd64/arm64（含 .exe 后缀）；需重建发布</td></tr>
 <tr><td>macOS CLI/桌面</td><td class="ok">方案</td><td class="ok">amd64/arm64</td><td class="warn">CLI 可跑</td><td class="warn">arm64 可装 / amd64 404</td><td class="bad">未验收</td><td>rc1 缺 darwin-amd64 与 latest 别名；再 Wails、Keychain、公证</td></tr>
 <tr><td>Android/iOS</td><td class="ok">gomobile 方案</td><td class="bad">未开始</td><td class="bad">未开始</td><td class="bad">无 APK/IPA</td><td class="bad">未验收</td><td>最小 binding + 真机单链路</td></tr>
