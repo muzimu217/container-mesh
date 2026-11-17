@@ -600,6 +600,31 @@ func (e *RegisterRejectedError) Error() string {
 // the product's behaviour.
 func IsRateLimited(err error) bool { return isRateLimited(err) }
 
+// IsNotAMember reports whether err is the node's refusal on membership
+// grounds: this device is not (or no longer) a member of the network.
+//
+// The node answers a register from a non-member with 401 and the reason
+// "device is not a member" (internal/discovery.ErrAnnounceNotMember).
+// The caller needs to tell that apart from a network fault, because the
+// two demand different things of the operator: one is "you were revoked",
+// the other is "the node is unreachable".
+//
+// The verdict comes from the STATUS CODE. It used to be read out of the
+// error text with strings.Contains(err.Error(), "not a member"), which
+// couples the client's behaviour to the server's wording: reword the
+// message and the client would quietly stop recognising a revocation, and
+// tell the operator to go debug their routing instead.
+func IsNotAMember(err error) bool {
+	if err == nil {
+		return false
+	}
+	var rej *registerRejectedError
+	if errors.As(err, &rej) {
+		return rej.Status == http.StatusUnauthorized
+	}
+	return false
+}
+
 // registerRejectedError is the internal alias of the exported type, so the
 // existing internal call sites read unchanged.
 type registerRejectedError = RegisterRejectedError

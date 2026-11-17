@@ -22,7 +22,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/muzimu217/container-mesh/internal/discovery"
@@ -125,7 +124,7 @@ func openMeshSessionWithSnapshotTimeout(ctx context.Context, state, passFlag str
 				// about membership, not a network fault, and the message must
 				// say so instead of sending the user off to debug routing
 				// (issue #8, report 1 finding on the revocation UX).
-				if perr := cl.Announce(waitCtx); perr != nil && strings.Contains(perr.Error(), "not a member") {
+				if perr := cl.Announce(waitCtx); perr != nil && discovery.IsNotAMember(perr) {
 					return nil, fmt.Errorf("this device has been removed from this network (revoked by the account owner, or the approval never happened)")
 				}
 				return nil, fmt.Errorf("no member view within %s (discovery node unreachable, or not approved yet?)", snapshotTimeout)
