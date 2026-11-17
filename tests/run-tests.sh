@@ -350,16 +350,32 @@ section "8. 端到端: 断线重连 (杀掉 relay 后自动恢复会话)"
 # 场景: 两端 --stay 常驻, relay 进程被杀并重启, 两端必须自动
 # 重连、重新握手, 并且后续消息继续可达。
 CODE8="reconnect-code-$$"
-FIFO="$TMP/send8.in"
-mkfifo "$FIFO"
 
+# The receiver starts first and stays up: it is the process that has to
+# survive the relay outage and still show the second message.
 "$BIN" recv --relay "$WS" --code "$CODE8" --name beta8 --out "$TMP" --stay \
     < /dev/null > "$TMP/recv8.log" 2>&1 &
 RECV8_PID=$!
-# 写入端先 sleep 再发第二条消息; 打开 fifo 会阻塞到 send 读端就绪
-( sleep 8; echo "m2-after-reconnect" ) > "$FIFO" &
-"$BIN" send --relay "$WS" --code "$CODE8" --name alpha8 --message "m1-before-kill" --stay \
-    < "$FIFO" > "$TMP/send8.log" 2>&1 &
+
+# The sender reads its second message from stdin, so stdin has to stay open
+# across the relay outage and then deliver one line. That used to be a named
+# pipe, but mkfifo(2) is not available everywhere: a seccomp profile that
+# blocks it makes mkfifo fail, the shell then creates a REGULAR file at that
+# path, the redirect reads it to EOF at once, and the sender never gets the
+# line. The symptom was a bare "重连后消息可达 (m2)" failure with no clue
+# that the setup, not the product, was broken.
+#
+# A plain pipe does the same job and needs no syscall beyond pipe(2):
+#   - the writer sleeps first, so the line arrives after the relay is killed
+#   - the reader sees EOF only after the line, so nothing is lost
+#   - the sender's stdin loop keeps the session alive on EOF (it waits for
+#     the context), so the process stays up for the assertion below
+#
+# The writer is started before the relay is killed, so the delay is measured
+# from the same point the named pipe's writer was.
+{ sleep 8; echo "m2-after-reconnect"; } | \
+    "$BIN" send --relay "$WS" --code "$CODE8" --name alpha8 --message "m1-before-kill" --stay \
+    > "$TMP/send8.log" 2>&1 &
 SEND8_PID=$!
 
 if wait_log "$TMP/recv8.log" "m1-before-kill" 20; then
