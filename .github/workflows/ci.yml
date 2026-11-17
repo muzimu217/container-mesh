@@ -59,10 +59,34 @@ jobs:
         run: sh packaging/install_test.sh
 
       - name: 交叉编译 (linux/amd64)
-        run: GOOS=linux GOARCH=amd64 go build -o /tmp/cmesh-linux-amd64 ./cmd/cm
+        # The version must be stamped: a release asset built without it
+        # reports "dev", and the @info verb would then tell an operator
+        # that their peer runs "dev" instead of the version they installed
+        # (round 62: the published rc1 binaries reported dev).
+        run: |
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build \
+            -trimpath -ldflags "-X github.com/muzimu217/container-mesh/internal/cli.Version=${GITHUB_REF_NAME}" \
+            -o /tmp/cmesh-linux-amd64 ./cmd/cm
 
       - name: 交叉编译 (linux/arm64)
-        run: GOOS=linux GOARCH=arm64 go build -o /tmp/cmesh-linux-arm64 ./cmd/cm
+        run: |
+          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build \
+            -trimpath -ldflags "-X github.com/muzimu217/container-mesh/internal/cli.Version=${GITHUB_REF_NAME}" \
+            -o /tmp/cmesh-linux-arm64 ./cmd/cm
+
+      - name: 发布资产的版本号必须是真版本，不是 dev
+        # The published binaries are what users install, so a "dev" version
+        # string reaches every user who follows the README. This step
+        # fails the build if the stamped version is missing.
+        run: |
+          got=$(/tmp/cmesh-linux-amd64 version)
+          echo "version: $got"
+          # Strip the "cmesh " prefix; what remains must be a real version.
+          ver=${got#cmesh }
+          case "$ver" in
+            "") echo "the release binary reports an EMPTY version" >&2; exit 1 ;;
+            *dev*) echo "the release binary reports '$got'" >&2; exit 1 ;;
+          esac
 
   linux-tun-probe:
     name: Linux 上的 TUN 探测
