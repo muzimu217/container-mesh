@@ -52,8 +52,23 @@ case "$url" in
     https://fixture.invalid/releases/latest/download/*)
         src="$FIXTURE_ROOT/releases/latest/download/${url##*/}"
         ;;
+    https://fixture.invalid/releases/download/*)
+        src="$FIXTURE_ROOT/releases/download/${url#https://fixture.invalid/releases/download/}"
+        ;;
+    https://api.fixture.invalid/repos/*/releases*)
+        # The release API: the installer falls back to it when
+        # /releases/latest/download is 404.
+        src="$FIXTURE_ROOT/api-releases.json"
+        ;;
     *) exit 1 ;;
 esac
+# A missing file is a 404, not a transport failure — that is what GitHub
+# answers for a release path that does not exist, and the installer
+# distinguishes the two.
+if [ ! -f "$src" ]; then
+    printf 'curl: (22) The requested URL returned error: 404\n' >&2
+    exit 22
+fi
 cp "$src" "$out"
 EOF
 chmod 0755 "$TMP/bin/curl"
@@ -72,6 +87,39 @@ assert_link "$install_root/current" versions/latest
 assert_link "$install_root/cmesh" current/cmesh
 cmp "$TMP/releases/latest/download/$fixture_asset" "$install_root/current/cmesh"
 test -x "$install_root/current/cmesh"
+
+# The default VERSION is "latest", and GitHub's /releases/latest points at
+# the newest NON-prerelease. While the only release is a prerelease (which
+# is where this project is — v1.0.0-rc1), that path is a 404 and the
+# default install fails outright: a new user following the README gets
+# nothing.
+#
+# The installer must therefore fall back to the release API, which lists
+# prereleases too, and install the newest release it finds.
+#
+# The fixture below serves the API response and the versioned asset path
+# but NOT /releases/latest/download — exactly the shape that broke. The
+# stub answers 404 for a missing file rather than a transport error.
+mkdir -p "$TMP/releases/download/v1.0.0-rc1"
+prerelease_asset="cmesh-v1.0.0-rc1-${fixture_os}-${fixture_arch}"
+printf 'fake cmesh binary for %s/%s (prerelease)\n' "$fixture_os" "$fixture_arch" \
+    > "$TMP/releases/download/v1.0.0-rc1/$prerelease_asset"
+prerelease_sum=$(shasum -a 256 "$TMP/releases/download/v1.0.0-rc1/$prerelease_asset" | awk '{print $1}')
+printf '%s  %s\n' "$prerelease_sum" "$prerelease_asset" \
+    > "$TMP/releases/download/v1.0.0-rc1/SHA256SUMS"
+printf '[{"tag_name":"v1.0.0-rc1","prerelease":true,"draft":false}]' \
+    > "$TMP/api-releases.json"
+# The "latest" tree is what GitHub 404s for a prerelease-only project.
+mv "$TMP/releases/latest" "$TMP/releases/latest-standby"
+
+prerelease_root="$TMP/prerelease-install"
+CMESH_BASE_URL=https://fixture.invalid/releases CMESH_INSTALL="$prerelease_root" \
+    CMESH_RELEASE_API=https://api.fixture.invalid/repos/muzimu217/container-mesh/releases \
+    PATH="$TMP/bin:$PATH" sh "$ROOT/packaging/install.sh"
+assert_link "$prerelease_root/current" versions/v1.0.0-rc1
+cmp "$TMP/releases/download/v1.0.0-rc1/$prerelease_asset" "$prerelease_root/current/cmesh"
+# The standby tree comes back for the later tests.
+mv "$TMP/releases/latest-standby" "$TMP/releases/latest"
 
 # The committed version directory must be traversable by someone who does
 # not own it. The staging directory comes from mktemp -d, which creates it

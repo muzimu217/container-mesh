@@ -97,7 +97,6 @@ else
     sums_url="$BASE_URL/download/$VERSION/SHA256SUMS"
     binary_url="$BASE_URL/download/$VERSION/$asset_base"
 fi
-
 say "cmesh installer"
 say "  platform : ${os}/${arch}"
 say "  asset    : $asset_base"
@@ -118,7 +117,46 @@ fetch() {
 }
 
 say "  downloading checksums..."
-fetch "$sums_url" "$tmpdir/SHA256SUMS" || die "cannot fetch the release checksums"
+if ! fetch "$sums_url" "$tmpdir/SHA256SUMS"; then
+    # GitHub's /releases/latest points at the newest NON-prerelease. While
+    # the only release is a prerelease — which is where this project is,
+    # v1.0.0-rc1 — that path is a 404, and the default install fails
+    # outright: a new user following the README gets nothing at all.
+    #
+    # So the "latest" case falls back to the release API, which lists
+    # prereleases too, and installs the newest release it names.
+    if [ "$VERSION" != latest ]; then
+        die "cannot fetch the release checksums"
+    fi
+    say "  no published release at the latest URL; asking the release API"
+    api_url="${CMESH_RELEASE_API:-https://api.github.com/repos/muzimu217/container-mesh/releases}"
+    if ! fetch "$api_url" "$tmpdir/releases.json"; then
+        die "cannot fetch the release checksums, and the release API is unreachable"
+    fi
+    # The newest release that is neither a draft nor a prerelease, and if
+    # there is none, the newest prerelease. Both are "a release"; the
+    # order is the order GitHub's own UI uses.
+    resolved=$(awk '
+        /"draft":/ { d = ($0 ~ /"draft": *true/) ? 1 : 0 }
+        /"prerelease":/ { p = ($0 ~ /"prerelease": *true/) ? 1 : 0 }
+        /"tag_name":/ {
+            if (match($0, /"tag_name": *"[^\"]+"/)) {
+                v = substr($0, RSTART, RLENGTH)
+                sub(/^"tag_name": *"/, "", v); sub(/"$/, "", v)
+                if (d == 0 && p == 0) { print v; exit }
+                if (best == "") best = v
+            }
+        }
+        END { if (best != "") print best }
+    ' "$tmpdir/releases.json" | head -1)
+    [ -n "$resolved" ] || die "the release API named no installable release"
+    say "  using release $resolved"
+    VERSION=$resolved
+    asset_base="cmesh-${VERSION}-${os}-${arch}${suffix}"
+    sums_url="$BASE_URL/download/$VERSION/SHA256SUMS"
+    binary_url="$BASE_URL/download/$VERSION/$asset_base"
+    fetch "$sums_url" "$tmpdir/SHA256SUMS" || die "cannot fetch the checksums for $VERSION"
+fi
 say "  downloading binary..."
 fetch "$binary_url" "$tmpdir/$asset_base" || die "cannot fetch the release binary"
 
