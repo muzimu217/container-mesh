@@ -374,8 +374,11 @@ func (c *Client) postRegister(ctx context.Context, body []byte, what string) err
 		}
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrBodyBytes))
 		_ = resp.Body.Close()
-		return fmt.Errorf("discovery: register rejected by %s: HTTP %d: %s",
-			c.addrs[idx], resp.StatusCode, printableBody(b))
+		return &registerRejectedError{
+			Addr:   c.addrs[idx],
+			Status: resp.StatusCode,
+			Body:   printableBody(b),
+		}
 	}
 	return fmt.Errorf("discovery: register failed on all %d addresses: %w", len(c.addrs), lastErr)
 }
@@ -589,17 +592,62 @@ func announceRetryDelay(joined bool, err error, heartbeat time.Duration) time.Du
 	return announceFastRetry + time.Duration(rand.Int64N(int64(announceFastJitter)))
 }
 
-// isRateLimited reports whether err is the limiter's rejection. The relay
-// answers 429 with body "too many requests" (rate bucket) or "too many
-// connections" (in-flight cap) — both mean this egress site's shared
-// allowance is exhausted and retrying fast only burns other devices' share.
+// RegisterRejectedError is a node's refusal of a register request, with the
+// status code kept alongside the text.
+//
+// It is exported so that the classification can be tested from outside the
+// package: the verdict is the product's behaviour, not an implementation
+// detail, and the shape that broke CI (a node whose PORT contains "429")
+// cannot be produced by a test server that only listens on a real port.
+type RegisterRejectedError struct {
+	Addr   string
+	Status int
+	Body   string
+}
+
+func (e *RegisterRejectedError) Error() string {
+	return fmt.Sprintf("discovery: register rejected by %s: HTTP %d: %s", e.Addr, e.Status, e.Body)
+}
+
+// IsRateLimited reports whether err is the limiter's rejection.
+//
+// It is exported for the same reason as RegisterRejectedError: the rule
+// ("the verdict comes from the status code, never from the address") is
+// the product's behaviour.
+func IsRateLimited(err error) bool { return isRateLimited(err) }
+
+// registerRejectedError is the internal alias of the exported type, so the
+// existing internal call sites read unchanged.
+type registerRejectedError = RegisterRejectedError
+
+// isRateLimited reports whether err is the limiter's rejection.
+//
+// The relay answers 429 with body "too many requests" (the rate bucket) or
+// "too many connections" (the in-flight cap) — both mean this egress site's
+// shared allowance is exhausted and retrying fast only burns other
+// devices' share.
+//
+// The verdict comes from the status code when there is one. Falling back to
+// the text is what this function used to do, and it misfired: the error
+// text carries the node's address, so a node on a port that happens to
+// contain "429" turned every error into a rate-limit verdict.
 func isRateLimited(err error) bool {
 	if err == nil {
 		return false
 	}
-	s := err.Error()
-	return strings.Contains(s, "429") || strings.Contains(s, "too many request") ||
-		strings.Contains(s, "too many connection")
+	var rej *registerRejectedError
+	if errors.As(err, &rej) {
+		if rej.Status == http.StatusTooManyRequests {
+			return true
+		}
+		// A node that is not answering 429 may still say so in prose
+		// ("too many requests" in the body). That is the limiter's own
+		// wording, and it only appears on a refusal — never in a transport
+		// error, which has no status code at all.
+		body := strings.ToLower(rej.Body)
+		return strings.Contains(body, "too many request") || strings.Contains(body, "too many connection")
+	}
+	return false
 }
 
 // streamLoop dials the members stream, applies pushes, and reconnects with
