@@ -161,6 +161,12 @@ func dialViaPicker(ctx context.Context, cfg DialConfig) (*Link, PathKind, error)
 	}
 	link, used, err := tryPaths(ctx, cfg, paths, dialPath)
 	if err != nil {
+		// Report the path that actually failed. The CLI prints link= from
+		// this value, so answering "direct" when the relay is what broke
+		// hides which route is at fault.
+		if used.Kind != "" {
+			return nil, used.Kind, err
+		}
 		return nil, PathDirect, err
 	}
 	return link, used.Kind, nil
@@ -180,10 +186,18 @@ func dialPath(ctx context.Context, cfg DialConfig, p Path) (*Link, error) {
 		}
 		return DialDirect(ctx, cfg)
 	case PathRelay:
-		// Not "no route". The relay trunk does not exist yet, so trying
-		// another path cannot help either, and ErrNoRoute would tell the
-		// caller to keep walking a list. This class stops the walk.
-		return nil, fmt.Errorf("%w: mesh: relay paths are not available yet", ErrSessionClosed)
+		// The relay trunk does not exist yet, so the attempt could not be
+		// made. It has to be its own class: ErrNoRoute is a routing fact
+		// (the member view holds no endpoint) and would tell the caller to
+		// keep walking a list of paths that cannot work either;
+		// ErrSessionClosed is a session fact, which is just as wrong
+		// because no session was ever opened.
+		//
+		// The wording matters as much as the class: "not available yet"
+		// reads like a statement about the route, and an operator reading
+		// the log would conclude the relay was down rather than that the
+		// feature is missing.
+		return nil, fmt.Errorf("%w: mesh: the relay trunk is not implemented", ErrRelayUnavailable)
 	default:
 		return nil, fmt.Errorf("%w: mesh: unknown path kind %q", ErrNoRoute, p.Kind)
 	}

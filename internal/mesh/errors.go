@@ -47,12 +47,22 @@ var (
 	// ErrSessionClosed: the session ended before the exchange finished
 	// (relay side; unused by the direct path).
 	ErrSessionClosed = errors.New("mesh: session closed")
+	// ErrRelayUnavailable: the relay path was chosen but the relay
+	// trunk is not built yet, so the attempt could not be made.
+	//
+	// It has to be its own class. ErrNoRoute is a routing fact — the
+	// member view holds no endpoint — and borrowing it would tell the
+	// caller to keep walking a list of paths that cannot work either.
+	// ErrSessionClosed is a session fact, which is just as wrong: no
+	// session was ever opened.
+	ErrRelayUnavailable = errors.New("mesh: relay path unavailable")
 )
 
 // dialClasses is every sentinel classifyDialError can attach. An error
 // that already carries one of them is passed through untouched.
 var dialClasses = []error{
 	ErrAuth, ErrUnreachable, ErrRefused, ErrNoRoute, ErrQuota, ErrSessionClosed,
+	ErrRelayUnavailable,
 }
 
 // refusalMarker marks an error whose peer WAS reached and refused the

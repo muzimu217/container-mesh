@@ -34,9 +34,11 @@ func TestRelayPathIsNotReportedAsNoRoute(t *testing.T) {
 			"class means 'no route', and the fallback rule would keep walking "+
 			"paths that cannot work either", err)
 	}
-	if !errors.Is(err, ErrSessionClosed) && !errors.Is(err, ErrRefused) {
-		t.Fatalf("the unimplemented relay path reports %v, want a class the "+
-			"fallback rule stops on", err)
+	if !errors.Is(err, ErrRelayUnavailable) {
+		t.Fatalf("the unimplemented relay path reports %v, want ErrRelayUnavailable: "+
+			"it needs its own class, because ErrNoRoute is a routing fact and "+
+			"ErrSessionClosed is a session fact, and neither describes a trunk "+
+			"that does not exist", err)
 	}
 }
 
