@@ -853,39 +853,57 @@ func dialOneRaw(ctx context.Context, addr *net.UDPAddr, cfg DialConfig, tlsCfg *
 		_ = udp.Close()
 		return nil, fmt.Errorf("quic dial %s: %w", addr, err)
 	}
+	// From here on the QUIC connection exists, so every failure has to
+	// release BOTH it and the socket. quic-go was handed a caller-owned
+	// packet connection (setupTransport records createdConn=false for this
+	// call shape), so closing the connection does not close the socket.
+	// Measured: an abandoned net.UDPConn keeps its descriptor until the
+	// garbage collector's finalizer runs, so the release used to be real
+	// but unbounded — a dial loop could hold hundreds of descriptors
+	// between collections.
+	abandon := func(err error) (*Link, error) {
+		_ = qc.CloseWithError(0, "abandoned")
+		_ = udp.Close()
+		return nil, err
+	}
 	st, err := qc.OpenStreamSync(cctx)
 	if err != nil {
-		_ = qc.CloseWithError(0, "no stream")
-		return nil, fmt.Errorf("open stream: %w", err)
+		return abandon(fmt.Errorf("open stream: %w", err))
 	}
 
 	hello := Hello{Proto: ProtoID, Kind: cfg.Kind, Time: time.Now().UTC()}
 	line, err := json.Marshal(hello)
 	if err != nil {
-		return nil, err
+		return abandon(err)
 	}
 	if _, err := fmt.Fprintf(st, "%s\n", line); err != nil {
-		return nil, fmt.Errorf("send hello: %w", err)
+		return abandon(fmt.Errorf("send hello: %w", err))
 	}
 	_ = st.SetReadDeadline(time.Now().Add(10 * time.Second))
 	br := bufio.NewReader(st)
 	ackLine, err := readLine(br, MaxHelloBytes)
 	if err != nil {
-		return nil, fmt.Errorf("read ack: %w", err)
+		return abandon(fmt.Errorf("read ack: %w", err))
 	}
 	if !bytes.Equal(bytes.TrimSpace(ackLine), []byte("ok")) {
 		// The peer WAS reached and declined. Mark it as a refusal so the
 		// classifier can tell "said no" apart from "nobody answered".
-		return nil, newRefused("listener refused: %s", ackLine)
+		return abandon(newRefused("listener refused: %s", ackLine))
 	}
 	_ = st.SetReadDeadline(time.Time{})
-	return &Link{qc: qc, st: st, sess: quicSession{st: st, conn: qc}, br: br}, nil
+	// The attempt succeeded, so the socket belongs to the link now: it is
+	// released when the link is closed.
+	return &Link{qc: qc, st: st, sess: quicSession{st: st, conn: qc}, br: br, udp: udp}, nil
 }
 
 // Link is an established, mutually-authenticated direct link.
 type Link struct {
 	qc *quic.Conn
 	st *quic.Stream
+	// udp is the socket this attempt opened. quic-go was handed it as a
+	// caller-owned packet connection, so it is not closed when the QUIC
+	// connection is — the link owns it and releases it on Close.
+	udp *net.UDPConn
 	// sess is the transport-agnostic view of the same stream. The
 	// business layer uses it, so the business code never names a QUIC
 	// type and a relayed session can be dropped in unchanged.
@@ -1059,7 +1077,16 @@ func (l *Link) Reader() *bufio.Reader { return l.br }
 func (l *Link) Loss() *BenchLoss { return lossOf(l.qc) }
 
 // Close tears the link down.
-func (l *Link) Close() error { return l.qc.CloseWithError(0, "bye") }
+// Close ends the link and releases the socket the dial opened. quic-go does
+// not close a caller-owned packet connection when the QUIC connection ends
+// (createdConn=false), so the socket is this type's responsibility.
+func (l *Link) Close() error {
+	err := l.qc.CloseWithError(0, "bye")
+	if l.udp != nil {
+		_ = l.udp.Close()
+	}
+	return err
+}
 
 // PingStats is the result of a ping exchange. Sent includes packets that
 // were written successfully; Lost is the number whose reply timed out.
