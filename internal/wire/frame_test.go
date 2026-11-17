@@ -102,3 +102,96 @@ func TestFrameTypeString(t *testing.T) {
 		t.Error("unknown type should still render")
 	}
 }
+
+// TestExistingFrameNumbersAreStable pins the wire numbers of the frames
+// that already existed.
+//
+// The relay trunk frames are APPENDED, and appending is only safe while
+// the older numbers stay where they are: the type byte is what a peer
+// dispatches on, so renumbering one of these turns a "hello" into a
+// "file-offer" for every peer built against an earlier release.
+func TestExistingFrameNumbersAreStable(t *testing.T) {
+	for _, tt := range []struct {
+		got  FrameType
+		want uint8
+	}{
+		{FrameHello, 1},
+		{FrameMsg, 2},
+		{FrameFileOffer, 3},
+		{FrameFileAccept, 4},
+		{FrameFileReject, 5},
+		{FrameFileChunk, 6},
+		{FrameFileAck, 7},
+		{FrameFileDone, 8},
+		{FrameFileResult, 9},
+		{FrameError, 10},
+		{FramePing, 11},
+		{FramePong, 12},
+		{FrameP2POffer, 13},
+		{FrameP2PAnswer, 14},
+		{FrameMuxStart, 15},
+		{FrameStreamData, 16},
+		{FrameForwardListen, 17},
+		{FrameForwardListenResult, 18},
+	} {
+		if uint8(tt.got) != tt.want {
+			t.Errorf("%s = %d, want %d: an existing frame number moved", tt.got, uint8(tt.got), tt.want)
+		}
+	}
+}
+
+// TestMeshRelayFrameTypes pins the two relay trunk frames.
+//
+// They are the control frames of the mesh's own relay (the trunk): one
+// asks the relay member to open a session on somebody's behalf, the other
+// answers. Both need a readable name — the frame type is what shows up in
+// a log line when a trunk request goes wrong — and both must be distinct
+// from every other frame, because the dispatch is a byte compare.
+func TestMeshRelayFrameTypes(t *testing.T) {
+	if got := FrameMeshRelayOpen.String(); got != "mesh-relay-open" {
+		t.Errorf("FrameMeshRelayOpen.String() = %q, want %q", got, "mesh-relay-open")
+	}
+	if got := FrameMeshRelayAnswer.String(); got != "mesh-relay-answer" {
+		t.Errorf("FrameMeshRelayAnswer.String() = %q, want %q", got, "mesh-relay-answer")
+	}
+
+	all := []FrameType{
+		FrameHello, FrameMsg, FrameFileOffer, FrameFileAccept, FrameFileReject,
+		FrameFileChunk, FrameFileAck, FrameFileDone, FrameFileResult, FrameError,
+		FramePing, FramePong, FrameP2POffer, FrameP2PAnswer, FrameMuxStart,
+		FrameStreamData, FrameForwardListen, FrameForwardListenResult,
+		FrameMeshRelayOpen, FrameMeshRelayAnswer,
+	}
+	seen := make(map[FrameType]bool, len(all))
+	for _, f := range all {
+		if seen[f] {
+			t.Errorf("frame type %d (%s) is used twice", uint8(f), f)
+		}
+		seen[f] = true
+	}
+}
+
+// TestMeshRelayFramesRoundTrip checks that the two new frames survive the
+// binary encoding like every other frame: the trunk control messages ride
+// the same header as the rest of the protocol.
+func TestMeshRelayFramesRoundTrip(t *testing.T) {
+	for _, want := range []*Frame{
+		{Type: FrameMeshRelayOpen, Stream: 3, Payload: []byte(`{"from":"a","to":"b"}`)},
+		{Type: FrameMeshRelayAnswer, Payload: []byte(`{"grant":false,"reason":"nope"}`)},
+	} {
+		enc, err := want.Encode(nil)
+		if err != nil {
+			t.Fatalf("%s: encode: %v", want.Type, err)
+		}
+		got, err := DecodeFrameBytes(enc)
+		if err != nil {
+			t.Fatalf("%s: decode: %v", want.Type, err)
+		}
+		if got.Type != want.Type || got.Stream != want.Stream {
+			t.Errorf("%s: header mismatch: %+v", want.Type, got)
+		}
+		if !bytes.Equal(got.Payload, want.Payload) {
+			t.Errorf("%s: payload mismatch", want.Type)
+		}
+	}
+}

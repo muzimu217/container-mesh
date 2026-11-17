@@ -80,6 +80,17 @@ const (
 	// FrameForwardListenResult answers it. Payload is JSON
 	// {"results":[{"id","status","message"}]}.
 	FrameForwardListenResult
+	// FrameMeshRelayOpen asks the relay member (the "trunk") to relay a
+	// session from one member to another. It is the mesh's own relay, not
+	// the pairing relay: the requester and the target are two DIFFERENT
+	// members, and the trunk is a third member that forwards between them.
+	//
+	// Appended at the end on purpose: the numbers of the frames above are
+	// on the wire, and a peer dispatches on the type byte.
+	FrameMeshRelayOpen
+	// FrameMeshRelayAnswer answers FrameMeshRelayOpen: granted or refused,
+	// with a reason the requester can show.
+	FrameMeshRelayAnswer
 )
 
 // MaxStreamData bounds one FrameStreamData payload.
@@ -131,6 +142,10 @@ func (t FrameType) String() string {
 		return "forward-listen"
 	case FrameForwardListenResult:
 		return "forward-listen-result"
+	case FrameMeshRelayOpen:
+		return "mesh-relay-open"
+	case FrameMeshRelayAnswer:
+		return "mesh-relay-answer"
 	default:
 		return fmt.Sprintf("frame(%d)", uint8(t))
 	}

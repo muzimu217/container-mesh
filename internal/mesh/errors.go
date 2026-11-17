@@ -56,13 +56,23 @@ var (
 	// ErrSessionClosed is a session fact, which is just as wrong: no
 	// session was ever opened.
 	ErrRelayUnavailable = errors.New("mesh: relay path unavailable")
+	// ErrRelayTrunkDisabled: the relay trunk is switched off on the node
+	// that was asked to relay (the anchor's control switch, D73).
+	//
+	// It is neither ErrAuth nor ErrRefused, and that is the whole point:
+	// the requester IS a member and the request WAS well formed — this
+	// node simply does not relay. A verdict (auth, refused) must not be
+	// retried on another path, because the answer does not change; a
+	// disabled trunk is a local condition, and another relay may well say
+	// yes.
+	ErrRelayTrunkDisabled = errors.New("mesh: relay trunk disabled")
 )
 
 // dialClasses is every sentinel classifyDialError can attach. An error
 // that already carries one of them is passed through untouched.
 var dialClasses = []error{
 	ErrAuth, ErrUnreachable, ErrRefused, ErrNoRoute, ErrQuota, ErrSessionClosed,
-	ErrRelayUnavailable,
+	ErrRelayUnavailable, ErrRelayTrunkDisabled,
 }
 
 // refusalMarker marks an error whose peer WAS reached and refused the

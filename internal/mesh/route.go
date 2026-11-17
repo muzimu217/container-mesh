@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/muzimu217/container-mesh/internal/identity"
 )
@@ -43,6 +44,21 @@ type Path struct {
 	// Endpoints are the addresses to try for a direct path (empty = use
 	// the dial config's own endpoints).
 	Endpoints []string
+	// ViaEndpoints are the addresses of the RELAY member for a relay path.
+	//
+	// A relay path has two address segments — caller→relay and
+	// relay→target — and they live in different network domains (the
+	// relay may be on a private network the caller reaches through a
+	// tunnel, the target may be reachable only from the relay's side).
+	// They cannot share one list, so the relay's addresses live here.
+	// Without them a relay path could not even name the node it meant to
+	// go through.
+	ViaEndpoints []string
+	// Hops is the remaining hop budget for this path. One hop is the
+	// shape the trunk carries today; the field is here so a multi-hop
+	// path does not have to change the path structure when it arrives.
+	// Zero means "unset", which reads as one hop.
+	Hops int
 }
 
 // PathPicker names the paths worth trying for a target, best first.
@@ -186,18 +202,28 @@ func dialPath(ctx context.Context, cfg DialConfig, p Path) (*Link, error) {
 		}
 		return DialDirect(ctx, cfg)
 	case PathRelay:
-		// The relay trunk does not exist yet, so the attempt could not be
-		// made. It has to be its own class: ErrNoRoute is a routing fact
-		// (the member view holds no endpoint) and would tell the caller to
-		// keep walking a list of paths that cannot work either;
+		// The relay trunk's CONTROL plane exists (the frame pair and the
+		// authorization state machine on the relay side), but its DATA
+		// plane does not: there is no session to open yet, so the attempt
+		// cannot be made.
+		//
+		// The class stays ErrRelayUnavailable. ErrNoRoute is a routing
+		// fact (the member view holds no endpoint) and would tell the
+		// caller to keep walking a list of paths that cannot work either;
 		// ErrSessionClosed is a session fact, which is just as wrong
 		// because no session was ever opened.
 		//
 		// The wording matters as much as the class: "not available yet"
 		// reads like a statement about the route, and an operator reading
 		// the log would conclude the relay was down rather than that the
-		// feature is missing.
-		return nil, fmt.Errorf("%w: mesh: the relay trunk is not implemented", ErrRelayUnavailable)
+		// feature is missing. The relay's own endpoints are named when
+		// they are known, so the log says WHICH relay was attempted.
+		if len(p.ViaEndpoints) == 0 {
+			return nil, fmt.Errorf("%w: mesh: the relay trunk is not implemented, and relay %s announced no endpoint to dial",
+				ErrRelayUnavailable, p.Via)
+		}
+		return nil, fmt.Errorf("%w: mesh: the relay trunk is not implemented (relay %s at %s)",
+			ErrRelayUnavailable, p.Via, strings.Join(p.ViaEndpoints, ", "))
 	default:
 		return nil, fmt.Errorf("%w: mesh: unknown path kind %q", ErrNoRoute, p.Kind)
 	}
