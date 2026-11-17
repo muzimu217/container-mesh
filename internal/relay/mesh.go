@@ -266,7 +266,7 @@ func (s *Server) meshMemberKey(id identity.DeviceID) (ed25519.PublicKey, error) 
 	if !ok {
 		return nil, discovery.ErrAnnounceNotMember
 	}
-	if time.Now().UTC().After(mm.Cert.ExpiresAt) {
+	if mm.Cert.Expired(time.Now()) {
 		return nil, fmt.Errorf("%w: certificate expired at %s",
 			discovery.ErrAnnounceNotMember, mm.Cert.ExpiresAt.Format(time.RFC3339))
 	}

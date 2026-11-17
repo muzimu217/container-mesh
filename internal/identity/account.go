@@ -226,6 +226,21 @@ func SignDelegatedCert(delegatorPub ed25519.PublicKey, delegatorPriv ed25519.Pri
 	return c, nil
 }
 
+// Expired reports whether the certificate is past its expiry.
+//
+// The check lives here because it was written out in three places outside
+// this package — the relay's member key lookup, the snapshot builder and
+// the mesh resolver — each with its own wording and its own error type.
+// Three copies of one rule is three places to keep in step, and the copies
+// had already drifted: one of them compared against time.Now().UTC() while
+// another compared against a `now` the caller had already captured, so the
+// two could disagree by the length of a request.
+//
+// Use it instead of touching Cert.ExpiresAt directly.
+func (c *DeviceCert) Expired(now time.Time) bool {
+	return now.UTC().After(c.ExpiresAt)
+}
+
 // VerifySigner checks a certificate against the key that signed it — the
 // account key for ordinary certificates, a delegator key for certificates
 // issued under a delegation. It enforces the ID/key binding, the signature

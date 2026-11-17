@@ -89,7 +89,7 @@ func BuildSnapshot(members *identity.MemberList, n *Node, now time.Time) *Member
 		// them anyway (a lapsed cert no longer proves membership), and
 		// sending them first only widens the window where an old cert is
 		// treated as a live member (security review F3).
-		if now.After(mm.Cert.ExpiresAt) {
+		if mm.Cert.Expired(now) {
 			continue
 		}
 		view := MemberView{Cert: mm.Cert}

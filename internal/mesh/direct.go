@@ -195,7 +195,7 @@ func (a MemberListAdapter) KeyFor(id identity.DeviceID) (ed25519.PublicKey, erro
 	if !ok {
 		return nil, fmt.Errorf("mesh: %s is not a member", id)
 	}
-	if time.Now().UTC().After(mm.Cert.ExpiresAt) {
+	if mm.Cert.Expired(time.Now()) {
 		return nil, fmt.Errorf("mesh: %s certificate expired", id)
 	}
 	return mm.Cert.DevicePub, nil

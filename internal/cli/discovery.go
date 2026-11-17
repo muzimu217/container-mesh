@@ -1207,7 +1207,7 @@ func watchApprovals(ctx context.Context, membersPath, certsDir string, start *id
 						fmt.Fprintf(os.Stderr, "cert file %s refused: verification failed: %v\n", name, err)
 						continue
 					}
-				} else if time.Now().UTC().After(cert.ExpiresAt) {
+				} else if cert.Expired(time.Now()) {
 					fmt.Fprintf(os.Stderr, "cert file %s refused: certificate expired at %s\n", name, cert.ExpiresAt.Format(time.RFC3339))
 					continue
 				}

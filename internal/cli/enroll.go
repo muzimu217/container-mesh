@@ -67,7 +67,7 @@ func enrollDevice(members *identity.MemberList, accountPub ed25519.PublicKey, re
 	if err := cert.VerifySigner(pub.DelegatorPub); err != nil {
 		return discovery.EnrollResponse{OK: false, Message: "certificate rejected: " + err.Error()}
 	}
-	if now.After(cert.ExpiresAt) {
+	if cert.Expired(now) {
 		return discovery.EnrollResponse{OK: false, Message: "certificate expired at " + cert.ExpiresAt.UTC().Format(time.RFC3339)}
 	}
 	// Quota: counted from the roster, so revoking a device frees its slot.
