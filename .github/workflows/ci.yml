@@ -82,10 +82,16 @@ jobs:
           got=$(/tmp/cmesh-linux-amd64 version)
           echo "version: $got"
           # Strip the "cmesh " prefix; what remains must be a real version.
+          #
+          # The check is EXACT: "dev" is the unstamped default, but a
+          # branch name like "develop" also contains those three letters
+          # and is a perfectly good version for a build off a branch.
+          # (Matching a substring here turned CI red on every push to
+          # develop — the check rejected its own branch name.)
           ver=${got#cmesh }
           case "$ver" in
             "") echo "the release binary reports an EMPTY version" >&2; exit 1 ;;
-            *dev*) echo "the release binary reports '$got'" >&2; exit 1 ;;
+            dev) echo "the release binary reports '$got'" >&2; exit 1 ;;
           esac
 
   linux-tun-probe:
