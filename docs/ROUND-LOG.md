@@ -1347,3 +1347,21 @@ LEAVE 那笔的 CI 红了。**红的是一个早就存在的测试**（`TestTran
 
 **本轮推送**：`660cdef` refactor(identity)（删死字段）· `e525d91` refactor(discovery)（适配器+transport 收敛）· `ed84f86` fix(cli)（撤销判定按状态码）· `f404612` refactor(identity)（过期判定收敛）。
 
+**★ Linux headless 安装代理回报（两台真实机）：全生命周期 PASS + 四个真缺陷**
+**PASS**：版本目录 0755、非特权用户 rc=0、非 root 装 `$HOME` rc=0、systemd active/enabled + journal 齐全、**SIGTERM 退出码 0 耗时 10–21ms**（端口立即可重绑）、kill -9 后 5s 自愈、升级失败时 `current` 不动且旧二进制仍可执行、`--uninstall` vs `--purge` 语义一致；**可移植性 PASS**（真静态、**Alpine musl 上完整安装器 rc=0**、走 busybox wget 回退 + sha256sum）；**真实公网闭环 PASS**（35 → 175：`mesh ping` **10/10、0 丢、151ms、link=direct**、`msg`、`send-to` 256KB sha256 逐字节一致、`run @info` 返回 `version 49ed13b-head`、bench 4MB 双向 0.65 MiB/s、面板 **401/401/200**）。
+**四个缺陷**：
+- **R62-4（高）**：已发布的 rc1 安装器**不含 0755 修复**——值守独立 diff 确认：发布版只有 `chmod 0755 "$stage/cmesh"`，**缺** `chmod 0755 "$stage"`（版本目录）。资产目录 Nov 16 10:12 vs 修复 `82ed647` Nov 16 15:09 → **资产比修复早 5 小时**。→ **需重新上传发布资产**（待网主放行）。
+- **R62-3（高）已修**：默认 `VERSION=latest` 走 `/releases/latest/download/`，**GitHub 的 latest 不含 prerelease**（唯一发布 rc1 是 prerelease）→ **默认安装必然 404**，新用户照 README 跑直接失败。修法：`latest` 拉不到 checksums 时**回退到 release API**（含 prerelease）。**红→绿已证**（去掉回退 → 回归测试正好在新用户失败处红）。
+- **R62-2（低-中）已修**：CI 交叉编译**没带 -ldflags** → **发布资产版本号是 `dev`** → **R61 的 @info 修复在发布链路上被抵消**。现在打上 `GITHUB_REF_NAME`，并新增一步**在二进制仍报空/dev 时让 CI 失败**。
+- **R62-1（中）待下一轮**：`current` 是目录时安装**静默 rc=1** 且留下 `.cmesh-link.*` 孤儿 → 服务下次重启起不来。
+**arm64 未测**（两台机无 qemu-user/binfmt）。**安全组实测**：175 只放行 **18090**（TCP 全端口扫 + UDP 65535 包全扫 + tcpdump 双重确认），新端口对公网 FILTERED → 数据面方向只能是 175→35。
+
+**★ 值守独立实测的真实公网基线**
+`mesh ping --count 100` → **100/100、0 丢、p50 60.224ms / p95 71.079ms、`link=direct`**。吞吐（每向）：1MB **1.04/1.01/1.01 MiB/s**（三轮一致）、4MB **0.60 MiB/s**（6.3s，字节精确相等）。
+**一个测量方法上的坑**：我第一次跑 4MB/16MB 全报「FAIL」，实际是**我自己的 250 秒超时**——单独跑 4MB 只用 **6.3 秒**。**小文件在公网上不慢（1MB 约 0.9 秒）；大文件慢是字节多，不是握手慢**——**测吞吐必须给足超时，否则会把超时误判成缺陷**。
+
+**★ quic-go 拥塞控制：独立复核确认是 Reno，且比旧结论更精确**
+`internal/congestion/cubic_sender.go` 的 `reno bool` 形参在 `sent_packet_handler.go` 里以 **`true // use Reno`** 传入；`c.reno` 改行为的两处是 `OnCongestionEvent`（**回退乘 0.7**）与 `maybeIncreaseCwnd`（**每 RTT 增 1 个 MSS**）——**Cubic 的公式在这条路径上根本没被调用**。类型名 `cubicSender` 只是历史遗留。仓库侧 `quicConfig()` 不覆盖拥塞控制参数 → **产品路径跑的就是经典 NewReno**。
+
+**本轮推送补充**：`699a38c` fix(packaging)（latest 回退到 release API）、`5f5e7e6` ci（交叉编译打版本戳 + 发布资产版本号门禁）。
+
