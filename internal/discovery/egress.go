@@ -9,17 +9,9 @@ import (
 	"net/http"
 	"syscall"
 	"time"
+
+	"github.com/muzimu217/container-mesh/internal/wsconn"
 )
-
-// resolvedAddr is the address a host name resolved to, as the dialer sees
-// it: the numeric address plus the original host name.
-type resolvedAddr struct {
-	addr string
-	host string
-}
-
-func (a *resolvedAddr) Network() string { return "tcp" }
-func (a *resolvedAddr) String() string  { return a.addr }
 
 // EgressPolicy decides whether a resolved address may be connected to.
 //
@@ -54,13 +46,29 @@ func EgressPolicy(addr net.Addr) error {
 //
 // timeout bounds the dial and the response headers.
 func EgressTransport(timeout time.Duration) *http.Transport {
+	return PolicyTransport(timeout, EgressPolicy)
+}
+
+// PolicyTransport returns an HTTP transport that applies the given policy to
+// every connection it makes.
+//
+// This is the one place the outbound HTTP transport is built. The client's
+// own register path used to carry a second copy of it, with one difference:
+// the policy there could be switched off (AllowLocalDiscovery, for the
+// local test harness). That difference is now a parameter, so the two
+// paths cannot drift apart again.
+//
+// A nil policy means no check — the caller has said so explicitly.
+func PolicyTransport(timeout time.Duration, policy func(net.Addr) error) *http.Transport {
 	dialer := &net.Dialer{Timeout: timeout, KeepAlive: 30 * time.Second}
-	dialer.Control = func(_, address string, _ syscall.RawConn) error {
-		host, _, err := net.SplitHostPort(address)
-		if err != nil {
-			return fmt.Errorf("discovery: egress policy: cannot parse %q: %w", address, err)
+	if policy != nil {
+		dialer.Control = func(_, address string, _ syscall.RawConn) error {
+			host, _, err := net.SplitHostPort(address)
+			if err != nil {
+				return fmt.Errorf("discovery: egress policy: cannot parse %q: %w", address, err)
+			}
+			return policy(wsconn.NewResolvedAddr(address, host))
 		}
-		return EgressPolicy(&resolvedAddr{addr: address, host: host})
 	}
 	return &http.Transport{
 		DialContext:           dialer.DialContext,

@@ -37,7 +37,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/muzimu217/container-mesh/internal/identity"
@@ -250,22 +249,7 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 // The check runs on the resolved address, inside the dialer, so the
 // connection is never made.
 func (c *Client) httpTransport() *http.Transport {
-	policy := c.egressPolicy()
-	dialer := &net.Dialer{Timeout: c.cfg.DialTimeout, KeepAlive: 30 * time.Second}
-	if policy != nil {
-		dialer.Control = func(_, address string, _ syscall.RawConn) error {
-			host, _, err := net.SplitHostPort(address)
-			if err != nil {
-				return fmt.Errorf("discovery: egress policy: cannot parse %q: %w", address, err)
-			}
-			return policy(&resolvedAddr{addr: address, host: host})
-		}
-	}
-	return &http.Transport{
-		DialContext:           dialer.DialContext,
-		TLSHandshakeTimeout:   c.cfg.DialTimeout,
-		ResponseHeaderTimeout: c.cfg.DialTimeout,
-	}
+	return PolicyTransport(c.cfg.DialTimeout, c.egressPolicy())
 }
 
 // egressPolicy returns the outbound address policy for the members stream.

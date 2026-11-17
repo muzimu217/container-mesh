@@ -104,22 +104,32 @@ type DialOptions struct {
 	EgressPolicy func(net.Addr) error
 }
 
-// resolvedAddr is the address a host name resolved to, as the dialer sees
+// ResolvedAddr is the address a host name resolved to, as the dialer sees
 // it: the numeric address plus the original host name.
-type resolvedAddr struct {
+//
+// It lives here because this package is the one that hands a resolved
+// address to a policy callback, and the discovery package — which owns the
+// policy — was carrying a second copy of the same adapter. Two copies of
+// one adapter is one more thing to keep in step; the copy in discovery
+// also grew an IP() method that nothing ever called.
+//
+// The IP() method is gone with it: net.Addr needs only Network() and
+// String(), and the policy reads the numeric address out of String().
+type ResolvedAddr struct {
 	addr string
 	host string
 }
 
-func (a *resolvedAddr) Network() string { return "tcp" }
-func (a *resolvedAddr) String() string  { return a.addr }
+func (a *ResolvedAddr) Network() string { return "tcp" }
+func (a *ResolvedAddr) String() string  { return a.addr }
 
-func (a *resolvedAddr) IP() net.IP {
-	host, _, err := net.SplitHostPort(a.addr)
-	if err != nil {
-		host = a.addr
-	}
-	return net.ParseIP(host)
+// Host returns the host name the address was resolved from, when there
+// was one.
+func (a *ResolvedAddr) Host() string { return a.host }
+
+// NewResolvedAddr builds the adapter a policy callback receives.
+func NewResolvedAddr(address, host string) *ResolvedAddr {
+	return &ResolvedAddr{addr: address, host: host}
 }
 
 // Dial opens a client connection.
@@ -138,7 +148,7 @@ func Dial(ctx context.Context, opts DialOptions) (*Conn, error) {
 			if err != nil {
 				return fmt.Errorf("wsconn: egress policy: cannot parse %q: %w", address, err)
 			}
-			return policy(&resolvedAddr{addr: address, host: host})
+			return policy(NewResolvedAddr(address, host))
 		}
 	}
 	d := websocket.Dialer{
