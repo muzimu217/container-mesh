@@ -19,7 +19,7 @@
   <div class="card kpi"><div class="label">M4 收口</div><div class="value warn">干道数据面未做</div><div class="label">授权判定+开关已落地；转发未做</div></div>
   <div class="card kpi"><div class="label">传输 CLI</div><div class="value ok">直连 PASS</div><div class="label">真实WAN 10/10 link=direct · 18090</div></div>
   <div class="card kpi"><div class="label">Go 全量测试</div><div class="value ok">PASS</div><div class="label">19 packages</div></div>
-  <div class="card kpi"><div class="label">Race detector</div><div class="value ok">PASS</div><div class="label">-race exit 0 · 14:20Z</div></div>
+  <div class="card kpi"><div class="label">Race detector</div><div class="value ok">PASS</div><div class="label">-race exit 0 · 18:40Z · 连跑3次</div></div>
   <div class="card kpi"><div class="label">本地 e2e</div><div class="value ok">43/43</div><div class="label">rc=0 · 含 mkfifo 修复</div></div>
   <div class="card kpi"><div class="label">资源 KPI</div><div class="value ok">PASS</div><div class="label">RSS post-GC 12.0MB &lt; 15MB</div></div>
   <div class="card kpi"><div class="label">P-5b 优雅下线</div><div class="value ok">PASS</div><div class="label">公网实测 1128ms &lt; 3s</div></div>
@@ -198,10 +198,10 @@
 <tr><td>Android/iOS</td><td class="ok">gomobile 方案</td><td class="bad">未开始</td><td class="bad">未开始</td><td class="bad">无 APK/IPA</td><td class="bad">未验收</td><td>最小 binding + 真机单链路</td></tr>
 <tr><td>NAS/router</td><td class="warn">方向</td><td class="warn">部分 Linux</td><td class="warn">通用能力</td><td class="bad">无专用包</td><td class="bad">未验收</td><td>确定厂商/架构矩阵</td></tr>
 </tbody></table></article></section>
-<section class="section"><div class="section-head"><h2>门禁与证据</h2><p>当前本地批次 · 2026-11-17 10:50Z</p></div><div class="grid three"><article class="card"><h3>Go CI</h3><div class="evidence">gofmt        PASS · 10:50Z
-go vet ./...  PASS · 10:50Z
-go build ./... PASS · 10:50Z
-go test ./... -race (19 包) PASS · 10:50Z
+<section class="section"><div class="section-head"><h2>门禁与证据</h2><p>当前本地批次 · 2026-11-17 18:40Z</p></div><div class="grid three"><article class="card"><h3>Go CI</h3><div class="evidence">gofmt        PASS · 18:40Z
+go vet ./...  PASS · 18:40Z
+go build ./... PASS · 18:40Z
+go test ./... -race (19 包) PASS · 18:40Z · 连跑3次 0/0/0 失败
 </div></article><article class="card"><h3>端到端与安装</h3><div class="evidence">tests/run-tests.sh --quick
 通过 43, 失败 0 · rc=0
 packaging/install_test.sh rc=0
