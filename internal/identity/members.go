@@ -15,11 +15,23 @@ import (
 )
 
 // Member is one device's standing in the network.
+//
+// There is deliberately no Endpoints field. It used to be one, and it was
+// ALWAYS empty: nothing in the tree ever wrote it, and the only two
+// mentions were the declaration and the renewal path copying the old (also
+// empty) value forward.
+//
+// A field that looks like it holds the member's addresses but never does
+// is worse than no field: a reader would conclude "this member has no
+// endpoints, so it cannot be dialed" — which is wrong for every member that
+// announced one. The addresses a member announced live in the discovery
+// node's own view (discovery.Node.endpts), and reach the clients through the
+// verified snapshot (discovery.OnlineMember.Endpoints). The member list
+// is the IDENTITY layer: who belongs, not where they are right now.
 type Member struct {
-	Cert      DeviceCert `json:"cert"`
-	AddedAt   time.Time  `json:"added_at"`
-	Endpoints []string   `json:"endpoints,omitempty"`
-	LastSeen  time.Time  `json:"last_seen"`
+	Cert     DeviceCert `json:"cert"`
+	AddedAt  time.Time  `json:"added_at"`
+	LastSeen time.Time  `json:"last_seen"`
 }
 
 // MemberList is the network's source of truth for who belongs.
@@ -158,7 +170,7 @@ func (m *MemberList) Add(c DeviceCert) error {
 	if old, ok := m.Members[c.DeviceID]; ok {
 		// Same key and account: a re-issue after renewal. Refresh it.
 		if old.Cert.DevicePub.Equal(c.DevicePub) && old.Cert.AccountID == c.AccountID {
-			m.Members[c.DeviceID] = Member{Cert: c, AddedAt: old.AddedAt, Endpoints: old.Endpoints, LastSeen: old.LastSeen}
+			m.Members[c.DeviceID] = Member{Cert: c, AddedAt: old.AddedAt, LastSeen: old.LastSeen}
 			m.Version++
 			return nil
 		}
