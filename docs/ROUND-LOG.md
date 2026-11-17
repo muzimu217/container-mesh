@@ -1323,3 +1323,27 @@ LEAVE 那笔的 CI 红了。**红的是一个早就存在的测试**（`TestTran
 
 **本轮推送补充**：`44204c2` fix(discovery)（限流判定按状态码）。
 
+### Round 62（2026-11-17 · 值守：架构测绘报出「干道控制面空转」+ 四处重复实现收敛）
+
+**★ 本轮最重要的发现（架构测绘代理报出，值守独立 grep 核实属实）**
+**全仓没有任何一处给 `cfg.Picker` 赋值**（`grep -rn "Picker:" internal/ | grep -v _test` **零命中**）。后果三条：① `route.go:161` 的 `if cfg.Picker == nil { return DialDirect(...) }` 让**「成员检查在 picker 之前」那段（route.go:171-175）在生产中永不执行**——实际生效的成员检查只有 `direct.go:724` 那一处；② `dialPath` 的 `PathRelay` 分支**零产生点**；③ `relaytrunk.go` 的 `Decide`/`AnswerFrame`/`InstalledRelayTrunk()` **零生产调用**（唯一写入点 `cli/discovery.go:823`），**第 0 笔的授权状态机今天一行也跑不到**。
+**含义（诚实记下）**：上一轮把「成员检查在 picker 之前」当作**已落地的安全属性**讨论，那个假设**不成立**——它是一条**设计正确但尚未接线**的规则。**安全属性要等接线后才真正成立。**
+**已做**：值守**立即通知**正在施工的数据面代理，把「接线 picker」并入任务范围，并给出**回归风险警告**（一旦 `cfg.Picker != nil` 就走 `tryPaths`，**直连失败后必须真的回落到 relay**，否则**现在能工作的直连会变成报错**）。
+**顺带纠正测绘代理的一处误报**：它说 `cli/discovery.go:824` 的「carries relays between members」文案不成立——**误报**，实际文案含「(authorization only so far: no bytes are forwarded yet)」，已写明只做授权。
+
+**★ 四处重复实现收敛（测绘清单 + 值守自己动手）**
+1. **出网策略的 resolved-address 适配器**：测绘清单写「两份」，**实际三份**（`discovery/egress.go` + `discovery/client.go` + `wsconn/wsconn.go`），**且已漂移**：wsconn 那份带一个**从未被调用**的 `IP()` 方法。现统一到 `wsconn`，死方法一并去掉。
+2. **出站 HTTP transport**：客户端的 register 路径原本带自己的 dialer 副本，唯一差别是策略可关（`AllowLocalDiscovery`）——差别现在是**一个构造函数的参数**，两条路径不会再漂移（**R56 的 SSRF 发现正是第二份副本会招致的漂移**）。
+3. **`identity.Member.Endpoints`**（死字段）：**声明了但从来没有写入过**——全树只有两处提及：声明本身，和续期路径把旧的（同样为空的）值原样拷贝。**「看起来装着成员地址、实际永远空」的字段比没有字段更糟**：读它的人会得出「该成员没有端点、不可拨号」的结论——**对每个 announce 过端点的成员都是错的**。地址在发现节点自己的视图里（`discovery.Node.endpts`），经**已验证的快照**到达客户端；名册是**身份层**（谁属于这个网）。**测试的一个教训**：第一版守卫写成 **JSON 层**（检查序列化后有没有 "endpoints" 键），**永远绿**——那字段带 `omitempty`，空值不上线；改成**类型层**（反射查字段名 + 字段数）才真正抓住。
+4. **证书过期判定五处** → `DeviceCert.Expired(now)` 一处。**副本已经漂移**：有的比 `time.Now().UTC()`、有的比调用方已捕获的 `now`——**快照构建器可能发布一个 resolver 马上要拒绝的成员**。
+
+**★ 撤销识别改为看状态码**
+客户端原来用 `strings.Contains(err.Error(), "not a member")` 判断撤销，**把行为耦合到服务端文案**：改一个字，客户端就静默地不再认识撤销，转而告诉运维「去查你的路由」。服务端本来就用 401 回答非成员，状态码已在类型化错误上——正解现成。**红→绿已证**（改回文本匹配 → 测试立刻红）。
+
+**门禁（这一轮特别加了「连跑三次」）**
+`gofmt`/`vet`/`build` 干净 · **`go test ./... -race -count=1` 连跑 3 次，失败数 0/0/0** · e2e **43/0** · 安装器回归过。**为什么加连跑三次**：这一轮值守侧观察到全仓有**负载相关的 flake**——**基线也会随机红**（`TestLivenessSurvivesTraffic` / `TestServeDiscoverySIGTERMExitsZero` / `TestBatchSurvivesLoss`，但每次红的**不是同一批**）。用 stash 对比确认了「基线也红」才排除了自己改动引入回归。**教训：本地全绿 + CI 红，先怀疑 flake，再怀疑自己。**
+
+**Hub**：oh-no 回报 PASS（`bfbe1f9` 无回退，e2e 43/0）；doubao 静默 6.8h 已发**具体催办**（限流判定复核 + 真实公网 bench @18090）；水位推进到 `16:34:06Z`。
+
+**本轮推送**：`660cdef` refactor(identity)（删死字段）· `e525d91` refactor(discovery)（适配器+transport 收敛）· `ed84f86` fix(cli)（撤销判定按状态码）· `f404612` refactor(identity)（过期判定收敛）。
+
