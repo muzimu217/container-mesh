@@ -1295,3 +1295,21 @@ R58/R59 的探针用 4500/39200（没开的端口），得出「安全组完全�
 
 **本轮推送**：`c896cfb` fix(mesh)（bench 帧跨读超时）。
 
+### Round 61（2026-11-17 · 值守：P-5b 优雅下线 + 干道第 0 笔 + @info 字段修正）
+
+**★ 本轮把「底层核心传输 CLI」的三个真实缺口补上了**（P-5b 优雅下线、P-7 配额尚未接线但干道授权已就位、@info version 字段）
+
+**P-5b 优雅下线（显式 LEAVE 广播）——从零实现，真实公网实测 PASS**
+此前 `grep -rn "LEAVE" internal/` **零命中**：P-5b 完全没实现（异常掉线 P-5 靠断连检测已达标，但主动退出没有任何通知机制）。**关键设计**：LEAVE 走 **announce 的签名变体**（`MemberAnnounce` 加 `Leave`/`Session`/`View`），**零 relay 改动**——announce 路径本来就被节点鉴权、限流、推送；新开 `/mesh/leave` 端点要动 stage-1 冻结区，不做。**签名覆盖 LEAVE 字段**（抓包改不成离场消息）；**`omitempty`** 保证正常 announce 字节一字不变（老锚点验新客户端心跳，新锚点验老客户端）；**session 机制**防重连竞争（离场只结束当前 session，旧 session 的迟到离场不误杀活成员；session 只前进）；**离场结束 presence 不结束 membership**（离开的仍是成员）；**幂等**；**投递失败上报为错误**（降级到断开检测仍收敛）。
+**真实公网实测**（锚点 18090，当前 HEAD）：SIGTERM → 锚点视图 **1128 ms**（预算 3s）标 offline，客户端日志 `left the network (LEAVE broadcast sent)`；**对照 kill -9 = 1010 ms**。**诚实说明**：本场景两者相当（收敛由连接断开主导），LEAVE 的独立价值在于走**独立 HTTP 路径**（与常驻 WS 流无关，WS 卡住时仍能送达）+ 降级不丢。单测 **11 条全绿**（广播收敛 2.5ms、丢失降级 957µs）。
+
+**干道第 0 笔（中转方授权判定 + 开关）——按网主裁定施工**
+`internal/mesh/relaytrunk.go`：判据顺序刻意为「① 请求方是成员 → ② 目标是成员 → ③ 开关开着 → ④ 非自环 → ⑤ 单跳」。**成员检查在转发之前**（F-3 教训）；**成员检查在开关检查之前**——这样「不是成员」的答案与本地策略无关，**名册状态不可枚举**（已撤销与从未入网者答案相同，我独立复核了代理的设计）。新哨兵 `ErrRelayTrunkDisabled` 与 `ErrAuth` 可区分。`Path` 加 `ViaEndpoints`/`Hops`；`dialPath` relay 分支仍返回 `ErrRelayUnavailable`（数据面下一笔）。**帧类型只追加末尾**（19/20），既有 18 帧线上编号一字未动。`--relay-trunk` **默认关**，接到**活成员列表**（撤销后下一个请求立即被拒）。**真机验证**：锚点打印 `relay trunk: off`。测试 12 条 + **三次变异检查**（删成员检查/对调顺序/开关不生效）全部被抓住。**明确未做**：数据面转发、push-open、「已有中转流 1 秒内拆」（只做到「新请求立即被拒」）、多跳择路、配额计量、跨账号、SIGMA E2E 层。
+
+**@info 的 version 字段（外部测试员两轮报的观察项）**
+原来 `runtime.Version()`（Go 工具链）同时打进 `version` 和 `go`——「version go1.27.4」对运维零信息量且字段名误导。现 `version` = cmesh 构建、`go` = 工具链。**循环依赖处理**：版本串在 `internal/cli.Version`（ldflags 打戳处），但 cli 已 import mesh → mesh 不能 import cli → 新建 `internal/version` 包做单一来源，cli 在 `init()` 交接，**ldflags 路径不变**。红→绿已证；**真实公网端到端**（打戳 `v1.0.0-rc1`）：`version v1.0.0-rc1` / `go go1.27.2`。
+
+**★ 一条被撤回的自查结论**：我一度怀疑「成员检查在开关检查之前」会泄露名册状态（已撤销设备得 `ErrAuth`、有效成员得 `ErrRelayTrunkDisabled`）。**复核后不成立**：区别只在「有效 vs 无效」，而设备本来就知道自己是不是成员；已撤销与从未入网者得到**相同**答案 → **名册不可枚举**。代理的设计是对的，我把这条复核过程也记下来。
+
+**本轮推送**：`bfbe1f9` fix(mesh)（@info version）、`4721ceb` feat(mesh)（干道授权 + 开关）、`6ca6a18` feat(discovery)（LEAVE 广播）。
+

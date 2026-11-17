@@ -13,15 +13,16 @@
 <main class="wrap">
 <header class="top">
   <div><div class="eyebrow">container-mesh / daily delivery board</div><h1 class="title">项目进度与路线看板</h1><p class="sub">每天看这里：当前开发完成到哪一步、门禁是否全绿、哪个平台真的能安装运行、下一步由谁推进。状态按代码和测试证据记录。</p></div>
-  <div class="stamp">看板更新<br><strong id="updated">2026-11-17 14:35Z</strong><br>远端 develop<br><strong>c896cfb</strong><br>真实 WAN 数据面全通(18090) · bench WAN 缺陷已修 · 干道第0笔施工中<br><strong>四线全活 · RSS 改判 PASS 12.0MB</strong></div>
+  <div class="stamp">看板更新<br><strong id="updated">2026-11-17 16:45Z</strong><br>远端 develop<br><strong>6ca6a18</strong><br>P-5b 优雅下线已实现(公网1128ms) · 干道第0笔已落地 · @info已修<br><strong>四线全活 · RSS PASS 12.0MB</strong></div>
 </header>
 <section class="grid kpis">
-  <div class="card kpi"><div class="label">M4 收口</div><div class="value warn">干道施工中</div><div class="label">直连 CLI 全 PASS；中转第0笔施工中</div></div>
+  <div class="card kpi"><div class="label">M4 收口</div><div class="value warn">干道数据面未做</div><div class="label">授权判定+开关已落地；转发未做</div></div>
   <div class="card kpi"><div class="label">传输 CLI</div><div class="value ok">直连 PASS</div><div class="label">真实WAN 10/10 link=direct · 18090</div></div>
   <div class="card kpi"><div class="label">Go 全量测试</div><div class="value ok">PASS</div><div class="label">19 packages</div></div>
   <div class="card kpi"><div class="label">Race detector</div><div class="value ok">PASS</div><div class="label">-race exit 0 · 14:20Z</div></div>
   <div class="card kpi"><div class="label">本地 e2e</div><div class="value ok">43/43</div><div class="label">rc=0 · 含 mkfifo 修复</div></div>
   <div class="card kpi"><div class="label">资源 KPI</div><div class="value ok">PASS</div><div class="label">RSS post-GC 12.0MB &lt; 15MB</div></div>
+  <div class="card kpi"><div class="label">P-5b 优雅下线</div><div class="value ok">PASS</div><div class="label">公网实测 1128ms &lt; 3s</div></div>
   <div class="card kpi"><div class="label">性能研究</div><div class="value info">P-3 空闲达标</div><div class="label">216–262 MiB/s · WAN 口径待测</div></div>
 </section>
 <section class="section" id="milestones">
@@ -165,6 +166,7 @@
     <div class="day"><h3>2026-11-16 · 外部复测与文档校正 <span class="pill green">PASS / 已修正</span></h3><p>oh-no 对 8c84e73 全项 PASS 无回退；kuku/netns 连续两轮无回应，已升级为广播催办。MESH-DESIGN §1.2 把 4 个不存在的文件当作已有文件列出，已加状态列写明当前 mesh 只有直连 QUIC。</p></div>
     <div class="day"><h3>2026-11-16 · 性能代理回报 + F-1 热推送修复 <span class="pill blue">已推送 · CI 全绿</span></h3><p>性能代理定位 7 项发现。最重的一项是真缺陷：旧订阅 channel 被 close 后永远可读，旧流陷入「推快照→立即再推」热循环——已修（消费侧检查 ok），红→绿已证，并由代理独立 lab 验证 1,343,108 B/s → 151.1 B/s（−99.99%）。同时定位了 P-3 吞吐不动的真正原因（分配只占采样 1.4%，瓶颈在 quic-go syscall 与拷贝），以及 WAN 丢包下 Cubic 的崩塌效应（0.5% 丢包 → 1.2 MiB/s）。</p></div>
     <div class="day"><h3>2026-11-16 · F-1 四方验证 + 端点 fallback 修复 + 资源 KPI 口径厘清 <span class="pill blue">已推送 · CI 全绿</span></h3><p>F-1 至此四方独立验证闭环（本会话 / 性能代理 lab / doubao / oh-no，缺陷版 100KB/s 不收敛 vs 修复版 12 B）。新修一个真缺陷：多端点 fallback 因复用同一 UDP socket + quic-go single-use Transport 而整体失效（第一次失败后后续端点全在已关闭 socket 上拨号）。资源 KPI 从「未达标」改记「达标」——本会话 150 秒实测稳态 7.7–9.7 MB（&lt;15 MB 目标），netns 的 75,268 KB 是 pre-GC 相位。另修正两条旧结论：systemd unit 其实存在（但有 5 处缺口，已修）、发布资产其实内嵌 VCS 信息（来源可复现，只是没写进仓库）。</p></div>
+    <div class="day"><h3>2026-11-17 · P-5b 优雅下线 + 干道第0笔 + @info 修正 <span class="pill green">已推送 · 真实公网实测</span></h3><p><b>P-5b 优雅下线从零实现</b>（此前 <code>grep LEAVE internal/</code> 零命中）：LEAVE 走 <b>announce 的签名变体</b>，零 relay 改动；签名覆盖离场字段、<code>omitempty</code> 保向后兼容、session 机制防重连竞争。真实公网实测 <b>1128ms</b>（预算 3s，kill -9 对照 1010ms）；单测 11 条全绿。<b>干道第 0 笔</b>按裁定落地：中转方授权判定（成员检查在转发之前、且在开关之前 → 名册不可枚举）+ <code>--relay-trunk</code> 开关默认关 + 帧类型只追加末尾。<b>@info</b> 的 version 字段改报 cmesh 构建（原来报 Go 工具链，外部测试员两轮报过）。</p></div>
     <div class="day"><h3>2026-11-17 · 端口事实修正 + 真实 WAN 数据面全通 + bench WAN 缺陷修复 <span class="pill green">已推送 · 四线全活</span></h3><p><b>R58/R59 的「安全组挡住所有入站 UDP」是测错了端口</b>——网主早开过 <b>18090</b>，探针却用了没开的 4500/39200。三端口同窗对照实测：<b>18090 收到 UDP</b>（两次可复现），4502/4500 收不到；当前 HEAD 完整链路在 18090 上 <b>10/10 ping、0 丢、link=direct</b>（p50 76ms）。同一条真实链路抓到并修复了一个<b>只在公网出现</b>的 bench 缺陷（读超时截断帧 → <code>invalid bench frame size</code>；A/B 旧客户端 <b>4/4 全败</b>→新通过，<code>c896cfb</code>）。<b>网主裁定落地</b>：干道中转方=有公网IP的锚点+开关（默认关），已写入 R-3.2/D73，第 0 笔施工中。四线全活：kuku（穿透已拒/43-0/SIGTERM 25轮未复现）、netns（<b>RSS 改判 PASS 12.0MB</b>/反向判据定案）、oh-no/doubao（PASS）。</p></div>
     <div class="day"><h3>2026-11-17 · mkfifo e2e 缺陷 + socket 释放 + ECN 撤回 <span class="pill green">远端 CI 全绿</span></h3><p>外部测试员报告的 <code>mkfifo</code> 依赖经值守独立复现（禁 mkfifo 环境 → <b>通过 42, 失败 1</b>）并修复为普通管道（修后 <b>43/0</b>）——此前每个容器化代理都跑不了完整 CI 路线。架构测绘代理报的「QUIC 连接泄漏」被值守复核<b>降级</b>为「非确定性释放」（GC finalizer 会收），但 4 条错误路径漏关 + socket 无主仍属真实问题，已修（<code>Link</code> 持有 socket，红→绿：去 GC 后 6→7 / 8→9 红 → 0.01s 绿）。另<b>撤回</b> R58 的 ECN 差 1 解释（实为 MTU 探测包），撤回内容保留可见。</p></div>
     <div class="day"><h3>2026-11-16 · 安全缺口修复 + relay CPU −71% <span class="pill blue">已推送 · CI 全绿</span></h3><p>kuku 回归发现<strong>出口地址策略只实现了一半</strong>：拒绝字面私网 IP，但解析后的地址无人复核，裸 net.Dialer 让「解析到回环的主机名」直连——SSRF 形态（kuku 实测穿透成功）。现经 Dialer.Control 在 DNS 后、连接前复核，逃生口用 build tag 隔离、出货二进制无此路径。性能代理另发现 relay 前向循环从未采用 RecvInto 扩容后的缓冲（真实消息平均 493KiB，是常态），makeslicecopy 占 relay CPU 23.73% → 修复后 CPU 中位 −71%。同一代理还推翻了上一轮两处结论：quic-go 暴露的是每连接丢包计数（度量前提已打开）、拥塞控制是 <strong>Reno 不是 Cubic</strong>。</p></div>
