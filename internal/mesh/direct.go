@@ -241,11 +241,21 @@ func (a SnapshotAdapter) KeyFor(id identity.DeviceID) (ed25519.PublicKey, error)
 
 // quicConfig returns the acceptance-mandated transport settings (see the
 // package comment).
+//
+// The Tracer hook is what makes the QUIC-level loss accounting observable:
+// quic-go creates the tracer ONCE PER CONNECTION (transport.go:294 for the
+// client, server.go:709 for the server), and the hook stores the loss
+// tracker under the connection's tracing id. See lossstat.go.
+//
+// quicConfig() is the ONLY place a quic.Config is built for the direct path,
+// and it is shared by quic.Dial (direct.go:838) and quic.Listen
+// (direct.go:373) — so both ends of a direct link are instrumented by one
+// hook, and the relay path (WebSocket, no QUIC) is untouched by it.
 func quicConfig() *quic.Config {
-	return &quic.Config{
+	return tracingConfig(&quic.Config{
 		MaxIdleTimeout:  10 * time.Second,
 		KeepAlivePeriod: 3 * time.Second,
-	}
+	})
 }
 
 // deviceTLS builds the mTLS config for one side of a direct link.
@@ -457,7 +467,7 @@ func (l *Listener) handle(conn *quic.Conn) {
 		if err != nil {
 			return
 		}
-		if err := l.serveStream(peerID, st); err != nil {
+		if err := l.serveStream(peerID, conn, st); err != nil {
 			// Close only the STREAM (graceful: pending error lines flush to
 			// the peer) and keep accepting — tearing the connection here
 			// would discard an error verdict the dialer is still waiting to
@@ -475,8 +485,11 @@ func (l *Listener) handle(conn *quic.Conn) {
 // The transport-specific part (the QUIC stream) stops at this function:
 // everything below it works on a Session, so the same session body serves
 // a direct link and a relayed link.
-func (l *Listener) serveStream(peerID identity.DeviceID, st *quic.Stream) error {
-	return l.serveSession(peerID, quicSession{st: st})
+//
+// conn is carried into the session so a handler can reach the QUIC
+// connection-level loss accounting (see quicSession.Loss).
+func (l *Listener) serveStream(peerID identity.DeviceID, conn *quic.Conn, st *quic.Stream) error {
+	return l.serveSession(peerID, quicSession{st: st, conn: conn})
 }
 
 // serveSession is the transport-agnostic session entry point: it reads the
@@ -866,7 +879,7 @@ func dialOneRaw(ctx context.Context, addr *net.UDPAddr, cfg DialConfig, tlsCfg *
 		return nil, newRefused("listener refused: %s", ackLine)
 	}
 	_ = st.SetReadDeadline(time.Time{})
-	return &Link{qc: qc, st: st, sess: quicSession{st: st}, br: br}, nil
+	return &Link{qc: qc, st: st, sess: quicSession{st: st, conn: qc}, br: br}, nil
 }
 
 // Link is an established, mutually-authenticated direct link.
@@ -1036,6 +1049,14 @@ func (l *Link) Session() Session { return l.sess }
 
 // Reader exposes the buffered reader positioned after the handshake.
 func (l *Link) Reader() *bufio.Reader { return l.br }
+
+// Loss reports the QUIC-level loss accounting of this link's connection, or
+// nil when the connection could not be instrumented.
+//
+// The number is per-CONNECTION: quic-go exposes no per-stream loss counter.
+// A bench session carries exactly one stream on its own connection, so the
+// two coincide there.
+func (l *Link) Loss() *BenchLoss { return lossOf(l.qc) }
 
 // Close tears the link down.
 func (l *Link) Close() error { return l.qc.CloseWithError(0, "bye") }

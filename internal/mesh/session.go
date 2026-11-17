@@ -55,6 +55,10 @@ type Session interface {
 // the business layer.
 type quicSession struct {
 	st *quic.Stream
+	// conn is the QUIC connection the stream belongs to. It is nil for a
+	// synthetic stream (tests). It is carried so that a session handler can
+	// reach the connection-level QUIC accounting — see Loss() below.
+	conn *quic.Conn
 }
 
 func (s quicSession) Read(p []byte) (int, error)  { return s.st.Read(p) }
@@ -66,3 +70,21 @@ func (s quicSession) Close() error { return s.st.Close() }
 
 func (s quicSession) SetReadDeadline(t time.Time) error  { return s.st.SetReadDeadline(t) }
 func (s quicSession) SetWriteDeadline(t time.Time) error { return s.st.SetWriteDeadline(t) }
+
+// Loss reports the QUIC-level loss accounting of the connection this session
+// runs on, or nil when the session has no connection behind it.
+//
+// This is NOT part of the Session interface on purpose: a Session is a
+// byte stream, and loss accounting is a transport concern. It lives on an
+// OPTIONAL interface (see lossReporter in bench.go) so a relayed session —
+// which has no QUIC connection of its own — can simply not implement it.
+//
+// The number is per-CONNECTION, not per-STREAM: quic-go exposes no
+// per-stream loss counter. A bench session carries exactly one stream on its
+// own connection, so the two coincide there.
+func (s quicSession) Loss() *BenchLoss {
+	if s.conn == nil {
+		return nil
+	}
+	return lossOf(s.conn)
+}

@@ -12,6 +12,8 @@ import (
 	"fmt"
 	"io"
 	"time"
+
+	"github.com/quic-go/quic-go"
 )
 
 // BenchConfig describes one bidirectional direct-link benchmark. Size applies
@@ -23,13 +25,112 @@ type BenchConfig struct {
 }
 
 // BenchStats reports application bytes moved by a completed benchmark.
-// QUIC retransmits below this stream, but quic-go does not expose a stable
-// per-stream retransmission counter, so Retransmissions is nil by design.
+//
+// Loss accounting: quic-go exposes no per-STREAM retransmission counter, but
+// it does expose per-CONNECTION loss accounting (ConnectionStats().PacketsLost
+// and the ConnectionTracer.LostPacket hook). A bench session runs on a
+// dedicated QUIC connection carrying exactly one stream, so the
+// per-connection loss count IS the loss this bench stream suffered.
+//
+// The field is named PacketsLost, NOT Retransmissions, on purpose: the
+// number quic-go reports is the count of packets DECLARED LOST, which is not
+// the same as the count of packets retransmitted. A packet declared lost may
+// turn out to have been merely reordered and later arrive (quic-go calls
+// those spurious losses, and they are reported separately). The old name
+// "Retransmissions" therefore promised a quantity the number does not
+// deliver, and callers that trusted it would over-count recovery work.
+//
+// PacketsLost holds the connection's declared-lost packet count when the
+// link could be instrumented, and nil when it could not (for example when
+// the peer answered on a connection this process did not dial). nil means
+// "not measured" — it is NOT zero.
 type BenchStats struct {
-	SentBytes       int64
-	ReceivedBytes   int64
-	Duration        time.Duration
-	Retransmissions *uint64
+	SentBytes     int64
+	ReceivedBytes int64
+	Duration      time.Duration
+	// PacketsLost is the number of QUIC packets the local side's
+	// connection declared lost. Per-CONNECTION, not per-stream.
+	PacketsLost *uint64
+	// Loss carries the full per-connection loss picture of the LOCAL side
+	// (the packets this side sent that quic-go declared lost). It is nil
+	// when the connection could not be instrumented.
+	Loss *BenchLoss
+	// PeerLoss carries the ANSWERING side's loss picture, as reported by
+	// the peer over the bench stats frame. It is nil when the peer did not
+	// report one.
+	PeerLoss *BenchLoss
+}
+
+// BenchLoss is the per-connection QUIC loss picture of one bench session.
+//
+// All counters come from quic-go: the tracer hooks (LostPacket,
+// DetectedSpuriousLoss, LossTimerExpired) and ConnectionStats().
+type BenchLoss struct {
+	// PacketsLost is the number of packets quic-go declared lost, as
+	// counted by the congestion controller (ConnectionStats). It is the
+	// count that actually drove the congestion window down.
+	PacketsLost uint64 `json:"packets_lost"`
+	// BytesLost is the number of bytes quic-go declared lost.
+	BytesLost uint64 `json:"bytes_lost"`
+	// TracerLost is the number of LostPacket tracer events. It is an
+	// INDEPENDENT count of the same loss events (tracer path vs
+	// ConnectionStats path), so the two cross-check each other.
+	//
+	// The tracer counts slightly MORE than PacketsLost in one case: a
+	// Path-MTU probe packet that is declared lost fires the tracer hook but
+	// never reaches the congestion controller
+	// (quic-go/internal/ackhandler/sent_packet_handler.go:789-790 skips
+	// path probes for OnCongestionEvent). So TracerLost >= PacketsLost,
+	// and the difference is the number of path-probe losses.
+	TracerLost uint64 `json:"tracer_lost"`
+	// TracerLostTimeThreshold / TracerLostReordering split TracerLost by
+	// the reason quic-go reported: a time-threshold loss is a packet the
+	// timer gave up on, a reordering-threshold loss is a packet the peer's
+	// ACK pattern declared missing.
+	TracerLostTimeThreshold uint64 `json:"tracer_lost_time_threshold"`
+	TracerLostReordering    uint64 `json:"tracer_lost_reordering"`
+	// SpuriousLost is the subset of declared-lost packets that was later
+	// acknowledged (reordering, not real loss).
+	SpuriousLost uint64 `json:"spurious_lost"`
+	// PTOCount is the number of probe-timeout expirations (loss detected by
+	// timer rather than by an ACK threshold).
+	PTOCount uint64 `json:"pto_count"`
+	// LossTimerCount is the number of ACK-threshold loss-timer expirations.
+	LossTimerCount uint64 `json:"loss_timer_count"`
+	// ECNCongested is the number of times the ECN state machine reached
+	// "capable" on this path. ECN congestion is a cwnd cutback WITHOUT a
+	// packet loss, so it is counted separately from PacketsLost.
+	ECNCongested uint64 `json:"ecn_congested"`
+	// PacketsSent / PacketsReceived are quic-go's own packet counters.
+	PacketsSent     uint64 `json:"packets_sent"`
+	PacketsReceived uint64 `json:"packets_received"`
+	BytesSent       uint64 `json:"bytes_sent"`
+	BytesReceived   uint64 `json:"bytes_received"`
+	// MinRTT / SmoothedRTT are quic-go's RTT estimates at the end of the run.
+	MinRTT      time.Duration `json:"min_rtt_ns"`
+	SmoothedRTT time.Duration `json:"smoothed_rtt_ns"`
+	// CwndMin / CwndMax are the smallest and largest congestion window
+	// quic-go reported during the run (bytes). CwndSamples is the number of
+	// observations.
+	CwndMin  uint64 `json:"cwnd_min"`
+	CwndMax  uint64 `json:"cwnd_max"`
+	CwndMean uint64 `json:"cwnd_mean"`
+	CwndLast uint64 `json:"cwnd_last"`
+	// CwndSamples is the number of congestion-window observations.
+	CwndSamples uint64 `json:"cwnd_samples"`
+	// InFlightMean / InFlightMax are the bytes in flight (the sender's own
+	// outstanding, unacknowledged data). InFlightMean / CwndMean is the
+	// "is the pipe full?" ratio: at 1.0 the flow is congestion-window
+	// limited; well below 1.0 the sender is blocked by something else
+	// (flow control, the application, the peer's read rate) and a bigger
+	// congestion window would not help.
+	InFlightMean uint64 `json:"in_flight_mean"`
+	InFlightMax  uint64 `json:"in_flight_max"`
+	// PeerStreamWindow / PeerConnWindow are the flow-control windows the
+	// PEER advertised for our data. They limit what this side may send,
+	// independently of the congestion window.
+	PeerStreamWindow uint64 `json:"peer_stream_window"`
+	PeerConnWindow   uint64 `json:"peer_conn_window"`
 }
 
 const (
@@ -48,6 +149,88 @@ type benchRequest struct {
 type benchWireStats struct {
 	SentBytes     int64 `json:"sent_bytes"`
 	ReceivedBytes int64 `json:"received_bytes"`
+	// Loss carries the answering side's per-connection loss picture, so the
+	// dialer can report BOTH directions' loss, not just its own.
+	//
+	// omitempty keeps the wire format backward compatible: an older peer
+	// ignores the field, and a newer peer reading an older frame gets nil
+	// (meaning "not measured") rather than a fabricated zero.
+	Loss *BenchLoss `json:"loss,omitempty"`
+}
+
+// lossReporter is the OPTIONAL capability a session may have: it can report
+// the QUIC-level loss accounting of the connection it runs on.
+//
+// It is an optional interface rather than a Session method because a
+// Session is a byte stream and loss accounting is a transport concern. A
+// relayed session has no QUIC connection of its own and simply does not
+// implement it — the bench then reports "no loss data" instead of a
+// fabricated zero.
+type lossReporter interface {
+	Loss() *BenchLoss
+}
+
+// lossOf builds the BenchLoss picture for one QUIC connection, or nil when
+// the connection cannot be instrumented.
+//
+// Two independent sources are combined:
+//
+//   - quic-go's own ConnectionStats() (per-connection PacketsLost etc.),
+//     which the congestion controller maintains; and
+//   - the tracer counters installed by tracingConfig.
+//
+// The two count the same events through different code paths. They differ
+// only for Path-MTU probe losses (tracer counts them, the congestion
+// controller does not) and for ECN congestion events (the congestion
+// controller counts them, the tracer's LostPacket hook does not).
+func lossOf(conn *quic.Conn) *BenchLoss {
+	if conn == nil {
+		return nil
+	}
+	tracker := trackerForConn(conn)
+	if tracker == nil {
+		return nil
+	}
+	s := tracker.read(conn)
+	return &BenchLoss{
+		PacketsLost:             s.PacketsLost,
+		BytesLost:               s.BytesLost,
+		TracerLost:              s.TracerLost,
+		TracerLostTimeThreshold: s.TracerLostTimeThreshold,
+		TracerLostReordering:    s.TracerLostReordering,
+		SpuriousLost:            s.Spurious,
+		PTOCount:                s.PTO,
+		LossTimerCount:          s.LossTimer,
+		ECNCongested:            s.ECNCongested,
+		PacketsSent:             s.PacketsSent,
+		PacketsReceived:         s.PacketsReceived,
+		BytesSent:               s.BytesSent,
+		BytesReceived:           s.BytesReceived,
+		MinRTT:                  s.MinRTT,
+		SmoothedRTT:             s.SmoothedRTT,
+		CwndMin:                 s.CwndMin,
+		CwndMax:                 s.CwndMax,
+		CwndMean:                cwndMean(s),
+		CwndLast:                s.CwndLast,
+		CwndSamples:             s.CwndSamples,
+		InFlightMean:            s.InFlightMean,
+		InFlightMax:             s.InFlightMax,
+		PeerStreamWindow:        s.PeerStreamWindow,
+		PeerConnWindow:          s.PeerConnWindow,
+	}
+}
+
+// cwndMean computes the mean observed congestion window.
+//
+// The mean is the number that matters for a cwnd-limited flow: the classic
+// bound is throughput <= cwnd / RTT, and the MEAN cwnd is what the flow
+// actually operated at across the run. The min is the worst single
+// observation, the max the best one.
+func cwndMean(s lossSnapshot) uint64 {
+	if s.CwndSamples == 0 {
+		return 0
+	}
+	return s.CwndSum / s.CwndSamples
 }
 
 // RunBench opens a separate authenticated direct-link stream and moves Size
@@ -85,7 +268,22 @@ func RunBench(ctx context.Context, cfg DialConfig, bench BenchConfig) (BenchStat
 	}
 	_ = link.Session().SetReadDeadline(time.Time{})
 
-	return runBenchStream(ctx, link.Session(), link.br, bench)
+	stats, err := runBenchStream(ctx, link.Session(), link.br, bench)
+	if err != nil {
+		return BenchStats{}, err
+	}
+	// The loss picture is read AFTER the transfer, so it covers every
+	// retransmission the transfer needed.
+	//
+	// ConnectionStats() is readable at any moment — it is a set of atomic
+	// counters (quic-go/internal/utils/connstats.go), not a value frozen at
+	// connection close — so no close/wait dance is needed here.
+	stats.Loss = link.Loss()
+	if stats.Loss != nil {
+		lost := stats.Loss.PacketsLost
+		stats.PacketsLost = &lost
+	}
+	return stats, nil
 }
 
 func validateBenchConfig(cfg BenchConfig) error {
@@ -179,7 +377,23 @@ func runBenchStream(ctx context.Context, st Session, br *bufio.Reader, cfg Bench
 			if err := <-sendDone; err != nil {
 				return BenchStats{}, fmt.Errorf("mesh: send bench data: %w", err)
 			}
-			wire, err := json.Marshal(benchWireStats{SentBytes: cfg.Size, ReceivedBytes: received})
+			// Report OUR OWN loss picture alongside the byte counts, so the
+			// dialer can see BOTH directions' loss from one number set.
+			//
+			// The snapshot is taken right here: our own send direction is
+			// finished (sendDone was awaited above), so every packet we
+			// sent has either been acked or declared lost by now. The
+			// dialer reads its OWN side again after the whole exchange, so
+			// the dialer's number is the more complete one.
+			var localLoss *BenchLoss
+			if lr, ok := st.(lossReporter); ok {
+				localLoss = lr.Loss()
+			}
+			wire, err := json.Marshal(benchWireStats{
+				SentBytes:     cfg.Size,
+				ReceivedBytes: received,
+				Loss:          localLoss,
+			})
 			if err != nil {
 				return BenchStats{}, err
 			}
@@ -192,10 +406,14 @@ func runBenchStream(ctx context.Context, st Session, br *bufio.Reader, cfg Bench
 	}
 	_ = remote
 	return BenchStats{
-		SentBytes:       cfg.Size,
-		ReceivedBytes:   received,
-		Duration:        time.Since(started),
-		Retransmissions: nil,
+		SentBytes:     cfg.Size,
+		ReceivedBytes: received,
+		Duration:      time.Since(started),
+		PacketsLost:   nil,
+		// PeerLoss is the ANSWERING side's own loss picture, carried in the
+		// bench stats frame. It is nil when the peer did not report one
+		// (an older build, or a session with no QUIC connection).
+		PeerLoss: remote.Loss,
 	}, nil
 }
 

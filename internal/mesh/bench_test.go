@@ -38,8 +38,40 @@ func TestRunBenchBidirectionalDirectLink(t *testing.T) {
 	if stats.Duration <= 0 {
 		t.Fatalf("duration = %s, want positive", stats.Duration)
 	}
-	if stats.Retransmissions != nil {
-		t.Fatalf("retransmissions = %v, want unavailable", *stats.Retransmissions)
+	// The loss accounting must be REAL, not nil: quic-go exposes per
+	// connection loss counters, and a bench session is one connection with
+	// one stream.
+	if stats.PacketsLost == nil {
+		t.Fatal("packets_lost = nil, want the measured connection loss count")
+	}
+	if stats.Loss == nil {
+		t.Fatal("loss = nil, want the measured connection loss picture")
+	}
+	if stats.Loss.PacketsLost != *stats.PacketsLost {
+		t.Fatalf("packets_lost = %d, loss.PacketsLost = %d, want equal",
+			*stats.PacketsLost, stats.Loss.PacketsLost)
+	}
+	// The tracer path and the ConnectionStats path are independent, so they
+	// must agree, except for the two accounted differences: Path-MTU probe
+	// losses (tracer only) and ECN congestion events (stats only).
+	if stats.Loss.TracerLost+stats.Loss.ECNCongested < stats.Loss.PacketsLost {
+		t.Fatalf("tracer_lost = %d, packets = %d, ecn = %d: tracer under-counts",
+			stats.Loss.TracerLost, stats.Loss.PacketsLost, stats.Loss.ECNCongested)
+	}
+	if stats.Loss.TracerLost < stats.Loss.PacketsLost {
+		t.Fatalf("tracer_lost = %d, packets = %d: tracer must not under-count",
+			stats.Loss.TracerLost, stats.Loss.PacketsLost)
+	}
+	if stats.Loss.CwndSamples == 0 {
+		t.Fatal("cwnd_samples = 0, want congestion-window observations")
+	}
+	// The peer must report its own loss picture back over the bench stats
+	// frame, so one run shows BOTH directions.
+	if stats.PeerLoss == nil {
+		t.Fatal("peer_loss = nil, want the peer's own loss picture")
+	}
+	if stats.PeerLoss.PacketsSent == 0 {
+		t.Fatal("peer_loss.packets_sent = 0")
 	}
 }
 

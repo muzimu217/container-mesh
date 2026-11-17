@@ -77,9 +77,50 @@ func runBench(args []string) error {
 	}
 	fmt.Printf("peer=%s\n", target)
 	fmt.Printf("direction=both size_each=%d sent=%d received=%d\n", size, stats.SentBytes, stats.ReceivedBytes)
-	fmt.Printf("duration=%s throughput_each=%s retransmissions=n/a\n", stats.Duration.Round(time.Millisecond), rateString(size, stats.Duration))
-	fmt.Println("note=QUIC is reliable, but this build does not expose a per-stream retransmission counter; n/a is not zero")
+	fmt.Printf("duration=%s throughput_each=%s packets_lost=%s\n",
+		stats.Duration.Round(time.Millisecond), rateString(size, stats.Duration),
+		lostString(stats.PacketsLost))
+	fmt.Println("note=packets_lost is the QUIC packet loss count of this link's connection (one connection, one stream); " +
+		"it counts packets DECLARED lost, not packets retransmitted, and n/a means the connection could not be instrumented")
+	if l := stats.Loss; l != nil {
+		fmt.Printf("loss_local=%s\n", lossString(l))
+	}
+	if l := stats.PeerLoss; l != nil {
+		fmt.Printf("loss_peer=%s\n", lossString(l))
+	}
 	return nil
+}
+
+// lostString renders the declared-lost packet count. nil means "not
+// available" (the connection could not be instrumented) — it is NOT zero.
+func lostString(v *uint64) string {
+	if v == nil {
+		return "n/a"
+	}
+	return fmt.Sprintf("%d", *v)
+}
+
+// lossString renders one side's per-connection loss picture.
+//
+// The two loss counters (packets= and tracer=) come from two INDEPENDENT
+// quic-go code paths — the congestion controller's ConnectionStats and the
+// tracer's LostPacket hook — so their agreement cross-checks the number.
+//
+// They differ in exactly two accounted ways:
+//
+//   - tracer= counts Path-MTU probe losses that the congestion controller
+//     never saw (quic-go skips path probes for OnCongestionEvent), so
+//     tracer >= packets in that case; and
+//   - packets= counts ECN congestion events (a cwnd cutback with no packet
+//     lost), which the tracer's LostPacket hook does not report.
+func lossString(l *mesh.BenchLoss) string {
+	return fmt.Sprintf(
+		"packets=%d bytes=%d tracer_lost=%d tracer_time=%d tracer_reorder=%d spurious=%d pto=%d loss_timer=%d ecn=%d packets_sent=%d packets_received=%d bytes_sent=%d bytes_received=%d min_rtt=%s smoothed_rtt=%s cwnd_min=%d cwnd_max=%d cwnd_mean=%d cwnd_last=%d cwnd_samples=%d in_flight_mean=%d in_flight_max=%d peer_stream_window=%d peer_conn_window=%d",
+		l.PacketsLost, l.BytesLost, l.TracerLost, l.TracerLostTimeThreshold, l.TracerLostReordering,
+		l.SpuriousLost, l.PTOCount, l.LossTimerCount, l.ECNCongested,
+		l.PacketsSent, l.PacketsReceived, l.BytesSent, l.BytesReceived,
+		l.MinRTT.Round(time.Microsecond), l.SmoothedRTT.Round(time.Microsecond),
+		l.CwndMin, l.CwndMax, l.CwndMean, l.CwndLast, l.CwndSamples, l.InFlightMean, l.InFlightMax, l.PeerStreamWindow, l.PeerConnWindow)
 }
 
 func rateString(bytes int64, d time.Duration) string {
