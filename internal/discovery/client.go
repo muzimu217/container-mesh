@@ -313,7 +313,7 @@ func (c *Client) Announce(ctx context.Context) error {
 	// The presence session this heartbeat establishes. A LEAVE names it
 	// so the node can tell a departure of the CURRENT session from a late
 	// one belonging to a connection that is already gone.
-	c.lastAnnounceTS.Store(a.Timestamp.UnixNano())
+	c.recordSession(a.Timestamp)
 	body, err := json.Marshal(RegisterRequest{Announce: a, Sig: a.Sign(c.cfg.Device)})
 	if err != nil {
 		return err
@@ -365,6 +365,32 @@ func (c *Client) postRegister(ctx context.Context, body []byte, what string) err
 		}
 	}
 	return fmt.Errorf("discovery: register failed on all %d addresses: %w", len(c.addrs), lastErr)
+}
+
+// recordSession advances the presence session reference.
+//
+// The reference only moves FORWARD, and it must move forward the SAME way
+// the node's does. The node keeps the largest announce timestamp it has
+// seen from this member, so a replayed old announce cannot roll it back.
+//
+// If this side stored the raw timestamp of the last announce, a clock that
+// jumped backwards would make the two sides disagree: the node would hold
+// the newer value and the departure would name the older one, which the
+// node then reads as a departure from a session that is no longer current
+// — and ignores. The member would stay "online" in everyone's view until
+// the presence timeout, which is exactly the budget the departure exists
+// to beat.
+func (c *Client) recordSession(ts time.Time) {
+	want := ts.UnixNano()
+	for {
+		cur := c.lastAnnounceTS.Load()
+		if want <= cur {
+			return
+		}
+		if c.lastAnnounceTS.CompareAndSwap(cur, want) {
+			return
+		}
+	}
 }
 
 // Leave performs the explicit graceful departure (P-5b) and takes this
