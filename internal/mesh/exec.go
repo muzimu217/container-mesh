@@ -33,6 +33,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/muzimu217/container-mesh/internal/version"
 )
 
 // Run session constants.
@@ -104,8 +106,13 @@ func receiveRun(br *bufio.Reader, st Session, cfg ListenerConfig) error {
 	switch req.Verb {
 	case "@info":
 		host, _ := os.Hostname()
+		// "version" is the cmesh build the peer is running; "go" is the
+		// toolchain that build was made with. They used to be the same
+		// string — runtime.Version() in both fields — so the field named
+		// "version" reported the Go version, which told an operator
+		// reading it nothing about the peer.
 		out(fmt.Sprintf("hostname  %s\nos       %s/%s\nversion  %s\ngo       %s\n",
-			host, runtime.GOOS, runtime.GOARCH, runtime.Version(), runtime.Version()))
+			host, runtime.GOOS, runtime.GOARCH, version.Version, runtime.Version()))
 		if b, err := os.ReadFile("/proc/uptime"); err == nil {
 			if secs, perr := strconv.ParseFloat(strings.Fields(string(b))[0], 64); perr == nil {
 				out(fmt.Sprintf("uptime   %.0f min\n", secs/60))

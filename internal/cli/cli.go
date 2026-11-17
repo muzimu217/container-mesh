@@ -11,10 +11,23 @@ import (
 	"io"
 	"os"
 	"time"
+
+	"github.com/muzimu217/container-mesh/internal/version"
 )
 
 // Version is stamped at build time with -ldflags "-X ...cli.Version=...".
 var Version = "dev"
+
+// init hands the stamped version to the package that reports it.
+//
+// The @info verb runs in internal/mesh and prints the peer's version. That
+// package cannot import this one — this one already imports it — so the
+// value is passed over here, at startup. The alternative was printing the
+// Go toolchain version in the "version" field, which told the operator
+// nothing about the peer while looking like the product version.
+func init() {
+	version.Version = Version
+}
 
 // ExitError carries a specific process exit code.
 type ExitError struct {
