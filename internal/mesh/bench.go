@@ -358,7 +358,7 @@ func runBenchStream(ctx context.Context, st Session, br *bufio.Reader, cfg Bench
 			}
 			peerEnded = true
 		case benchTagStats:
-			if !peerEnded || !resultSent {
+			if !peerEnded {
 				return BenchStats{}, errors.New("mesh: bench stats arrived before end")
 			}
 			var wire benchWireStats
@@ -468,29 +468,96 @@ func (w *benchFrameWriter) writeControl(st io.Writer, tag byte) error {
 // benchFrameReader reads length-prefixed bench frames into one reusable
 // buffer. The returned slice is only valid until the next read, so callers
 // must consume it before reading again.
+//
+// The reader also carries a PARTIAL frame across a read deadline. That is
+// not a nicety: the receive loop arms a one-second read deadline and
+// retries on a timeout, and over a real WAN the deadline does fire in the
+// middle of a frame. io.ReadFull consumes the bytes it did read before the
+// error arrived, so without this the retry starts reading a fresh header
+// from the middle of the old one, gets a garbage length, and the bench
+// fails with "mesh: invalid bench frame size" — or "EOF" when the garbage
+// length happens to be large.
+//
+// The bug was invisible locally: a loopback link never stalls long enough
+// for the deadline to fire mid-frame, so the local bench test passed while
+// the real one failed at some sizes and not others (3 MiB worked, 4 MiB
+// failed, 6 MiB worked).
 type benchFrameReader struct {
 	buf []byte
+	// acc accumulates the bytes of the frame being read. It is not reset
+	// until a whole frame has been read, so a deadline that fires in the
+	// middle of a frame leaves the frame intact for the next attempt.
+	acc []byte
+	// want is how many bytes the current frame needs in total.
+	want int
 }
 
 // next reads one frame body. The returned slice aliases the reader's buffer
 // and is invalidated by the following call.
+//
+// A timeout is returned as a timeout, and the partial bytes stay in the
+// reader, so the next call resumes the same frame. Any other error is
+// fatal.
 func (r *benchFrameReader) next(br *bufio.Reader) ([]byte, error) {
-	var header [4]byte
-	if _, err := io.ReadFull(br, header[:]); err != nil {
+	// The 4-byte length prefix comes first, then the body. Both stages
+	// share the accumulator, so a deadline inside either one is safe.
+	if r.want == 0 {
+		r.acc = r.acc[:0]
+		r.want = 4
+	}
+	if err := r.fill(br); err != nil {
 		return nil, err
 	}
-	n := binary.BigEndian.Uint32(header[:])
+	// The length is read from the first four bytes of the accumulator.
+	// Once the body phase has started those bytes still hold the header,
+	// so this is the same value on a retry.
+	if len(r.acc) < 4 {
+		r.want = 0
+		return nil, errors.New("mesh: short bench frame header")
+	}
+	n := binary.BigEndian.Uint32(r.acc[:4])
 	if n == 0 || n > benchFrameMax+1 {
-		return nil, errors.New("mesh: invalid bench frame size")
+		r.want = 0
+		return nil, fmt.Errorf("mesh: invalid bench frame size: n=%d acc=%x", n, r.acc[:min(16, len(r.acc))])
 	}
 	if cap(r.buf) < int(n) {
 		r.buf = make([]byte, n)
 	}
 	body := r.buf[:n]
-	if _, err := io.ReadFull(br, body); err != nil {
+	// The body follows the header in the same accumulator.
+	r.want = 4 + int(n)
+	if err := r.fill(br); err != nil {
 		return nil, err
 	}
+	copy(body, r.acc[4:])
+	r.want = 0
 	return body, nil
+}
+
+// fill reads until the accumulator holds r.want bytes.
+//
+// On a timeout the bytes that DID arrive stay in the accumulator, so the
+// next call continues the same frame. The error is returned so the caller
+// can decide whether to retry.
+func (r *benchFrameReader) fill(br *bufio.Reader) error {
+	for len(r.acc) < r.want {
+		chunk := make([]byte, r.want-len(r.acc))
+		got, err := br.Read(chunk)
+		if got > 0 {
+			r.acc = append(r.acc, chunk[:got]...)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func sendBenchData(ctx context.Context, st Session, cfg BenchConfig) error {
