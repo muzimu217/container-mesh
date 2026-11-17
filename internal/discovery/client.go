@@ -26,6 +26,7 @@ import (
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -35,6 +36,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -47,6 +49,11 @@ const (
 	DefaultDialTimeout   = 10 * time.Second
 	maxStreamBackoff     = 30 * time.Second
 	streamInitialBackoff = time.Second
+	// DefaultLeaveTimeout bounds the LEAVE broadcast of an explicit
+	// graceful departure (P-5b). It sits inside the 3 s convergence
+	// budget on purpose: the broadcast plus the view push must fit, and a
+	// lost LEAVE still converges through the members stream.
+	DefaultLeaveTimeout = 2 * time.Second
 	// maxErrBodyBytes bounds how much of an error response is echoed into an
 	// error message. Error text is actionable (O-4); unbounded reads of a
 	// hostile body are not.
@@ -80,6 +87,12 @@ type ClientConfig struct {
 	// DialTimeout bounds both the HTTP register and the stream dial
 	// (0 = DefaultDialTimeout).
 	DialTimeout time.Duration
+	// LeaveTimeout bounds the LEAVE broadcast of an explicit graceful
+	// departure (0 = DefaultLeaveTimeout). The bound keeps a wedged
+	// network from holding the departure open past the convergence
+	// budget: the LEAVE is an accelerator, and the members stream the
+	// client closes right after it is the fallback.
+	LeaveTimeout time.Duration
 	// HTTPClient overrides the client used for register requests (nil = built
 	// from DialTimeout). Tests inject fault-injecting transports; callers
 	// behind proxies can pin their own dial behavior.
@@ -138,6 +151,40 @@ type Client struct {
 	// connSeq numbers members-stream connections; only the stream goroutine
 	// reads and writes it.
 	connSeq int
+
+	// left marks the graceful departure (P-5b). Once it is set the
+	// client announces no more, does not re-establish the members stream,
+	// and refuses further announces: a heartbeat that landed after the
+	// LEAVE would put the member back online.
+	left atomic.Bool
+	// leftCh is closed when the departure starts. The announce loop and
+	// the stream loop select on it so they unwind immediately instead of
+	// waiting out a heartbeat period.
+	leftCh   chan struct{}
+	leftOnce sync.Once
+
+	// announceMu serializes the announce loop against the LEAVE
+	// broadcast. A heartbeat that is in flight when the departure starts
+	// must not land AFTER the LEAVE: it would resurrect the member.
+	announceMu sync.Mutex
+
+	// lastAnnounceTS is the timestamp of the last announce this client
+	// sent (Unix nanoseconds, the member's own clock). It is the
+	// presence session a LEAVE names.
+	lastAnnounceTS atomic.Int64
+
+	// stopAnnounce cancels the announce loop's context. The departure
+	// uses it to abort an announce that is in flight, without tearing
+	// down the members stream: the LEAVE broadcast and the stream close
+	// are separate steps and the stream must still be there when the
+	// departure starts.
+	stopAnnounceMu sync.Mutex
+	stopAnnounce   context.CancelFunc
+
+	// streamConn is the live members-stream connection (nil while the
+	// stream is down). The departure closes it, so the anchor sees a
+	// graceful close instead of a dead socket.
+	streamConn atomic.Pointer[wsconn.Conn]
 }
 
 // NewClient validates the configuration and normalizes addresses. Bad
@@ -163,6 +210,9 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	if cfg.DialTimeout <= 0 {
 		cfg.DialTimeout = DefaultDialTimeout
 	}
+	if cfg.LeaveTimeout <= 0 {
+		cfg.LeaveTimeout = DefaultLeaveTimeout
+	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
@@ -177,6 +227,7 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		updates:     make(chan struct{}, 1),
 		streamKick:  make(chan struct{}, 1),
 		announceNow: make(chan struct{}, 1),
+		leftCh:      make(chan struct{}),
 	}
 	if cfg.HTTPClient != nil {
 		c.httpc = cfg.HTTPClient
@@ -258,16 +309,41 @@ func (c *Client) Joined() bool {
 // A live node's 4xx is authoritative (not-membership is not fixed by trying
 // another node of the same network), so it is returned as-is; only transport
 // failures trigger failover.
+//
+// After a graceful departure (Leave) the client announces no more: a
+// heartbeat that landed after the LEAVE would put the member back online.
 func (c *Client) Announce(ctx context.Context) error {
+	if c.left.Load() {
+		return errors.New("discovery: this device left the network; no further announces")
+	}
+	c.announceMu.Lock()
+	defer c.announceMu.Unlock()
+	if c.left.Load() {
+		return errors.New("discovery: this device left the network; no further announces")
+	}
 	a := MemberAnnounce{
 		DeviceID:  c.cfg.Device.ID(),
 		Endpoints: c.cfg.Endpoints,
 		Timestamp: time.Now(),
 	}
+	// The presence session this heartbeat establishes. A LEAVE names it
+	// so the node can tell a departure of the CURRENT session from a late
+	// one belonging to a connection that is already gone.
+	c.lastAnnounceTS.Store(a.Timestamp.UnixNano())
 	body, err := json.Marshal(RegisterRequest{Announce: a, Sig: a.Sign(c.cfg.Device)})
 	if err != nil {
 		return err
 	}
+	return c.postRegister(ctx, body, "announce")
+}
+
+// postRegister sends a signed register body to the discovery node, failing
+// over across the configured addresses.
+//
+// The failure semantics are the announce path's, unchanged: a live node's
+// 4xx is authoritative (not-membership is not fixed by trying another node
+// of the same network), only transport failures trigger failover.
+func (c *Client) postRegister(ctx context.Context, body []byte, what string) error {
 	// addrIdx is also written by the stream reconnect loop; read it under
 	// the same lock (race detector: Announce's unlocked read raced
 	// streamLoop's locked rotate on shared-list runs).
@@ -286,7 +362,7 @@ func (c *Client) Announce(ctx context.Context) error {
 		resp, err := c.httpc.Do(req)
 		if err != nil {
 			lastErr = err
-			c.log.Warn("announce failed; failing over", "addr", c.addrs[idx], "err", err)
+			c.log.Warn(what+" failed; failing over", "addr", c.addrs[idx], "err", err)
 			continue
 		}
 		if resp.StatusCode == http.StatusOK {
@@ -304,24 +380,133 @@ func (c *Client) Announce(ctx context.Context) error {
 	return fmt.Errorf("discovery: register failed on all %d addresses: %w", len(c.addrs), lastErr)
 }
 
+// Leave performs the explicit graceful departure (P-5b) and takes this
+// device out of the mesh.
+//
+// The departure has three steps, in this order:
+//
+//  1. The announce loop stops. A heartbeat that landed after the LEAVE
+//     would put the member back online — the departure is what the rest of
+//     the network must see, not a race with the next heartbeat.
+//  2. The LEAVE is broadcast: a signed, timestamped announcement that the
+//     discovery node applies like any other announce, so it ends the
+//     member's presence and pushes the new view to every other member.
+//  3. The members stream is closed. That is the FALLBACK: if the LEAVE was
+//     lost on the way, the anchor still sees the stream go away and expires
+//     the presence through the transport path (P-5).
+//
+// The LEAVE is an accelerator, never the only mechanism: step 3 converges on
+// its own whenever the transport path is intact, and a lost LEAVE still
+// leaves the member offline — the only difference is how fast.
+//
+// Leave is idempotent: the departure is broadcast once, and calling Leave
+// again is harmless.
+func (c *Client) Leave(ctx context.Context) error {
+	// 1. Stop announcing. cancelAnnounce aborts an announce that is in
+	// flight (its request dies with the context), so the announce mutex
+	// is free again and no heartbeat can follow the LEAVE.
+	c.left.Store(true)
+	c.leftOnce.Do(func() { close(c.leftCh) })
+	c.cancelAnnounce()
+
+	// The broadcast is bounded: a wedged network must not hold the
+	// departure open past the convergence budget.
+	lctx := ctx
+	if c.cfg.LeaveTimeout > 0 {
+		var cancel context.CancelFunc
+		lctx, cancel = context.WithTimeout(ctx, c.cfg.LeaveTimeout)
+		defer cancel()
+	}
+
+	// 2. Broadcast the departure.
+	err := c.sendLeave(lctx)
+
+	// 3. Close the members stream: the anchor sees a graceful close and
+	// expires the presence even if the LEAVE never arrived.
+	if conn := c.streamConn.Load(); conn != nil {
+		_ = conn.Close()
+	}
+	return err
+}
+
+// sendLeave broadcasts the explicit departure message.
+//
+// It names the presence session it ends (the last announce this client
+// sent) so the node can tell it apart from a late departure of an older
+// session — the member may have reconnected in the meantime, and that new
+// connection must not be taken offline.
+func (c *Client) sendLeave(ctx context.Context) error {
+	c.announceMu.Lock()
+	defer c.announceMu.Unlock()
+	a := MemberAnnounce{
+		DeviceID:  c.cfg.Device.ID(),
+		Timestamp: time.Now(),
+		Leave:     true,
+		Session:   c.lastAnnounceTS.Load(),
+	}
+	if snap := c.Snapshot(); snap != nil {
+		a.View = snap.Version
+	}
+	body, err := json.Marshal(RegisterRequest{Announce: a, Sig: a.Sign(c.cfg.Device)})
+	if err != nil {
+		return err
+	}
+	return c.postRegister(ctx, body, "leave")
+}
+
+// cancelAnnounce stops the announce loop. It is safe to call when the loop
+// was never started.
+func (c *Client) cancelAnnounce() {
+	c.stopAnnounceMu.Lock()
+	cancel := c.stopAnnounce
+	c.stopAnnounceMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+// setStopAnnounce records the announce loop's cancel function so a
+// departure can abort an in-flight announce.
+func (c *Client) setStopAnnounce(cancel context.CancelFunc) {
+	c.stopAnnounceMu.Lock()
+	c.stopAnnounce = cancel
+	c.stopAnnounceMu.Unlock()
+}
+
 // Run blocks until ctx is cancelled: heartbeat loop plus snapshot stream,
 // each retrying with failover until the context ends. The first announce
 // fires immediately so a joiner is visible without waiting one period.
 // View-only clients (NoAnnounce) run the stream alone — their machine's
 // announcer is the long-running join process. Run returns ctx.Err() on
 // cancellation.
+//
+// A graceful departure (Leave) ends Run with a nil error: leaving is a
+// decision, not a failure.
 func (c *Client) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	// The announce loop gets its OWN context. The departure cancels the
+	// announce (no further heartbeat may resurrect the member) WITHOUT
+	// tearing down the members stream: the LEAVE broadcast and the stream
+	// close are separate steps, and the stream must still be alive when
+	// the departure starts — otherwise the departure would degrade into
+	// the abnormal-disconnect path instead of the explicit broadcast.
+	announceCtx, stopAnnounce := context.WithCancel(ctx)
+	c.setStopAnnounce(stopAnnounce)
+	defer stopAnnounce()
 	errc := make(chan error, 1)
 	go func() { errc <- c.streamLoop(ctx) }()
 
 	if c.cfg.NoAnnounce {
-		<-ctx.Done()
-		return ctx.Err()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-c.leftCh:
+			return nil
+		}
 	}
 
-	firstErr := c.Announce(ctx)
+	firstErr := c.Announce(announceCtx)
 	if firstErr != nil {
 		// Non-fatal: the loop keeps trying, and a "not a member" failure is
 		// the expected pre-approval state — the FIRST retry must already be
@@ -336,8 +521,13 @@ func (c *Client) Run(ctx context.Context) error {
 	defer t.Stop()
 	for {
 		select {
-		case <-ctx.Done():
-			return ctx.Err()
+		case <-announceCtx.Done():
+			if c.left.Load() {
+				return nil // a deliberate departure, not a failure
+			}
+			return announceCtx.Err()
+		case <-c.leftCh:
+			return nil
 		case <-c.announceNow:
 			// A stream recovery asked for an out-of-band announce: the
 			// server expired this device's presence when the old stream
@@ -345,13 +535,13 @@ func (c *Client) Run(ctx context.Context) error {
 			// view shows it offline — waiting for the heartbeat left
 			// 0–30 s of stale "offline" after the transport was already
 			// back (R40-1, the recovery-visibility batch with C-4).
-			err := c.Announce(ctx)
+			err := c.Announce(announceCtx)
 			if err != nil {
 				c.log.Warn("recovery announce failed", "err", err)
 			}
 			t.Reset(announceRetryDelay(c.Joined(), err, c.cfg.Heartbeat))
 		case <-t.C:
-			err := c.Announce(ctx)
+			err := c.Announce(announceCtx)
 			if err != nil {
 				c.log.Warn("announce failed", "err", err)
 			} else {
@@ -429,8 +619,16 @@ func (c *Client) streamLoop(ctx context.Context) error {
 		if ctx.Err() != nil {
 			return nil
 		}
+		if c.left.Load() {
+			// The departure is done: the stream must not come back, or the
+			// member would reappear in the view it just left.
+			return nil
+		}
 		healthy, err := c.streamOnce(ctx)
 		if ctx.Err() != nil {
+			return nil
+		}
+		if c.left.Load() {
 			return nil
 		}
 		// A stream that produced a verified snapshot was healthy: reconnect
@@ -460,6 +658,11 @@ func (c *Client) streamLoop(ctx context.Context) error {
 		case <-ctx.Done():
 			timer.Stop()
 			return nil
+		case <-c.leftCh:
+			// A departure started while the stream was down: do not dial
+			// the member back into the network it just left.
+			timer.Stop()
+			return nil
 		case <-c.streamKick:
 			// An announce succeeded while this device was still unjoined:
 			// approval just landed, and the remaining backoff wait — built
@@ -477,6 +680,9 @@ func (c *Client) streamLoop(ctx context.Context) error {
 }
 
 func (c *Client) streamOnce(ctx context.Context) (bool, error) {
+	if c.left.Load() {
+		return false, errors.New("discovery: this device left the network")
+	}
 	c.connSeq++
 	connNo := c.connSeq
 	c.mu.Lock()
@@ -515,6 +721,19 @@ func (c *Client) streamOnce(ctx context.Context) (bool, error) {
 		return false, err
 	}
 	defer conn.Close()
+	// Publish the live connection so a departure can close it: the anchor
+	// then sees a graceful close and expires the presence immediately,
+	// instead of waiting for the socket to die (the P-5 fallback for a
+	// LEAVE that never arrived).
+	c.streamConn.Store(conn)
+	defer c.streamConn.CompareAndSwap(conn, nil)
+	// A departure may have started while the dial was in flight. The
+	// connection must not outlive it: close it right away instead of
+	// holding a stream the node has already been told to forget.
+	if c.left.Load() {
+		_ = conn.Close()
+		return false, errors.New("discovery: this device left the network")
+	}
 
 	// healthy records whether this stream produced a verified snapshot: the
 	// caller resets its reconnect penalty on that signal. The stream itself

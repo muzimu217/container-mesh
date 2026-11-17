@@ -298,6 +298,13 @@ func endpointsToSave(resolved []string) []string {
 	return out
 }
 
+// gracefulLeaveTimeout bounds the departure broadcast of a graceful exit
+// (P-5b). It sits inside the 3 s convergence budget on purpose: the
+// broadcast plus the view push have to fit, and a broadcast that never
+// arrives still converges through the members stream the client closes
+// right after it.
+const gracefulLeaveTimeout = 2 * time.Second
+
 // runJoin implements `cmesh join <invite>`: announce until the membership
 // approval lands, then show the network. With --once it exits after joining;
 // otherwise it keeps announcing and printing topology changes until
@@ -524,7 +531,11 @@ func runJoin(args []string) error {
 		fmt.Fprintf(os.Stderr, "PUBKEY: %s\n\n", base64.StdEncoding.EncodeToString(dev.PublicKey()))
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	// SIGINT (Ctrl-C) and SIGTERM (systemd stop, docker stop) both mean
+	// "leave the network gracefully" (P-5b): the departure is BROADCAST, so
+	// the other members' views say offline right away instead of waiting
+	// for this process's socket to die.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if *timeout > 0 {
 		var cancel context.CancelFunc
@@ -532,7 +543,30 @@ func runJoin(args []string) error {
 		defer cancel()
 	}
 
-	go func() { _ = cl.Run(ctx) }()
+	// The client's own lifetime is NOT the signal context. The graceful
+	// departure has to run BEFORE the run loop is torn down: if the signal
+	// reached the client directly, the members stream would die first and
+	// the departure would degrade into the abnormal-disconnect path instead
+	// of the explicit LEAVE broadcast.
+	runCtx, stopRun := context.WithCancel(context.Background())
+	defer stopRun()
+	go func() { _ = cl.Run(runCtx) }()
+
+	// gracefulLeave is the single exit path of a member that is in the
+	// network (P-5b): the LEAVE broadcast tells the other members right
+	// away, and the members stream the client closes right after it is the
+	// fallback for a broadcast that never arrives.
+	gracefulLeave := func() {
+		leaveCtx, cancelLeave := context.WithTimeout(context.Background(), gracefulLeaveTimeout)
+		err := cl.Leave(leaveCtx)
+		cancelLeave()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "leave broadcast failed (%v); leaving through the connection close\n", err)
+		} else {
+			fmt.Fprintf(os.Stderr, "left the network (LEAVE broadcast sent)\n")
+		}
+		stopRun()
+	}
 
 	printSnapshot := func() {
 		snap := cl.Snapshot()
@@ -598,6 +632,10 @@ func runJoin(args []string) error {
 					printSnapshot()
 					lastSig = viewSig()
 					if *once {
+						// The process is about to exit while it is a
+						// member: say goodbye to the network instead of
+						// letting the socket die silently.
+						gracefulLeave()
 						return nil
 					}
 					continue
@@ -614,6 +652,10 @@ func runJoin(args []string) error {
 			}
 		case <-ctx.Done():
 			if cl.Joined() {
+				// Graceful departure (P-5b): broadcast the LEAVE so the
+				// other members' views say offline now, then let the run
+				// loop go.
+				gracefulLeave()
 				return nil
 			}
 			if ctx.Err() == context.DeadlineExceeded {
@@ -658,6 +700,11 @@ func runServeDiscovery(args []string) error {
 	// token — the page itself is a static shell that carries no state.
 	panel := fs.Bool("panel", false, "serve the visualization panel at /panel (its data endpoint /api/mesh needs the panel token)")
 	panelToken := fs.String("panel-token", "", "token for the panel's data endpoint; generated and printed when --panel is set and this is empty")
+	// The relay trunk: this node carries relays between two OTHER members
+	// when somebody asks it to (D73). It is off unless it is asked for —
+	// an anchor that relays for the whole network without being told is a
+	// public relay, and the switch is the operator's decision.
+	relayTrunk := fs.Bool("relay-trunk", false, "act as a mesh relay trunk: carry relays between two other members (default off)")
 	verbose := fs.Bool("v", false, "verbose (debug) logging")
 	if err := fs.Parse(args); err != nil {
 		return ExitError{Code: 2, Err: err}
@@ -757,6 +804,28 @@ func runServeDiscovery(args []string) error {
 		fmt.Fprintf(os.Stderr, "  panel token: %s  (keep it private; the data endpoint rejects anything else)\n", tok)
 	}
 	srv.EnableDiscovery(members)
+
+	// The relay trunk's authorization state machine. The switch decides
+	// whether this node relays at all, and it is off by default.
+	//
+	// The member resolver is the LIVE member list (the same one the direct
+	// link pins certificates against), so a revoked device is refused on
+	// its next request — no restart, no cached snapshot.
+	if *relayTrunk {
+		trunk, err := mesh.NewRelayTrunk(mesh.RelayTrunkConfig{
+			Self:    dev.ID(),
+			Members: relayMembersResolver{srv: srv},
+			Enabled: true,
+		})
+		if err != nil {
+			return ExitError{Code: 1, Err: fmt.Errorf("serve-discovery: --relay-trunk: %w", err)}
+		}
+		mesh.SetRelayTrunk(trunk)
+		fmt.Fprintf(os.Stderr, "  relay trunk: ON — this node carries relays between members "+
+			"(authorization only so far: no bytes are forwarded yet)\n")
+	} else {
+		fmt.Fprintf(os.Stderr, "  relay trunk: off (pass --relay-trunk to carry relays between members)\n")
+	}
 
 	// The stop watcher needs the server handle, so it starts here — but the
 	// signal registration above already ran, so a signal that arrived in the

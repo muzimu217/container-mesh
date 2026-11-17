@@ -34,6 +34,14 @@ type Node struct {
 	// member that dropped out must still say when it was last there.
 	lastSeenAt map[identity.DeviceID]time.Time
 
+	// sessionTS remembers which presence session each device is in: the
+	// timestamp of the newest announce it sent (the member's own clock).
+	// An explicit LEAVE (P-5b) names the session it ends, so a departure
+	// that belongs to an OLDER session cannot end the current one — the
+	// member reconnected after that session began, and the late message
+	// must not take its new connection offline (the reconnect race).
+	sessionTS map[identity.DeviceID]time.Time
+
 	// subs are the connected members receiving pushes.
 	subs map[identity.DeviceID]chan struct{}
 
@@ -57,6 +65,7 @@ func NewNode(members *identity.MemberList) *Node {
 		members:    members,
 		lastSeen:   make(map[identity.DeviceID]time.Time),
 		lastSeenAt: make(map[identity.DeviceID]time.Time),
+		sessionTS:  make(map[identity.DeviceID]time.Time),
 		endpts:     make(map[identity.DeviceID][]string),
 		subs:       make(map[identity.DeviceID]chan struct{}),
 		streams:    make(map[identity.DeviceID]int),
@@ -114,8 +123,13 @@ func (n *Node) DetachStream(id identity.DeviceID) {
 // checks (signature, timestamp, endpoint shapes) stay in the caller's
 // Validate call; membership is duplicated here as a structural backstop.
 //
+// A LEAVE (a.Leave) is the explicit graceful departure (P-5b): instead of
+// refreshing the presence it ENDS it, and subscribers are pushed the change
+// so every other member's view shows the departure right away.
+//
 // The boolean reports whether the endpoints changed, so the HTTP layer can
-// decide whether the update is worth pushing.
+// decide whether the update is worth pushing. For a LEAVE it reports
+// whether the presence actually ended.
 func (n *Node) Register(a MemberAnnounce, when time.Time) bool {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -123,6 +137,17 @@ func (n *Node) Register(a MemberAnnounce, when time.Time) bool {
 	// the caller skipped Validate (external security review, high finding).
 	if !n.members.Contains(a.DeviceID) {
 		return false
+	}
+	if a.Leave {
+		return n.leaveLocked(a, when)
+	}
+	// The presence session advances with every accepted announce: the
+	// newest announce's timestamp defines the session a LEAVE has to name.
+	// It only moves forward — a replayed OLD announce must not roll the
+	// session reference back (that would make a legitimate departure look
+	// stale and cost the node its explicit path).
+	if ts, ok := n.sessionTS[a.DeviceID]; !ok || a.Timestamp.After(ts) {
+		n.sessionTS[a.DeviceID] = a.Timestamp
 	}
 	// An announce from a device with no recorded presence is an
 	// offline→online TRANSITION (C-4/R39-1): DetachStream pushed the
@@ -158,6 +183,47 @@ func (n *Node) Register(a MemberAnnounce, when time.Time) bool {
 		n.notifyAll()
 	}
 	return changed
+}
+
+// leaveLocked applies an explicit graceful departure (P-5b). The caller
+// holds n.mu.
+//
+// The departure ends the member's PRESENCE, not its membership: a member
+// that left is still a member and may come back (the member list is the
+// identity layer's business, this is the reachability view).
+//
+// Three rules make the departure safe to broadcast repeatedly and to
+// deliver late:
+//
+//   - It only ends the CURRENT presence session. A departure that names an
+//     older session belongs to a connection that is already gone: the
+//     member reconnected after that session began, and taking the new
+//     connection offline would be a false "offline" for a live member (the
+//     reconnect race).
+//   - It is idempotent: a member that is already offline stays offline,
+//     and no subscriber is woken for a change that did not happen.
+//   - The announced endpoints SURVIVE, exactly like a stream detach: they
+//     are what the member's listener last advertised, and blanking them
+//     would make an offline member undialable for a whole heartbeat (issue
+//     #8 endpoint-oscillation fix).
+func (n *Node) leaveLocked(a MemberAnnounce, when time.Time) bool {
+	if a.Session != 0 {
+		if ts, ok := n.sessionTS[a.DeviceID]; ok && a.Session < ts.UnixNano() {
+			// A departure from an older presence session: the member is in a
+			// newer one, and that one is alive. Ignore the late message.
+			return false
+		}
+	}
+	if _, online := n.lastSeen[a.DeviceID]; !online {
+		// Already gone (a repeated departure, or a member that was never
+		// here): nothing changes, nothing to push.
+		return false
+	}
+	delete(n.lastSeen, a.DeviceID)
+	// "When did it go" stays available for the operator's view.
+	n.lastSeenAt[a.DeviceID] = when
+	n.notifyAll()
+	return true
 }
 
 // LastSeenAt reports when the device was last present — online now or not.

@@ -49,10 +49,31 @@ const SweepInterval = 15 * time.Second
 //
 // Endpoints are candidate addresses, public and private. The receiver tries
 // them in order when dialing; nothing here is authoritative.
+//
+// A member that is leaving says so in the SAME message (Leave). P-5b wants
+// an explicit departure broadcast, and the announce path is the one path the
+// discovery node authenticates, rate-limits and applies today — so the
+// departure rides it instead of inventing a second endpoint (which would
+// need a change in the frozen relay layer). The departure is a signed,
+// timestamped announce like any other: a stranger cannot fake one.
 type MemberAnnounce struct {
 	DeviceID  identity.DeviceID `json:"device_id"`
 	Endpoints []string          `json:"endpoints"`
 	Timestamp time.Time         `json:"timestamp"`
+	// Leave marks this message as an explicit graceful departure (P-5b).
+	// The node ends the member's presence and pushes the new view.
+	Leave bool `json:"leave,omitempty"`
+	// Session names the presence session the departure ends: the Unix
+	// nanoseconds of the announce that established it (the member's own
+	// clock, so no clock skew is involved). A departure for an OLDER
+	// session is ignored: the member reconnected after that session
+	// began, and the late message belongs to a connection that is already
+	// gone (the reconnect race).
+	Session int64 `json:"session,omitempty"`
+	// View is the member-list version the sender last saw. It says which
+	// membership generation the member believed it was leaving; the node
+	// does not act on it, it is carried for diagnostics.
+	View uint64 `json:"view,omitempty"`
 }
 
 // Errors from announce validation. Each is distinct so the node can answer
@@ -124,6 +145,13 @@ func (a MemberAnnounce) Validate(memberKey ed25519.PublicKey, sig []byte, now ti
 // signable is the exact byte range the signature covers. Marshaling the
 // struct without the signature (which lives outside it) is deterministic:
 // every field has a fixed JSON shape.
+//
+// The LEAVE fields are part of the signed range: a captured announce must
+// not be convertible into a departure by whoever is in the path. They are
+// omitempty, so a NORMAL announce keeps the exact bytes it had before the
+// departure existed — an anchor running the older code still verifies a new
+// client's heartbeats, and a new anchor still verifies an old client's
+// (C-4: no version bump, no broken signature).
 func (a MemberAnnounce) signable() []byte {
 	// Re-marshal through a fixed field order to avoid depending on struct
 	// field order staying stable across refactors.
@@ -131,7 +159,10 @@ func (a MemberAnnounce) signable() []byte {
 		DeviceID  identity.DeviceID `json:"device_id"`
 		Endpoints []string          `json:"endpoints"`
 		Timestamp time.Time         `json:"timestamp"`
-	}{a.DeviceID, a.Endpoints, a.Timestamp})
+		Leave     bool              `json:"leave,omitempty"`
+		Session   int64             `json:"session,omitempty"`
+		View      uint64            `json:"view,omitempty"`
+	}{a.DeviceID, a.Endpoints, a.Timestamp, a.Leave, a.Session, a.View})
 	return b
 }
 
