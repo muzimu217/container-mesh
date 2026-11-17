@@ -133,10 +133,17 @@ func (t *lossTracker) tracer() *logging.ConnectionTracer {
 			t.peerConnWindow.Store(int64(p.InitialMaxData))
 		},
 		ECNStateUpdated: func(state logging.ECNState, _ logging.ECNStateTrigger) {
-			// quic-go's ECN tracker reports a congestion event when a
-			// CONFIRMED-capable path marks packets CE. That event reaches
-			// the congestion controller (cwnd cutback) but is not a packet
-			// loss, so it must not be counted as one.
+			// This counts the transition INTO the capable state, which the
+			// tracker fires at most once per connection (quic-go
+			// ackhandler/ecn.go: capability is confirmed once and the state
+			// machine stays there). It is therefore an indicator that the
+			// path CAN carry congestion marks — not a count of congestion
+			// events, and not a packet loss.
+			//
+			// A real CE event on a confirmed path reaches the congestion
+			// controller (cwnd cutback) but NEITHER counter here: it does
+			// not declare a packet lost, so it explains no difference
+			// between PacketsLost and TracerLost.
 			if state == logging.ECNStateCapable {
 				t.ecnCongested.Add(1)
 			}
