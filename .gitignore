@@ -33,3 +33,11 @@ probe.json
 .codeartsdoer/
 .team/verify/
 .team/hub-watermark
+
+# autoresearch 会话状态（插件已在隔离 worktree 运行；develop 侧只留 config.json 供插件读取，
+# 必须忽略，否则会被别人的 git add -A 扫进提交）
+.auto/
+autoresearch-dashboard.html
+
+# 本地工具目录（不入库，防插件 add -A 扫入实验提交）
+.atomcode/
