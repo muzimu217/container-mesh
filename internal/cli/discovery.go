@@ -38,6 +38,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -321,6 +322,8 @@ func runJoin(args []string) error {
 	once := fs.Bool("once", false, "exit as soon as this device is a member")
 	timeout := fs.Duration("timeout", 10*time.Minute, "how long to wait for approval before giving up (0 = forever)")
 	credStr := fs.String("cred", "", "team credential: join with this string instead of an invite (no per-device approval needed)")
+	relayTrunk := fs.String("relay-trunk", "", "address of the relay trunk to join (host:port): this device stays connected to it so it can RECEIVE relayed sessions")
+	relayTrunkID := fs.String("relay-trunk-id", "", "device ID of the relay trunk (required with --relay-trunk: the join is pinned against it)")
 	if err := fs.Parse(args); err != nil {
 		return ExitError{Code: 2, Err: err}
 	}
@@ -552,6 +555,22 @@ func runJoin(args []string) error {
 	defer stopRun()
 	go func() { _ = cl.Run(runCtx) }()
 
+	// The relay trunk join: this device stays CONNECTED to the anchor so
+	// that the anchor can reach it for relayed sessions.
+	//
+	// This is what makes a PURE-OUTBOUND member reachable: it has no
+	// inbound port, so the anchor cannot dial it. But it can dial the
+	// anchor, and it keeps that connection open — so the anchor reaches
+	// it BACK over it. That is the whole mechanism of the trunk (D73).
+	if *relayTrunk != "" {
+		if *relayTrunkID == "" {
+			return ExitError{Code: 2, Err: errors.New(
+				"--relay-trunk needs --relay-trunk-id: the join is pinned against the trunk's device ID, " +
+					"and a member that does not know which anchor it is joining must not join an arbitrary one")}
+		}
+		go joinRelayTrunk(runCtx, dev, resolver, identity.DeviceID(*relayTrunkID), *relayTrunk, filepath.Join(dir, "inbox"))
+	}
+
 	// gracefulLeave is the single exit path of a member that is in the
 	// network (P-5b): the LEAVE broadcast tells the other members right
 	// away, and the members stream the client closes right after it is the
@@ -705,6 +724,7 @@ func runServeDiscovery(args []string) error {
 	// an anchor that relays for the whole network without being told is a
 	// public relay, and the switch is the operator's decision.
 	relayTrunk := fs.Bool("relay-trunk", false, "act as a mesh relay trunk: carry relays between two other members (default off)")
+	relayListenPort := fs.Int("relay-port", 0, "UDP port for the relay trunk's listener (default: the HTTP port + 1)")
 	verbose := fs.Bool("v", false, "verbose (debug) logging")
 	if err := fs.Parse(args); err != nil {
 		return ExitError{Code: 2, Err: err}
@@ -811,6 +831,16 @@ func runServeDiscovery(args []string) error {
 	// The member resolver is the LIVE member list (the same one the direct
 	// link pins certificates against), so a revoked device is refused on
 	// its next request — no restart, no cached snapshot.
+	// relaySelfEPS is the PUBLIC address on which this node accepts
+	// relays, published in the member view so a requester can find a
+	// trunk to relay through.
+	//
+	// It is the announced host with the RELAY port: the relay listener
+	// has its own ALPN and therefore its own UDP port, so the direct
+	// address cannot carry it. The host is the announced one for the same
+	// reason the direct address is — on a cloud server the public IP is a
+	// NAT mapping, not a local interface.
+	var relaySelfEPS []string
 	if *relayTrunk {
 		trunk, err := mesh.NewRelayTrunk(mesh.RelayTrunkConfig{
 			Self:    dev.ID(),
@@ -821,8 +851,62 @@ func runServeDiscovery(args []string) error {
 			return ExitError{Code: 1, Err: fmt.Errorf("serve-discovery: --relay-trunk: %w", err)}
 		}
 		mesh.SetRelayTrunk(trunk)
-		fmt.Fprintf(os.Stderr, "  relay trunk: ON — this node carries relays between members "+
-			"(authorization only so far: no bytes are forwarded yet)\n")
+		// The revocation watch: an ESTABLISHED relay must be torn down
+		// when one of its ends stops being a member, not just the next
+		// request refused. The watch re-checks every second.
+		trunk.StartRevocationWatch(ctx, time.Second)
+		// The relay listener: the port members reach the trunk on. It
+		// has its own ALPN, so it is a SEPARATE UDP port from the
+		// direct-link listener (one socket can serve only one ALPN).
+		//
+		// The port is --relay-port when given, else the HTTP port + 1
+		// (the direct-link listener takes the HTTP port when the
+		// anchor announces it).
+		relayPort := *relayListenPort
+
+		if relayPort == 0 {
+			if _, p, perr := net.SplitHostPort(*addr); perr == nil {
+				if n, cerr := strconv.Atoi(p); cerr == nil {
+					relayPort = n + 1
+				}
+			}
+		}
+		if relayPort > 0 {
+			rl, lerr := mesh.NewRelayListener(ctx, mesh.RelayListenerConfig{
+				Device:  dev,
+				Members: relayMembersResolver{srv: srv},
+				Addrs:   []string{net.JoinHostPort("0.0.0.0", strconv.Itoa(relayPort))},
+				Trunk:   trunk,
+				Joiners: mesh.NewJoinerTable(),
+			})
+			if lerr != nil {
+				fmt.Fprintf(os.Stderr, "  note: cannot bind the relay listener on UDP %d (%v)\n", relayPort, lerr)
+			} else {
+				defer rl.Close()
+				fmt.Fprintf(os.Stderr, "  relay trunk: ON — UDP %d carries relays between members\n", relayPort)
+				fmt.Fprintf(os.Stderr, "    (the payload is end-to-end encrypted: the trunk sees routing metadata, not content)\n")
+				// The PUBLIC address on which the relay listener is
+				// reachable. The announced host with the relay port: the
+				// direct address carries the direct listener, and the two
+				// speak different ALPNs on different ports.
+				relayHost := ""
+				if *announce != "" {
+					if h, _, err := net.SplitHostPort(*announce); err == nil {
+						relayHost = h
+					}
+				} else if h, _, err := net.SplitHostPort(*addr); err == nil {
+					relayHost = h
+				}
+				if relayHost != "" && relayHost != "0.0.0.0" && relayHost != "::" {
+					relaySelfEPS = []string{net.JoinHostPort(relayHost, strconv.Itoa(relayPort))}
+				} else {
+					fmt.Fprintf(os.Stderr, "  note: the relay listener is on UDP %d but no public address is known;\n", relayPort)
+					fmt.Fprintf(os.Stderr, "        pass --announce <public-host:port> so members can find this trunk\n")
+				}
+			}
+		} else {
+			fmt.Fprintf(os.Stderr, "  relay trunk: ON — authorization is live, but no relay listener could be bound\n")
+		}
 	} else {
 		fmt.Fprintf(os.Stderr, "  relay trunk: off (pass --relay-trunk to carry relays between members)\n")
 	}
@@ -943,7 +1027,7 @@ func runServeDiscovery(args []string) error {
 		// listener is bound and accepting) — the loop retries at heartbeat
 		// cadence after that, so a transient register failure just waits
 		// for the next tick rather than reading like a fault.
-		go selfAnnounceLoop(ctx, selfURL, selfEPS, dev, srv.Ready())
+		go selfAnnounceLoop(ctx, selfURL, selfEPS, relaySelfEPS, dev, srv.Ready())
 	} else if *announce == "" {
 		fmt.Fprintf(os.Stderr, "note: --addr is a wildcard and no --announce given: this node will show as offline\n")
 		fmt.Fprintf(os.Stderr, "  in member views; pass --announce <members-facing-address>:port to make it visible\n")
@@ -1027,7 +1111,7 @@ func localAddr(host string) bool {
 // are logged, never fatal — a node that cannot reach itself via its own
 // published address is a deployment problem worth one log line per attempt,
 // not a crash.
-func selfAnnounceLoop(ctx context.Context, selfURL string, eps []string, dev *identity.Device, ready <-chan struct{}) {
+func selfAnnounceLoop(ctx context.Context, selfURL string, eps []string, relayEPS []string, dev *identity.Device, ready <-chan struct{}) {
 	// Gate the first announce on the listener actually accepting (issue #8
 	// rounds 10/11: announcing before the socket accepts races the bind and
 	// loses — measured refusal rates 6%→86% across two commits). A 15s
@@ -1041,7 +1125,12 @@ func selfAnnounceLoop(ctx context.Context, selfURL string, eps []string, dev *id
 		return
 	}
 	post := func() {
-		a := discovery.MemberAnnounce{DeviceID: dev.ID(), Endpoints: eps, Timestamp: time.Now()}
+		a := discovery.MemberAnnounce{
+			DeviceID:       dev.ID(),
+			Endpoints:      eps,
+			RelayEndpoints: relayEPS,
+			Timestamp:      time.Now(),
+		}
 		req := discovery.RegisterRequest{Announce: a, Sig: a.Sign(dev)}
 		b, err := json.Marshal(req)
 		if err != nil {
@@ -1226,6 +1315,53 @@ func watchApprovals(ctx context.Context, membersPath, certsDir string, start *id
 				// next tick would treat our write as an external edit (D-3).
 				noteFileState()
 				srv.SetMeshMembers(cur)
+			}
+		}
+	}
+}
+
+// joinRelayTrunk keeps this device connected to a relay trunk.
+//
+// The connection is what makes a pure-outbound member reachable: it has
+// no inbound port, so the anchor has to come to it, and it does that over
+// this connection.
+//
+// The trunk's device ID is required: the join is PINNED against the
+// member view's key for that device, so a member cannot be tricked into
+// joining an impostor.
+func joinRelayTrunk(ctx context.Context, dev *identity.Device, resolver *liveViewResolver, trunkID identity.DeviceID, endpoint, inboxDir string) {
+	for {
+		err := mesh.JoinRelayTrunk(ctx, mesh.RelayJoinConfig{
+			Device:    dev,
+			Resolver:  resolver,
+			Trunk:     trunkID,
+			Endpoints: []string{endpoint},
+			OnSession: func(sess mesh.Session, requester identity.DeviceID) error {
+				// The relayed session is served with the SAME session
+				// dispatch the direct link uses, so a member-to-member
+				// message that arrives through a trunk is handled
+				// exactly like one that arrives directly.
+				return mesh.ServeRelayedSession(mesh.KindMsg, requester, sess, mesh.ListenerConfig{
+					OnMessage: func(from identity.DeviceID, text string) {
+						fmt.Fprintf(os.Stderr, "📩 from %s: %s\n", from, text)
+					},
+					InboxDir: inboxDir,
+					OnFile: func(from identity.DeviceID, savedPath string, h mesh.FileHeader) {
+						fmt.Fprintf(os.Stderr, "📬 from %s: %s → %s (sha256 %s…, %d bytes)\n",
+							from, h.Name, savedPath, h.SHA256[:12], h.Size)
+					},
+				})
+			},
+		})
+		if ctx.Err() != nil {
+			return
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "relay trunk join failed (%v); retrying\\n", err)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(2 * time.Second):
 			}
 		}
 	}

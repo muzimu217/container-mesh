@@ -4,11 +4,13 @@
 package mesh
 
 import (
+	"bufio"
 	"context"
+	"crypto/ed25519"
 	"errors"
 	"fmt"
-	"strings"
 
+	"github.com/muzimu217/container-mesh/internal/discovery"
 	"github.com/muzimu217/container-mesh/internal/identity"
 )
 
@@ -59,6 +61,19 @@ type Path struct {
 	// path does not have to change the path structure when it arrives.
 	// Zero means "unset", which reads as one hop.
 	Hops int
+	// TargetKey is the target's public key, from the member view.
+	//
+	// A relay path needs it and a direct path does not: the direct path
+	// gets its key from the TLS pinning (the peer presents its
+	// certificate and the pin checks it against the view), but the
+	// RELAYED session's end-to-end handshake is verified by the
+	// requester against the view directly — there is no certificate
+	// involved, because the relay terminates TLS on both hops.
+	//
+	// Without this key the requester could not verify the target's
+	// signed hello, and an unverified handshake is worth nothing: the
+	// relay could then present its own key as the target's.
+	TargetKey ed25519.PublicKey
 }
 
 // PathPicker names the paths worth trying for a target, best first.
@@ -150,13 +165,50 @@ func tryPaths(ctx context.Context, cfg DialConfig, paths []Path, dial pathDialer
 	return nil, lastPath, lastErr
 }
 
-// dialViaPicker establishes a session, letting the configured picker
+// DialViaPicker establishes a session, letting the configured picker
 // choose the path.
 //
 // With no picker, it dials direct exactly as before. With a picker, it
 // walks the picker's paths. The returned PathKind tells the caller which
 // path was used, so the CLI can report the path it actually took instead
 // of guessing it from the outcome.
+//
+// It is the EXPORTED entry point for the CLI: the internal callers
+// (SendMsg, SendFile, SendRun, RunBench) do not care which path was
+// taken, but `cmesh mesh ping` does — it prints "link=relay".
+func DialViaPicker(ctx context.Context, cfg DialConfig) (*Link, PathKind, error) {
+	return dialViaPicker(ctx, cfg)
+}
+
+// DialViaPickerPath is DialViaPicker, and it also reports the PATH that
+// was used — not just its kind.
+//
+// The CLI prints "link=relay via=<deviceID>", and "relay" alone does not
+// say WHICH trunk carried the traffic — which is the first thing an
+// operator wants to know when a ping is slow.
+func DialViaPickerPath(ctx context.Context, cfg DialConfig) (*Link, Path, error) {
+	if cfg.Picker == nil {
+		link, err := DialDirect(ctx, cfg)
+		if err != nil {
+			return nil, Path{}, err
+		}
+		return link, Path{Kind: PathDirect}, nil
+	}
+	if _, err := cfg.Resolver.KeyFor(cfg.Target); err != nil {
+		return nil, Path{}, fmt.Errorf("%w: %w", ErrAuth, err)
+	}
+	paths, err := cfg.Picker.Pick(ctx, cfg.Target, cfg.Kind)
+	if err != nil {
+		return nil, Path{}, err
+	}
+	link, used, err := tryPaths(ctx, cfg, paths, dialPath)
+	if err != nil {
+		return nil, used, err
+	}
+	return link, used, nil
+}
+
+// dialViaPicker is the internal implementation. See DialViaPicker.
 func dialViaPicker(ctx context.Context, cfg DialConfig) (*Link, PathKind, error) {
 	if cfg.Picker == nil {
 		link, err := DialDirect(ctx, cfg)
@@ -190,10 +242,13 @@ func dialViaPicker(ctx context.Context, cfg DialConfig) (*Link, PathKind, error)
 
 // dialPath establishes a session over one path.
 //
-// Only the direct path is implemented. The relay path is where the
-// relay trunk (PR-2) plugs in: at that point this function opens a
-// relay route instead of a QUIC stream, and the business layer — which
-// only ever sees a Session — cannot tell the difference.
+// The direct path is a mutually-authenticated QUIC link. The relay path
+// opens a RELAYED session through a trunk member: the requester asks the
+// trunk to carry a session to the target, and then speaks the end-to-end
+// protocol THROUGH the trunk.
+//
+// The business layer only ever sees a Session, so it cannot tell the
+// difference between the two.
 func dialPath(ctx context.Context, cfg DialConfig, p Path) (*Link, error) {
 	switch p.Kind {
 	case PathDirect:
@@ -202,29 +257,190 @@ func dialPath(ctx context.Context, cfg DialConfig, p Path) (*Link, error) {
 		}
 		return DialDirect(ctx, cfg)
 	case PathRelay:
-		// The relay trunk's CONTROL plane exists (the frame pair and the
-		// authorization state machine on the relay side), but its DATA
-		// plane does not: there is no session to open yet, so the attempt
-		// cannot be made.
-		//
-		// The class stays ErrRelayUnavailable. ErrNoRoute is a routing
-		// fact (the member view holds no endpoint) and would tell the
-		// caller to keep walking a list of paths that cannot work either;
-		// ErrSessionClosed is a session fact, which is just as wrong
-		// because no session was ever opened.
-		//
-		// The wording matters as much as the class: "not available yet"
-		// reads like a statement about the route, and an operator reading
-		// the log would conclude the relay was down rather than that the
-		// feature is missing. The relay's own endpoints are named when
-		// they are known, so the log says WHICH relay was attempted.
-		if len(p.ViaEndpoints) == 0 {
-			return nil, fmt.Errorf("%w: mesh: the relay trunk is not implemented, and relay %s announced no endpoint to dial",
-				ErrRelayUnavailable, p.Via)
-		}
-		return nil, fmt.Errorf("%w: mesh: the relay trunk is not implemented (relay %s at %s)",
-			ErrRelayUnavailable, p.Via, strings.Join(p.ViaEndpoints, ", "))
+		return dialViaRelay(ctx, cfg, p)
 	default:
 		return nil, fmt.Errorf("%w: mesh: unknown path kind %q", ErrNoRoute, p.Kind)
 	}
+}
+
+// dialViaRelay opens a session to the target THROUGH a relay member.
+//
+// The steps:
+//
+//  1. Resolve the target's key from the member view. The relayed
+//     session's end-to-end handshake is verified against that key — the
+//     relay terminates TLS on both hops, so there is no certificate to
+//     pin. A target that is not a member fails HERE, before the relay
+//     ever hears the target's identity.
+//  2. Open a session to the RELAY member (by its endpoints).
+//  3. Ask the relay to carry a session to the target, and complete the
+//     end-to-end handshake through it.
+//
+// The error classes are deliberate:
+//
+//   - A relay that is not a member → ErrAuth. A verdict: the answer
+//     will not change on another relay.
+//   - A relay whose switch is off → ErrRelayTrunkDisabled. A local
+//     condition: another relay may well say yes, so the caller may try.
+//   - A relay whose quota is full → ErrQuota. Also a local condition.
+//   - A relay that cannot be reached → ErrUnreachable. A network fact.
+//
+// The wording matters as much as the class: the log says WHICH relay was
+// attempted, so an operator reading it knows where to look.
+func dialViaRelay(ctx context.Context, cfg DialConfig, p Path) (*Link, error) {
+	if cfg.Resolver == nil {
+		return nil, fmt.Errorf("%w: mesh: the relay path needs a member resolver", ErrRelayUnavailable)
+	}
+	// ① the target's key, from the LIVE member view.
+	wantKey, err := cfg.Resolver.KeyFor(cfg.Target)
+	if err != nil {
+		// The target is not a (current) member. This is an auth-class
+		// failure: the target's identity must not be handed to a relay
+		// that would then try to reach it.
+		return nil, fmt.Errorf("%w: %w", ErrAuth, err)
+	}
+	if len(p.TargetKey) == 0 {
+		// The picker did not supply the target's key. The member view
+		// is the authority, and it was consulted above — so the path's
+		// key is only a convenience. Use the view's.
+		p.TargetKey = wantKey
+	}
+
+	// ② the relay's endpoints.
+	if len(p.ViaEndpoints) == 0 {
+		return nil, fmt.Errorf("%w: mesh: the relay member %s announced no endpoint to dial",
+			ErrRelayUnavailable, p.Via)
+	}
+	// The relay must be a member too: a node that is not a member is
+	// not allowed to carry this network's traffic.
+	if _, err := cfg.Resolver.KeyFor(p.Via); err != nil {
+		return nil, fmt.Errorf("%w: mesh: the relay member %s is not a member of this view: %w",
+			ErrAuth, p.Via, err)
+	}
+
+	kind := cfg.Kind
+	if kind == "" {
+		kind = KindDial
+	}
+
+	// ③ open the relayed session.
+	//
+	// relayLink is the QUIC link to the relay member. It is captured
+	// here so the relayed link can release it: nothing else owns it.
+	var relayLink *Link
+	sess, err := OpenRelay(ctx, RelayRequesterConfig{
+		Device:    cfg.Device,
+		Resolver:  cfg.Resolver,
+		Target:    cfg.Target,
+		Kind:      kind,
+		TargetKey: p.TargetKey,
+		Relay:     p.Via,
+		Dial: func(ctx context.Context, relay identity.DeviceID, endpoints []string) (Session, error) {
+			// The session to the relay member is a QUIC link, and it is
+			// owned by the RELAYED link below — so that closing the
+			// relayed link also releases the connection to the relay
+			// and the socket it opened.
+			//
+			// It is the RELAY protocol's session, not the direct link's:
+			// the two have different ALPNs, so the trunk's relay port
+			// cannot be confused with the direct-link port.
+			link, err := DialRelaySession(ctx, cfg.Device, cfg.Resolver, relay, p.ViaEndpoints)
+			if err != nil {
+				return nil, err
+			}
+			relayLink = link
+			return link.Session(), nil
+		},
+	})
+	if err != nil {
+		if relayLink != nil {
+			_ = relayLink.Close()
+		}
+		return nil, classifyDialError(err)
+	}
+	// The relayed link owns the relay link: closing it releases both.
+	return &Link{
+		sess: sess,
+		br:   bufio.NewReader(sess),
+		closer: func() error {
+			_ = sess.Close()
+			if relayLink != nil {
+				return relayLink.Close()
+			}
+			return nil
+		},
+	}, nil
+}
+
+// ViewPicker is the picker that reads the LIVE member view.
+//
+// It is what the CLI uses: the direct path first (the owner's ruling —
+// "中继只兜底：大文件走直连，直连失败再走中继"), and then the relay
+// candidates, in the deterministic device-ID order (R-3.2).
+//
+// The relay candidates are the members that have announced an endpoint,
+// are not the target, and are not the requester itself. That is what
+// RelayCandidates computes — the picker only adds the ADDRESSES, because
+// a relay path without an address cannot be dialled.
+//
+// The picker does NOT decide whether a relay is willing: that is the
+// trunk's own decision, and it may refuse. A refusal is a local
+// condition, and the path layer moves on to the next candidate.
+type ViewPicker struct {
+	// View is the live member snapshot. It is read at PICK time, not
+	// captured at construction: the view changes (a member leaves, an
+	// endpoint changes), and a picker built on a stale view would keep
+	// offering paths that cannot work.
+	View func() *discovery.MemberSnapshot
+	// Self is the requester's own device ID. It is excluded from the
+	// relay candidates.
+	Self identity.DeviceID
+	// TargetKey resolves the target's public key from the view, so the
+	// relay path can verify the target's end-to-end hello.
+	TargetKey func(identity.DeviceID) (ed25519.PublicKey, error)
+}
+
+// Pick returns the direct path first, then the relay candidates.
+func (p ViewPicker) Pick(ctx context.Context, target identity.DeviceID, kind string) ([]Path, error) {
+	out := []Path{{Kind: PathDirect}}
+	view := p.View()
+	if view == nil {
+		// No view: there is only the direct path. The dialer's own
+		// endpoint list is used for it.
+		return out, nil
+	}
+	for _, id := range RelayCandidates(view, target, p.Self) {
+		mv, ok := view.Members[id]
+		if !ok {
+			continue
+		}
+		// The relay path is dialled on the candidate's RELAY endpoints, not
+		// on its direct ones: a relay session speaks its own ALPN and needs
+		// its own UDP port, so the direct addresses would fail the ALPN
+		// negotiation. A candidate that has announced no relay endpoint
+		// cannot serve as a trunk.
+		if len(mv.RelayEndpoints) == 0 {
+			continue
+		}
+		path := Path{
+			Kind:         PathRelay,
+			Via:          id,
+			ViaEndpoints: append([]string(nil), mv.RelayEndpoints...),
+			Hops:         1,
+		}
+		if p.TargetKey != nil {
+			key, err := p.TargetKey(target)
+			if err != nil {
+				// The target's key is not available. The relay path
+				// cannot verify the target's hello without it, so the
+				// relay candidates are dropped. The direct path is
+				// still offered — the direct path pins the certificate
+				// itself.
+				return out, nil
+			}
+			path.TargetKey = key
+		}
+		out = append(out, path)
+	}
+	return out, nil
 }

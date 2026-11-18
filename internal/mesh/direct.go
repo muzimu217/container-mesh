@@ -191,6 +191,13 @@ type MemberResolver interface {
 type MemberListAdapter struct{ List *identity.MemberList }
 
 func (a MemberListAdapter) KeyFor(id identity.DeviceID) (ed25519.PublicKey, error) {
+	if a.List == nil {
+		// A nil list is a resolver with no view. It must answer "not a
+		// member" rather than panic: the relay path asks the resolver
+		// before it has any other information, and a panic there would
+		// take the process down.
+		return nil, fmt.Errorf("mesh: %s is not a member (no member view is available)", id)
+	}
 	mm, ok := a.List.Get(id)
 	if !ok {
 		return nil, fmt.Errorf("mesh: %s is not a member", id)
@@ -524,6 +531,22 @@ func (l *Listener) serveSession(peerID identity.DeviceID, st Session) error {
 	_ = st.SetReadDeadline(time.Time{})
 
 	return serveSession(h.Kind, peerID, br, st, l.cfg)
+}
+
+// ServeRelayedSession serves a RELAYED session with the same dispatch
+// the direct link uses.
+//
+// The business layer must not be able to tell a relayed session from a
+// direct one: a member-to-member message that arrives through a trunk is
+// handled exactly like one that arrives directly, and the pings, the
+// files and the commands work the same way.
+//
+// The kind comes from the relay's open record — the requester asked for
+// a session of that kind, and the target's handler for that kind serves
+// it. That is why the kind travels in the open record.
+func ServeRelayedSession(kind string, peerID identity.DeviceID, sess Session, cfg ListenerConfig) error {
+	br := bufio.NewReader(sess)
+	return serveSession(kind, peerID, br, sess, cfg)
 }
 
 // serveSession dispatches an established session to the handler for its
@@ -909,6 +932,14 @@ type Link struct {
 	// type and a relayed session can be dropped in unchanged.
 	sess Session
 	br   *bufio.Reader
+	// closer releases the resources behind sess when the link is closed.
+	//
+	// It is nil for a direct link (the QUIC connection and the socket
+	// are released by Close itself) and set for a RELAYED link, whose
+	// session is backed by a QUIC connection to the relay member that
+	// nothing else owns. Without it a relayed link would leak the
+	// connection and the socket.
+	closer func() error
 }
 
 // SendMsg delivers short text messages to a member. Frames are
@@ -1081,6 +1112,14 @@ func (l *Link) Loss() *BenchLoss { return lossOf(l.qc) }
 // not close a caller-owned packet connection when the QUIC connection ends
 // (createdConn=false), so the socket is this type's responsibility.
 func (l *Link) Close() error {
+	// A relayed link has no QUIC connection of its own: its session is
+	// backed by one to the RELAY member, released by the closer.
+	if l.closer != nil {
+		return l.closer()
+	}
+	if l.qc == nil {
+		return nil
+	}
 	err := l.qc.CloseWithError(0, "bye")
 	if l.udp != nil {
 		_ = l.udp.Close()
@@ -1226,4 +1265,94 @@ func readLine(br *bufio.Reader, capBytes int) ([]byte, error) {
 
 func ed25519KeysEqual(a, b ed25519.PublicKey) bool {
 	return bytes.Equal(a, b)
+}
+
+// DialRelaySession opens a RELAY-PROTOCOL session to a member.
+//
+// It is like DialDirect, with two differences:
+//
+//  1. The ALPN is the relay protocol's, not the direct link's. That is
+//     what keeps the two protocols from reaching each other: a peer that
+//     speaks the direct-link protocol cannot land on the relay protocol
+//     and vice versa.
+//  2. There is no hello and no kind dispatch. The relay protocol has its
+//     own record framing, and the session's MEANING is decided by the
+//     first record (a join or an open).
+//
+// The certificate is pinned against the member view exactly as on the
+// direct path, so the relay member is authenticated the same way.
+func DialRelaySession(
+	ctx context.Context,
+	dev *identity.Device,
+	resolver MemberResolver,
+	target identity.DeviceID,
+	endpoints []string,
+) (*Link, error) {
+	if dev == nil || resolver == nil || target == "" {
+		return nil, errors.New("mesh: relay dial needs device, resolver and target")
+	}
+	if len(endpoints) == 0 {
+		return nil, fmt.Errorf("%w: mesh: %s announced no relay endpoint to dial", ErrNoRoute, target)
+	}
+	wantKey, err := resolver.KeyFor(target)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrAuth, err)
+	}
+	cert, err := dev.TLSCertificate()
+	if err != nil {
+		return nil, err
+	}
+	pin := func(id identity.DeviceID, pub ed25519.PublicKey) error {
+		if id != target {
+			return fmt.Errorf("mesh: endpoint answered as %s, not %s", id, target)
+		}
+		if !ed25519KeysEqual(pub, wantKey) {
+			return errors.New("mesh: peer certificate key does not match the member view")
+		}
+		return nil
+	}
+	tlsCfg, err := deviceTLS(&cert, pin)
+	if err != nil {
+		return nil, err
+	}
+	tlsCfg.NextProtos = []string{RelayALPN}
+
+	var lastErr error
+	for _, ep := range endpoints {
+		addr, err := net.ResolveUDPAddr("udp", ep)
+		if err != nil {
+			lastErr = fmt.Errorf("bad endpoint %q in the member view", ep)
+			continue
+		}
+		link, err := dialRelayOne(ctx, addr, dev, tlsCfg)
+		if err == nil {
+			return link, nil
+		}
+		classified := classifyDialError(err)
+		lastErr = preferDialError(lastErr, classified)
+	}
+	return nil, fmt.Errorf("mesh: all %d relay endpoint(s) for %s failed: %w",
+		len(endpoints), target, lastErr)
+}
+
+// dialRelayOne attempts a single relay-protocol endpoint.
+func dialRelayOne(ctx context.Context, addr *net.UDPAddr, dev *identity.Device, tlsCfg *tls.Config) (*Link, error) {
+	udp, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	if err != nil {
+		return nil, fmt.Errorf("mesh: local udp bind: %w", err)
+	}
+	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	qc, err := quic.Dial(cctx, udp, addr, tlsCfg, quicConfig())
+	if err != nil {
+		_ = udp.Close()
+		return nil, fmt.Errorf("quic dial relay %s: %w", addr, err)
+	}
+	st, err := qc.OpenStreamSync(cctx)
+	if err != nil {
+		_ = qc.CloseWithError(0, "abandoned")
+		_ = udp.Close()
+		return nil, fmt.Errorf("open relay stream: %w", err)
+	}
+	return &Link{qc: qc, st: st, sess: quicSession{st: st, conn: qc}, br: bufio.NewReader(st), udp: udp}, nil
 }

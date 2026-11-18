@@ -169,12 +169,15 @@ func probeMember(ctx context.Context, sess *meshSession, target identity.DeviceI
 	if err != nil {
 		return reachabilityDegraded, err.Error()
 	}
-	link, err := mesh.DialDirect(ctx, mesh.DialConfig{
+	// The picker is used here too, so a probe of a pure-outbound member
+	// succeeds THROUGH the trunk instead of reporting "degraded".
+	link, used, err := mesh.DialViaPickerPath(ctx, mesh.DialConfig{
 		Device:    sess.dev,
 		Resolver:  sess.resolver,
 		Target:    target,
 		Endpoints: eps,
 		Kind:      mesh.KindPing,
+		Picker:    sess.picker(),
 	})
 	if err != nil {
 		return reachabilityDegraded, err.Error()
@@ -186,6 +189,9 @@ func probeMember(ctx context.Context, sess *meshSession, target identity.DeviceI
 			err = errors.New("probe received no reply")
 		}
 		return reachabilityDegraded, err.Error()
+	}
+	if used.Kind == mesh.PathRelay {
+		return "relay", ""
 	}
 	return reachabilityDirect, ""
 }

@@ -171,6 +171,70 @@ func TestMeshRelayFrameTypes(t *testing.T) {
 	}
 }
 
+// TestMeshRelayDataFrameTypes pins the two data-plane frames of the mesh
+// relay trunk.
+//
+// The control frames (open/answer) say whether the trunk WILL carry a
+// relay; these two carry the relay itself. FrameMeshRelayData moves the
+// opaque bytes of the relayed session, and FrameMeshRelayClose tears the
+// relay down.
+//
+// They are appended at the END of the type list on purpose: the type byte
+// is on the wire, so a peer built against an earlier release dispatches on
+// it. TestExistingFrameNumbersAreStable is the guard.
+func TestMeshRelayDataFrameTypes(t *testing.T) {
+	if got := FrameMeshRelayData.String(); got != "mesh-relay-data" {
+		t.Errorf("FrameMeshRelayData.String() = %q, want %q", got, "mesh-relay-data")
+	}
+	if got := FrameMeshRelayClose.String(); got != "mesh-relay-close" {
+		t.Errorf("FrameMeshRelayClose.String() = %q, want %q", got, "mesh-relay-close")
+	}
+	if got := FrameMeshRelayHello.String(); got != "mesh-relay-hello" {
+		t.Errorf("FrameMeshRelayHello.String() = %q, want %q", got, "mesh-relay-hello")
+	}
+
+	all := []FrameType{
+		FrameHello, FrameMsg, FrameFileOffer, FrameFileAccept, FrameFileReject,
+		FrameFileChunk, FrameFileAck, FrameFileDone, FrameFileResult, FrameError,
+		FramePing, FramePong, FrameP2POffer, FrameP2PAnswer, FrameMuxStart,
+		FrameStreamData, FrameForwardListen, FrameForwardListenResult,
+		FrameMeshRelayOpen, FrameMeshRelayAnswer,
+		FrameMeshRelayData, FrameMeshRelayClose, FrameMeshRelayHello,
+	}
+	seen := make(map[FrameType]bool, len(all))
+	for _, f := range all {
+		if seen[f] {
+			t.Errorf("frame type %d (%s) is used twice", uint8(f), f)
+		}
+		seen[f] = true
+	}
+}
+
+// TestMeshRelayDataFramesRoundTrip checks that the two data-plane frames
+// survive the binary encoding like every other frame.
+func TestMeshRelayDataFramesRoundTrip(t *testing.T) {
+	for _, want := range []*Frame{
+		{Type: FrameMeshRelayData, Stream: 1, Payload: []byte(`{"n":1}`)},
+		{Type: FrameMeshRelayClose, Payload: []byte(`{"reason":"bye"}`)},
+		{Type: FrameMeshRelayHello, Stream: 1, Payload: []byte(`{"eph":"..."}`)},
+	} {
+		enc, err := want.Encode(nil)
+		if err != nil {
+			t.Fatalf("%s: encode: %v", want.Type, err)
+		}
+		got, err := DecodeFrameBytes(enc)
+		if err != nil {
+			t.Fatalf("%s: decode: %v", want.Type, err)
+		}
+		if got.Type != want.Type || got.Stream != want.Stream {
+			t.Errorf("%s: header mismatch: %+v", want.Type, got)
+		}
+		if !bytes.Equal(got.Payload, want.Payload) {
+			t.Errorf("%s: payload mismatch", want.Type)
+		}
+	}
+}
+
 // TestMeshRelayFramesRoundTrip checks that the two new frames survive the
 // binary encoding like every other frame: the trunk control messages ride
 // the same header as the rest of the protocol.

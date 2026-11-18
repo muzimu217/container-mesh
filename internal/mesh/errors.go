@@ -152,7 +152,38 @@ func isCryptoError(err error) bool {
 	if !errors.As(err, &te) {
 		return false
 	}
+	if te.ErrorCode == tlsAlertNoApplicationProtocol {
+		// The peer REJECTED OUR ALPN. Its certificate was never even
+		// looked at, so this is not a credential failure: it means "this
+		// port does not speak this protocol".
+		//
+		// It matters because the mesh announces TWO kinds of endpoint on
+		// the same member (the direct link and the relay trunk), and a
+		// dial that tries the wrong one must not be classified as an
+		// auth failure. An auth failure STOPS the path walk (the same
+		// credentials will be refused everywhere); a "wrong port" fact
+		// must let the walk continue to the next endpoint.
+		return false
+	}
 	return te.ErrorCode.IsCryptoError()
+}
+
+// tlsAlertNoApplicationProtocol is the TLS alert 120 (no_application_protocol).
+//
+// quic-go maps a TLS alert to the transport error code 0x100 + the alert
+// number, so this constant is the QUIC encoding of alert 120.
+const tlsAlertNoApplicationProtocol quic.TransportErrorCode = 0x100 + 120
+
+// isALPNMismatch reports whether err is "the peer rejected our ALPN".
+//
+// It is the signal to move on to the next endpoint: the port exists and
+// answered, but it does not speak this protocol.
+func isALPNMismatch(err error) bool {
+	var te *quic.TransportError
+	if !errors.As(err, &te) {
+		return false
+	}
+	return te.ErrorCode == tlsAlertNoApplicationProtocol
 }
 
 // isTimeoutError reports whether err is a "nobody answered in time"

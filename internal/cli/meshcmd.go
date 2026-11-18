@@ -14,6 +14,7 @@ package cli
 import (
 	"bufio"
 	"context"
+	"crypto/ed25519"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -177,6 +178,33 @@ func snapContains(snap *discovery.MemberSnapshot, id identity.DeviceID) bool {
 	return ok
 }
 
+// picker builds the path picker for this session.
+//
+// The picker is what makes the RELAY path reachable from the CLI: it is
+// asked for the paths to the target, and it answers with the direct path
+// first and the relay candidates after (D73: "中继只兜底：大文件走直连，
+// 直连失败再走中继").
+//
+// The view is read at PICK time, not captured now: the member view
+// changes while the command runs (a member leaves, an endpoint changes),
+// and a picker built on a stale snapshot would keep offering paths that
+// cannot work.
+//
+// The target key comes from the LIVE view too — the relayed session's
+// end-to-end handshake is verified against it, and the relay terminates
+// TLS on both hops, so there is no certificate to pin.
+func (s *meshSession) picker() mesh.PathPicker {
+	return mesh.ViewPicker{
+		View: func() *discovery.MemberSnapshot {
+			return s.cl.Snapshot()
+		},
+		Self: s.dev.ID(),
+		TargetKey: func(id identity.DeviceID) (ed25519.PublicKey, error) {
+			return s.resolver.KeyFor(id)
+		},
+	}
+}
+
 func runMesh(args []string) error {
 	if len(args) == 0 {
 		return ExitError{Code: 2, Err: errors.New("mesh needs a subcommand: ping")}
@@ -230,6 +258,7 @@ func runRun(args []string) error {
 		Resolver:  sess.resolver,
 		Target:    target,
 		Endpoints: eps,
+		Picker:    sess.picker(),
 	}, verb, verbArgs)
 	if err != nil {
 		return ExitError{Code: 1, Err: err}
@@ -291,6 +320,7 @@ func runMsg(args []string) error {
 		Resolver:  sess.resolver,
 		Target:    target,
 		Endpoints: eps,
+		Picker:    sess.picker(),
 	}, texts); err != nil {
 		return ExitError{Code: 1, Err: err}
 	}
@@ -340,6 +370,7 @@ func runSendTo(args []string) error {
 		Resolver:  sess.resolver,
 		Target:    target,
 		Endpoints: eps,
+		Picker:    sess.picker(),
 	}, *file)
 	if err != nil {
 		return ExitError{Code: 1, Err: err}
@@ -397,12 +428,20 @@ func runMeshPing(args []string) error {
 		return ExitError{Code: 1, Err: err}
 	}
 
-	link, err := mesh.DialDirect(ctx, mesh.DialConfig{
+	// The picker is what makes the RELAY path reachable: the direct
+	// path is tried first, and the relay candidates after it (D73).
+	//
+	// The path that was actually used is REPORTED: "link=relay via=<id>"
+	// is the only way an operator can tell that the ping went through a
+	// trunk — and a ping that silently took the relay would look like a
+	// direct ping with a worse RTT.
+	link, used, err := mesh.DialViaPickerPath(ctx, mesh.DialConfig{
 		Device:    sess.dev,
 		Resolver:  sess.resolver,
 		Target:    target,
 		Endpoints: eps,
 		Kind:      mesh.KindPing,
+		Picker:    sess.picker(),
 	})
 	if err != nil {
 		return ExitError{Code: 1, Err: err}
@@ -423,6 +462,16 @@ func runMeshPing(args []string) error {
 		linkClass = reachabilityDirect
 	} else if stats.Sent > 0 {
 		linkClass = reachabilityDegraded
+	}
+	// The link the session actually took. "relay" is reported with the
+	// relay member's ID, because "relay" alone does not say WHICH
+	// trunk carried the traffic — and that is the first thing an
+	// operator wants to know.
+	if used.Kind == mesh.PathRelay {
+		linkClass = "relay"
+		if used.Via != "" {
+			linkClass = "relay via=" + used.Via.String()
+		}
 	}
 	fmt.Printf("--- %s: %d/%d pings, lost %d (%.1f%%), p50 %.3fms p95 %.3fms, link=%s (P-1 line: <5ms)\n",
 		target, stats.Received, stats.Sent, stats.Lost, stats.LossPercent(), p50, p95, linkClass)

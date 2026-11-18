@@ -91,6 +91,41 @@ const (
 	// FrameMeshRelayAnswer answers FrameMeshRelayOpen: granted or refused,
 	// with a reason the requester can show.
 	FrameMeshRelayAnswer
+	// FrameMeshRelayData carries the opaque bytes of a relayed session.
+	//
+	// It is the DATA plane of the mesh's own relay: the trunk moves these
+	// bytes between two other members without being able to read them (the
+	// end-to-end layer is inside the payload). The Stream field carries
+	// the relay session id, so several relays can share one connection
+	// without their bytes getting mixed up.
+	//
+	// Appended at the end on purpose: the numbers of the frames above are
+	// on the wire, and a peer dispatches on the type byte.
+	FrameMeshRelayData
+	// FrameMeshRelayClose tears a relayed session down. Payload is JSON
+	// {"reason":"..."}.
+	//
+	// It exists as its own type (rather than as a flag on the data frame)
+	// so a close is never mistaken for data, and so a peer that sees a
+	// close can drop the session without having to parse a payload.
+	FrameMeshRelayClose
+	// FrameMeshRelayHello carries the END-TO-END handshake of a relayed
+	// session: the ephemeral public key of one end, its device ID, a
+	// timestamp and a signature over the transcript.
+	//
+	// It is a separate type from the data frame on purpose: the handshake
+	// is exchanged ONCE per session and in the clear (it is not secret —
+	// it is signed), while the data frames carry ciphertext. Letting the
+	// two share a type would make the first frame of a session ambiguous.
+	FrameMeshRelayHello
+	// FrameMeshRelayJoin announces that a member is connected to the
+	// anchor and is willing to RECEIVE relayed sessions.
+	//
+	// It is what makes a pure-outbound member reachable: it dials the
+	// anchor (it has no inbound port of its own) and stays connected, and
+	// the anchor opens the relay stream back to it over that connection.
+	// Payload is JSON {"device":"<deviceID>"}.
+	FrameMeshRelayJoin
 )
 
 // MaxStreamData bounds one FrameStreamData payload.
@@ -146,6 +181,14 @@ func (t FrameType) String() string {
 		return "mesh-relay-open"
 	case FrameMeshRelayAnswer:
 		return "mesh-relay-answer"
+	case FrameMeshRelayData:
+		return "mesh-relay-data"
+	case FrameMeshRelayClose:
+		return "mesh-relay-close"
+	case FrameMeshRelayHello:
+		return "mesh-relay-hello"
+	case FrameMeshRelayJoin:
+		return "mesh-relay-join"
 	default:
 		return fmt.Sprintf("frame(%d)", uint8(t))
 	}
