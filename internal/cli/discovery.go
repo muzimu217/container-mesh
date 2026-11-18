@@ -88,6 +88,35 @@ func discoveryAllowLocal() bool {
 	return cmeshtest.Enabled
 }
 
+// discoveryAllowPrivate reports whether the operator asked for a PRIVATE
+// deployment.
+//
+// A private deployment is one where the anchor has no public address: it
+// lives on a LAN and is reached by a private address (10.x, 192.168.x) or
+// by a name that resolves to one. The default outbound policy refuses
+// those addresses, because a discovery origin that resolves to a loopback
+// or a private address is an SSRF vector — the round-56 finding closed
+// that hole.
+//
+// The switch reopens the door for the operator who explicitly says this
+// is their own network, and only for them: it is an environment variable
+// rather than a flag because it has to apply to EVERY command that dials
+// the anchor (join, msg, send-to, run, ping), and each of those parses
+// its own flags.
+//
+// It is narrower than the test-only escape hatch (AllowLocalDiscovery):
+// the reserved and documentation ranges stay refused even with it, and the
+// relaxation applies to private, loopback and link-local addresses only.
+//
+//	CMESH_ALLOW_PRIVATE_DISCOVERY=1
+func discoveryAllowPrivate() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("CMESH_ALLOW_PRIVATE_DISCOVERY"))) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+
 // randomToken returns a fresh panel token.
 //
 // A token is a bearer secret for the roster, so it is generated from the
@@ -468,13 +497,14 @@ func runJoin(args []string) error {
 	}
 
 	cl, err := discovery.NewClient(withDiscoveryClientTransport(discovery.ClientConfig{
-		Addrs:               inv.DiscoveryAddrs,
-		Device:              dev,
-		AccountID:           inv.AccountID,
-		AccountPub:          []byte(inv.AccountPub),
-		Endpoints:           announced,
-		AllowLocalDiscovery: discoveryAllowLocal(),
-		Logger:              setupLogging(false),
+		Addrs:                 inv.DiscoveryAddrs,
+		Device:                dev,
+		AccountID:             inv.AccountID,
+		AccountPub:            []byte(inv.AccountPub),
+		Endpoints:             announced,
+		AllowLocalDiscovery:   discoveryAllowLocal(),
+		AllowPrivateDiscovery: discoveryAllowPrivate(),
+		Logger:                setupLogging(false),
 	}))
 	if err != nil {
 		return ExitError{Code: 1, Err: err}

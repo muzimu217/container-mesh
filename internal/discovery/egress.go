@@ -20,6 +20,21 @@ import (
 // the second call: resolve, then look at what the name actually points at.
 // This function is that second call.
 func EgressPolicy(addr net.Addr) error {
+	return EgressPolicyWith(addr, false)
+}
+
+// EgressPolicyWith is the switchable form.
+//
+// privateAllowed relaxes the policy for a deployment that opted into
+// private networking: a self-hosted mesh on a LAN reaches its anchor by a
+// private address or by a name that resolves to one, and the default
+// policy refuses both — so the client could not even enroll.
+//
+// The relaxation is NARROW: the private, loopback and link-local ranges
+// are allowed, because a real private deployment uses them. The reserved
+// and documentation ranges are still refused: they are never a deployment
+// target.
+func EgressPolicyWith(addr net.Addr, privateAllowed bool) error {
 	host, _, err := net.SplitHostPort(addr.String())
 	if err != nil {
 		host = addr.String()
@@ -27,6 +42,14 @@ func EgressPolicy(addr net.Addr) error {
 	ip := net.ParseIP(host)
 	if ip == nil {
 		return fmt.Errorf("discovery: egress policy: %q did not resolve to an IP address", addr)
+	}
+	if privateAllowed {
+		if !allowedPrivateIP(ip) {
+			return fmt.Errorf(
+				"discovery: egress policy: %s resolved to %s, which is not an address a private "+
+					"deployment may use (the reserved ranges are refused even then)", addr, ip)
+		}
+		return nil
 	}
 	if !isPublicRoutableIP(ip) {
 		return fmt.Errorf(
@@ -47,6 +70,15 @@ func EgressPolicy(addr net.Addr) error {
 // timeout bounds the dial and the response headers.
 func EgressTransport(timeout time.Duration) *http.Transport {
 	return PolicyTransport(timeout, EgressPolicy)
+}
+
+// EgressTransportWith is EgressTransport with the private-deployment
+// switch. A caller that opted into private networking gets the relaxed
+// policy on every path it dials.
+func EgressTransportWith(timeout time.Duration, privateAllowed bool) *http.Transport {
+	return PolicyTransport(timeout, func(addr net.Addr) error {
+		return EgressPolicyWith(addr, privateAllowed)
+	})
 }
 
 // PolicyTransport returns an HTTP transport that applies the given policy to

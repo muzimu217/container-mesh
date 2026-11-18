@@ -115,6 +115,20 @@ type ClientConfig struct {
 	//
 	// Production never sets it.
 	AllowLocalDiscovery bool
+	// AllowPrivateDiscovery relaxes the outbound address policy for a
+	// PRIVATE deployment: one where the anchor is addressed by a private
+	// address (10.x, 192.168.x) or by a name that resolves to one.
+	//
+	// The default policy refuses those addresses, which is right for the
+	// public case — a discovery origin that resolves to a loopback or a
+	// private address is an SSRF vector, and the round-56 finding closed
+	// it. But a self-hosted mesh on a LAN has no public address at all, so
+	// without this switch a private deployment cannot even enroll.
+	//
+	// It is deliberately NARROWER than AllowLocalDiscovery: the private,
+	// loopback and link-local ranges are allowed, while the reserved and
+	// documentation ranges stay refused.
+	AllowPrivateDiscovery bool
 	// Logger receives heartbeat and stream outcomes.
 	Logger *slog.Logger
 }
@@ -199,7 +213,7 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		return nil, fmt.Errorf("discovery: client needs the account public key (got %d bytes)", len(cfg.AccountPub))
 	}
 	for _, a := range cfg.Addrs {
-		if _, err := normalizeBaseURL(a); err != nil {
+		if _, err := normalizeBaseURLWith(a, cfg.AllowPrivateDiscovery); err != nil {
 			return nil, fmt.Errorf("discovery: bad discovery address %q: %w", a, err)
 		}
 	}
@@ -217,7 +231,7 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	}
 	addrs := make([]string, 0, len(cfg.Addrs))
 	for _, a := range cfg.Addrs {
-		addrs = append(addrs, strings.TrimRight(normalizedAddr(a), "/"))
+		addrs = append(addrs, strings.TrimRight(normalizedAddrWith(a, cfg.AllowPrivateDiscovery), "/"))
 	}
 	c := &Client{
 		cfg:         cfg,
@@ -264,6 +278,11 @@ func (c *Client) egressPolicy() func(net.Addr) error {
 	}
 	if c.cfg.EgressPolicy != nil {
 		return c.cfg.EgressPolicy
+	}
+	if c.cfg.AllowPrivateDiscovery {
+		return func(addr net.Addr) error {
+			return EgressPolicyWith(addr, true)
+		}
 	}
 	return EgressPolicy
 }
@@ -771,7 +790,7 @@ func (c *Client) streamOnce(ctx context.Context) (bool, error) {
 	c.mu.Lock()
 	idx := c.addrIdx
 	c.mu.Unlock()
-	u, err := membersWSURL(c.addrs[idx])
+	u, err := membersWSURLWith(c.addrs[idx], c.cfg.AllowPrivateDiscovery)
 	if err != nil {
 		return false, err
 	}
@@ -996,7 +1015,14 @@ func (c *Client) applySnapshot(snap *MemberSnapshot) {
 // so other packages — the credential enrollment path — address the same
 // node the same way.
 func NormalizeDiscoveryURL(a string) (string, error) {
-	u, err := normalizeBaseURL(a)
+	return NormalizeDiscoveryURLWith(a, false)
+}
+
+// NormalizeDiscoveryURLWith is NormalizeDiscoveryURL with the
+// private-deployment switch: privateAllowed lets a private address (or a
+// name that resolves to one) be a discovery origin.
+func NormalizeDiscoveryURLWith(a string, privateAllowed bool) (string, error) {
+	u, err := normalizeBaseURLWith(a, privateAllowed)
 	if err != nil {
 		return "", err
 	}
@@ -1004,6 +1030,13 @@ func NormalizeDiscoveryURL(a string) (string, error) {
 }
 
 func normalizeBaseURL(a string) (*url.URL, error) {
+	return normalizeBaseURLWith(a, false)
+}
+
+// normalizeBaseURLWith is the switchable form: privateAllowed relaxes the
+// literal-address half of the policy, so a private deployment can address
+// its anchor by a private IP.
+func normalizeBaseURLWith(a string, privateAllowed bool) (*url.URL, error) {
 	if !strings.Contains(a, "://") {
 		// Bare "host:port" defaults to https on the TLS port: a discovery
 		// node published on 443 (the one port most restricted egress
@@ -1029,7 +1062,7 @@ func normalizeBaseURL(a string) (*url.URL, error) {
 	}
 	if host := u.Hostname(); host == "" {
 		return nil, fmt.Errorf("no host")
-	} else if !allowedDiscoveryHost(host) {
+	} else if !allowedDiscoveryHostWith(host, privateAllowed) {
 		return nil, fmt.Errorf("disallowed host %q", host)
 	}
 	if u.Port() == "" {
@@ -1045,7 +1078,22 @@ func normalizeBaseURL(a string) (*url.URL, error) {
 }
 
 func normalizedAddr(a string) string {
-	u, err := normalizeBaseURL(a)
+	return normalizedAddrWith(a, false)
+}
+
+// normalizedAddrWith is the switchable form.
+//
+// The scheme matters here: the register URL is built by appending a path
+// to the address, and an address without a scheme ("10.0.0.5:18095")
+// cannot be parsed as a URL at all. So when the default policy refuses a
+// private address, this returns the address UNCHANGED — and the caller
+// then fails with "first path segment in URL cannot contain colon"
+// instead of the policy's own message.
+//
+// With the private-deployment switch on, the address IS normalized, so it
+// keeps its scheme and the flow works.
+func normalizedAddrWith(a string, privateAllowed bool) string {
+	u, err := normalizeBaseURLWith(a, privateAllowed)
 	if err != nil {
 		return a
 	}
@@ -1055,7 +1103,12 @@ func normalizedAddr(a string) string {
 
 // membersWSURL derives the stream endpoint: same origin, ws/wss scheme.
 func membersWSURL(base string) (string, error) {
-	u, err := normalizeBaseURL(base)
+	return membersWSURLWith(base, false)
+}
+
+// membersWSURLWith is the switchable form.
+func membersWSURLWith(base string, privateAllowed bool) (string, error) {
+	u, err := normalizeBaseURLWith(base, privateAllowed)
 	if err != nil {
 		return "", err
 	}

@@ -229,14 +229,64 @@ func validEndpoint(e string) bool {
 // or hostname used as a discovery server. Hostnames are syntax-checked only;
 // callers that dial them must use an egress policy that revalidates resolved
 // addresses before connecting.
+//
+// privateAllowed relaxes the literal-address half of the policy so a
+// PRIVATE deployment can be reached: a self-hosted mesh on a LAN addresses
+// its anchor by a private address (10.0.0.5, 192.168.1.10), and the
+// default policy refuses it — so the join cannot even be enrolled, let
+// alone reach it.
+//
+// The relaxation is deliberately NARROW: it lets private, loopback and
+// link-local addresses through, and it still refuses the reserved and
+// documentation ranges, which are never a real deployment target. The
+// deeper check — what a hostname RESOLVES to — is the egress policy's job,
+// and it is relaxed by the same switch, because a private anchor is
+// usually reached by NAME (mesh-anchor.internal), and a name that resolves
+// to a private address must be allowed too.
+//
+// What this switch does NOT relax: a hostname that resolves to a loopback
+// address is still refused unless the caller asked for private
+// deployments. That keeps the SSRF finding of round 56 closed for the
+// default path — a malicious discovery node cannot make a client dial
+// 127.0.0.1 — while opening the door for the private deployment the
+// operator explicitly asked for.
 func allowedDiscoveryHost(host string) bool {
+	return allowedDiscoveryHostWith(host, false)
+}
+
+// allowedDiscoveryHostWith is the switchable form.
+func allowedDiscoveryHostWith(host string, privateAllowed bool) bool {
 	if strings.EqualFold(strings.TrimSuffix(host, "."), "localhost") {
+		// "localhost" is a name, not an address, and it always means the
+		// local machine. A private deployment does not use it.
 		return false
 	}
 	if ip := net.ParseIP(strings.Trim(host, "[]")); ip != nil {
+		if privateAllowed {
+			return allowedPrivateIP(ip)
+		}
 		return isPublicRoutableIP(ip)
 	}
 	return true
+}
+
+// allowedPrivateIP reports whether an address may be used by a deployment
+// that opted into private networking.
+//
+// Everything the public policy refuses stays refused EXCEPT the ranges that
+// a real private deployment uses: private (10/8, 172.16/12, 192.168/16),
+// loopback (a same-host anchor) and link-local. The reserved and
+// documentation ranges are still refused: they are never a deployment
+// target, and allowing them would open the SSRF hole the default policy
+// closes.
+func allowedPrivateIP(ip net.IP) bool {
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() {
+		return true
+	}
+	if ip.IsLinkLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast() {
+		return false
+	}
+	return !isReservedIP(ip)
 }
 
 func isPublicRoutableIP(ip net.IP) bool {

@@ -94,11 +94,11 @@ func enrollWithCredentialUsing(ctx context.Context, cred *credential.Credential,
 		// tag, so the shipped binary has no such escape.
 		client.Transport = &http.Transport{ResponseHeaderTimeout: enrollTimeout}
 	default:
-		client.Transport = discovery.EgressTransport(enrollTimeout)
+		client.Transport = discovery.EgressTransportWith(enrollTimeout, discoveryAllowPrivate())
 	}
 	var lastErr error
 	for _, addr := range cred.Public.DiscoveryAddrs {
-		base, err := discovery.NormalizeDiscoveryURL(addr)
+		base, err := discovery.NormalizeDiscoveryURLWith(addr, discoveryAllowPrivate())
 		if err != nil {
 			lastErr = err
 			continue
