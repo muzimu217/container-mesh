@@ -342,8 +342,8 @@ func dialViaRelay(ctx context.Context, cfg DialConfig, p Path) (*Link, error) {
 			// and the socket it opened.
 			//
 			// It is the RELAY protocol's session, not the direct link's:
-			// the two have different ALPNs, so the trunk's relay port
-			// cannot be confused with the direct-link port.
+			// the two have different ALPNs, so the trunk's relay
+			// endpoint cannot be confused with a direct-link one.
 			link, err := DialRelaySession(ctx, cfg.Device, cfg.Resolver, relay, p.ViaEndpoints)
 			if err != nil {
 				return nil, err
@@ -414,11 +414,13 @@ func (p ViewPicker) Pick(ctx context.Context, target identity.DeviceID, kind str
 		if !ok {
 			continue
 		}
-		// The relay path is dialled on the candidate's RELAY endpoints, not
-		// on its direct ones: a relay session speaks its own ALPN and needs
-		// its own UDP port, so the direct addresses would fail the ALPN
-		// negotiation. A candidate that has announced no relay endpoint
-		// cannot serve as a trunk.
+		// The relay path is dialled on the candidate's RELAY endpoints,
+		// not on its direct ones: a relay session speaks its own ALPN, so
+		// the address has to be one where that protocol is served. (In
+		// the default shape the two share one socket and one port, and
+		// the announced relay endpoints are the direct ones — D76.)
+		// A candidate that has announced no relay endpoint cannot serve
+		// as a trunk.
 		if len(mv.RelayEndpoints) == 0 {
 			continue
 		}

@@ -62,6 +62,12 @@ type discoveryClientTransport struct {
 	webSocketDial func(context.Context, wsconn.DialOptions) (*wsconn.Conn, error)
 }
 
+// joinResolverHook is intentionally nil in production. CLI tests use it to
+// observe the resolver a join built, so they can assert on the member view
+// that join actually got — the one the relay trunk join pins the trunk's
+// certificate against.
+var joinResolverHook func(*liveViewResolver)
+
 var discoveryClientTransportHook discoveryClientTransport
 
 func withDiscoveryClientTransport(cfg discovery.ClientConfig) discovery.ClientConfig {
@@ -295,6 +301,49 @@ func (r relayMembersResolver) KeyFor(id identity.DeviceID) (ed25519.PublicKey, e
 	return mesh.MemberListAdapter{List: r.srv.MeshMembers()}.KeyFor(id)
 }
 
+// memberEndpoints reports the addresses a member announced for direct
+// connections.
+func memberEndpoints(srv *relay.Server, id identity.DeviceID) []string {
+	node := srv.DiscoNode()
+	if node == nil {
+		return nil
+	}
+	return node.Endpoints(id)
+}
+
+// memberRelayEndpoints reports the addresses a member announced for
+// RELAYS.
+//
+// The anchor's own view is the node's: it records every announce it
+// accepted, so it knows where each member can be reached.
+func memberRelayEndpoints(srv *relay.Server, id identity.DeviceID) []string {
+	node := srv.DiscoNode()
+	if node == nil {
+		return nil
+	}
+	return node.RelayEndpoints(id)
+}
+
+// relayAnnounceHost returns the host to publish the relay endpoint on.
+//
+// It is the announced host when there is one, else the --addr host. The
+// announced one is right on a cloud server, where the public IP is a NAT
+// mapping and not an address on any local interface.
+func relayAnnounceHost(announce, addr string) string {
+	host := ""
+	if announce != "" {
+		if h, _, err := net.SplitHostPort(announce); err == nil {
+			host = h
+		}
+	} else if h, _, err := net.SplitHostPort(addr); err == nil {
+		host = h
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		return ""
+	}
+	return host
+}
+
 func saveDiscoveryConfig(dir string, cfg discoveryConfig) (string, error) {
 	b, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
@@ -509,8 +558,25 @@ func runJoin(args []string) error {
 	if err != nil {
 		return ExitError{Code: 1, Err: err}
 	}
+	// The live view resolver is pointed at the client UNCONDITIONALLY.
+	//
+	// It used to be set only when a listener was configured ("--listen"),
+	// which meant a PURE-OUTBOUND member's resolver stayed empty forever:
+	// its member view was "no verified member view yet", every membership
+	// lookup failed, and the relay trunk join could never authenticate —
+	// so the one member shape the trunk exists for (a member with no
+	// inbound port) could not use it at all (defect B of the round-61
+	// real-machine report).
+	//
+	// The resolver is what the relay join pins the trunk's certificate
+	// against, so it is needed by EVERY member, listener or not.
+	resolver.set(cl)
+	// The hook lets a test observe the join's OWN resolver — the one the
+	// relay join uses. It is nil in production.
+	if joinResolverHook != nil {
+		joinResolverHook(resolver)
+	}
 	if listener != nil {
-		resolver.set(cl)
 		// D-1b: wildcard-only binds print as "bound, not announced" instead
 		// of an empty list that reads like nothing is listening.
 		parts := make([]string, 0, 2)
@@ -754,7 +820,14 @@ func runServeDiscovery(args []string) error {
 	// an anchor that relays for the whole network without being told is a
 	// public relay, and the switch is the operator's decision.
 	relayTrunk := fs.Bool("relay-trunk", false, "act as a mesh relay trunk: carry relays between two other members (default off)")
-	relayListenPort := fs.Int("relay-port", 0, "UDP port for the relay trunk's listener (default: the HTTP port + 1)")
+	relayListenPort := fs.Int("relay-port", 0, "UDP port for the relay trunk's own listener (0 = share the direct-link port; ALPN separates the two protocols)")
+	// The relay quota (P-7). The defaults are the requirement's numbers
+	// (20 concurrent relays, 50 MiB/s); these flags let an operator
+	// tighten them without a rebuild — which is what makes the quota
+	// testable on a real deployment (defect H of the round-61 real-machine
+	// report: there was no way to lower it except by recompiling).
+	relayMaxStreams := fs.Int("relay-max-streams", mesh.DefaultRelayMaxStreams, "how many relays this node may carry at once")
+	relayMaxBytesPerSec := fs.Int("relay-max-bytes-per-sec", mesh.DefaultRelayBytesPerSec, "how many bytes per second this node may forward for others")
 	verbose := fs.Bool("v", false, "verbose (debug) logging")
 	if err := fs.Parse(args); err != nil {
 		return ExitError{Code: 2, Err: err}
@@ -865,49 +938,92 @@ func runServeDiscovery(args []string) error {
 	// relays, published in the member view so a requester can find a
 	// trunk to relay through.
 	//
-	// It is the announced host with the RELAY port: the relay listener
-	// has its own ALPN and therefore its own UDP port, so the direct
-	// address cannot carry it. The host is the announced one for the same
-	// reason the direct address is — on a cloud server the public IP is a
-	// NAT mapping, not a local interface.
+	// The relay endpoint is the announced host with the RELAY port. In
+	// the default (same port) shape that port IS the direct-link port:
+	// ALPN is negotiated per connection, so one socket serves both
+	// protocols (D76). With an explicit --relay-port it is that port
+	// instead. The host is the announced one for the same reason the
+	// direct address is — on a cloud server the public IP is a NAT
+	// mapping, not a local interface.
+	//
+	// trunk and joiners are hoisted out of the --relay-trunk block: the
+	// DIRECT-LINK listener needs them, because the relay protocol rides
+	// on the direct link's socket when no separate relay port was asked
+	// for (D76).
+	var relayTrunkInst *mesh.RelayTrunk
+	var relayJoiners *mesh.JoinerTable
 	var relaySelfEPS []string
 	if *relayTrunk {
+		// The joiner table: the members that have JOINED this trunk. A
+		// joined member is reachable over the connection it opened
+		// towards the anchor — the only way a PURE-OUTBOUND member (no
+		// inbound port at all) can be reached.
+		joiners := mesh.NewJoinerTable()
 		trunk, err := mesh.NewRelayTrunk(mesh.RelayTrunkConfig{
 			Self:    dev.ID(),
 			Members: relayMembersResolver{srv: srv},
 			Enabled: true,
+			Quota: mesh.RelayQuota{
+				MaxStreams:     *relayMaxStreams,
+				MaxBytesPerSec: *relayMaxBytesPerSec,
+			},
+			Joiners: joiners,
+			// The trunk's dialer: how it reaches a member that has NOT
+			// joined it — a member with direct endpoints of its own.
+			//
+			// Without it the trunk's data plane was DEAD in this
+			// deployment: OpenFlow answered "no dialer installed" and
+			// every relay to a non-joined member was refused (defect D
+			// of the round-61 real-machine report).
+			//
+			// The RELAY endpoints are used, not the direct ones: the
+			// dial opens a relay-protocol session, and a direct
+			// endpoint does not speak it (unless the member serves both
+			// on one port, which is the same-port shape).
+			Dial: func(ctx context.Context, target identity.DeviceID, kind string) (mesh.Session, error) {
+				eps := memberRelayEndpoints(srv, target)
+				if len(eps) == 0 {
+					eps = memberEndpoints(srv, target)
+				}
+				if len(eps) == 0 {
+					return nil, fmt.Errorf("%w: %s announced no endpoint to reach it on",
+						mesh.ErrRelayUnavailable, target)
+				}
+				link, err := mesh.DialRelaySession(ctx, dev, relayMembersResolver{srv: srv}, target, eps)
+				if err != nil {
+					return nil, err
+				}
+				return link.Session(), nil
+			},
 		})
 		if err != nil {
 			return ExitError{Code: 1, Err: fmt.Errorf("serve-discovery: --relay-trunk: %w", err)}
 		}
 		mesh.SetRelayTrunk(trunk)
+		relayTrunkInst = trunk
+		relayJoiners = joiners
 		// The revocation watch: an ESTABLISHED relay must be torn down
 		// when one of its ends stops being a member, not just the next
 		// request refused. The watch re-checks every second.
 		trunk.StartRevocationWatch(ctx, time.Second)
-		// The relay listener: the port members reach the trunk on. It
-		// has its own ALPN, so it is a SEPARATE UDP port from the
-		// direct-link listener (one socket can serve only one ALPN).
-		//
-		// The port is --relay-port when given, else the HTTP port + 1
-		// (the direct-link listener takes the HTTP port when the
-		// anchor announces it).
-		relayPort := *relayListenPort
 
-		if relayPort == 0 {
-			if _, p, perr := net.SplitHostPort(*addr); perr == nil {
-				if n, cerr := strconv.Atoi(p); cerr == nil {
-					relayPort = n + 1
-				}
-			}
-		}
+		// The RELAY PORT.
+		//
+		// Zero (the default) means "the SAME port as the direct link".
+		// ALPN is negotiated per connection, so one UDP socket serves
+		// both protocols and the operator does not have to open a second
+		// port in their security group (D76).
+		//
+		// An explicit --relay-port still gets a listener of its own, for
+		// the deployments that want the two protocols on separate ports.
+		relayPort := *relayListenPort
 		if relayPort > 0 {
 			rl, lerr := mesh.NewRelayListener(ctx, mesh.RelayListenerConfig{
 				Device:  dev,
 				Members: relayMembersResolver{srv: srv},
 				Addrs:   []string{net.JoinHostPort("0.0.0.0", strconv.Itoa(relayPort))},
 				Trunk:   trunk,
-				Joiners: mesh.NewJoinerTable(),
+				Joiners: joiners,
 			})
 			if lerr != nil {
 				fmt.Fprintf(os.Stderr, "  note: cannot bind the relay listener on UDP %d (%v)\n", relayPort, lerr)
@@ -915,19 +1031,8 @@ func runServeDiscovery(args []string) error {
 				defer rl.Close()
 				fmt.Fprintf(os.Stderr, "  relay trunk: ON — UDP %d carries relays between members\n", relayPort)
 				fmt.Fprintf(os.Stderr, "    (the payload is end-to-end encrypted: the trunk sees routing metadata, not content)\n")
-				// The PUBLIC address on which the relay listener is
-				// reachable. The announced host with the relay port: the
-				// direct address carries the direct listener, and the two
-				// speak different ALPNs on different ports.
-				relayHost := ""
-				if *announce != "" {
-					if h, _, err := net.SplitHostPort(*announce); err == nil {
-						relayHost = h
-					}
-				} else if h, _, err := net.SplitHostPort(*addr); err == nil {
-					relayHost = h
-				}
-				if relayHost != "" && relayHost != "0.0.0.0" && relayHost != "::" {
+				relayHost := relayAnnounceHost(*announce, *addr)
+				if relayHost != "" {
 					relaySelfEPS = []string{net.JoinHostPort(relayHost, strconv.Itoa(relayPort))}
 				} else {
 					fmt.Fprintf(os.Stderr, "  note: the relay listener is on UDP %d but no public address is known;\n", relayPort)
@@ -935,7 +1040,8 @@ func runServeDiscovery(args []string) error {
 				}
 			}
 		} else {
-			fmt.Fprintf(os.Stderr, "  relay trunk: ON — authorization is live, but no relay listener could be bound\n")
+			fmt.Fprintf(os.Stderr, "  relay trunk: ON — authorization is live; the relay shares the direct-link port\n")
+			fmt.Fprintf(os.Stderr, "    (the payload is end-to-end encrypted: the trunk sees routing metadata, not content)\n")
 		}
 	} else {
 		fmt.Fprintf(os.Stderr, "  relay trunk: off (pass --relay-trunk to carry relays between members)\n")
@@ -1013,6 +1119,16 @@ func runServeDiscovery(args []string) error {
 			Device:  dev,
 			Members: relayMembersResolver{srv: srv},
 			Addrs:   bindAddrs,
+			// The relay protocol RIDES on this listener's socket when no
+			// separate relay port was asked for: ALPN is negotiated per
+			// connection, so one UDP port serves both protocols and the
+			// operator does not have to open a second port in their
+			// security group (D76).
+			//
+			// The relay endpoints are nil here: the SAME address serves
+			// both, so the member view's direct endpoints are enough.
+			RelayTrunk:   relayTrunkInst,
+			RelayJoiners: relayJoiners,
 			// The discovery node is a full member: it receives messages and
 			// files like any other node (a real deployment has the anchor
 			// receiving the reports and artifacts of the network it
@@ -1036,6 +1152,22 @@ func runServeDiscovery(args []string) error {
 			udpBound = ml.BoundAddrs()
 			fmt.Fprintf(os.Stderr, "  mesh direct-link listener: UDP %s\n", strings.Join(ml.BoundAddrs(), ", "))
 		}
+	}
+
+	// The RELAY ENDPOINT of this node, in the same-port shape.
+	//
+	// The relay protocol rides on the direct link's socket, so the relay
+	// endpoint IS the direct endpoint. It has to be published as the relay
+	// endpoint too, because a requester looks for a trunk's RELAY
+	// endpoints (ViewPicker) — a trunk with no relay endpoint is not a
+	// relay candidate at all.
+	//
+	// The announcement carries both lists, so the requester's view says
+	// "this member accepts relays HERE".
+	if len(relaySelfEPS) == 0 && relayTrunkInst != nil && len(selfEPS) > 0 {
+		relaySelfEPS = append([]string(nil), selfEPS...)
+		fmt.Fprintf(os.Stderr, "  relay trunk: ON — the relay protocol shares the direct-link port (UDP %s)\n",
+			strings.Join(selfEPS, ", "))
 	}
 
 	// Port self-check: the operator's question is always "which port do I
@@ -1359,19 +1491,34 @@ func watchApprovals(ctx context.Context, membersPath, certsDir string, start *id
 // The trunk's device ID is required: the join is PINNED against the
 // member view's key for that device, so a member cannot be tricked into
 // joining an impostor.
+//
+// The RETRY lives HERE, not inside mesh.JoinRelayTrunk. The old code
+// looped forever inside the mesh package, so this function's error
+// message never printed and a member that could not join failed
+// SILENTLY (defect G of the round-61 real-machine report). The retry is
+// the caller's job: it has the log line, and it can decide whether a
+// failure is worth retrying.
 func joinRelayTrunk(ctx context.Context, dev *identity.Device, resolver *liveViewResolver, trunkID identity.DeviceID, endpoint, inboxDir string) {
+	backoff := 2 * time.Second
 	for {
 		err := mesh.JoinRelayTrunk(ctx, mesh.RelayJoinConfig{
 			Device:    dev,
 			Resolver:  resolver,
 			Trunk:     trunkID,
 			Endpoints: []string{endpoint},
-			OnSession: func(sess mesh.Session, requester identity.DeviceID) error {
+			OnSession: func(sess mesh.Session, requester identity.DeviceID, kind string) error {
 				// The relayed session is served with the SAME session
 				// dispatch the direct link uses, so a member-to-member
 				// message that arrives through a trunk is handled
 				// exactly like one that arrives directly.
-				return mesh.ServeRelayedSession(mesh.KindMsg, requester, sess, mesh.ListenerConfig{
+				//
+				// The KIND comes from the relay's open record: it is the
+				// kind the requester asked for, so the target serves the
+				// handler that kind always runs.
+				if kind == "" {
+					kind = mesh.KindMsg
+				}
+				return mesh.ServeRelayedSession(kind, requester, sess, mesh.ListenerConfig{
 					OnMessage: func(from identity.DeviceID, text string) {
 						fmt.Fprintf(os.Stderr, "📩 from %s: %s\n", from, text)
 					},
@@ -1387,12 +1534,28 @@ func joinRelayTrunk(ctx context.Context, dev *identity.Device, resolver *liveVie
 			return
 		}
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "relay trunk join failed (%v); retrying\\n", err)
+			fmt.Fprintf(os.Stderr, "relay trunk join failed (%v); retrying in %s\n", err, backoff)
 			select {
 			case <-ctx.Done():
 				return
-			case <-time.After(2 * time.Second):
+			case <-time.After(backoff):
 			}
+			// The backoff grows, but it is capped: the anchor is the one
+			// node this member can always reach, so giving up on it is
+			// not an option — the operator just does not want the log
+			// line every two seconds forever.
+			if backoff < 30*time.Second {
+				backoff *= 2
+			}
+			continue
+		}
+		// The connection ended on its own (the trunk restarted). Wait a
+		// beat before dialling again, so a restarting anchor is not
+		// hammered.
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
 		}
 	}
 }

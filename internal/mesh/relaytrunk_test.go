@@ -12,6 +12,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -614,7 +616,10 @@ type pipeSession struct {
 	// readErr, when set, is returned by the next Read. It is how a test
 	// simulates "the peer hung up".
 	readErr error
-	mu      sync.Mutex
+	// readDeadline bounds a blocking Read. The zero value means "no
+	// deadline".
+	readDeadline time.Time
+	mu           sync.Mutex
 	// seen records every byte that crossed this session, so a test can
 	// assert what the OTHER end could read. It is how the end-to-end
 	// encryption test checks that the trunk never held the plaintext: the
@@ -672,6 +677,7 @@ func (p *pipeSession) Write(b []byte) (int, error) {
 func (p *pipeSession) Read(b []byte) (int, error) {
 	p.mu.Lock()
 	readErr := p.readErr
+	deadline := p.readDeadline
 	p.mu.Unlock()
 	if readErr != nil {
 		return 0, readErr
@@ -686,6 +692,14 @@ func (p *pipeSession) Read(b []byte) (int, error) {
 		return copy(b, chunk), nil
 	default:
 	}
+	// The deadline turns "the peer will never send anything" into a
+	// prompt failure instead of a hang.
+	var timeout <-chan time.Time
+	if !deadline.IsZero() {
+		timer := time.NewTimer(time.Until(deadline))
+		defer timer.Stop()
+		timeout = timer.C
+	}
 	select {
 	case chunk, ok := <-p.in:
 		if !ok {
@@ -694,6 +708,8 @@ func (p *pipeSession) Read(b []byte) (int, error) {
 		return copy(b, chunk), nil
 	case <-p.closed:
 		return 0, io.EOF
+	case <-timeout:
+		return 0, os.ErrDeadlineExceeded
 	case <-p.peer.closed:
 		// The peer ended its send side. Drain what it already sent,
 		// then EOF.
@@ -715,7 +731,20 @@ func (p *pipeSession) Close() error {
 	return nil
 }
 
-func (p *pipeSession) SetReadDeadline(t time.Time) error  { return nil }
+// SetReadDeadline arms a read deadline.
+//
+// The pipe used to ignore it, which meant a test that waited for a
+// record that would never arrive HUNG instead of failing. A test that
+// hangs is a test that never reports: the red it was supposed to show
+// never showed up. The deadline turns "the record never came" into a
+// prompt, actionable failure.
+func (p *pipeSession) SetReadDeadline(t time.Time) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.readDeadline = t
+	return nil
+}
+
 func (p *pipeSession) SetWriteDeadline(t time.Time) error { return nil }
 
 // failRead makes the next Read return err (simulating a hung-up peer).
@@ -783,9 +812,28 @@ func TestTrunkOpenFlowForwardsBytes(t *testing.T) {
 		})
 	}()
 
-	rec, err := readRelayRecord(bufio.NewReader(cRead))
+	// The FIRST record the target sees is the OPEN record: it is what
+	// tells the target who is calling. Without it the target has no way
+	// of knowing whose end-to-end hello it is looking at (defect C of the
+	// round-61 real-machine report).
+	cBr := bufio.NewReader(cRead)
+	open, err := readRelayRecord(cBr)
 	if err != nil {
 		t.Fatalf("the target received nothing: %v", err)
+	}
+	if open.Type != uint8(wire.FrameMeshRelayOpen) {
+		t.Fatalf("the target received record type %d, want an open record", open.Type)
+	}
+	if open.From != f.alice.ID() {
+		t.Fatalf("the open record names %q, want the requester %s", open.From, f.alice.ID())
+	}
+	if open.Kind != KindPing {
+		t.Fatalf("the open record names kind %q, want %q", open.Kind, KindPing)
+	}
+
+	rec, err := readRelayRecord(cBr)
+	if err != nil {
+		t.Fatalf("the target received no data record: %v", err)
 	}
 	if rec.Type != uint8(wire.FrameMeshRelayData) {
 		t.Fatalf("the target received record type %d, want a data record", rec.Type)
@@ -1192,6 +1240,71 @@ func TestRelayJoinCodecRoundTrip(t *testing.T) {
 // payload moving as ciphertext.
 // ---------------------------------------------------------------------------
 
+// joinedTarget is a test double for a member that has JOINED the trunk.
+//
+// It is what a pure-outbound member looks like from the trunk's side: a
+// long-lived connection plus the ability to open a FRESH session for each
+// relayed session. The fresh session is the whole point — before, the
+// trunk spliced against the join connection itself, and one relay's end
+// took the target's membership of the trunk down with it (defect E of the
+// round-61 real-machine report).
+type joinedTarget struct {
+	device identity.DeviceID
+	// sessions receives the TARGET end of each fresh session, so the
+	// test can serve it.
+	sessions chan *pipeSession
+	// open holds the trunk end of the last fresh session, so the test
+	// can inspect what crossed it.
+	trunkEnds chan *pipeSession
+}
+
+func newJoinedTarget(device identity.DeviceID) *joinedTarget {
+	return &joinedTarget{
+		device:    device,
+		sessions:  make(chan *pipeSession, 8),
+		trunkEnds: make(chan *pipeSession, 8),
+	}
+}
+
+// open is the TrunkJoiner opener: one fresh session per relayed session.
+func (j *joinedTarget) open(ctx context.Context) (Session, error) {
+	trunkEnd, targetEnd := newPipeSessionPair()
+	j.trunkEnds <- trunkEnd
+	j.sessions <- targetEnd
+	return trunkEnd, nil
+}
+
+// serveOne serves the next relayed session: it reads the OPEN record
+// (which names the requester) and then performs the target's half of the
+// end-to-end handshake.
+//
+// It returns the plain-bytes session and the requester.
+func (j *joinedTarget) serveOne(t *testing.T, cfg RelayTargetConfig) (Session, identity.DeviceID, error) {
+	t.Helper()
+	var targetEnd *pipeSession
+	select {
+	case targetEnd = <-j.sessions:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the trunk never opened a session towards the target")
+		return nil, "", nil
+	}
+	br := bufio.NewReader(targetEnd)
+	open, err := readRelayRecord(br)
+	if err != nil {
+		t.Fatalf("the target received no open record: %v", err)
+		return nil, "", err
+	}
+	if open.Type != uint8(wire.FrameMeshRelayOpen) {
+		t.Fatalf("the target received record type %d, want an open record", open.Type)
+		return nil, "", err
+	}
+	sess, err := ServeRelayTarget(targetEnd, framedRecordReader{br: br}, cfg)
+	if err != nil {
+		return nil, open.From, err
+	}
+	return sess, open.From, nil
+}
+
 // TestRelaySessionCarriesAPayloadEndToEnd is the headline test.
 //
 // The chain:
@@ -1205,15 +1318,15 @@ func TestRelayJoinCodecRoundTrip(t *testing.T) {
 func TestRelaySessionCarriesAPayloadEndToEnd(t *testing.T) {
 	f := newTrunkFixture(t)
 
-	// The trunk's connections to A and to C.
+	// The trunk's connection to A.
 	trunkToA, aSide := newPipeSessionPair()
-	trunkToC, cSide := newPipeSessionPair()
 
 	joiners := NewJoinerTable()
 	trunk, err := NewRelayTrunk(RelayTrunkConfig{
 		Self:    f.hub.ID(),
 		Members: MemberListAdapter{List: f.members},
 		Enabled: true,
+		Joiners: joiners,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1226,13 +1339,18 @@ func TestRelaySessionCarriesAPayloadEndToEnd(t *testing.T) {
 
 	// C has joined the trunk (a pure-outbound member has no inbound
 	// port, so the anchor comes to it over the connection it opened).
-	joiner := &TrunkJoiner{Device: f.bob.ID(), sess: trunkToC, br: bufio.NewReader(trunkToC)}
-	joiners.Add(joiner)
+	target := newJoinedTarget(f.bob.ID())
+	joiners.Add(&TrunkJoiner{
+		Device: f.bob.ID(),
+		sess:   trunkToA, // unused by the flow; the opener is what matters
+		br:     bufio.NewReader(trunkToA),
+		open:   target.open,
+	})
 
 	// C serves its end of the relayed session in the background.
 	targetDone := make(chan error, 1)
 	go func() {
-		sess, err := ServeRelayTarget(cSide, framedRecordReader{br: bufio.NewReader(cSide)}, RelayTargetConfig{
+		sess, _, err := target.serveOne(t, RelayTargetConfig{
 			Device:       f.bob,
 			Requester:    f.alice.ID(),
 			RequesterKey: f.alice.PublicKey(),
@@ -1298,13 +1416,13 @@ func TestRelaySessionTheTrunkCannotReadThePayload(t *testing.T) {
 	f := newTrunkFixture(t)
 
 	trunkToA, aSide := newPipeSessionPair()
-	trunkToC, cSide := newPipeSessionPair()
 
 	joiners := NewJoinerTable()
 	trunk, err := NewRelayTrunk(RelayTrunkConfig{
 		Self:    f.hub.ID(),
 		Members: MemberListAdapter{List: f.members},
 		Enabled: true,
+		Joiners: joiners,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1312,12 +1430,17 @@ func TestRelaySessionTheTrunkCannotReadThePayload(t *testing.T) {
 	go func() {
 		_ = trunk.ServeRequester(context.Background(), trunkToA, joiners)
 	}()
-	joiner := &TrunkJoiner{Device: f.bob.ID(), sess: trunkToC, br: bufio.NewReader(trunkToC)}
-	joiners.Add(joiner)
+	target := newJoinedTarget(f.bob.ID())
+	joiners.Add(&TrunkJoiner{
+		Device: f.bob.ID(),
+		sess:   trunkToA,
+		br:     bufio.NewReader(trunkToA),
+		open:   target.open,
+	})
 
 	targetDone := make(chan string, 1)
 	go func() {
-		sess, err := ServeRelayTarget(cSide, framedRecordReader{br: bufio.NewReader(cSide)}, RelayTargetConfig{
+		sess, _, err := target.serveOne(t, RelayTargetConfig{
 			Device:       f.bob,
 			Requester:    f.alice.ID(),
 			RequesterKey: f.alice.PublicKey(),
@@ -1374,6 +1497,15 @@ func TestRelaySessionTheTrunkCannotReadThePayload(t *testing.T) {
 	// Checking only that the target received the right bytes would not
 	// prove this at all: a relay that forwarded the plaintext would make
 	// that check pass too.
+	//
+	// The target's side is the session the trunk opened for THIS relay —
+	// the same session the trunk spliced against.
+	var trunkToC *pipeSession
+	select {
+	case trunkToC = <-target.trunkEnds:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the trunk never opened a session towards the target")
+	}
 	for _, side := range []struct {
 		name string
 		sess *pipeSession
@@ -1501,9 +1633,11 @@ func TestViewPickerOffersTheRelayCandidates(t *testing.T) {
 		Members: map[identity.DeviceID]discovery.MemberView{
 			f.alice.ID(): {Cert: f.aliceCert, Endpoints: []string{"10.0.0.1:7000"}},
 			f.bob.ID():   {Cert: f.bobCert, Endpoints: []string{"10.0.0.2:7000"}},
-			// The hub is a trunk: it accepts RELAYS on its own port, which
-			// is not its direct-link port — a relay session speaks its own
-			// ALPN, and one UDP socket can serve only one ALPN.
+			// The hub is a trunk: it accepts RELAYS on its own port,
+			// which is not its direct-link port. A relay session speaks
+			// its own ALPN, so a requester has to dial the relay
+			// endpoint (D76: in the default shape the two share one
+			// socket, and the ALPN decides).
 			f.hub.ID(): {
 				Cert:           f.hubCert,
 				Endpoints:      []string{"10.0.0.3:7000"},
@@ -1838,5 +1972,118 @@ func TestTrunkRevocationWatchTearsDownAnEstablishedRelay(t *testing.T) {
 			t.Fatal("the revocation watch did not tear the established relay down")
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestTrunkWithoutADialerRefusesWithAnActionableReason pins defect D.
+//
+// The anchor built its trunk WITHOUT a dialer, so the trunk's data plane
+// was DEAD in that deployment: OpenFlow answered "no dialer installed"
+// and every relay to a member that had not joined was refused.
+//
+// The trunk must either have a way to reach members (a dialer, or the
+// joiners table) or refuse with a reason that says so.
+func TestTrunkWithoutADialerRefusesWithAnActionableReason(t *testing.T) {
+	f := newTrunkFixture(t)
+	req, _ := newPipeSessionPair()
+	trunk, err := NewRelayTrunk(RelayTrunkConfig{
+		Self:    f.hub.ID(),
+		Members: MemberListAdapter{List: f.members},
+		Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = trunk.OpenFlow(context.Background(), RelayOpen{
+		From: f.alice.ID(),
+		To:   f.bob.ID(),
+		Hops: 1,
+	}, req)
+	if err == nil {
+		t.Fatal("a trunk with no way to reach members opened a flow")
+	}
+	if !errors.Is(err, ErrRelayUnavailable) {
+		t.Fatalf("the refusal is %v, want ErrRelayUnavailable", err)
+	}
+	if !strings.Contains(err.Error(), "dialer") {
+		t.Fatalf("the refusal %q does not say what is missing", err)
+	}
+}
+
+// TestTrunkWithADialerReachesAMemberThatHasNotJoined pins defect D from
+// the other side: with a dialer, the trunk reaches a member that has NOT
+// joined it.
+//
+// That is the whole point of the dialer: a member with endpoints of its
+// own does not have to join the trunk to be relayed through it.
+func TestTrunkWithADialerReachesAMemberThatHasNotJoined(t *testing.T) {
+	f := newTrunkFixture(t)
+	req, tgt := newPipeSessionPair()
+	dialed := false
+	trunk, err := NewRelayTrunk(RelayTrunkConfig{
+		Self:    f.hub.ID(),
+		Members: MemberListAdapter{List: f.members},
+		Enabled: true,
+		Dial: func(ctx context.Context, target identity.DeviceID, kind string) (Session, error) {
+			dialed = true
+			return tgt, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := trunk.OpenFlow(context.Background(), RelayOpen{
+		From: f.alice.ID(),
+		To:   f.bob.ID(),
+		Hops: 1,
+		Kind: KindPing,
+	}, req); err != nil {
+		t.Fatalf("a trunk with a dialer refused a reachable member: %v", err)
+	}
+	if !dialed {
+		t.Fatal("the trunk did not dial the member that has not joined")
+	}
+}
+
+// TestJoinRelayTrunkReturnsInsteadOfRetryingForever pins defect G.
+//
+// The old JoinRelayTrunk looped forever INSIDE itself, so the caller's
+// "relay trunk join failed (%v); retrying" line was DEAD CODE and a
+// member that could never join failed SILENTLY.
+//
+// One call must produce one answer: an error the caller can log.
+func TestJoinRelayTrunkReturnsInsteadOfRetryingForever(t *testing.T) {
+	f := newTrunkFixture(t)
+	// An endpoint nothing listens on: the join must FAIL, and fail
+	// promptly.
+	deadline := time.Now().Add(20 * time.Second)
+	err := JoinRelayTrunk(context.Background(), RelayJoinConfig{
+		Device:    f.alice,
+		Resolver:  MemberListAdapter{List: f.members},
+		Trunk:     f.hub.ID(),
+		Endpoints: []string{"127.0.0.1:1"},
+	})
+	if err == nil {
+		t.Fatal("the join to a dead trunk succeeded")
+	}
+	if elapsed := time.Since(deadline); elapsed > 20*time.Second {
+		t.Fatalf("the join took %s to fail: it must return, not retry forever", elapsed)
+	}
+}
+
+// TestJoinRelayTrunkRefusesAnEmptyEndpointList pins the other half of
+// defect G: the join must say what is missing rather than spin.
+func TestJoinRelayTrunkRefusesAnEmptyEndpointList(t *testing.T) {
+	f := newTrunkFixture(t)
+	err := JoinRelayTrunk(context.Background(), RelayJoinConfig{
+		Device:   f.alice,
+		Resolver: MemberListAdapter{List: f.members},
+		Trunk:    f.hub.ID(),
+	})
+	if err == nil {
+		t.Fatal("the join with no endpoint succeeded")
+	}
+	if !errors.Is(err, ErrNoRoute) {
+		t.Fatalf("the refusal is %v, want ErrNoRoute", err)
 	}
 }

@@ -336,15 +336,33 @@ type ListenerConfig struct {
 	// same trust shape as Tailscale SSH. Operators who want file/message
 	// but not command execution set this.
 	ExecDisabled bool
+	// RelayTrunk serves the relay protocol on THIS listener's socket.
+	//
+	// It is nil on a client that does not run a trunk. When it is set,
+	// a connection that negotiated the relay ALPN is served by it
+	// instead of by the direct-link dispatch — that is what lets ONE
+	// UDP port carry both protocols (D76).
+	RelayTrunk *RelayTrunk
+	// RelayJoiners is the table of members that have joined this
+	// listener's trunk. It may be nil: a fresh table is built then.
+	RelayJoiners *JoinerTable
 }
 
 // Listener accepts direct links from fellow members.
+//
+// It ALSO serves the relay protocol when RelayTrunk is set: ALPN is
+// negotiated per connection, so one socket and one quic.Listener can
+// carry both the direct-link protocol and the relay protocol, and the
+// negotiated protocol decides which one a connection speaks.
 type Listener struct {
 	lns []*quic.Listener
 	cfg ListenerConfig
 	// bound records the resolved local endpoints (port 0 → actual port).
 	bound []string
 	stop  chan struct{}
+	// relay is the handler for the connections that negotiated the relay
+	// ALPN. It is nil when this listener does not run a trunk.
+	relay *RelayHandler
 }
 
 // NewListener binds the configured UDP endpoints and starts accepting.
@@ -375,7 +393,26 @@ func NewListener(ctx context.Context, cfg ListenerConfig) (*Listener, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The advertised ALPNs.
+	//
+	// The direct link always offers directALPN. It ALSO offers
+	// RelayALPN when this listener runs a trunk, because ALPN is
+	// negotiated PER CONNECTION: one UDP socket and one quic.Listener
+	// can serve both protocols, and the negotiated protocol decides which
+	// one a connection speaks (D76).
+	//
+	// The old comment here said "one socket can serve only one ALPN".
+	// That was WRONG — it is the reason the trunk needed a second UDP
+	// port, and the reason an operator had to open one more port in
+	// their security group for the relay to work at all.
+	tlsCfg.NextProtos = []string{directALPN}
+	if cfg.RelayTrunk != nil {
+		tlsCfg.NextProtos = append(tlsCfg.NextProtos, RelayALPN)
+	}
 	l := &Listener{cfg: cfg, stop: make(chan struct{})}
+	if cfg.RelayTrunk != nil {
+		l.relay = NewRelayHandler(cfg.RelayTrunk, cfg.RelayJoiners)
+	}
 	for _, a := range cfg.Addrs {
 		udpAddr, err := net.ResolveUDPAddr("udp", a)
 		if err != nil {
@@ -464,7 +501,25 @@ func (l *Listener) acceptLoop(ln *quic.Listener) {
 
 // handle drives one accepted connection: one authenticated hello per stream,
 // then the session body. Stream-level failures do not kill the connection.
+//
+// THE PROTOCOL IS CHOSEN BY THE NEGOTIATED ALPN. A connection that
+// negotiated the relay ALPN speaks the relay protocol, and it is served
+// by the relay handler; a connection that negotiated the direct ALPN
+// speaks the direct-link protocol. That is what lets ONE UDP port carry
+// both (D76) — and it is still as isolated as separate sockets were: a
+// peer that offers the wrong ALPN never gets past the handshake.
 func (l *Listener) handle(conn *quic.Conn) {
+	if proto := conn.ConnectionState().TLS.NegotiatedProtocol; proto == RelayALPN {
+		if l.relay == nil {
+			// This listener does not run a trunk. The handshake should
+			// not have succeeded (the relay ALPN was not advertised),
+			// but a peer that got here anyway is refused.
+			_ = conn.CloseWithError(0, "this node does not relay")
+			return
+		}
+		l.relay.ServeConn(conn)
+		return
+	}
 	defer conn.CloseWithError(0, "bye")
 	// The peer's identity comes from its pinned device certificate (mTLS);
 	// receive handlers stamp it onto every message and file they accept.

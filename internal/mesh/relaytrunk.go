@@ -184,7 +184,19 @@ type RelayTrunkConfig struct {
 	// must be testable without a network, and a test that has to stand up
 	// three QUIC listeners to prove "a revoked device's stream is torn
 	// down" is a test that cannot be written.
+	//
+	// The session it returns must be a DEDICATED one for this flow: the
+	// trunk writes the relay's OPEN record onto it and splices the
+	// requester's stream against it. A session that is shared with other
+	// traffic would mix two relays' records together.
 	Dial func(ctx context.Context, target identity.DeviceID, kind string) (Session, error)
+	// Joiners is the table of members that have JOINED this trunk.
+	//
+	// A joined member is reachable over the connection it opened towards
+	// the trunk — which is the ONLY way a pure-outbound member (no
+	// inbound port at all) can be reached. When it is set, the trunk
+	// prefers it over Dial.
+	Joiners *JoinerTable
 }
 
 // trunkState is the trunk's own state.
@@ -205,6 +217,7 @@ type RelayTrunk struct {
 	self    identity.DeviceID
 	members MemberResolver
 	dial    func(ctx context.Context, target identity.DeviceID, kind string) (Session, error)
+	joiners *JoinerTable
 	quota   RelayQuota
 
 	mu    sync.RWMutex
@@ -251,6 +264,7 @@ func NewRelayTrunk(cfg RelayTrunkConfig) (*RelayTrunk, error) {
 		self:    cfg.Self,
 		members: cfg.Members,
 		dial:    cfg.Dial,
+		joiners: cfg.Joiners,
 		quota:   cfg.Quota.withDefaults(),
 		state:   trunkOff,
 		flows:   make(map[uint64]*relayFlow),
@@ -455,6 +469,17 @@ const relayProtoID = "cmesh-relay/1"
 // relayed record can never be bigger than a direct one.
 const maxRelayRecord = 1 << 20
 
+// relayHandshakeTimeout bounds the end-to-end handshake that happens
+// THROUGH the trunk.
+//
+// It exists because a handshake has no natural end of its own: the
+// requester waits for the target's hello, and the target only produces
+// it when the trunk has routed the session to it. If any of those steps
+// stalls, the requester would block in a socket read forever — the
+// caller's context does not interrupt a blocking read. A bounded
+// handshake turns a stall into an error the caller can report.
+const relayHandshakeTimeout = 30 * time.Second
+
 // relayRecord is the envelope of one relay protocol message.
 //
 // The DATA field is OPAQUE to the trunk: it is the end-to-end ciphertext.
@@ -609,13 +634,23 @@ func (q RelayQuota) withDefaults() RelayQuota {
 
 // relayFlow is one live relay: the requester's stream and the target's
 // stream, spliced together.
+//
+// The two sides are NOT symmetric in ownership. The requester's side is a
+// session the flow OWNS: it is the QUIC stream the requester opened on
+// its connection to the trunk, and closing the flow closes it. The
+// target's side is a DEDICATED stream opened towards the target for this
+// flow alone — never the target's long-lived join connection. That is
+// what makes several relays to the same target possible at once, and what
+// stops one relay's end from tearing the target's join down (defect E of
+// the round-61 real-machine report: the old code closed the join
+// connection, so the target could receive exactly ONE relay, ever).
 type relayFlow struct {
 	id   uint64
 	from identity.DeviceID
 	to   identity.DeviceID
 
 	// req is the session to the requester (A), tgt the session to the
-	// target (C).
+	// target (C). Both are owned by the flow.
 	req Session
 	tgt Session
 	// reqBr and tgtBr are the BUFFERED READERS over req and tgt.
@@ -628,6 +663,21 @@ type relayFlow struct {
 	tgtBr *bufio.Reader
 	// total is the lifetime byte count, for the trunk's statistics.
 	total int64
+	// done is closed when the flow ends, and doneOnce guards it.
+	//
+	// The trunk's serving path WAITS on it: the requester's connection
+	// must stay open for as long as the flow carries bytes. Returning
+	// from the serving function while the flow was still alive closed
+	// the requester's QUIC connection under it, and the requester never
+	// even got to read the grant (defect A of the round-61 real-machine
+	// report).
+	done     chan struct{}
+	doneOnce sync.Once
+}
+
+// finish marks the flow as ended. It is safe to call more than once.
+func (f *relayFlow) finish() {
+	f.doneOnce.Do(func() { close(f.done) })
 }
 
 // RelayFramePayload is the decoded FrameMeshRelayData payload.
@@ -710,6 +760,56 @@ func RelayJoinFrame(j RelayJoin) (*wire.Frame, error) {
 	return &wire.Frame{Type: wire.FrameMeshRelayJoin, Payload: payload}, nil
 }
 
+// dialTarget opens a DEDICATED session to the target.
+//
+// The JOINERS table is preferred over the plain dialer: a member that has
+// joined the trunk is reachable over the connection it opened, which is
+// the only way a PURE-OUTBOUND member (no inbound port at all) can be
+// reached. The plain dialer is the fallback for a member that has
+// endpoints of its own.
+//
+// The session is dedicated: it belongs to ONE flow. The trunk writes
+// that flow's OPEN record onto it and splices the requester's stream
+// against it — so two relays to the same target can never mix their
+// records together.
+func (t *RelayTrunk) dialTarget(ctx context.Context, target identity.DeviceID, kind string) (Session, error) {
+	if t.joiners != nil {
+		if sess, err := t.joiners.Open(ctx, target); err == nil {
+			return sess, nil
+		}
+	}
+	if t.dial == nil {
+		return nil, fmt.Errorf("%w: mesh: relay trunk: this node cannot reach members (no dialer installed)",
+			ErrRelayUnavailable)
+	}
+	return t.dial(ctx, target, kind)
+}
+
+// dialTargetWith opens a DEDICATED session to the target, falling back to
+// the caller's own joiner table.
+//
+// The caller's table is the fallback rather than the trunk's because the
+// trunk's table and the caller's table are the same table in the
+// shipped wiring — but a caller that serves a requester with a table of
+// its own must not silently lose it.
+func (t *RelayTrunk) dialTargetWith(ctx context.Context, target identity.DeviceID, kind string, dialer RelayJoiner) (Session, error) {
+	if t.joiners != nil {
+		if sess, err := t.joiners.Open(ctx, target); err == nil {
+			return sess, nil
+		}
+	}
+	if dialer != nil {
+		if sess, err := dialer.Open(ctx, target); err == nil {
+			return sess, nil
+		}
+	}
+	if t.dial == nil {
+		return nil, fmt.Errorf("%w: mesh: relay trunk: this node cannot reach members (no dialer installed)",
+			ErrRelayUnavailable)
+	}
+	return t.dial(ctx, target, kind)
+}
+
 // OpenFlow opens a relay flow for the given request.
 //
 // It is the DATA plane's entry point, and it is where the authorization is
@@ -745,7 +845,7 @@ func (t *RelayTrunk) OpenFlow(ctx context.Context, open RelayOpen, req Session) 
 		return 0, fmt.Errorf("%w: mesh: relay trunk: this node does not relay (the trunk switch is off)",
 			ErrRelayTrunkDisabled)
 	}
-	if t.dial == nil {
+	if t.dial == nil && t.joiners == nil {
 		return 0, fmt.Errorf("%w: mesh: relay trunk: this node cannot reach members (no dialer installed)",
 			ErrRelayUnavailable)
 	}
@@ -769,10 +869,28 @@ func (t *RelayTrunk) OpenFlow(ctx context.Context, open RelayOpen, req Session) 
 	// be released — otherwise a failing target would leak a stream slot
 	// per attempt, and the trunk would eventually refuse every relay for
 	// reasons that have nothing to do with the quota.
-	tgt, err := t.dial(ctx, open.To, open.Kind)
+	tgt, err := t.dialTarget(ctx, open.To, open.Kind)
 	if err != nil {
 		t.releaseStream()
 		return 0, fmt.Errorf("mesh: relay trunk: cannot reach %s: %w", open.To, err)
+	}
+
+	// The OPEN record towards the TARGET. The target has no way of knowing
+	// who is asking for it: it sees a stream on the connection it opened
+	// towards the trunk, and the requester's identity travels in this
+	// record. Without it the target cannot pick the right key for the
+	// end-to-end handshake, so the handshake can never complete (defect C
+	// of the round-61 real-machine report).
+	if err := writeRelayRecord(tgt, relayRecord{
+		Type: uint8(wire.FrameMeshRelayOpen),
+		From: open.From,
+		To:   open.To,
+		Kind: open.Kind,
+		Hops: open.Hops,
+	}); err != nil {
+		_ = tgt.Close()
+		t.releaseStream()
+		return 0, fmt.Errorf("mesh: relay trunk: tell %s who is calling: %w", open.To, err)
 	}
 
 	t.mu.Lock()
@@ -786,6 +904,7 @@ func (t *RelayTrunk) OpenFlow(ctx context.Context, open RelayOpen, req Session) 
 		tgt:   tgt,
 		reqBr: bufio.NewReader(req),
 		tgtBr: bufio.NewReader(tgt),
+		done:  make(chan struct{}),
 	}
 	t.flows[id] = flow
 	t.mu.Unlock()
@@ -833,6 +952,15 @@ func (t *RelayTrunk) releaseStream() {
 }
 
 // closeFlow tears a flow down and frees its slot.
+//
+// It closes BOTH of the flow's own sessions, and only those.
+//
+// The target's session used to be the target's long-lived JOIN connection,
+// and closing it here meant the target could receive exactly ONE relay
+// ever: the first flow's end took its whole inbox away with it (defect E
+// of the round-61 real-machine report). The target's side is now a
+// session opened for THIS flow alone (see relayFlow), so closing it ends
+// this flow and nothing else.
 func (t *RelayTrunk) closeFlow(id uint64, reason string) {
 	t.mu.Lock()
 	flow, ok := t.flows[id]
@@ -846,6 +974,7 @@ func (t *RelayTrunk) closeFlow(id uint64, reason string) {
 	if !ok {
 		return
 	}
+	flow.finish()
 	_ = flow.req.Close()
 	_ = flow.tgt.Close()
 }
@@ -889,18 +1018,28 @@ func (t *RelayTrunk) CloseAll() {
 // the trunk closes the other side's stream — so the far end sees the end
 // of the session, and the tail of the message is not lost. That is the
 // whole reason Session documents Close() as a HALF close.
+//
+// IT ENDS WHEN EITHER SIDE ENDS. The old code waited for BOTH
+// directions to finish, and a peer that closes its send side and then
+// waits for the reply would leave the other direction blocked in a read
+// forever: the flow never ended, its quota slot was never given back,
+// and the relay stayed counted as live (defect E of the round-61
+// real-machine report: "the first flow succeeds, then immediately
+// 'cannot reach <target>'" was the visible symptom of a flow that never
+// let go).
+//
+// Closing the flow ends the other direction: the flow's teardown closes
+// both of its sessions, which unblocks the reader on the other side.
 func (t *RelayTrunk) splice(flow *relayFlow) {
-	var wg sync.WaitGroup
-	wg.Add(2)
+	done := make(chan struct{})
 	go func() {
-		defer wg.Done()
+		defer close(done)
 		t.forwardRecords(flow, flow.reqBr, flow.tgt)
 	}()
 	go func() {
-		defer wg.Done()
 		t.forwardRecords(flow, flow.tgtBr, flow.req)
 	}()
-	wg.Wait()
+	<-done
 	t.closeFlow(flow.id, "relay finished")
 }
 
@@ -1306,6 +1445,13 @@ func OpenRelay(ctx context.Context, cfg RelayRequesterConfig) (Session, error) {
 	if err != nil {
 		return nil, fmt.Errorf("mesh: relay: cannot reach the relay member: %w", err)
 	}
+	// The HANDSHAKE is bounded. Without a deadline, a trunk that accepts
+	// the connection and then goes quiet leaves the requester blocked in
+	// a read forever: the caller's context does not interrupt a blocking
+	// socket read, and the requester hangs instead of failing. A failed
+	// relay is an error the caller can act on; a hung one is not.
+	handshakeDeadline := time.Now().Add(relayHandshakeTimeout)
+	_ = conn.SetReadDeadline(handshakeDeadline)
 	r := &relaySession{
 		conn:   conn,
 		e2e:    e2e,
@@ -1365,6 +1511,9 @@ func OpenRelay(ctx context.Context, cfg RelayRequesterConfig) (Session, error) {
 		_ = conn.Close()
 		return nil, err
 	}
+	// The handshake is over: the deadline comes off, so the relayed
+	// session is bounded by the caller's own budget from here on.
+	_ = conn.SetReadDeadline(time.Time{})
 	return r, nil
 }
 
@@ -1457,7 +1606,19 @@ func relayRefusal(rec relayRecord) error {
 // to receive relayed sessions.
 //
 // It is the trunk's handle on the connection: when a relay needs this
-// member as the target, the trunk opens a flow on the joiner's session.
+// member as the target, the trunk opens a FRESH STREAM on the joiner's
+// connection and writes the relay's OPEN record onto it.
+//
+// A fresh stream per relay is not a detail — it is the reason two things
+// work at all:
+//
+//   - The target's session handler and the join loop do not COMPETE for
+//     the same bytes. Before, both read from one bufio.Reader, and the
+//     join loop swallowed the end-to-end hello that belonged to the
+//     session handler (defect C of the round-61 real-machine report).
+//   - Ending one relay does not end the target's membership of the
+//     trunk. The join connection outlives every flow on it (defect E of
+//     the same report).
 type TrunkJoiner struct {
 	// Device is the joining member's device ID.
 	Device identity.DeviceID
@@ -1465,10 +1626,31 @@ type TrunkJoiner struct {
 	sess Session
 	// br reads the records the joiner sends.
 	br *bufio.Reader
+	// open opens a FRESH session to this member, for ONE relayed
+	// session.
+	//
+	// It is a seam rather than a field of concrete type so that the
+	// trunk's data plane can be tested without a QUIC stack: the pipe
+	// based tests supply their own.
+	open func(ctx context.Context) (Session, error)
 	// mu guards the write side.
 	mu sync.Mutex
 	// closed marks the joiner as gone.
 	closed bool
+}
+
+// Open opens a fresh session to this member for one relayed session.
+func (j *TrunkJoiner) Open(ctx context.Context) (Session, error) {
+	j.mu.Lock()
+	closed := j.closed
+	j.mu.Unlock()
+	if closed {
+		return nil, errors.New("mesh: relay trunk: the joiner is gone")
+	}
+	if j.open == nil {
+		return nil, errors.New("mesh: relay trunk: this joiner cannot carry another session")
+	}
+	return j.open(ctx)
 }
 
 // Send writes one record to the joiner.
@@ -1492,17 +1674,20 @@ func (j *TrunkJoiner) Close() error {
 	return j.sess.Close()
 }
 
-// RelayJoiner opens the session to a member that has joined the trunk.
+// RelayJoiner opens a session to a member that has joined the trunk.
 //
 // It is the trunk's Dial function: it looks the member up in the joiners
-// table and returns the session to it.
+// table and returns a session to it.
 //
 // The member must be a JOINER (not merely a member with endpoints): the
 // trunk reaches a pure-outbound member over the connection that member
 // opened, which is the whole point of the join.
 type RelayJoiner interface {
-	// Joiner returns the session to the member that has joined.
-	Joiner(id identity.DeviceID) (Session, error)
+	// Open opens a DEDICATED session to the member that has joined. The
+	// session belongs to ONE relayed session: the trunk writes that
+	// session's OPEN record onto it and splices the requester's stream
+	// against it.
+	Open(ctx context.Context, id identity.DeviceID) (Session, error)
 }
 
 // JoinerTable is the trunk's table of joined members.
@@ -1532,7 +1717,22 @@ func (t *JoinerTable) Remove(id identity.DeviceID) {
 	delete(t.joiners, id)
 }
 
+// Open opens a dedicated session to the member that has joined.
+func (t *JoinerTable) Open(ctx context.Context, id identity.DeviceID) (Session, error) {
+	t.mu.RLock()
+	j, ok := t.joiners[id]
+	t.mu.RUnlock()
+	if !ok {
+		return nil, fmt.Errorf("mesh: relay trunk: %s has not joined this trunk", id)
+	}
+	return j.Open(ctx)
+}
+
 // Joiner returns the session to the member that has joined.
+//
+// It is the joiner's LONG-LIVED connection. It must not be spliced: the
+// connection carries every relay to that member, so a splice on it would
+// mix them together.
 func (t *JoinerTable) Joiner(id identity.DeviceID) (Session, error) {
 	t.mu.RLock()
 	j, ok := t.joiners[id]
@@ -1554,11 +1754,24 @@ func (t *JoinerTable) Count() int {
 //
 // The member announces itself with a join record and then stays
 // connected. The trunk keeps the connection for as long as it lives:
-// when a relay needs this member as the target, the trunk writes the
-// target's records on it.
+// when a relay needs this member as the target, the trunk opens a FRESH
+// STREAM on it (see TrunkJoiner.Open) and writes that relay's records
+// there.
 //
 // The connection ends when the member closes it or the trunk is stopped.
+//
+// The opener is the seam for opening a fresh stream towards the member.
+// It may be nil: a joiner with no opener can still be served, it just
+// cannot carry a relayed session — the trunk then refuses the relay with
+// "this node cannot reach <target> right now" rather than splicing two
+// relays' records together.
 func (t *RelayTrunk) ServeJoiner(ctx context.Context, sess Session, table *JoinerTable) error {
+	return t.ServeJoinerWithOpener(ctx, sess, table, nil)
+}
+
+// ServeJoinerWithOpener serves a join connection that can open fresh
+// streams towards the member.
+func (t *RelayTrunk) ServeJoinerWithOpener(ctx context.Context, sess Session, table *JoinerTable, open func(context.Context) (Session, error)) error {
 	br := bufio.NewReader(sess)
 	rec, err := readRelayRecord(br)
 	if err != nil {
@@ -1573,7 +1786,7 @@ func (t *RelayTrunk) ServeJoiner(ctx context.Context, sess Session, table *Joine
 	if _, err := t.members.KeyFor(rec.From); err != nil {
 		return fmt.Errorf("%w: mesh: relay trunk: %s is not a member of this view", ErrAuth, rec.From)
 	}
-	joiner := &TrunkJoiner{Device: rec.From, sess: sess, br: br}
+	joiner := &TrunkJoiner{Device: rec.From, sess: sess, br: br, open: open}
 	table.Add(joiner)
 	defer func() {
 		table.Remove(rec.From)
@@ -1612,6 +1825,13 @@ func (t *RelayTrunk) ServeRequester(ctx context.Context, sess Session, dialer Re
 // The `first` parameter is the record that was already read, if the
 // caller had to peek at it (the listener peeks to tell a joiner from a
 // requester). Passing nil means "read it here".
+//
+// IT BLOCKS FOR THE WHOLE RELAY. That is the point: the caller is the
+// listener, and the listener's contract is "this function owns the
+// connection until it is done with it". Returning as soon as the grant
+// was written closed the requester's QUIC connection while the relay was
+// still carrying its bytes, so the requester never even got to read the
+// grant (defect A of the round-61 real-machine report).
 func (t *RelayTrunk) ServeRequesterWithFirst(ctx context.Context, sess Session, dialer RelayJoiner, br *bufio.Reader, first *relayRecord) error {
 	var rec relayRecord
 	var err error
@@ -1645,22 +1865,23 @@ func (t *RelayTrunk) ServeRequesterWithFirst(ctx context.Context, sess Session, 
 	// local condition, and the requester must be able to try another
 	// relay.
 	if err := t.reserveStream(); err != nil {
-		ans := RelayAnswer{
-			Grant:  false,
-			Reason: fmt.Sprintf("this node is carrying as many relays as it may"),
-			Class:  RelayClassQuota,
-		}
 		_ = writeRelayRecord(sess, relayRecord{
 			Type:   uint8(wire.FrameMeshRelayAnswer),
 			Grant:  false,
-			Reason: ans.Reason,
-			Class:  ans.Class,
+			Reason: "this node is carrying as many relays as it may",
+			Class:  RelayClassQuota,
 		})
 		return err
 	}
 
-	// Open the session to the target.
-	tgt, err := dialer.Joiner(open.To)
+	// Open a DEDICATED session to the target.
+	//
+	// Dedicated, not the target's join connection: the join connection
+	// carries every relay to that target, and the records of two relays
+	// must never interleave. It is also what makes ending one relay not
+	// end the target's membership of the trunk (defect E of the
+	// round-61 real-machine report).
+	tgt, err := t.dialTargetWith(ctx, open.To, open.Kind, dialer)
 	if err != nil {
 		t.releaseStream()
 		_ = writeRelayRecord(sess, relayRecord{
@@ -1670,6 +1891,30 @@ func (t *RelayTrunk) ServeRequesterWithFirst(ctx context.Context, sess Session, 
 			Class:  RelayClassRefused,
 		})
 		return err
+	}
+
+	// The OPEN record towards the TARGET. It is what tells the target
+	// WHO is asking: the target resolves the requester's key from the
+	// member view and verifies the requester's end-to-end hello against
+	// it. Without this record the target has no idea whose handshake it
+	// is looking at, and the handshake can never complete (defect C of
+	// the round-61 real-machine report).
+	if err := writeRelayRecord(tgt, relayRecord{
+		Type: uint8(wire.FrameMeshRelayOpen),
+		From: open.From,
+		To:   open.To,
+		Kind: open.Kind,
+		Hops: open.Hops,
+	}); err != nil {
+		_ = tgt.Close()
+		t.releaseStream()
+		_ = writeRelayRecord(sess, relayRecord{
+			Type:   uint8(wire.FrameMeshRelayAnswer),
+			Grant:  false,
+			Reason: fmt.Sprintf("this node cannot reach %s right now", open.To),
+			Class:  RelayClassRefused,
+		})
+		return fmt.Errorf("mesh: relay trunk: tell %s who is calling: %w", open.To, err)
 	}
 
 	// The flow is registered so the quota counts it and the revocation
@@ -1685,6 +1930,7 @@ func (t *RelayTrunk) ServeRequesterWithFirst(ctx context.Context, sess Session, 
 		tgt:   tgt,
 		reqBr: br,
 		tgtBr: bufio.NewReader(tgt),
+		done:  make(chan struct{}),
 	}
 	t.flows[id] = flow
 	t.mu.Unlock()
@@ -1699,6 +1945,7 @@ func (t *RelayTrunk) ServeRequesterWithFirst(ctx context.Context, sess Session, 
 		Grant:   true,
 		Session: id,
 	}); err != nil {
+		t.closeFlow(id, "the grant could not be written")
 		return err
 	}
 
@@ -1710,7 +1957,18 @@ func (t *RelayTrunk) ServeRequesterWithFirst(ctx context.Context, sess Session, 
 	// cannot mix two records up — the receiving side finds the record
 	// boundaries on its own.
 	go t.splice(flow)
-	return nil
+
+	// Wait for the relay to finish. The caller's connection must stay
+	// open for exactly as long as the relay carries bytes: the requester
+	// is still reading records (its hello, its payload, the close) on
+	// this very session. Returning here would close it underneath them.
+	select {
+	case <-flow.done:
+		return nil
+	case <-ctx.Done():
+		t.closeFlow(id, "the trunk's context ended")
+		return ctx.Err()
+	}
 }
 
 // relayTargetSession is the TARGET's view of a relayed session.
@@ -1903,13 +2161,25 @@ type RelayTargetConfig struct {
 // The trunk needs a listener of its own: a member that wants to be
 // relayed THROUGH connects to it and speaks the relay protocol. The
 // direct-link listener cannot serve it, because the direct link's hello
-// protocol has no room for "I want to be a relay target" — and because
-// the relay protocol has its own ALPN.
+// protocol has no room for "I want to be a relay target".
 //
-// The ALPN matters: a direct-link client must not be able to land on the
-// relay protocol, and a relay client must not be able to land on the
-// direct link's kind dispatch. Separate ALPNs make the two protocols
-// unreachable from each other.
+// The ALPN separates the two protocols: a direct-link client must not be
+// able to land on the relay protocol, and a relay client must not be able
+// to land on the direct link's kind dispatch. Separate ALPNs make the two
+// protocols unreachable from each other.
+//
+// BUT THE ALPN DOES NOT NEED A SEPARATE PORT. ALPN is negotiated PER
+// CONNECTION, so one UDP socket and one quic.Listener can serve both
+// protocols: the listener advertises both ALPNs, and the negotiated
+// protocol decides which one a connection speaks (D76). The old comment
+// here said "one socket can serve only one ALPN" — that was WRONG, and
+// it is why an operator had to open a SECOND UDP port in their security
+// group for the trunk to work at all.
+//
+// A dedicated relay listener still exists for the deployments that WANT a
+// separate port (--relay-port), and it is the DEFAULT-free path: the
+// direct listener serves the relay protocol too when a trunk is
+// configured on it.
 // ---------------------------------------------------------------------------
 
 // RelayALPN is the ALPN of the mesh relay protocol.
@@ -1918,6 +2188,9 @@ type RelayTargetConfig struct {
 // a peer that speaks the direct-link protocol must not be able to reach
 // the relay protocol, and vice versa. The TLS handshake fails on an
 // ALPN mismatch, so the isolation is enforced by the transport.
+//
+// The separation is by PROTOCOL, not by PORT: the same socket may offer
+// both ALPNs, and each connection ends up on one of them (D76).
 const RelayALPN = "container-mesh-relay/1"
 
 // RelayListenerConfig configures the relay listener.
@@ -1936,6 +2209,149 @@ type RelayListenerConfig struct {
 	Trunk *RelayTrunk
 	// Joiners is the table of members that have joined this trunk.
 	Joiners *JoinerTable
+}
+
+// RelayHandler serves relay-protocol connections.
+//
+// It is the part of the relay listener that does NOT depend on the
+// socket: given a QUIC connection that negotiated the relay ALPN, it
+// drives the protocol on it.
+//
+// It exists as its own type because a relay connection does not have to
+// arrive on a socket of its own. ALPN is negotiated PER CONNECTION, so
+// one UDP socket and one quic.Listener can serve BOTH the direct-link
+// protocol and the relay protocol — the negotiated protocol decides which
+// one a connection speaks (D76). The direct listener therefore hands
+// its relay-ALPN connections to a RelayHandler, and the dedicated relay
+// listener hands its connections to the same handler.
+type RelayHandler struct {
+	trunk   *RelayTrunk
+	joiners *JoinerTable
+}
+
+// NewRelayHandler builds the handler that serves relay connections.
+//
+// The trunk and the joiner table may be nil at construction time and
+// installed later — the handler reads them per connection, so an anchor
+// that starts its trunk before its listener is still correct.
+func NewRelayHandler(trunk *RelayTrunk, joiners *JoinerTable) *RelayHandler {
+	if joiners == nil {
+		joiners = NewJoinerTable()
+	}
+	return &RelayHandler{trunk: trunk, joiners: joiners}
+}
+
+// Joiners returns the handler's joiner table.
+func (h *RelayHandler) Joiners() *JoinerTable {
+	if h == nil {
+		return nil
+	}
+	return h.joiners
+}
+
+// ServeConn drives one accepted relay connection.
+//
+// The peer's identity comes from its pinned device certificate (mTLS),
+// the same trust anchor the direct path uses.
+//
+// The first record decides what the connection IS: a join record makes
+// the peer a joiner (a member that is willing to RECEIVE relayed
+// sessions), an open record makes it a requester (a member that wants a
+// session carried).
+//
+// THE CONNECTION OUTLIVES THE FUNCTION for a REQUESTER. The relay it
+// carries is still running when the grant was written, so the requester
+// is still reading records on this very connection. Closing the
+// connection when this function returns — which the old code did, with a
+// `defer conn.CloseWithError(0, "bye")` — killed the relay underneath
+// the requester, and the requester never even got to read the grant
+// (defect A of the round-61 real-machine report).
+//
+// So the connection is closed by whoever OWNS the relay's lifetime: the
+// flow does it when the relay ends. The connection is only closed here
+// on the error paths, where no relay was started.
+func (h *RelayHandler) ServeConn(conn *quic.Conn) {
+	peerID := identity.DeviceID(conn.ConnectionState().TLS.PeerCertificates[0].Subject.CommonName)
+	st, err := conn.AcceptStream(context.Background())
+	if err != nil {
+		_ = conn.CloseWithError(0, "bye")
+		return
+	}
+	sess := quicSession{st: st, conn: conn}
+	trunk := h.trunk
+	if trunk == nil {
+		trunk = InstalledRelayTrunk()
+	}
+	if trunk == nil {
+		_ = st.Close()
+		_ = conn.CloseWithError(0, "bye")
+		return
+	}
+	// Peek at the first record to tell a joiner from a requester.
+	br := bufio.NewReader(sess)
+	rec, err := readRelayRecord(br)
+	if err != nil {
+		_ = st.Close()
+		_ = conn.CloseWithError(0, "bye")
+		return
+	}
+	switch rec.Type {
+	case uint8(wire.FrameMeshRelayJoin):
+		// The joiner announces ITSELF; the record carries its device
+		// ID. It must match the certificate's CN — otherwise a member
+		// could claim to be somebody else.
+		if rec.From != peerID {
+			_ = st.Close()
+			_ = conn.CloseWithError(0, "bye")
+			return
+		}
+		h.serveJoiner(trunk, conn, sess, br, peerID)
+	case uint8(wire.FrameMeshRelayOpen):
+		h.serveRequester(trunk, conn, sess, br, &rec)
+	default:
+		_ = st.Close()
+		_ = conn.CloseWithError(0, "bye")
+	}
+}
+
+// serveJoiner serves a member that has joined the trunk.
+//
+// The joiner's connection is LONG-LIVED: it carries every relay the
+// trunk sends to that member, one FRESH STREAM per relay. The opener
+// below is how a new relay's stream is created.
+func (h *RelayHandler) serveJoiner(trunk *RelayTrunk, conn *quic.Conn, sess Session, br *bufio.Reader, peerID identity.DeviceID) {
+	open := func(ctx context.Context) (Session, error) {
+		st, err := conn.OpenStreamSync(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("mesh: relay trunk: open a stream to %s: %w", peerID, err)
+		}
+		return quicSession{st: st, conn: conn}, nil
+	}
+	joiner := &TrunkJoiner{Device: peerID, sess: sess, br: br, open: open}
+	h.joiners.Add(joiner)
+	defer func() {
+		h.joiners.Remove(peerID)
+		_ = joiner.Close()
+	}()
+	// The joiner stays connected until it goes away. The trunk reaches
+	// it over this session when a relay needs it as the target.
+	for {
+		if _, err := readRelayRecord(br); err != nil {
+			return
+		}
+	}
+}
+
+// serveRequester serves a member that wants a session carried.
+//
+// The open record was already read (the listener peeks at it to tell a
+// joiner from a requester), so it is handed over rather than re-read.
+//
+// The connection is NOT closed here: the relay is still running. The
+// flow's own teardown closes the requester's session, and this
+// connection goes with it.
+func (h *RelayHandler) serveRequester(trunk *RelayTrunk, conn *quic.Conn, sess Session, br *bufio.Reader, first *relayRecord) {
+	_ = trunk.ServeRequesterWithFirst(context.Background(), sess, h.joiners, br, first)
 }
 
 // RelayListener accepts relay-protocol connections.
@@ -2046,76 +2462,17 @@ func (l *RelayListener) acceptLoop(ln *quic.Listener) {
 
 // handle drives one accepted relay connection.
 //
-// The peer's identity comes from its pinned device certificate (mTLS),
-// the same trust anchor the direct path uses.
-//
-// The first record decides what the connection IS: a join record makes
-// the peer a joiner (a member that is willing to RECEIVE relayed
-// sessions), an open record makes it a requester (a member that wants a
-// session carried).
+// It delegates to the shared RelayHandler: the same handler serves the
+// relay connections that arrive on the DIRECT listener's socket (when
+// they negotiated the relay ALPN), so there is exactly one
+// implementation of the relay protocol.
 func (l *RelayListener) handle(conn *quic.Conn) {
-	defer conn.CloseWithError(0, "bye")
-	peerID := identity.DeviceID(conn.ConnectionState().TLS.PeerCertificates[0].Subject.CommonName)
-	st, err := conn.AcceptStream(context.Background())
-	if err != nil {
-		return
-	}
-	sess := quicSession{st: st, conn: conn}
-	trunk := l.cfg.Trunk
-	if trunk == nil {
-		trunk = InstalledRelayTrunk()
-	}
-	if trunk == nil {
-		_ = st.Close()
-		return
-	}
-	// Peek at the first record to tell a joiner from a requester.
-	br := bufio.NewReader(sess)
-	rec, err := readRelayRecord(br)
-	if err != nil {
-		_ = st.Close()
-		return
-	}
-	switch rec.Type {
-	case uint8(wire.FrameMeshRelayJoin):
-		// The joiner announces ITSELF; the record carries its device
-		// ID. It must match the certificate's CN — otherwise a member
-		// could claim to be somebody else.
-		if rec.From != peerID {
-			_ = st.Close()
-			return
-		}
-		l.serveJoiner(trunk, sess, br, peerID)
-	case uint8(wire.FrameMeshRelayOpen):
-		l.serveRequester(trunk, sess, br, &rec)
-	default:
-		_ = st.Close()
-	}
+	l.handler().ServeConn(conn)
 }
 
-// serveJoiner serves a member that has joined the trunk.
-func (l *RelayListener) serveJoiner(trunk *RelayTrunk, sess Session, br *bufio.Reader, peerID identity.DeviceID) {
-	joiner := &TrunkJoiner{Device: peerID, sess: sess, br: br}
-	l.cfg.Joiners.Add(joiner)
-	defer func() {
-		l.cfg.Joiners.Remove(peerID)
-		_ = joiner.Close()
-	}()
-	// The joiner stays connected until it goes away. The trunk reaches
-	// it over this session when a relay needs it as the target.
-	for {
-		if _, err := readRelayRecord(br); err != nil {
-			return
-		}
-	}
-}
-
-// serveRequester serves a member that wants a session carried.
-//
-// The open record was already read (the listener peeks at it to tell a
-// joiner from a requester), so it is handed over rather than re-read.
-func (l *RelayListener) serveRequester(trunk *RelayTrunk, sess Session, br *bufio.Reader, first *relayRecord) {
-	_ = trunk.ServeRequesterWithFirst(context.Background(), sess, l.cfg.Joiners, br, first)
+// handler returns the listener's relay handler.
+func (l *RelayListener) handler() *RelayHandler {
+	return NewRelayHandler(l.cfg.Trunk, l.cfg.Joiners)
 }
 
 // ---------------------------------------------------------------------------
@@ -2143,13 +2500,19 @@ type RelayJoinConfig struct {
 	Endpoints []string
 	// OnSession is called when the trunk routes a relayed session to
 	// this member. It receives the session's Session (plain bytes in
-	// and out) and the requester's device ID.
+	// and out), the requester's device ID, and the session KIND.
+	//
+	// The kind matters: the target's business layer dispatches on it
+	// (ping, msg, file, …), and it arrives in the OPEN record the
+	// trunk wrote. A target that ignored it would serve every relayed
+	// session with the same handler — a ping answered by the message
+	// handler, for instance.
 	//
 	// It is a callback rather than an inline handler because the
 	// member's business layer (the messages, the files, the pings)
 	// lives in the direct path's session dispatch, and it must be able
 	// to serve a RELAYED session the same way.
-	OnSession func(sess Session, requester identity.DeviceID) error
+	OnSession func(sess Session, requester identity.DeviceID, kind string) error
 }
 
 // JoinRelayTrunk connects a member to a relay trunk and stays connected.
@@ -2158,9 +2521,12 @@ type RelayJoinConfig struct {
 // node in the network this member can always reach, so it is the natural
 // place to reconnect to.
 //
-// The trunk's device ID is REQUIRED, and the dial pins the trunk's
-// certificate against the member view's key for it. A member that does
-// not know which anchor it is joining must not join an arbitrary one.
+// IT DOES NOT RETRY BY ITSELF. The old version looped forever inside this
+// function, so the caller's error handling — "relay trunk join failed
+// (%v); retrying" — was DEAD CODE and a member that could never join
+// failed SILENTLY (defect G of the round-61 real-machine report). The
+// retry is the caller's job: it has the log line, and it knows whether a
+// failure is worth retrying.
 func JoinRelayTrunk(ctx context.Context, cfg RelayJoinConfig) error {
 	if cfg.Device == nil || cfg.Resolver == nil {
 		return errors.New("mesh: relay join needs a device and a member resolver")
@@ -2171,30 +2537,16 @@ func JoinRelayTrunk(ctx context.Context, cfg RelayJoinConfig) error {
 	if len(cfg.Endpoints) == 0 {
 		return fmt.Errorf("%w: mesh: no relay trunk endpoint to dial", ErrNoRoute)
 	}
-	backoff := 500 * time.Millisecond
-	for {
-		err := joinRelayTrunkOnce(ctx, cfg)
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		if err != nil {
-			// The trunk may simply be restarting. Keep trying: this
-			// connection is the member's only inbound path.
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(backoff):
-			}
-			if backoff < 10*time.Second {
-				backoff *= 2
-			}
-			continue
-		}
-		backoff = 500 * time.Millisecond
-	}
+	return joinRelayTrunkOnce(ctx, cfg)
 }
 
 // joinRelayTrunkOnce makes one connection to the trunk and serves it.
+//
+// The connection carries EVERY relay the trunk sends to this member: the
+// join record goes on the first stream, and each relayed session gets
+// its OWN stream. That is what keeps the session handler and the
+// dispatch loop from competing for the same bytes (defect C of the
+// round-61 real-machine report).
 func joinRelayTrunkOnce(ctx context.Context, cfg RelayJoinConfig) error {
 	link, err := DialRelaySession(ctx, cfg.Device, cfg.Resolver, cfg.Trunk, cfg.Endpoints)
 	if err != nil {
@@ -2210,19 +2562,32 @@ func joinRelayTrunkOnce(ctx context.Context, cfg RelayJoinConfig) error {
 	}); err != nil {
 		return fmt.Errorf("mesh: relay join: send the join record: %w", err)
 	}
-	// The trunk routes relayed sessions to this connection. The first
-	// record after the join is the OPEN record (which names the
-	// requester), then the end-to-end handshake, then the traffic.
+
+	// The trunk routes relayed sessions to this connection, one FRESH
+	// STREAM each. The first stream is the one the join record went on
+	// (the trunk reads the join record from it); every later stream
+	// starts with an OPEN record naming the requester.
+	conn := link.qc
+	if conn == nil {
+		return errors.New("mesh: relay join: the relay connection cannot carry extra sessions")
+	}
+	go func() {
+		for {
+			st, err := conn.AcceptStream(context.Background())
+			if err != nil {
+				return
+			}
+			go serveRelayedSession(quicSession{st: st, conn: conn}, cfg)
+		}
+	}()
+
+	// The first stream: the join record was written on it, and it stays
+	// open as the connection's keepalive. Nothing else is read from it.
 	br := bufio.NewReader(sess)
 	for {
-		rec, err := readRelayRecord(br)
-		if err != nil {
+		if _, err := readRelayRecord(br); err != nil {
 			return err
 		}
-		if rec.Type != uint8(wire.FrameMeshRelayOpen) {
-			continue
-		}
-		go serveRelayedSession(sess, br, cfg, rec)
 	}
 }
 
@@ -2232,7 +2597,18 @@ func joinRelayTrunkOnce(ctx context.Context, cfg RelayJoinConfig) error {
 // The requester's identity comes from the open record the trunk sends;
 // the requester's key is resolved from the member view, and the
 // requester's hello is verified against it.
-func serveRelayedSession(sess Session, br *bufio.Reader, cfg RelayJoinConfig, open relayRecord) {
+func serveRelayedSession(sess Session, cfg RelayJoinConfig) {
+	br := bufio.NewReader(sess)
+	open, err := readRelayRecord(br)
+	if err != nil {
+		_ = sess.Close()
+		return
+	}
+	if open.Type != uint8(wire.FrameMeshRelayOpen) {
+		// Not a relay session: this stream is not ours. Drop it.
+		_ = sess.Close()
+		return
+	}
 	// The requester must be a member — the same check the trunk made.
 	// It is made AGAIN here, because the member view on the target may
 	// be fresher than the one on the trunk.
@@ -2251,6 +2627,6 @@ func serveRelayedSession(sess Session, br *bufio.Reader, cfg RelayJoinConfig, op
 		return
 	}
 	if cfg.OnSession != nil {
-		_ = cfg.OnSession(tsess, open.From)
+		_ = cfg.OnSession(tsess, open.From, open.Kind)
 	}
 }

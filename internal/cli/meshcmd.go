@@ -144,8 +144,23 @@ func openMeshSessionWithSnapshotTimeout(ctx context.Context, state, passFlag str
 	}
 }
 
-// resolveTarget waits until the target appears in the live view with at
-// least one endpoint, or the context ends.
+// resolveTarget waits until the target appears in the live view, and
+// returns its direct endpoints.
+//
+// A target with NO endpoints is NOT an error. It is a PURE-OUTBOUND
+// member: it has no inbound port, so it can only be reached THROUGH a
+// relay. The old code refused it outright ("has announced no endpoints
+// (is it running with --listen?)"), which made the relay path
+// unreachable from the product CLI — `mesh ping`, `msg`, `send-to`,
+// `run` and `bench` all go through here, so none of them could ever
+// take the relay path (defect F of the round-61 real-machine report).
+//
+// The picker decides the path: it offers the direct path first (with an
+// empty endpoint list, which the dialer refuses) and the relay
+// candidates after it. So returning an empty list is exactly right: the
+// direct attempt fails fast and the relay attempt follows.
+//
+// What IS still an error is a target that is not a member at all.
 func (s *meshSession) resolveTarget(ctx context.Context, target identity.DeviceID) ([]string, error) {
 	t := time.NewTicker(100 * time.Millisecond)
 	defer t.Stop()
@@ -153,16 +168,10 @@ func (s *meshSession) resolveTarget(ctx context.Context, target identity.DeviceI
 		snap := s.cl.Snapshot()
 		if snap != nil {
 			if mv, ok := snap.Members[target]; ok {
-				if len(mv.Endpoints) > 0 {
-					return mv.Endpoints, nil
-				}
-				// A member with zero endpoints is in a STABLE state — the
-				// announce carries endpoints atomically, so waiting cannot
-				// grow them. Say the actionable thing immediately instead
-				// of stalling to the deadline (issue #8 D-4: an online
-				// restricted container used to wait the full --timeout for
-				// a hint that only fired for offline targets).
-				return nil, fmt.Errorf("%s is a member but has announced no endpoints (is it running with --listen?)", target)
+				// A member with zero endpoints is reachable through a
+				// relay — that is the whole point of the trunk. The
+				// endpoints list may be empty.
+				return mv.Endpoints, nil
 			}
 			return nil, fmt.Errorf("%s is not a member of this network", target)
 		}
