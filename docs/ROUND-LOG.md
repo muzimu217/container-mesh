@@ -1405,3 +1405,9 @@ LEAVE 那笔的 CI 红了。**红的是一个早就存在的测试**（`TestTran
 **真机（Linux 175.24.139.148）验收**：仓库自带的安装回归在真机上 **rc=0**；**非特权用户**执行已安装的二进制 → **`cmesh v1.0.0`**（版本目录 `drwxr-xr-x` = 0755）——**R62-4 闭环**。
 **待网主放行**：上传这些资产并重发 release（rc1 的资产仍是坏的 0700 版本目录）。
 
+**★ v1.0.0-rc2 已发布（20 个资产全部上传）**
+`https://github.com/muzimu217/container-mesh/releases/tag/v1.0.0-rc2`（prerelease）。
+**资产**：19 个文件（6 平台二进制 + 6 归档 + 安装器 + `SHA256SUMS`）+ 6 个 `cmesh-latest-*` 别名 = **GitHub 上 20 个**。**本地 `shasum -c SHA256SUMS` → 19/19 OK**。
+**真机验证（从 GitHub 下载）**：安装器 **HTTP 200 / 8558 字节**，且**下载到的这份里确认含两个修复**（`chmod 0755 "$stage"` 版本目录、release API 回退）。二进制在慢速链路上仍在下载（本机到 GitHub ~0.67 MiB/s，与本轮测得的 hub 出口带宽一致），**版本号已在本地资产上确认为 `cmesh v1.0.0-rc2`**。
+**对比 rc1**：只有 **10 个资产**（缺 darwin-amd64 二进制、windows 两个平台全缺），`SHA256SUMS` **15 行对 10 个资产、7 行悬空** → **新用户按 README 装不上**。rc2 是它的完整替代。
+
