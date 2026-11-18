@@ -44,8 +44,20 @@ const (
 type MemberView struct {
 	Cert      identity.DeviceCert `json:"cert"`
 	Endpoints []string            `json:"endpoints,omitempty"`
-	LastSeen  time.Time           `json:"last_seen,omitzero"`
-	Online    bool                `json:"online"`
+	// RelayEndpoints are the addresses on which this member accepts
+	// RELAYS, as opposed to direct connections.
+	//
+	// They are a separate field because a relay session speaks its own
+	// ALPN, which needs its own UDP port — one socket can serve only one
+	// ALPN. A requester that wants to reach a target through a trunk
+	// therefore has to dial the trunk's RELAY endpoint; the direct
+	// endpoints would fail the ALPN negotiation.
+	//
+	// Empty for every member that does not run a trunk, which is every
+	// client today.
+	RelayEndpoints []string  `json:"relay_endpoints,omitempty"`
+	LastSeen       time.Time `json:"last_seen,omitzero"`
+	Online         bool      `json:"online"`
 }
 
 // MemberSnapshot is what GET /mesh/members pushes: who belongs (from the
@@ -100,6 +112,9 @@ func BuildSnapshot(members *identity.MemberList, n *Node, now time.Time) *Member
 		// oscillation fix). Online remains the pure liveness signal (P-5).
 		if eps := n.Endpoints(id); len(eps) > 0 {
 			view.Endpoints = eps
+		}
+		if eps := n.RelayEndpoints(id); len(eps) > 0 {
+			view.RelayEndpoints = eps
 		}
 		if t, seen := n.LastSeen(id); seen && now.Sub(t) <= MemberTimeout {
 			view.Online = true

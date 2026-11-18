@@ -74,6 +74,20 @@ type MemberAnnounce struct {
 	// membership generation the member believed it was leaving; the node
 	// does not act on it, it is carried for diagnostics.
 	View uint64 `json:"view,omitempty"`
+	// RelayEndpoints are the addresses on which the sender ACCEPTS
+	// RELAYS, as opposed to direct connections.
+	//
+	// Only a node that runs a relay trunk has these. They travel in the
+	// announce because the announce is the only channel a member has to
+	// publish an address: the member view is built from what members
+	// announce.
+	//
+	// They are separate from Endpoints because a relay session speaks its
+	// own ALPN, and one UDP socket can serve only one ALPN — the relay
+	// listener is therefore a different port. A requester that wants to
+	// reach a target through a trunk has to dial the trunk's RELAY
+	// endpoint; the direct ones would fail the ALPN negotiation.
+	RelayEndpoints []string `json:"relay_endpoints,omitempty"`
 }
 
 // Errors from announce validation. Each is distinct so the node can answer
@@ -162,7 +176,11 @@ func (a MemberAnnounce) signable() []byte {
 		Leave     bool              `json:"leave,omitempty"`
 		Session   int64             `json:"session,omitempty"`
 		View      uint64            `json:"view,omitempty"`
-	}{a.DeviceID, a.Endpoints, a.Timestamp, a.Leave, a.Session, a.View})
+		// RelayEndpoints are part of the signed range for the same reason
+		// the departure fields are: a captured announce must not be
+		// edited to point a requester at an attacker's relay endpoint.
+		RelayEndpoints []string `json:"relay_endpoints,omitempty"`
+	}{a.DeviceID, a.Endpoints, a.Timestamp, a.Leave, a.Session, a.View, a.RelayEndpoints})
 	return b
 }
 

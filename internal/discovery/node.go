@@ -25,6 +25,17 @@ type Node struct {
 	// (who is reachable right now).
 	lastSeen map[identity.DeviceID]time.Time
 	endpts   map[identity.DeviceID][]string
+	// relayEndpts are the addresses on which a member ACCEPTS RELAYS.
+	//
+	// They are separate from the direct-link endpoints because a relay
+	// session uses its own ALPN, and one UDP socket can serve only one
+	// ALPN — so the relay listener is a different port. A requester that
+	// wants to reach a target through a trunk has to dial the TRUNK's
+	// relay endpoint, not its direct one; without this field the two are
+	// indistinguishable and the relay path cannot be dialled at all.
+	//
+	// Only a node that runs a trunk has these.
+	relayEndpts map[identity.DeviceID][]string
 
 	// lastSeenAt remembers WHEN a device was last present, and it survives
 	// the device going offline. It is deliberately NOT the same map as
@@ -62,14 +73,15 @@ type Node struct {
 // addresses on top.
 func NewNode(members *identity.MemberList) *Node {
 	return &Node{
-		members:    members,
-		lastSeen:   make(map[identity.DeviceID]time.Time),
-		lastSeenAt: make(map[identity.DeviceID]time.Time),
-		sessionTS:  make(map[identity.DeviceID]time.Time),
-		endpts:     make(map[identity.DeviceID][]string),
-		subs:       make(map[identity.DeviceID]chan struct{}),
-		streams:    make(map[identity.DeviceID]int),
-		now:        time.Now,
+		members:     members,
+		lastSeen:    make(map[identity.DeviceID]time.Time),
+		lastSeenAt:  make(map[identity.DeviceID]time.Time),
+		sessionTS:   make(map[identity.DeviceID]time.Time),
+		endpts:      make(map[identity.DeviceID][]string),
+		relayEndpts: make(map[identity.DeviceID][]string),
+		subs:        make(map[identity.DeviceID]chan struct{}),
+		streams:     make(map[identity.DeviceID]int),
+		now:         time.Now,
 	}
 }
 
@@ -140,6 +152,17 @@ func (n *Node) Register(a MemberAnnounce, when time.Time) bool {
 	}
 	if a.Leave {
 		return n.leaveLocked(a, when)
+	}
+	// The relay endpoints a member publishes are recorded separately from
+	// its direct ones: they are the addresses on which it accepts RELAYS,
+	// and the relay path is dialled there.
+	//
+	// The map is written DIRECTLY: Register already holds n.mu, and
+	// calling SetRelayEndpoints would take it again — a self-deadlock on
+	// a non-reentrant mutex. (It hung the whole package under -race,
+	// which is how it was found.)
+	if len(a.RelayEndpoints) > 0 {
+		n.setRelayEndpointsLocked(a.DeviceID, a.RelayEndpoints)
 	}
 	// The presence session advances with every accepted announce: the
 	// newest announce's timestamp defines the session a LEAVE has to name.
@@ -234,6 +257,39 @@ func (n *Node) LastSeenAt(id identity.DeviceID) (time.Time, bool) {
 	defer n.mu.Unlock()
 	t, ok := n.lastSeenAt[id]
 	return t, ok
+}
+
+// SetRelayEndpoints records the addresses on which a member accepts
+// relays.
+//
+// Only a node that runs a trunk has these: the anchor announces its own
+// relay listener, and it is the anchor that puts them into the member
+// view so a requester can find a trunk to relay through.
+//
+// It takes the lock itself, so it must NOT be called from a path that
+// already holds n.mu — Register does, and it writes the map directly for
+// that reason. Calling this from Register deadlocks the package: a
+// non-reentrant mutex, waited on by the goroutine that holds it.
+func (n *Node) SetRelayEndpoints(id identity.DeviceID, eps []string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.setRelayEndpointsLocked(id, eps)
+}
+
+// setRelayEndpointsLocked is the lock-free half. The caller holds n.mu.
+func (n *Node) setRelayEndpointsLocked(id identity.DeviceID, eps []string) {
+	if len(eps) == 0 {
+		delete(n.relayEndpts, id)
+		return
+	}
+	n.relayEndpts[id] = append([]string(nil), eps...)
+}
+
+// RelayEndpoints returns a copy of a member's relay addresses.
+func (n *Node) RelayEndpoints(id identity.DeviceID) []string {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return append([]string(nil), n.relayEndpts[id]...)
 }
 
 // Endpoints returns a copy of a device's current candidate addresses.
