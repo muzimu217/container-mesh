@@ -83,10 +83,15 @@ type MemberAnnounce struct {
 	// announce.
 	//
 	// They are separate from Endpoints because a relay session speaks its
-	// own ALPN, and one UDP socket can serve only one ALPN — the relay
-	// listener is therefore a different port. A requester that wants to
-	// reach a target through a trunk has to dial the trunk's RELAY
-	// endpoint; the direct ones would fail the ALPN negotiation.
+	// own ALPN, and a requester that wants to reach a target through a
+	// trunk has to dial the RIGHT endpoint list.
+	//
+	// The separation is by PROTOCOL, not by PORT: in the default shape
+	// the relay rides on the same socket as the direct link (ALPN is
+	// negotiated per connection), and the two lists hold the same
+	// addresses. The field stays because an operator can still put the
+	// relay on a port of its own (--relay-port), and then the two lists
+	// differ.
 	RelayEndpoints []string `json:"relay_endpoints,omitempty"`
 }
 

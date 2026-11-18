@@ -48,10 +48,16 @@ type MemberView struct {
 	// RELAYS, as opposed to direct connections.
 	//
 	// They are a separate field because a relay session speaks its own
-	// ALPN, which needs its own UDP port — one socket can serve only one
-	// ALPN. A requester that wants to reach a target through a trunk
-	// therefore has to dial the trunk's RELAY endpoint; the direct
-	// endpoints would fail the ALPN negotiation.
+	// ALPN, and a requester that wants to reach a target through a trunk
+	// has to reach the RIGHT endpoint list: with a separate relay port
+	// the direct endpoints would fail the ALPN negotiation.
+	//
+	// The separation is by PROTOCOL, not by PORT: in the default shape
+	// the relay rides on the same socket as the direct link (ALPN is
+	// negotiated per connection), and the two lists hold the same
+	// addresses. The field stays because an operator can still put the
+	// relay on a port of its own (--relay-port), and then the two lists
+	// differ.
 	//
 	// Empty for every member that does not run a trunk, which is every
 	// client today.
