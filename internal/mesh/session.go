@@ -61,6 +61,41 @@ type Session interface {
 	SetWriteDeadline(t time.Time) error
 }
 
+// sessionAborter is the OPTIONAL way to end a session on BOTH sides at
+// once.
+//
+// The Session contract's Close() is a HALF close: it writes a FIN, the
+// peer sees the end of this direction, and this end keeps its receive
+// side open. That is exactly what the relay's splice needs when one
+// direction ends while the other may still have an answer on the way.
+//
+// A TEARDOWN is a different thing. When the trunk revokes a relay, or the
+// rate quota is exceeded, the flow has to STOP NOW: the peer must not be
+// able to keep it alive by ignoring the FIN, and the trunk's own readers
+// must not wait for a peer that is being cut off.
+//
+// The abort is optional so a transport that cannot abort still works — it
+// falls back to the half close.
+type sessionAborter interface {
+	// Abort ends the session on both sides: the peer's reads fail, and so
+	// do this end's pending reads.
+	Abort() error
+}
+
+// abortSession ends a session, aborting it when the transport can.
+//
+// It is the teardown path. The half close (Close) is the polite end of ONE
+// direction; this is the end of the whole session.
+func abortSession(s Session) error {
+	if s == nil {
+		return nil
+	}
+	if a, ok := s.(sessionAborter); ok {
+		return a.Abort()
+	}
+	return s.Close()
+}
+
 // quicSession adapts a *quic.Stream to Session.
 //
 // The adapter is thin today (quic.Stream already has the right method
@@ -81,6 +116,18 @@ func (s quicSession) Write(p []byte) (int, error) { return s.st.Write(p) }
 // Close half-closes: quic.Stream.Close() writes a FIN on the send side
 // and leaves the receive side open.
 func (s quicSession) Close() error { return s.st.Close() }
+
+// Abort ends the session on BOTH sides.
+//
+// The half close (Close) writes a FIN and leaves the receive side open.
+// An abort is the hard end: the peer sees a reset and this end's pending
+// reads fail. It is what a teardown needs — a relay that was revoked must
+// not be able to keep streaming by ignoring the FIN.
+func (s quicSession) Abort() error {
+	s.st.CancelRead(0)
+	s.st.CancelWrite(0)
+	return nil
+}
 
 func (s quicSession) SetReadDeadline(t time.Time) error  { return s.st.SetReadDeadline(t) }
 func (s quicSession) SetWriteDeadline(t time.Time) error { return s.st.SetWriteDeadline(t) }

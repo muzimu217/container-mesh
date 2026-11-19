@@ -323,12 +323,15 @@ func (t *RelayTrunk) SetEnabled(on bool) {
 // difference to learn anything about the trunk.
 func (t *RelayTrunk) Decide(open RelayOpen) (RelayAnswer, error) {
 	if _, err := t.members.KeyFor(open.From); err != nil {
+		// The reason goes with the refusal: "not a member" and
+		// "certificate lapsed" are the same verdict but they are not the
+		// same PROBLEM, and only the second one has a remedy.
 		return denyRelay(RelayClassAuth, ErrAuth,
-			"mesh: relay trunk: the requester %s is not a member of this view", open.From)
+			"mesh: relay trunk: the requester %s is not a member of this view: %v", open.From, err)
 	}
 	if _, err := t.members.KeyFor(open.To); err != nil {
 		return denyRelay(RelayClassAuth, ErrAuth,
-			"mesh: relay trunk: the target %s is not a member of this view", open.To)
+			"mesh: relay trunk: the target %s is not a member of this view: %v", open.To, err)
 	}
 	if !t.Enabled() {
 		return denyRelay(RelayClassDisabled, ErrRelayTrunkDisabled,
@@ -468,6 +471,55 @@ const relayProtoID = "cmesh-relay/1"
 // opaque payload). It matches the wire package's 1 MiB frame cap, so a
 // relayed record can never be bigger than a direct one.
 const maxRelayRecord = 1 << 20
+
+// maxRelayPlaintext is the largest plaintext that fits in ONE relay
+// record.
+//
+// A relay record is JSON, and JSON carries a []byte as base64: four
+// bytes of wire for every three bytes of payload. The end-to-end seal
+// adds a 12-byte nonce and a 16-byte tag. So the plaintext that fits is
+// roughly three quarters of the record limit, less the seal and the JSON
+// envelope.
+//
+// It matters because the file sender writes 1 MiB chunks, and 1 MiB did
+// NOT fit: the record came out at 1398158 bytes against a 1048576-byte
+// limit, so every file bigger than about a megabyte failed through the
+// relay with "record too large" — while the same file went through the
+// direct link without complaint. The margin below is deliberately
+// generous: the exact size depends on the JSON envelope, and a record
+// that is one byte over the limit is a hard failure.
+const maxRelayPlaintext = maxRelayRecord*3/4 - 1024
+
+// sealAndWriteRelayData seals the plaintext and writes it as relay
+// records, SPLITTING it when it does not fit in one.
+//
+// The split is safe. The end-to-end seal is counter-based — a fresh
+// nonce per message — so every piece is sealed and opened on its own,
+// and the business layer above reads a STREAM: it sees the same bytes in
+// the same order, only in more pieces.
+//
+// It returns how many bytes were written.
+func sealAndWriteRelayData(w io.Writer, e2e *E2ESession, p []byte) (int, error) {
+	total := len(p)
+	for len(p) > 0 {
+		n := len(p)
+		if n > maxRelayPlaintext {
+			n = maxRelayPlaintext
+		}
+		sealed, err := e2e.Seal(p[:n])
+		if err != nil {
+			return total - len(p), err
+		}
+		if err := writeRelayRecord(w, relayRecord{
+			Type: uint8(wire.FrameMeshRelayData),
+			Data: sealed,
+		}); err != nil {
+			return total - len(p), err
+		}
+		p = p[n:]
+	}
+	return total, nil
+}
 
 // relayHandshakeTimeout bounds the end-to-end handshake that happens
 // THROUGH the trunk.
@@ -961,7 +1013,30 @@ func (t *RelayTrunk) releaseStream() {
 // of the round-61 real-machine report). The target's side is now a
 // session opened for THIS flow alone (see relayFlow), so closing it ends
 // this flow and nothing else.
+//
+// This is the GRACEFUL end: the two sessions are half-closed (a FIN), so
+// the bytes the peer has not read yet are still delivered. That matters
+// for the delivery ack: the trunk writes the ack and closes the flow in
+// the same breath, and an ABORT (a RESET_STREAM) would discard the ack
+// before the requester ever read it. Use closeFlowForced for the teardown
+// that must not be polite.
 func (t *RelayTrunk) closeFlow(id uint64, reason string) {
+	t.tearDownFlow(id, reason, false)
+}
+
+// closeFlowForced tears a flow down and frees its slot, ABORTING both
+// sessions.
+//
+// It is the teardown for the cases where the peer must not be able to
+// keep the flow alive: a revocation, a quota refusal, a hard peer
+// failure. A half close asks the peer to stop; an abort makes it stop.
+// A revoked device that ignored the FIN must not be able to keep
+// streaming through this trunk.
+func (t *RelayTrunk) closeFlowForced(id uint64, reason string) {
+	t.tearDownFlow(id, reason, true)
+}
+
+func (t *RelayTrunk) tearDownFlow(id uint64, reason string, forced bool) {
 	t.mu.Lock()
 	flow, ok := t.flows[id]
 	if ok {
@@ -975,6 +1050,11 @@ func (t *RelayTrunk) closeFlow(id uint64, reason string) {
 		return
 	}
 	flow.finish()
+	if forced {
+		_ = abortSession(flow.req)
+		_ = abortSession(flow.tgt)
+		return
+	}
 	_ = flow.req.Close()
 	_ = flow.tgt.Close()
 }
@@ -1002,7 +1082,7 @@ func (t *RelayTrunk) CloseAll() {
 	}
 	t.mu.RUnlock()
 	for _, id := range ids {
-		t.closeFlow(id, "the trunk is shutting down")
+		t.closeFlowForced(id, "the trunk is shutting down")
 	}
 }
 
@@ -1030,16 +1110,35 @@ func (t *RelayTrunk) CloseAll() {
 //
 // Closing the flow ends the other direction: the flow's teardown closes
 // both of its sessions, which unblocks the reader on the other side.
+// splice carries the two directions of a flow until BOTH of them are done.
+//
+// The two directions end at DIFFERENT times, and that is the whole point.
+// Every request/response protocol in this codebase does the same thing:
+// `cmesh msg`, `cmesh run` and `cmesh send-to` all send their request,
+// HALF-close (FIN), and only THEN wait for the answer. So the request
+// direction ends FIRST, while the answer is still on its way.
+//
+// The splice used to treat the first end as the end of the flow: it
+// closed both of the flow's sessions, so the answer — still travelling on
+// the other direction — was discarded. The symptom on the real machine was
+// that the message reached the target but the DELIVERY ACK never came
+// back, and the requester saw EOF instead.
+//
+// The rule is therefore: one direction ending HALF-CLOSES the far side
+// (the far side may still have something to say), and the flow is over
+// only when both directions are done.
 func (t *RelayTrunk) splice(flow *relayFlow) {
-	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(2)
 	go func() {
-		defer close(done)
+		defer wg.Done()
 		t.forwardRecords(flow, flow.reqBr, flow.tgt)
 	}()
 	go func() {
+		defer wg.Done()
 		t.forwardRecords(flow, flow.tgtBr, flow.req)
 	}()
-	<-done
+	wg.Wait()
 	t.closeFlow(flow.id, "relay finished")
 }
 
@@ -1060,7 +1159,23 @@ func (t *RelayTrunk) forwardRecords(flow *relayFlow, br *bufio.Reader, to Sessio
 	for {
 		rec, err := readRelayRecord(br)
 		if err != nil {
-			_ = to.Close()
+			if errors.Is(err, io.EOF) {
+				// The sender is DONE SENDING — a half close, not a
+				// failure. The far side may still have an answer to
+				// give, so the far side is half-closed too and this
+				// direction ends here.
+				//
+				// This is the case every request/response protocol
+				// produces: "send the request, FIN, wait for the
+				// answer".
+				_ = to.Close()
+				return
+			}
+			// A hard failure: the peer is GONE, not merely finished.
+			// Nothing can be salvaged, so the flow is torn down — and
+			// tearing it down releases the other direction, which would
+			// otherwise wait for a peer that will never answer.
+			t.closeFlowForced(flow.id, "relay peer failed")
 			return
 		}
 		if rec.Type == uint8(wire.FrameMeshRelayClose) {
@@ -1079,7 +1194,7 @@ func (t *RelayTrunk) forwardRecords(flow *relayFlow, br *bufio.Reader, to Sessio
 				Close:  true,
 				Reason: "the relay's rate quota was exceeded",
 			})
-			t.closeFlow(flow.id, "relay rate quota exceeded")
+			t.closeFlowForced(flow.id, "relay rate quota exceeded")
 			return
 		}
 		if err := writeRelayRecord(to, rec); err != nil {
@@ -1186,7 +1301,7 @@ func (t *RelayTrunk) RevokeFlows() int {
 		if t.stillMember(f.from) && t.stillMember(f.to) {
 			continue
 		}
-		t.closeFlow(f.id, "a member of this relay was revoked")
+		t.closeFlowForced(f.id, "a member of this relay was revoked")
 		revoked++
 	}
 	return revoked
@@ -1307,28 +1422,23 @@ type relaySession struct {
 	closed bool
 }
 
-// Write seals the plaintext and sends it as one relay record.
+// Write seals the plaintext and sends it as relay records.
 //
-// The whole write becomes ONE record: the record framing is the message
-// boundary on the wire, and a message must not be split across two
-// records (the target would deliver two half-messages).
+// A write that does not fit in ONE record is split (see
+// sealAndWriteRelayData): the record framing is the envelope on the
+// wire, not a message boundary — the business layer above reads a
+// stream, so it sees the same bytes in the same order either way.
 func (r *relaySession) Write(p []byte) (int, error) {
 	r.wmu.Lock()
 	defer r.wmu.Unlock()
 	if r.closed {
 		return 0, errors.New("mesh: relay: the session is closed")
 	}
-	sealed, err := r.e2e.Seal(p)
+	n, err := sealAndWriteRelayData(r.conn, r.e2e, p)
 	if err != nil {
-		return 0, err
+		return n, fmt.Errorf("mesh: relay: write: %w", err)
 	}
-	if err := writeRelayRecord(r.conn, relayRecord{
-		Type: uint8(wire.FrameMeshRelayData),
-		Data: sealed,
-	}); err != nil {
-		return 0, fmt.Errorf("mesh: relay: write: %w", err)
-	}
-	return len(p), nil
+	return n, nil
 }
 
 // Read returns the plaintext of the next record.
@@ -1397,6 +1507,18 @@ func (r *relaySession) SetReadDeadline(t time.Time) error {
 // SetWriteDeadline bounds the pending and future writes.
 func (r *relaySession) SetWriteDeadline(t time.Time) error {
 	return r.conn.SetWriteDeadline(t)
+}
+
+// Abort ends the relayed session on both sides.
+//
+// The half close (Close) is the polite end of the send direction. This is
+// the hard end: the trunk tears the flow down (a revocation, a quota
+// refusal) and the requester must not be able to keep the session alive.
+func (r *relaySession) Abort() error {
+	r.wmu.Lock()
+	r.closed = true
+	r.wmu.Unlock()
+	return abortSession(r.conn)
 }
 
 // OpenRelay opens a relayed session to the target through the trunk.
@@ -1884,10 +2006,19 @@ func (t *RelayTrunk) ServeRequesterWithFirst(ctx context.Context, sess Session, 
 	tgt, err := t.dialTargetWith(ctx, open.To, open.Kind, dialer)
 	if err != nil {
 		t.releaseStream()
+		// The CAUSE goes to the requester.
+		//
+		// The bare "this node cannot reach <target> right now" was the
+		// worst kind of message: it is true, and it says nothing. The
+		// real reason is usually something an operator can act on — the
+		// member's certificate lapsed, the join connection is not up yet,
+		// the target has no endpoints. The requester is already known to
+		// be a member (the authorization ran before this point), so
+		// telling it the cause leaks nothing to a stranger.
 		_ = writeRelayRecord(sess, relayRecord{
 			Type:   uint8(wire.FrameMeshRelayAnswer),
 			Grant:  false,
-			Reason: fmt.Sprintf("this node cannot reach %s right now", open.To),
+			Reason: fmt.Sprintf("this node cannot reach %s right now: %v", open.To, err),
 			Class:  RelayClassRefused,
 		})
 		return err
@@ -1945,7 +2076,7 @@ func (t *RelayTrunk) ServeRequesterWithFirst(ctx context.Context, sess Session, 
 		Grant:   true,
 		Session: id,
 	}); err != nil {
-		t.closeFlow(id, "the grant could not be written")
+		t.closeFlowForced(id, "the grant could not be written")
 		return err
 	}
 
@@ -1966,7 +2097,7 @@ func (t *RelayTrunk) ServeRequesterWithFirst(ctx context.Context, sess Session, 
 	case <-flow.done:
 		return nil
 	case <-ctx.Done():
-		t.closeFlow(id, "the trunk's context ended")
+		t.closeFlowForced(id, "the trunk's context ended")
 		return ctx.Err()
 	}
 }
@@ -2005,17 +2136,11 @@ func (t *relayTargetSession) Write(p []byte) (int, error) {
 	if t.closed {
 		return 0, errors.New("mesh: relay target: the session is closed")
 	}
-	sealed, err := t.e2e.Seal(p)
+	n, err := sealAndWriteRelayData(t.conn, t.e2e, p)
 	if err != nil {
-		return 0, err
+		return n, fmt.Errorf("mesh: relay target: write: %w", err)
 	}
-	if err := writeRelayRecord(t.conn, relayRecord{
-		Type: uint8(wire.FrameMeshRelayData),
-		Data: sealed,
-	}); err != nil {
-		return 0, fmt.Errorf("mesh: relay target: write: %w", err)
-	}
-	return len(p), nil
+	return n, nil
 }
 
 // Read returns the plaintext of the next record.
@@ -2073,6 +2198,18 @@ func (t *relayTargetSession) SetReadDeadline(ts time.Time) error {
 
 func (t *relayTargetSession) SetWriteDeadline(ts time.Time) error {
 	return t.conn.SetWriteDeadline(ts)
+}
+
+// Abort ends the target's side of the relayed session on both sides.
+//
+// The half close (Close) is the polite end of the send direction. This is
+// the hard end, and it is what a teardown needs: the trunk must be able
+// to cut the target's session off, not merely ask it to stop.
+func (t *relayTargetSession) Abort() error {
+	t.wmu.Lock()
+	t.closed = true
+	t.wmu.Unlock()
+	return abortSession(t.conn)
 }
 
 // ServeRelayTarget performs the TARGET's half of the end-to-end
@@ -2629,4 +2766,19 @@ func serveRelayedSession(sess Session, cfg RelayJoinConfig) {
 	if cfg.OnSession != nil {
 		_ = cfg.OnSession(tsess, open.From, open.Kind)
 	}
+	// The target's side of the flow ENDS here.
+	//
+	// The direct path does the same thing (see Listener.handle: it closes
+	// the stream when the handler returns), and the relay path used to
+	// skip it. That asymmetry was the leak: the trunk's splice waits for
+	// BOTH directions to end, and the target's direction could only end
+	// if the target closed its side. It did not, so the flow never ended,
+	// the trunk never freed its slot, and after twenty relays the trunk
+	// refused every new one ("carrying as many relays as it may") — a
+	// relay that had worked perfectly well, and then stopped, for a
+	// reason that had nothing to do with the network.
+	//
+	// The close is a HALF close: the requester still gets the bytes the
+	// handler wrote (the delivery ack) before it sees the end.
+	_ = tsess.Close()
 }

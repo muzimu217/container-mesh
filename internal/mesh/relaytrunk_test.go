@@ -596,12 +596,14 @@ func TestRelayPathCarriesTheRelayEndpoint(t *testing.T) {
 // makes a pair of sessions a wire: writing to one is reading from the
 // other, and nothing loops back.
 //
-// CLOSE SEMANTICS OF THIS DOUBLE: Close() ends the session on BOTH sides
-// of this endpoint — the local reader sees EOF and the peer sees EOF.
-// The real Session is a HALF close, and the relay's splice relies on that
-// to propagate an end-of-message without discarding the tail. What this
-// double still exercises is exactly that property: the reader drains the
-// bytes that are ALREADY QUEUED before it reports EOF, so a message's tail
+// CLOSE SEMANTICS OF THIS DOUBLE: Close() is a HALF close — it ends the
+// SEND side only, so the peer sees EOF while this end keeps reading. The
+// real Session does exactly that (quic.Stream.Close() writes a FIN), and
+// the relay's splice relies on it to carry an answer that arrives AFTER
+// the request ended. Abort() is the hard end: both sides go down.
+//
+// What this double still exercises is that the reader drains the bytes
+// that are ALREADY QUEUED before it reports EOF, so a message's tail
 // cannot be lost. The half-close PROPAGATION is what the relay's splice
 // does (it closes the far side when the near side ends), and that is what
 // the forwarding test asserts.
@@ -613,6 +615,14 @@ type pipeSession struct {
 	// closed is closed when this session ends.
 	closed    chan struct{}
 	closeOnce sync.Once
+	// sendClosed is closed when this session ends its SEND side only.
+	// The peer sees EOF on it; this end can still READ what the peer
+	// sends. That is the HALF close the real Session does
+	// (quic.Stream.Close() writes a FIN), and the relay's splice has to
+	// survive it: "send the request, FIN, then wait for the answer" is
+	// what every request/response protocol does.
+	sendClosed chan struct{}
+	sendOnce   sync.Once
 	// readErr, when set, is returned by the next Read. It is how a test
 	// simulates "the peer hung up".
 	readErr error
@@ -646,8 +656,8 @@ func (p *pipeSession) seenBytes() []byte {
 
 // newPipeSessionPair builds two connected sessions.
 func newPipeSessionPair() (*pipeSession, *pipeSession) {
-	a := &pipeSession{in: make(chan []byte, 64), closed: make(chan struct{})}
-	b := &pipeSession{in: make(chan []byte, 64), closed: make(chan struct{})}
+	a := &pipeSession{in: make(chan []byte, 64), closed: make(chan struct{}), sendClosed: make(chan struct{})}
+	b := &pipeSession{in: make(chan []byte, 64), closed: make(chan struct{}), sendClosed: make(chan struct{})}
 	a.peer = b
 	b.peer = a
 	return a, b
@@ -713,21 +723,66 @@ func (p *pipeSession) Read(b []byte) (int, error) {
 	case <-p.peer.closed:
 		// The peer ended its send side. Drain what it already sent,
 		// then EOF.
-		select {
-		case chunk, ok := <-p.in:
-			if !ok {
-				return 0, io.EOF
-			}
-			return copy(b, chunk), nil
-		default:
-		}
-		return 0, io.EOF
+		return p.drainThenEOF(b)
+	case <-p.peer.sendClosed:
+		// The peer HALF-closed: it will send nothing more, but it is
+		// still listening. This is the end of the request, not the end
+		// of the conversation.
+		return p.drainThenEOF(b)
 	}
 }
 
-// Close ends the session.
+// drainThenEOF hands back the bytes that are already queued and then
+// reports the end of the stream.
+func (p *pipeSession) drainThenEOF(b []byte) (int, error) {
+	select {
+	case chunk, ok := <-p.in:
+		if !ok {
+			return 0, io.EOF
+		}
+		return copy(b, chunk), nil
+	default:
+	}
+	return 0, io.EOF
+}
+
+// Close ends the SEND side of the session.
+//
+// It is a HALF close: the peer sees the end of this direction, and this
+// end keeps its receive side open. The real Session is a half close
+// (quic.Stream.Close() writes a FIN), and the relay's splice DEPENDS on
+// it: a request that ends before its answer arrives must not take the
+// answer down with it.
+//
+// The double used to close both sides at once, which is not what the real
+// session does — and the difference is invisible until the half-close
+// protocols are exercised.
 func (p *pipeSession) Close() error {
+	p.CloseWrite()
+	return nil
+}
+
+// Abort ends the session on BOTH sides.
+//
+// The half close above is what a FIN means. A TEARDOWN is different: the
+// peer must not be able to keep the session alive by ignoring the FIN,
+// and this end's pending reads must fail instead of waiting for a peer
+// that is being cut off.
+func (p *pipeSession) Abort() error {
 	p.closeOnce.Do(func() { close(p.closed) })
+	p.CloseWrite()
+	return nil
+}
+
+// CloseWrite ends the SEND side only.
+//
+// The peer sees EOF — nothing more will arrive on this direction — while
+// this end keeps its receive side open. The real Session is a half close
+// (quic.Stream.Close() writes a FIN and the receive side stays open), and
+// the relay's splice depends on it: a request that ends before its answer
+// arrives must not take the answer down with it.
+func (p *pipeSession) CloseWrite() error {
+	p.sendOnce.Do(func() { close(p.sendClosed) })
 	return nil
 }
 
