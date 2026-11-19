@@ -1430,3 +1430,55 @@ LEAVE 那笔的 CI 红了。**红的是一个早就存在的测试**（`TestTran
 
 **本轮最重要的方法学教训**：**代理写的单元测试没有覆盖它自己声称的那条路径**——多个缺陷的根因就是「测试绕过了出问题的那一层」（A 绕过了 listener）。**测试必须走真实路径，不走方便的入口。**
 
+---
+
+**★ 中转干道真机打通（决定性验收）：`link=relay via=<锚点>`**
+
+拓扑（**两台真实机、纯出站、无任何入站端口**）：
+**锚点/中转 A** = `175.24.139.148:18090`（`--relay-trunk`，同端口双 ALPN，D76）；
+**请求方 B** 与**目标 C** 同在 `162.14.97.79`，**都不 `--listen`** → 它们之间**只能走中转**。
+C 用 `--relay-trunk 175.24.139.148:18090 --relay-trunk-id <A的deviceID>` 加入干道（纯出站成员可达的机制：锚点从 C 主动开的那条连接反向够它）。
+
+**四项核心传输全部走通中转**：
+`mesh ping` → **3/3 pings, lost 0, p50 72.3ms, `link=relay via=<A>`**；`msg` → `delivered 1 message(s)`；`run @info` → 返回对端主机信息；`send-to` → `receiver verified`，收件箱 sha256 **逐字节匹配**。
+直连路径未回归：同机 ping 锚点 → `link=direct`，p50 37.2ms。
+
+**★ 本轮抓到并修掉的 7 个缺陷（每个都有红→绿证据）**
+
+**① 中转端点从未到达请求方**（`internal/discovery/node.go`）。`changed` 的比较在**写入之前**做 → 中转端点一写就永远说「没变」→ **从不推送视图** → 请求方看不到任何中转候选。修：中转端点纳入比较、写入挪到比较之后。
+红：`TestTheRelayEndpointsAloneAreEnoughToTriggerAPush`（"the relay endpoints appeared but no view was pushed"）。
+
+**② 半关闭被当成整流结束：回执在中转回程上被丢**（`internal/mesh/relaytrunk.go`）。`splice` 用 `<-done` 等**任一**方向结束就 `closeFlow`，把还在路上的回执一起关掉。真机症状：**消息送达了（C 打印 📩），但投递回执没了** → `mesh: await delivery ack: EOF`。
+修：等**两个方向都结束**；读方向拿到 EOF 只**半关**对端（对端可能还有话说），只有硬错误才拆流。
+红：`TestTheTrunkCarriesAnAnswerThatArrivesAfterTheRequestEnded` → `the requester never got the answer: EOF`。
+
+**③ 我这次修复引入的回归：配额槽永久泄漏，干道 20 次后彻底堵死**。修 ② 之后目标方向永不结束（真实目标的处理函数写完回执就 `return`，**从不关闭自己的会话**）→ 流永不结束 → 干道的配额槽永不归还。
+真机证据：连做 20 次中转全过，**第 21 次起** `quota exceeded: this node is carrying as many relays as it may`；而且**每次失败还会毒化下一次握手**（下一次报 `read the target's hello: EOF`，要等 join 重连的 32s 退避才恢复）。
+修：目标处理完就**半关自己的会话**（与直连路径 `Listener.handle` 对齐）。
+红：`TestAFinishedRelayFreesTheTrunksSlot` → `the trunk carries 1 flows, want 0`。
+
+**④ 撤销/超限没有真正掐断流量**。`closeFlow` 原来只是礼貌 FIN，被撤销的对端可以无视它继续推流。
+修：新增**可选的 `sessionAborter` 接口**（quic-go 的 `CancelRead/CancelWrite`），并把「正常收尾」与「强制拆除」分成两条路径 —— 正常收尾**半关**（半关不会丢掉对端还没读走的字节），撤销/超限/硬错误才 **abort**。
+**为什么必须分开**：abort 是 RESET_STREAM，**会丢掉对端还没读走的数据** —— 而投递回执恰好就是这种数据，abort 得太快会把回执在请求方读到之前销毁（症状从 EOF 变成 "stream canceled by remote"）。
+
+**⑤ 经中转的大文件必失败**（`record too large`）。中转记录是 JSON，`[]byte` 在 JSON 里是 **base64**（4/3 膨胀），而端到端封签再加 12 字节 nonce + 16 字节 tag → 文件发送的 1 MiB 分块封出来 **1398158 字节** > **1048576** 的记录上限 → **任何大于约 1 MiB 的文件经中转直接失败**，而同一份文件走直连毫无怨言。
+修：写侧按记录上限**拆分**（端到端封签是**计数器式**的，每条消息一个新 nonce → 拆分后逐块开箱，业务层读的是**流**，字节序不变）。
+红：`TestTheRelayCarriesAWriteBiggerThanOneRecord` → `record too large (2097210 bytes)`。
+
+**⑥ 假投递回执**（`internal/mesh/direct.go`）。`receiveMsgs` 把**任何**读错误都当成正常半关 → 超限的帧、截断的帧、被 reset 的连接，**照样回 "done"** → 发送端报告「已投递」，而目标**根本没收到**。假回执比直接失败更危险，因为它**是静默的**。
+修：区分「干净半关」与「真失败」，失败回 `err: <原因>` 并让发送端报错。
+**一个容易踩的坑**（代理独立发现）：`io.ReadFull` 对「头都没读到」和「头说 100 字节但 body 一个字节没来」**都返回 `io.EOF`** → 只判 `err == io.EOF` **修不好**，头和体必须分开读。
+代理在真机上把红与绿都跑出来了（旧代码：`the receiver answered "done" — that is the DELIVERY RECEIPT for a frame it never read`）。
+
+**⑦ `join --timeout` 实为整个成员进程的期限 → 默认 10 分钟后成员自动退网**（`internal/cli/discovery.go`）。flag 说明写的是「等审批的期限」，实现却把它套在**信号上下文**上 → 那正是**整个成员进程**的生命周期。超时一到 → 优雅退网 → 广播 LEAVE → 成员从名册消失、锚点再也够不到它（真机日志 `left the network (LEAVE broadcast sent)`，随后所有中转请求报 `this node cannot reach <target> right now`）。
+修：超时只约束**等审批**那一段，**审批落地即解除**；被撤销后重新计时。代理在真机上验证：修复前 `timeout 15` 的进程在 10 秒后就没了，修复后仍在运行（退出码 124，是外层 `timeout` 杀的）。
+
+**★ 本轮仍未闭环的部分（诚实记下）**
+
+**经中转的大文件仍会挂**：实测 **≥256 KiB** 的文件经中转超时（256 KiB→读回执超时；2 MiB→写超时），而**同一台机直连 3 MiB 只要 4.7 秒**。已测得该 join 腿吞吐约 **19 KB/s**（RTT 36ms、RTO 量化突发），同时在客户端网卡侧看到 **UDP 校验和错误计数在一次传输中涨了 412**。**两个解释尚未分开**：① Reno 拥塞窗口下限；② 客户端 UDP 校验和卸载故障（锚点抓包显示所有包 `udp sum ok`，但客户端内核报损坏）。已派专项代理：**进程内已复现「一次失败毒化下一次握手」并给出修法**；尺寸拐点的根因还需要客户端主机的 `ethtool` 与抓包取证。
+
+**★ 本轮的方法学教训（三条，都很贵）**
+① **半关闭是这类协议的命门**：请求方向先结束、响应方向还在路上 —— 任何「一个方向结束就拆流」的写法都会丢回执。这个 bug 在直连路径测不出来，只能在中转路径上现形。
+② **测试替身骗了我**：`pipeSession.Close()` 两边都关，**模拟不了**真实 `quic.Stream.Close()` 的半关闭 —— 于是既有单测全绿、真机是红的。**替身必须照抄被替对象的语义**，否则它保护的是错误的行为。（修好替身后，缺陷立刻在单测里现形。）
+③ **我自己的修复引入了新缺陷，是靠真机连续操作才暴露的**：单测测不出「流永不结束」，只能靠**连做 25 次中转**。同理，「修了 A 却坏了 B」只有把 A、B 放在同一条真机链路上一起验才会现形。
+

@@ -1,6 +1,16 @@
 # container-mesh 项目总规划与交付口径
 
-更新时间：2026-11-16。当前分支：`develop`。远端 tip：`9cc946e`。本轮（Round 49–56）共推送 **14 笔**、9 次推送，远端 CI 每轮均 success。**①** P-3 bench frame 复用（32MiB 双向累计分配 699.34MB → 74.08MB，−89.4%，吞吐未变；oh-no 三轮字节完整性专项全过）；**②** **F-1 discovery 热推送缺陷修复**（`close(old)` 使旧订阅 channel 永远可读 → 旧流热循环，1,343,108 B/s → **151.1 B/s，−99.99%**，**四方独立验证闭环**）；**③** **出口地址策略补齐三条路径**（原只拒绝字面私网 IP，**解析后地址无人复核** → 主机名可穿透 = SSRF；现 members WS / register HTTP / enroll HTTP **三条全受约束**，经 `Dialer.Control` 在 DNS 后连接前判定；逃生口用 build tag `cmeshtest` 隔离，`go tool nm` 确认**出货二进制无此路径**）；**④** **relay 前向循环读缓冲未复用**（从未采用 `RecvInto` 扩容后的缓冲 → 每条 >64KiB 消息重付 64→128→256→512KiB 分配拷贝链；实测消息平均 493KiB 属常态；`makeslicecopy` 占 relay CPU 23.73% → 4.88%，**CPU 中位 −71%**）；**⑤** **多端点 fallback 整体失效修复**（复用同一 UDP socket + quic-go single-use Transport）；**⑥** `cmesh relay` 优雅停止自动化覆盖；**⑦** `packaging/install_test.sh` 接入 CI；**⑧** **systemd unit 五处缺口修复**（含缺 `--account-pub` → **入网端点根本不挂载**）；**⑨** README 安装命令 404 修复；**⑩** mkrelease 归档目录名带 `.exe` 修复；**⑪** 快照路径补 `MaxEndpoints` 上限（恶意快照 500 端点全收）；**⑫** **调用方 deadline 不约束端点循环**（`status --probe --probe-timeout 3s` 实测跑 5.12s）；**⑬** **join 保存的端点仍是 `:0`**（announce 与配置文件读的是两个不同的列表 → 成员短暂离线）；**⑭** **PR-1「路径选择的骨架」已落地**（3 笔，**不含 relay 能力**：错误分类 sentinel 覆盖 quic-go「Dial 返回 nil、错误到 read ack 才浮现」+ Session 抽象 11 处签名重写 + PathPicker（`Picker==nil` 直接走原路径，无第二条代码路径）+ RelayCandidates 纯排序；施工代理另修「多端点只保留最后一个错误 → ErrAuth 被 ErrUnreachable 抹掉」）。**性能结论两次被推翻并更正**：quic-go 暴露的是**每连接**丢包计数（度量前提**已打开**）、拥塞控制是 **Reno 不是 Cubic**（数值巧合导致名错，换算法需 fork quic-go）；**P-3 崩塌机制是 cwnd 塌缩**；**Linux 604–638 MiB/s 达标、darwin 233–270 不达标**（GSO 仅 Linux）。**资源 KPI 从「未达标」改记「达标」**：本地 150 秒实测稳态 **7.7–9.7 MB**（<15MB 目标），此前记录的 75,268 KB 是 **pre-GC 相位**。**oh-no 报的「凭证成员 kill -9 检出 70–90s」经值守实测复核为非回归**（HEAD 0.1s / 历史 SHA 0.2s；根因是判据用错——anchor 默认日志级别 Warn，快速离线路径不打日志）。
+更新时间：2026-11-19。当前分支：`develop`。本地 tip：`b67bf66`（本轮四笔代码提交，待放行推送）。**本轮是中转干道的真机打通轮**。
+
+**① 中转干道真机验收通过（决定性）**：锚点 A = `175.24.139.148:18090`（`--relay-trunk`，同端口双 ALPN，D76）；请求方 B 与目标 C 同在 `162.14.97.79`，**都不 `--listen`** → 它们之间**只能走中转**。CLI 打出 **`link=relay via=<锚点>`**：`mesh ping` 3/3、0 丢、p50 72.3ms；`msg` 投递成功；`run @info` 返回对端信息；`send-to` sha256 **逐字节匹配**。直连未回归（`link=direct` p50 37.2ms）。
+
+**② 本轮修掉 7 个真缺陷（每个都有红→绿证据）**：**中转端点从未到达请求方**（`changed` 的比较写在写入之前 → 永远说「没变」→ 从不推视图）；**半关闭被当成整流结束**（splice 等「任一方向结束」→ 回执在中转回程上被丢，真机 `await delivery ack: EOF`，而消息其实送达了）；**（本次修复引入的回归）配额槽永久泄漏**（目标侧从不关闭自己的会话 → 流永不结束 → 真机连做 20 次中转后干道**彻底拒新请求**）；**撤销/超限没有真正掐断流量**（新增可选 `sessionAborter`；正常收尾半关、强制拆除才 abort —— abort 是 RESET_STREAM，**会毁掉对端还没读走的回执**）；**经中转的大文件必失败**（relay 记录是 JSON+base64，1 MiB 分块封出 1398158 字节 > 1048576 上限 → 任何 >1 MiB 的文件经中转直接失败，已改为按上限拆分）；**假投递回执**（`receiveMsgs` 把任何读错误都当正常半关 → 发送端报「已投递」而目标**根本没收到**）；**`join --timeout` 实为整个成员进程的期限**（默认 10 分钟后成员**自动退网**并广播 LEAVE → 锚点从此够不到它）。
+
+**③ 本地完整门禁全绿**：gofmt / vet / `go test ./... -race` / build / e2e **49-0** / 离线安装回归 / linux-amd64 + linux-arm64 交叉编译。Mimosa 深度扫描（171 包）：**本轮改动的包里 0 项发现**（15 项全在 `internal/relay/cockpit-dist/` 的压缩 JS 产物里，与本轮无关）。
+
+**仍未闭环（诚实记下）**：**≥256 KiB 的文件经中转仍会挂**（同机**直连 3 MiB 只要 4.7 秒**）——该 join 腿吞吐仅 ~19 KB/s、客户端网卡侧 `InCsumErrors` 一次传输涨 412（**87% 入向数据报被判损坏**），**「Reno 拥塞窗口下限」与「客户端 UDP 校验和卸载故障」两个解释尚未分开**，需客户端主机抓包 + `ethtool -k` 定论；**成员证书过期会把已获批成员锁在网外**（TLS pin 失败 → join 建不起来 → 锚点 joiners 表里没有它 → 之后所有中转报「cannot reach」），本轮已让过期原因**带上时间与补救动作**、让中转拒绝**带上真实原因**，但**续期策略待网主裁定**。
+
+**此前轮次摘要**：Round 49–56（14 笔、9 次推送，远端 CI 每轮 success）——P-3 bench frame 复用（32MiB 双向累计分配 699.34MB → 74.08MB，−89.4%，吞吐未变）；**F-1 discovery 热推送缺陷修复**（`close(old)` 使旧订阅 channel 永远可读 → 旧流热循环，1,343,108 B/s → **151.1 B/s，−99.99%**，**四方独立验证闭环**）；**出口地址策略补齐三条路径**（原只拒绝字面私网 IP，**解析后地址无人复核** → 主机名可穿透 = SSRF；现 members WS / register HTTP / enroll HTTP **三条全受约束**，经 `Dialer.Control` 在 DNS 后连接前判定；逃生口用 build tag `cmeshtest` 隔离，`go tool nm` 确认**出货二进制无此路径**）；**relay 前向循环读缓冲未复用**（makeslicecopy 占 relay CPU 23.73% → 4.88%，**CPU 中位 −71%**）；**多端点 fallback 整体失效修复**；`packaging/install_test.sh` 接入 CI；**systemd unit 五处缺口修复**；README 安装命令 404 修复；mkrelease 归档目录名带 `.exe` 修复；快照路径补 `MaxEndpoints` 上限；**调用方 deadline 不约束端点循环**；**join 保存的端点仍是 `:0`**；**PR-1「路径选择的骨架」已落地**（不含 relay 能力）。**性能结论两次被推翻并更正**：quic-go 暴露的是**每连接**丢包计数、拥塞控制是 **Reno 不是 Cubic**（换算法需 fork quic-go）；**P-3 崩塌机制是 cwnd 塌缩**；**Linux 604–638 MiB/s 达标、darwin 233–270 不达标**（GSO 仅 Linux）。**资源 KPI 记「达标」**（本地 150 秒实测稳态 **7.7–9.7 MB**，此前记录的 75,268 KB 是 **pre-GC 相位**）。
 
 ## 项目状态口径
 
@@ -78,7 +88,9 @@ M4 硬阻塞复核（2026-11-15 更新）：真实 Release 与 Linux systemd 验
 
 ### M4-C / v1.1：中继路由与增量视图
 
-尚未开始。当前阶段 1 `send/recv` relay 使用共享 code + A/B 配对，只能证明配对文件/消息通道，不能作为 mesh device-ID relay。mesh relay trunk 需要独立的成员认证、目标路由、端到端加密、配额和路径回退协议；在该协议和无 UDP endpoint 的独立测试完成前，`mesh ping/bench/msg/file` 不宣称 relay-only。
+**数据面已在真机打通**（2026-11-19）：mesh relay trunk 具备独立的成员认证、目标路由、端到端加密、配额与路径回退；**在两台真实机上，两个都没有入站端口的纯出站成员经锚点中转跑通**，`mesh ping` 打出 `link=relay via=<锚点>`，`msg` / `run` / `send-to` 均可用（sha256 逐字节匹配）。阶段 1 的 `send/recv` relay 仍是另一条通道（共享 code + A/B 配对），与设备 ID 干道并存但不是一回事。
+
+**未闭环的部分**：① **经中转的大文件**（≥256 KiB 挂，而同机直连 3 MiB 只要 4.7 秒）——该 join 腿吞吐 ~19 KB/s、客户端网卡侧 87% 入向数据报被判校验和损坏，「Reno 窗口下限」与「客户端 UDP 校验和卸载故障」两个解释尚未分开，需客户端主机抓包取证；② **成员证书过期会把已获批成员锁在网外**（TLS pin 失败 → join 建不起来），续期策略待裁定；③ 跨账号中转判据（视图缺每成员账号归属）、撤销「端到端 1 秒」（当前是「B 的视图更新后 1 秒内拆流」）。
 
 ### 连接生命周期
 

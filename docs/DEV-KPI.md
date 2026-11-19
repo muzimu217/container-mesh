@@ -1,22 +1,24 @@
 # container-mesh 开发与平台 KPI 看板
 
-更新时间：2026-11-16 12:20Z。分支：`develop`。远端 tip：**`47cff18`**。本轮共推送 7 笔提交、3 次推送（`7a66f5e` → `d206c14` → `47cff18`），每次推送前完整门禁全绿，远端 CI 三轮均 **success**（含新加入的「离线安装回归」CI 步骤并通过）。
+更新时间：2026-11-19 06:10Z。分支：`develop`。远端 tip：**`b67bf66`**（本轮四笔代码提交；文档提交在其上）。**本轮是中转干道的真机打通轮**：`link=relay via=<锚点>` 第一次在真实公网上打出来，四个核心传输（ping / msg / run / send-to）在**两个都没有入站端口的纯出站成员**之间跑通。
 
-**已推送的 7 笔**：`7e4bd2c` perf(mesh) bench frame 复用 / `2739355` test(cli) relay 优雅停止覆盖 + 握手 flaky / `f81a2f5` ci 离线安装回归 + gitignore / `7a66f5e` docs 文档偏差修正 / `a4080e8` fix(relay) **F-1 热推送** / `d206c14` docs 性能发现 / `47cff18` docs 独立验证记录。
+**本轮四笔提交**：`50ff889` fix(discovery) 中转端点变化时也要推视图 / `1f7b8dd` fix(mesh) 中转的流必须活得比请求长、以答案收尾 / `44adf6d` fix(mesh) 不要把没发生的投递报成投递 / `b67bf66` fix(cli) join 超时只管审批、不管成员寿命。推送前本地完整门禁全绿（gofmt / vet / `go test -race` / build / e2e **49-0** / 安装回归 / 双架构交叉编译）。
 
-**① P-3 bench frame 复用**（`7e4bd2c`）：`internal/mesh/bench.go` 收发两侧改为复用单个帧缓冲。32MiB 双向累计分配 **699.34MB → 74.08MB（−89.4%）**；`readBenchFrame`(288MB/41%) 与 `sendBenchData`(277MB/39%) 已从分配榜消失，剩余热点全在 quic-go/socket 内核层。**吞吐未变**——回环双向 1/8/32MiB 分别 103–113 / 86–101 / 71–104 MiB/s，**P-3 目标 ≥200 MiB/s 仍未达标**。独立验证：oh-no 在 `7a66f5e` 做字节完整性专项，双向 sent/received 全部精确相等、对抗尺寸（4095/4097/65535/65537/1048577/33554431）无损、同进程连跑 3 轮 32MiB 无跨帧残留、单测 `-race ×3` 全绿。
+**真机验收（决定性）**：锚点 A = `175.24.139.148:18090`（`--relay-trunk`，同端口双 ALPN，D76）；请求方 B 与目标 C 同在 `162.14.97.79`，**都不 `--listen`** → 它们之间**只能走中转**；C 以 `--relay-trunk` 加入干道。
+`mesh ping` → **3/3、0 丢、p50 72.3ms、`link=relay via=<A>`**；`msg` → 投递成功；`run @info` → 返回对端信息；`send-to` → sha256 **逐字节匹配**。直连未回归（`link=direct` p50 37.2ms）。
 
-**② F-1 discovery 热推送（1.05 MB/s）**（`a4080e8`）：性能代理在真实 anchor 复现——任意一次性命令后，被用成员的 anchor 推送速率从 158 B/15s 暴涨到 **15.8 MB/15s**，代理自测 lab 测得 16,144,158 B/12s = **1,343,108 B/s**（放大 ×10,957），无界。根因：`Subscribe` 用 `close(old)` 废弃旧订阅，**关闭的 channel 永远可读**，旧订阅者的 `case <-ch:` 立即且永久触发 → `streamMeshMembers` 陷入"推整份快照→立即再推"热循环。修复在**消费侧**（`case _, ok := <-ch`，`!ok` 即退出），不动 `Subscribe` 语义。红→绿：修复前红（"orphaned stream still receiving (757 bytes)"），修复后绿；复核时手动置空 `if !ok` 重跑**再次确认红**。**独立验证**：代理对落地后的 HEAD 做 A/B，**1,343,108 B/s → 151.1 B/s（−99.99%）**，4 次一次性命令后 226.8 B/s 不累积。
+**本轮修掉的 7 个真缺陷（每个都有红→绿证据）**
+① **中转端点从未到达请求方**：`changed` 的比较写在写入之前 → 永远说「没变」→ 从不推视图 → 请求方看不到任何中转候选。
+② **半关闭被当成整流结束**：splice 等「任一方向结束」就拆流 → 回执在中转回程上被丢（真机 `await delivery ack: EOF`，而消息其实送达了）。
+③ **（本次修复引入的回归）配额槽永久泄漏**：目标侧从不关闭自己的会话 → 流永不结束 → 真机连做 20 次中转后干道**彻底拒新请求**。
+④ **撤销/超限没有真正掐断流量**：新增可选 `sessionAborter`（quic-go 的 `CancelRead/CancelWrite`）；正常收尾**半关**、强制拆除才 abort —— **abort 是 RESET_STREAM，会毁掉对端还没读走的回执**。
+⑤ **经中转的大文件必失败**：relay 记录是 JSON+base64（4/3 膨胀）再加封签开销 → 1 MiB 分块封出 **1398158 字节 > 1048576 上限** → 任何 >1 MiB 的文件经中转直接失败（已改为按上限拆分；端到端封签是计数器式的，拆分安全）。
+⑥ **假投递回执**：`receiveMsgs` 把任何读错误都当正常半关 → 发送端报「已投递」而目标**根本没收到**。坑：`io.ReadFull` 对「body 一个字节没来」也返回 `io.EOF`，所以头/体必须分开读。
+⑦ **`join --timeout` 实为整个成员进程的期限**：默认 10 分钟后成员**自动退网**并广播 LEAVE → 锚点从此够不到它 → 之后所有中转报「cannot reach」。
 
-**③ relay 优雅停止自动化覆盖**（`2739355`）：`cmesh relay` 此前**零进程级测试**（K-1 修复没有自动化保护）。`internal/cli/relay.go` 抽出 `serveRelay` 供测试驱动。**红→绿已证**：移除 `srv.Shutdown` 调用 → 测试红（"relay did not stop within 20s"）；恢复 → 绿。
+**仍未闭环（诚实记下）**：**≥256 KiB 的文件经中转仍会挂**（同一台机**直连 3 MiB 只要 4.7 秒**）—— 该 join 腿吞吐仅 ~19 KB/s，客户端网卡侧 `InCsumErrors` 一次传输涨 412（**87% 入向数据报被判损坏**）；**「Reno 拥塞窗口下限」与「客户端 UDP 校验和卸载故障」两个解释尚未分开**，需要客户端主机抓包 + `ethtool -k` 定论（这是环境取证，不是本仓代码）。**成员证书过期会把已获批成员锁在网外**（TLS pin 失败 → join 建不起来 → 锚点的 joiners 表里没有它 → 之后所有中转报「cannot reach」）：本轮已让过期原因带上**时间与补救动作**、让中转拒绝带上**真实原因**，但**续期策略待网主裁定**（`join --cred` 的成员证书活到委派过期后没有自动续期）。
 
-**④ F-1 接进 CI**（`f81a2f5`）：`packaging/install_test.sh` **从未**进入 CI——这正是 F-1 连续逃逸两次的根因（"CI 绿"对安装器毫无意义）。已加入 `.github/workflows/ci.yml`，远端 CI 该步骤已通过。
-
-**⑤ 文档偏差修正**（`7a66f5e`）：`docs/architecture/MESH-DESIGN.md` §1.2 的"新建文件"表把 `internal/mesh/route.go`、`relay.go`、`agent.go`、`internal/e2e/e2e.go` 列为文件——**四个均不存在**。已加状态列并写明"当前 mesh 只有直连 QUIC，relay-only 报错 rc=1 不伪造"。
-
-**⑥ 仓库卫生 + flaky 缓解**（`f81a2f5` / `2739355`）：`.gitignore` 补 `*.test`/`*.prof`/`*.out`；mesh 测试握手超时 5s → 10s（与生产默认一致），全量 `-race` 下曾出现一次 `TestPingRoundTrip` 的 QUIC 拨号超时，定位为 runner 负载下 flaky、非产品缺陷。
-
-**外部复核**：oh-no ✅ 三轮全项 PASS（`8c84e73` / `407fde3` / `7a66f5e` 字节完整性专项）；doubao ✅（F-1 在 linux/amd64 rc=0）；kuku 与 netns **连续两轮无回应**，本轮已升级为广播催办并再次派单（Hub 各路 ok:true），仍未回报。prerelease `v1.0.0-rc1` 实际只有 **10 个资产**（矩阵需 20），`windows/arm64` 完全缺失。Linux systemd 16/17 PASS（仅 reboot 待授权）。水位：`2026-11-16T12:05:24Z`。
+**外部复核**：本轮真机验收由本会话独立完成（两台真实机 + 纯出站拓扑）。审计代理报出的四个缺陷（半关闭丢回执、配额泄漏、撤销不掐断、大文件记录超限）经本会话**独立复核机制后采信**——每个都补了红→绿测试并复现了真机症状。oh-no / doubao / kuku / netns 本轮无新回报（网主已亲自唤醒 kuku 与 netns）。prerelease `v1.0.0-rc2` 仍是最新发布（20 资产，19/19 校验和匹配）。水位：`2026-11-19T06:10:00Z`。
 
 这张表把代码、可运行产物、安装包、真机验收分开记账。交叉编译通过不等于平台交付完成；设计方案存在也不等于安装包完成。
 
