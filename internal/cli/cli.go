@@ -169,11 +169,27 @@ Usage:
         Print a join string for this account. It carries no secret: using it
         only lets a device ASK to join (R-1.5).
 
-  cmesh cred create --disc host:port [--ttl 24h] [--max-devices 10]
+  cmesh cred create --disc host:port [--ttl 8760h] [--max-devices 10]
         Print a TEAM credential: one string a member's device can join with,
         without the owner signing that device by hand. The credential is
         bound to an expiry and a device quota, and it is a SECRET — hand it
-        over like a password.
+        over like a password. The default lifetime is a year, so a device
+        that joins under it STAYS in the network (the owner's ruling:
+        membership is persistent until the owner turns the key). Pass a
+        short --ttl for temporary guests. The summary prints the
+        credential's ID — keep it: "cmesh cred revoke --cred-id ID" turns
+        the credential off and takes every device that joined under it out
+        of the network.
+
+  cmesh cred list --state DIR
+        List the network's credentials with their member counts and
+        expiries. Where a rotation starts.
+
+  cmesh cred revoke --state DIR --cred-id ID
+        Turn a credential off AND remove every device that joined under it.
+        The anchor hot-reloads the roster, so the devices leave within a
+        second. Account-approved devices and members of other credentials
+        are untouched.
 
   cmesh verify --file PATH [--checksums SHA256SUMS] [--sha256 HEX]
         Check a downloaded binary against the published digest. Reads local

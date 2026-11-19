@@ -51,7 +51,22 @@ const Version = 1
 const Prefix = "cmesh1"
 
 // DefaultTTL is the credential's default lifetime.
-const DefaultTTL = 24 * time.Hour
+//
+// It used to be 24 hours, and that made "join with the credential" mean
+// "join for a day": the member's certificate inherited the credential's
+// remaining lifetime, so a device that joined on Monday silently fell out
+// of the network on Tuesday — no error, no renewal, just gone.
+//
+// The owner's ruling is the opposite: "既然已经入网，那就是持续性入网，它不会
+// 掉线那种，除非我自己改密钥". So the default credential is a YEAR, and a
+// device that joins under it stays for a year. The credential's TTL now
+// answers "how long may this string be used to JOIN", not "how long do the
+// joiners stay".
+//
+// A short TTL is still the way to make TEMPORARY access — pass --ttl 24h
+// and the devices that join under it are guests for a day. Rotation (see
+// `cmesh cred revoke`) is what takes an existing member out.
+const DefaultTTL = 365 * 24 * time.Hour
 
 // DefaultMaxDevices is the credential's default device quota.
 const DefaultMaxDevices = 10
