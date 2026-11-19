@@ -205,7 +205,11 @@ func sniTestClient(t *testing.T, addr, serverName string, clientCert *tls.Certif
 		}
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// The handshake deadline is generous: the client must send its
+	// certificate, the server must verify it, and on a loaded machine
+	// that chain can take longer than five seconds. Five seconds made
+	// this a false red in the full parallel suite.
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	conn, err := quic.Dial(ctx, udp, raddr, cfg, quicConfig())
 	if err != nil {
@@ -519,7 +523,11 @@ func TestALPNCarriesIdentity(t *testing.T) {
 			return nil
 		},
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// The handshake deadline is generous: the client must send its
+	// certificate, the server must verify it, and on a loaded machine
+	// that chain can take longer than five seconds. Five seconds made
+	// this a false red in the full parallel suite.
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	conn, err := quic.Dial(ctx, udp, raddr, cfg, quicConfig())
 	if err != nil {
@@ -779,9 +787,12 @@ func TestServerSideVerifyConnectionUnaffected(t *testing.T) {
 		sniTestPub(t, &serverIdent.cert), serverIdent.id.String()); err != nil {
 		t.Fatalf("dial with SNI failed: %v", err)
 	}
-	// TLS 1.3 ordering: the SERVER sends Finished before the client sends its
-	// certificate, so the CLIENT can consider the handshake done before the
-	// server has verified the client cert. Wait for the server-side callback.
+	// TLS 1.3 ordering: the SERVER sends Finished before the client sends
+	// its certificate, so the CLIENT can consider the handshake done before
+	// the server has verified the client cert. The server's callback runs
+	// when the client's certificate arrives — which is after the client's
+	// own handshake returned. So the wait has to be long enough for the
+	// certificate to travel, and it must not be a fixed short sleep.
 	// The wait is generous on purpose: under TLS 1.3 the server's
 	// VerifyConnection runs when the CLIENT's certificate arrives, and the
 	// client may consider the handshake finished before that happens. A
@@ -921,7 +932,11 @@ func TestNewDialerWithExtraALPNToOldServer(t *testing.T) {
 			return nil
 		},
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// The handshake deadline is generous: the client must send its
+	// certificate, the server must verify it, and on a loaded machine
+	// that chain can take longer than five seconds. Five seconds made
+	// this a false red in the full parallel suite.
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	conn, err := quic.Dial(ctx, udp2, raddr, cfg2, quicConfig())
 	if err != nil {
@@ -999,7 +1014,11 @@ func TestMultiCertFallbackServesWhichCert(t *testing.T) {
 			return nil
 		},
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// The handshake deadline is generous: the client must send its
+	// certificate, the server must verify it, and on a loaded machine
+	// that chain can take longer than five seconds. Five seconds made
+	// this a false red in the full parallel suite.
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	conn, err := quic.Dial(ctx, udp2, raddr, cfg2, quicConfig())
 	if err != nil {
@@ -1511,7 +1530,11 @@ func TestMultiCertSNILessClientGetsDefaultIdentity(t *testing.T) {
 			return nil
 		},
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// The handshake deadline is generous: the client must send its
+	// certificate, the server must verify it, and on a loaded machine
+	// that chain can take longer than five seconds. Five seconds made
+	// this a false red in the full parallel suite.
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	conn, err := quic.Dial(ctx, udp2, raddr, cfg2, quicConfig())
 	if err != nil {
