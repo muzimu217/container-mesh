@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"sync"
 	"time"
@@ -57,6 +58,28 @@ type MemberList struct {
 	// Keyed by the delegation's own ID, which is also the quota bucket.
 	Delegations map[string]Delegation `json:"delegations,omitempty"`
 
+	// RevokedCreds is the anchor's credential revocation list: credential
+	// ids the owner has turned off, mapped to when the revocation happened.
+	//
+	// It closes D77's last gap. The delegation record — the roster's only
+	// other knowledge of a credential — is written at ENROLL time, so a
+	// credential that leaked before anyone joined with it had no record to
+	// remove and stayed live until its expiry (a year by default). An id on
+	// this list is refused at enroll regardless of the credential's
+	// signature or expiry, and — because the list outlives the delegation
+	// record — a revoked credential's string cannot bring its delegation
+	// back by being presented again. The anchor-side set is enough: a
+	// revoked credential's devices are already out of the roster (the
+	// revocation of a used credential kicks them), and a member only ever
+	// verifies certs of CURRENT members against CURRENT delegation records,
+	// so the set never needs to reach the members (see the snapshot's
+	// Delegations comment for what does travel and why).
+	//
+	// omitempty: rosters written before the list existed have no field, and
+	// an empty list must not grow one — the file shape stays readable by
+	// whatever wrote it last.
+	RevokedCreds map[string]time.Time `json:"revoked_creds,omitempty"`
+
 	mu sync.Mutex
 }
 
@@ -84,6 +107,14 @@ func (m *MemberList) AddDelegation(d Delegation) error {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// A revoked id never re-enters the roster. The enroll path checks the
+	// revocation list before it gets anywhere near here, but this is the
+	// data structure's own floor: no caller, present or future, can quietly
+	// re-install what the owner turned off (a re-presented credential string
+	// carries the SAME id, account-signed and all).
+	if _, revoked := m.RevokedCreds[d.ID]; revoked {
+		return fmt.Errorf("identity: credential %s was revoked and cannot be authorised again", d.ID)
+	}
 	if m.Delegations == nil {
 		m.Delegations = make(map[string]Delegation)
 	}
@@ -141,8 +172,82 @@ func (m *MemberList) RevokeDelegation(id string) ([]DeviceID, error) {
 		}
 	}
 	delete(m.Delegations, id)
+	// The id goes on the revocation list as part of the same mutation: the
+	// credential's account signature outlives the delegation record, so
+	// without this the old string would simply re-enrol (the enroll path
+	// would find no delegation and write a fresh one). Kicking the members
+	// is half of a rotation; making it non-resurrectable is the other half.
+	if m.RevokedCreds == nil {
+		m.RevokedCreds = make(map[string]time.Time)
+	}
+	if _, seen := m.RevokedCreds[id]; !seen {
+		m.RevokedCreds[id] = time.Now().UTC()
+	}
 	m.Version++
 	return removed, nil
+}
+
+// RevokeCredential records a credential id on the revocation list WITHOUT
+// needing a delegation record on the roster.
+//
+// This is pre-revocation, for the credential that leaked before anyone used
+// it: the roster only learns a credential's id at enroll time, so there is
+// nothing to kick and nothing to remove — the owner's decision must be
+// recorded somewhere, and this is that somewhere. An id on the list is
+// refused at enroll forever (there is no un-revoke; re-issuing means a new
+// credential with a new id), and AddDelegation refuses to re-authorise it.
+//
+// Idempotent: listing an already-listed id is a no-op (returns false, no
+// version bump), so an operator double-running the command does not churn
+// the version every member orders its view by. It returns whether THIS call
+// newly listed the id.
+func (m *MemberList) RevokeCredential(id string) (bool, error) {
+	if id == "" {
+		return false, errors.New("identity: credential id required")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.RevokedCreds == nil {
+		m.RevokedCreds = make(map[string]time.Time)
+	}
+	if _, seen := m.RevokedCreds[id]; seen {
+		return false, nil
+	}
+	m.RevokedCreds[id] = time.Now().UTC()
+	m.Version++
+	return true, nil
+}
+
+// CredentialRevoked reports whether a credential id is on the revocation
+// list. This is the check the enroll path runs FIRST — before signature and
+// expiry, which a leaked credential still satisfy.
+func (m *MemberList) CredentialRevoked(id string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, ok := m.RevokedCreds[id]
+	return ok
+}
+
+// RevokedCredentials lists the revoked ids, sorted (map order is random; a
+// stable order keeps status output and tests reproducible).
+func (m *MemberList) RevokedCredentials() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]string, 0, len(m.RevokedCreds))
+	for id := range m.RevokedCreds {
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// DelegationByID finds a delegation record by its credential id — the same
+// id the credential string carries and the revocation list is keyed by.
+func (m *MemberList) DelegationByID(id string) (Delegation, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	d, ok := m.Delegations[id]
+	return d, ok
 }
 
 // DelegationFor finds the authorisation that covers a signing key.
@@ -295,15 +400,47 @@ func (m *MemberList) SaveMembers(path string) error {
 			snapshot.Delegations[k] = v
 		}
 	}
+	// The revocation list travels with them: a revoke that did not survive
+	// the restart was never a revoke, and the enroll path checks this set
+	// on every admission.
+	if len(m.RevokedCreds) > 0 {
+		snapshot.RevokedCreds = make(map[string]time.Time, len(m.RevokedCreds))
+		for k, v := range m.RevokedCreds {
+			snapshot.RevokedCreds[k] = v
+		}
+	}
 	m.mu.Unlock()
 	blob, err := json.MarshalIndent(&snapshot, "", "  ")
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(dirOf(path), 0o700); err != nil {
+	dir := dirOf(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	return os.WriteFile(path, blob, 0o600)
+	// Write-then-rename instead of a plain WriteFile: a crash mid-write
+	// must not leave a truncated members.json — the file is the anchor's
+	// only copy of the roster AND the revocation list, and a truncated file
+	// either refuses to load (a dead anchor) or loads short (members and
+	// revocations silently gone). The rename is atomic within the same
+	// directory; the temp file is removed on every failure path.
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // no-op after a successful rename
+	if _, err := tmp.Write(blob); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmpName, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
 }
 
 // LoadMembers reads a member list written by SaveMembers.
