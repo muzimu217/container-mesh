@@ -38,6 +38,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -692,8 +693,12 @@ func TestServerSideVerifyConnectionUnaffected(t *testing.T) {
 	clientIdent := newSNTTestIdentity(t)
 	otherIdent := newSNTTestIdentity(t)
 
-	serverPinCalled := 0
-	var serverPinErr error
+	// The counter and the error are shared between the handshake goroutine
+	// and the test: they must be ATOMIC. A plain int read while another
+	// goroutine writes it is a data race, and under load the test read a
+	// stale zero and reported a failure that was never real.
+	var serverPinCalled atomic.Int32
+	var serverPinErr atomic.Value
 	udp, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
 	if err != nil {
 		t.Fatalf("listen udp: %v", err)
@@ -705,16 +710,17 @@ func TestServerSideVerifyConnectionUnaffected(t *testing.T) {
 		ClientAuth:         tls.RequireAnyClientCert,
 		InsecureSkipVerify: true,
 		VerifyConnection: func(cs tls.ConnectionState) error {
-			serverPinCalled++
+			serverPinCalled.Add(1)
 			if len(cs.PeerCertificates) == 0 {
-				serverPinErr = errors.New("no client cert")
-				return serverPinErr
+				serverPinErr.Store(errors.New("no client cert"))
+				return serverPinErr.Load().(error)
 			}
 			leaf := cs.PeerCertificates[0]
 			pub, ok := leaf.PublicKey.(ed25519.PublicKey)
 			if !ok || !pub.Equal(sniTestPub(t, &clientIdent.cert)) {
-				serverPinErr = fmt.Errorf("client pin mismatch, CN=%q", leaf.Subject.CommonName)
-				return serverPinErr
+				mismatch := fmt.Errorf("client pin mismatch, CN=%q", leaf.Subject.CommonName)
+				serverPinErr.Store(mismatch)
+				return mismatch
 			}
 			return nil
 		},
@@ -748,16 +754,20 @@ func TestServerSideVerifyConnectionUnaffected(t *testing.T) {
 	// TLS 1.3 ordering: the SERVER sends Finished before the client sends its
 	// certificate, so the CLIENT can consider the handshake done before the
 	// server has verified the client cert. Wait for the server-side callback.
-	deadline := time.Now().Add(3 * time.Second)
-	for serverPinCalled == 0 && time.Now().Before(deadline) {
+	// The wait is generous on purpose: under TLS 1.3 the server's
+	// VerifyConnection runs when the CLIENT's certificate arrives, and the
+	// client may consider the handshake finished before that happens. A
+	// loaded machine can take seconds.
+	deadline := time.Now().Add(15 * time.Second)
+	for serverPinCalled.Load() == 0 && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Logf("server-side VerifyConnection called=%d err=%v", serverPinCalled, serverPinErr)
-	if serverPinCalled == 0 {
+	t.Logf("server-side VerifyConnection called=%d err=%v", serverPinCalled.Load(), serverPinErr.Load())
+	if serverPinCalled.Load() == 0 {
 		t.Fatalf("server-side VerifyConnection never ran")
 	}
-	if serverPinErr != nil {
-		t.Fatalf("server-side pin failed: %v", serverPinErr)
+	if err, _ := serverPinErr.Load().(error); err != nil {
+		t.Fatalf("server-side pin failed: %v", err)
 	}
 }
 

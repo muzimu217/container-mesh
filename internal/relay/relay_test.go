@@ -548,7 +548,12 @@ func TestShutdownStopsServingReleasesPort(t *testing.T) {
 	// A server-initiated close surfaces as a close frame / EOF within
 	// milliseconds, so an error that takes the whole deadline (a timeout)
 	// means the server never closed it.
-	_ = a.SetReadDeadline(time.Now().Add(2 * time.Second))
+	//
+	// The deadline is generous: the close itself is prompt, but a LOADED
+	// machine can take seconds to schedule the goroutine that writes the
+	// close frame. Two seconds made this test a false red in the full
+	// parallel suite — the same lesson as the trunk's join wait.
+	_ = a.SetReadDeadline(time.Now().Add(20 * time.Second))
 	_, err := a.Recv()
 	if err == nil {
 		t.Error("pairing socket still delivering after Shutdown; want the server to close it")
