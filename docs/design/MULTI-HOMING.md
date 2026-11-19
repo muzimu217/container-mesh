@@ -10,12 +10,31 @@
 
 **版本**：D1（2026-11-19）
 
-> ⚠️ **待实测的一项**：§4 的 SNI 选证书方案，其前提是「QUIC 的 TLS 1.3 下，服务端的
-> `GetCertificate` 能读到 ClientHello 的 SNI」。这一点**尚未实测**，正在用进程内真实 QUIC
-> 握手验证（2026-11-19 派出）。DeviceID 不是合法 DNS 名，Go 的 crypto/tls 可能在握手
-> 阶段就拒绝非法 SNI —— 若如此，§4 需要改用「合法前缀的 SNI」或「ALPN 编码群组身份」
-> 两条替代路径之一。**该验证的结论会改写 §4，本文档其余部分（身份/连接/state 分层、
-> 规模估算、风险）不受影响。**
+> ✅ **§4 的 SNI 机制已实测通过**（2026-11-19，进程内真实 QUIC 握手，18 个实验全过，
+> `internal/mesh/sni_select_test.go`）：
+>
+> - **QUIC 下 `GetCertificate` 会被调用，且 `chi.ServerName` 就是客户端填的 DeviceID**
+>   （线级证明：解析原始 ClientHello 得到 `SNI host_name = "inycnepctiqwr6te"`）。
+> - **DeviceID 可以直接当 SNI 用**：Go 的 crypto/tls **从不校验 SNI 的 DNS 合法性** ——
+>   客户端只剥 IP 字面量，服务端原样塞进 `chi.ServerName`。实测矩阵全部握手成功：
+>   下划线、空格、斜杠都照过；只有 IP 字面量会被剥掉（此时回落默认证书）。
+> - **pin 未被削弱**：SNI 指向 A 却拿到 B 的证书 → 握手失败（`pin mismatch: peer CN=...`）。
+>   `VerifyConnection` 读的是实际出示的证书，与 SNI 无关。
+> - **旧客户端兼容有一个必须知道的实现细节**：Go 只在「ServerName 非空**或** Certificates
+>   为空」时才调 `GetCertificate`。多身份监听器若把默认证书放进 `Certificates`，旧客户端
+>   **根本不会进回调**。**做法：`Certificates` 留空，回调里对未命中 SNI 显式返回默认证书**
+>   （不要返回 `nil, nil`）。
+> - ⚠️ **必须加固的一处**：**TLS 会话恢复会完全绕过 `GetCertificate`**（实测第三次拨号
+>   只收到 2 次回调）—— 恢复连接沿用首次会话的证书，身份路由被跳过。当前**不可利用**
+>   （`deviceTLS` 不设 `ClientSessionCache`，恢复不会发生），但多宿主形态应显式
+>   `SessionTicketsDisabled = true`：恢复对本产品零收益（每条直连是长连接），而它会静默
+>   破坏身份路由。
+> - 备选（SNI = `cm-<deviceid>.mesh`）与 ALPN 载体**也都实测可行**，但主方案用原文即可
+>   —— DeviceID 本就是公开的成员视图字段（证书 CN 里就是它），无新增泄漏。
+> - 仍未证实：Linux/容器环境的复跑、0-RTT 与恢复的交互、`GetConfigForClient` 拿不到 SNI
+>   （那一层做不了路由）、跨进程/NAT 下 SNI 是否被改写。
+>
+> **文档其余部分（身份/连接/state 分层、规模估算、风险）不受影响。**
 
 ---
 
