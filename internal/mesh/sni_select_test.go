@@ -168,6 +168,18 @@ func sniTestServer(t *testing.T, probe *sniProbe, route func(chi *tls.ClientHell
 // (InsecureSkipVerify + VerifyConnection).
 func sniTestClient(t *testing.T, addr, serverName string, clientCert *tls.Certificate, expectPub ed25519.PublicKey, expectCN string) error {
 	t.Helper()
+	return sniTestClientKeepOpen(t, addr, serverName, clientCert, expectPub, expectCN, false)
+}
+
+// sniTestClientKeepOpen dials and, when keepOpen is set, LEAVES THE
+// CONNECTION OPEN.
+//
+// The distinction matters: under TLS 1.3 the client sends its certificate
+// AFTER the handshake has returned, so a client that closes immediately
+// (as the default does) never lets the server's VerifyConnection run.
+// The test that checks the server's pin needs the client to stay.
+func sniTestClientKeepOpen(t *testing.T, addr, serverName string, clientCert *tls.Certificate, expectPub ed25519.PublicKey, expectCN string, keepOpen bool) error {
+	t.Helper()
 	udp, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
 	if err != nil {
 		t.Fatalf("client listen udp: %v", err)
@@ -215,7 +227,13 @@ func sniTestClient(t *testing.T, addr, serverName string, clientCert *tls.Certif
 	if err != nil {
 		return err
 	}
-	defer conn.CloseWithError(0, "")
+	if keepOpen {
+		// The caller closes it. Closing here would cut the connection
+		// before the client certificate could travel.
+		t.Cleanup(func() { _ = conn.CloseWithError(0, "") })
+	} else {
+		defer conn.CloseWithError(0, "")
+	}
 	// Force the handshake to complete and the ALPN to be visible.
 	st := conn.ConnectionState()
 	if st.TLS.NegotiatedProtocol != "container-mesh-direct/1" {
@@ -783,8 +801,11 @@ func TestServerSideVerifyConnectionUnaffected(t *testing.T) {
 		}
 	}()
 
-	if err := sniTestClient(t, ln.Addr().String(), otherIdent.id.String(), &clientIdent.cert,
-		sniTestPub(t, &serverIdent.cert), serverIdent.id.String()); err != nil {
+	// The client must STAY CONNECTED: under TLS 1.3 it sends its
+	// certificate after the handshake, so a client that closes right away
+	// would stop the server's VerifyConnection from ever running.
+	if err := sniTestClientKeepOpen(t, ln.Addr().String(), otherIdent.id.String(), &clientIdent.cert,
+		sniTestPub(t, &serverIdent.cert), serverIdent.id.String(), true); err != nil {
 		t.Fatalf("dial with SNI failed: %v", err)
 	}
 	// TLS 1.3 ordering: the SERVER sends Finished before the client sends
