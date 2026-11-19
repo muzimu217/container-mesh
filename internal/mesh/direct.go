@@ -203,7 +203,16 @@ func (a MemberListAdapter) KeyFor(id identity.DeviceID) (ed25519.PublicKey, erro
 		return nil, fmt.Errorf("mesh: %s is not a member", id)
 	}
 	if mm.Cert.Expired(time.Now()) {
-		return nil, fmt.Errorf("mesh: %s certificate expired", id)
+		// Say WHEN it expired, and say what to do about it.
+		//
+		// The bare "certificate expired" was invisible in practice: the
+		// relay's refusal to the requester said "this node cannot reach
+		// <target> right now", so the operator had no way to learn that
+		// the member had simply lapsed and needed a new certificate. A
+		// member that lapsed is a normal thing that happens; it has to
+		// read like one.
+		return nil, fmt.Errorf("mesh: %s certificate expired at %s (it has to be re-issued)",
+			id, mm.Cert.ExpiresAt.UTC().Format(time.RFC3339))
 	}
 	return mm.Cert.DevicePub, nil
 }
@@ -633,16 +642,49 @@ func serveSession(kind string, peerID identity.DeviceID, br *bufio.Reader, st Se
 	}
 }
 
+// msgErrPrefix is the prefix of the message receiver's FAILURE line.
+//
+// It is "err: " because that is the convention the other handlers in
+// this package already use for a refusal (the file handler writes
+// "err: receiver has no inbox configured", the bench handler writes
+// "err: <reason>").
+//
+// The format is chosen so it can NEVER be confused with the success
+// receipt: the receipt is "done" and the sender's success test is a
+// "done" PREFIX, while "err:" shares no prefix with "done" in either
+// direction. So a failure line can never be read as a delivery
+// receipt, and the receipt can never be read as a failure.
+const msgErrPrefix = "err: "
+
 // receiveMsgs prints incoming messages until the sender half-closes the
 // stream, then ACKs. The ack is load-bearing: the sender must not tear the
 // connection until every frame has been CONSUMED (not just delivered to the
 // kernel) — a connection close races the receiver's reads and can discard
 // the tail (observed in tests as silently dropped messages).
+//
+// THE ACK IS A DELIVERY RECEIPT, so it may only be written when every
+// frame really was read.
+//
+// The old loop `break`ed on ANY read error and then wrote "done", which
+// made a frame over the cap, a frame truncated mid-body and a reset
+// connection all look like a successful delivery: the sender reported
+// "delivered" while the target had never seen the message. A false
+// receipt is worse than an outright failure, because it is silent.
+//
+// So a broken frame is answered with an explicit "err: <reason>" line
+// and reported as an error, and ONLY a clean half-close gets the "done"
+// receipt.
 func receiveMsgs(from identity.DeviceID, br *bufio.Reader, st Session, onMsg func(identity.DeviceID, string)) error {
 	for {
-		frame, err := readFrame(br, MaxMsgBytes)
+		frame, cleanEnd, err := readMsgFrame(br, MaxMsgBytes)
 		if err != nil {
-			break // sender half-close is a normal end
+			// A broken frame: the message was NOT delivered, so the
+			// sender must not be told it was. The reason travels with
+			// the line, so the operator sees WHY.
+			return writeMsgFailure(st, err)
+		}
+		if cleanEnd {
+			break // the sender half-closed: a normal end
 		}
 		if onMsg != nil {
 			onMsg(from, string(frame))
@@ -652,6 +694,81 @@ func receiveMsgs(from identity.DeviceID, br *bufio.Reader, st Session, onMsg fun
 		return err
 	}
 	return nil
+}
+
+// readMsgFrame reads one length-prefixed message frame and reports
+// whether the stream ended CLEANLY.
+//
+// The distinction is the whole point, and a plain readFrame cannot make
+// it: readFrame reports one error for BOTH "the sender half-closed" and
+// "the frame is broken", so the receiver cannot tell them apart. Worse,
+// io.ReadFull does not help either — it reports io.EOF for "the stream
+// ended before ANY header byte" AND for "the header promised 100 bytes
+// and the body never came" (a zero-byte read of the body is still
+// io.EOF).
+//
+// So the header and the body are read SEPARATELY, and the header is
+// what decides:
+//
+//   - EOF while reading the very first header byte = the sender
+//     half-closed = a clean end (cleanEnd).
+//   - anything else about the header = a broken frame.
+//   - EOF (or a short read) while reading the body = a TRUNCATED
+//     frame, never a clean end: the length prefix promised bytes that
+//     did not arrive.
+func readMsgFrame(br *bufio.Reader, capBytes int64) (frame []byte, cleanEnd bool, err error) {
+	var l [4]byte
+	n, err := io.ReadFull(br, l[:])
+	if err != nil {
+		if errors.Is(err, io.EOF) && n == 0 {
+			// Nothing at all was read: the sender half-closed. This
+			// is the normal end of the message stream.
+			return nil, true, nil
+		}
+		// A partial header, a reset stream, a deadline: the frame is
+		// broken, and the stream did not end cleanly.
+		return nil, false, fmt.Errorf("mesh: read the frame header: %w", err)
+	}
+	size := binary.BigEndian.Uint32(l[:])
+	if int64(size) > capBytes {
+		return nil, false, fmt.Errorf("mesh: frame of %d bytes exceeds the %d byte cap", size, capBytes)
+	}
+	body := make([]byte, size)
+	if _, err := io.ReadFull(br, body); err != nil {
+		// The body MUST arrive in full. io.EOF here means the stream
+		// ended after the header: the frame is truncated, not
+		// finished — so this is a failure, never a clean end.
+		return nil, false, fmt.Errorf("mesh: truncated frame (%d bytes announced): %w", size, err)
+	}
+	return body, false, nil
+}
+
+// writeMsgFailure writes the receiver's failure line and returns the
+// error that caused it.
+//
+// The line is ONE line: the sender reads it with readLine, so a reason
+// carrying a newline would be truncated at the first newline and the
+// rest of it would be read as a SECOND line — a second answer the
+// sender would have to interpret. The reason is flattened for that
+// reason, not for looks.
+func writeMsgFailure(st Session, reason error) error {
+	msg := strings.NewReplacer("\r", " ", "\n", " ").Replace(reason.Error())
+	fmt.Fprintf(st, "%s%s\n", msgErrPrefix, msg)
+	return reason
+}
+
+// checkMsgAck judges the receiver's answer to a message send.
+//
+// The answer is a DELIVERY RECEIPT, so only the receipt counts as one:
+// "done" means the receiver consumed every frame the sender wrote.
+// Anything else is a FAILURE — and the receiver's explicit "err:"
+// line is the most useful kind of failure, because it carries the
+// reason (a frame over the cap, a truncated frame, …).
+func checkMsgAck(ack []byte) error {
+	if bytes.HasPrefix(ack, []byte("done")) {
+		return nil
+	}
+	return fmt.Errorf("mesh: receiver error: %s", ack)
 }
 
 // receiveFile reads one FileHeader line, streams the body to InboxDir,
@@ -1029,14 +1146,20 @@ func SendMsg(ctx context.Context, cfg DialConfig, texts []string) error {
 		return fmt.Errorf("mesh: close send side: %w", err)
 	}
 	_ = link.Session().SetReadDeadline(time.Now().Add(10 * time.Second))
-	ack, err := readLine(link.br, 16)
+	// The cap is MaxHelloBytes, not 16: the success receipt is four
+	// bytes ("done"), but the FAILURE line carries the reason ("err:
+	// frame of 65537 bytes exceeds the 65536 byte cap"), and a cap of
+	// 16 turned every failure into the useless "line too long" — the
+	// operator lost the one thing that says WHY the send failed.
+	ack, err := readLine(link.br, MaxHelloBytes)
 	if err != nil {
 		return fmt.Errorf("mesh: await delivery ack: %w", err)
 	}
-	if !bytes.HasPrefix(ack, []byte("done")) {
-		return fmt.Errorf("mesh: receiver error: %s", ack)
-	}
-	return nil
+	// The ack is a DELIVERY RECEIPT: only "done" means the receiver
+	// consumed every frame. Anything else — including the receiver's
+	// explicit "err:" line — is a failure, and the send must say so
+	// rather than report a delivery that never happened.
+	return checkMsgAck(ack)
 }
 
 // SendFile streams one file to a member. The sender hashes the file first
