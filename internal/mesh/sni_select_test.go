@@ -436,8 +436,15 @@ func TestGetCertificateAlwaysCalledWithoutDefaultCert(t *testing.T) {
 				return
 			}
 			go func() {
-				time.Sleep(300 * time.Millisecond)
-				conn.CloseWithError(0, "")
+				// Do NOT close the connection on a timer: under TLS 1.3
+				// the server's VerifyConnection runs when the CLIENT's
+				// certificate arrives, and the client may not have sent
+				// it yet when a fixed sleep expires — the connection was
+				// then closed before the pin could ever run, and the test
+				// reported "the pin never ran" for a handshake that had
+				// simply been cut short. The connection is closed by the
+				// test's own cleanup instead.
+				<-conn.Context().Done()
 			}()
 		}
 	}()
@@ -592,8 +599,15 @@ func TestFallbackWithMultipleCertsFails(t *testing.T) {
 				return
 			}
 			go func() {
-				time.Sleep(300 * time.Millisecond)
-				conn.CloseWithError(0, "")
+				// Do NOT close the connection on a timer: under TLS 1.3
+				// the server's VerifyConnection runs when the CLIENT's
+				// certificate arrives, and the client may not have sent
+				// it yet when a fixed sleep expires — the connection was
+				// then closed before the pin could ever run, and the test
+				// reported "the pin never ran" for a handshake that had
+				// simply been cut short. The connection is closed by the
+				// test's own cleanup instead.
+				<-conn.Context().Done()
 			}()
 		}
 	}()
@@ -643,8 +657,15 @@ func TestFallbackWithSingleCertWorks(t *testing.T) {
 				return
 			}
 			go func() {
-				time.Sleep(300 * time.Millisecond)
-				conn.CloseWithError(0, "")
+				// Do NOT close the connection on a timer: under TLS 1.3
+				// the server's VerifyConnection runs when the CLIENT's
+				// certificate arrives, and the client may not have sent
+				// it yet when a fixed sleep expires — the connection was
+				// then closed before the pin could ever run, and the test
+				// reported "the pin never ran" for a handshake that had
+				// simply been cut short. The connection is closed by the
+				// test's own cleanup instead.
+				<-conn.Context().Done()
 			}()
 		}
 	}()
@@ -741,8 +762,15 @@ func TestServerSideVerifyConnectionUnaffected(t *testing.T) {
 				return
 			}
 			go func() {
-				time.Sleep(300 * time.Millisecond)
-				conn.CloseWithError(0, "")
+				// Do NOT close the connection on a timer: under TLS 1.3
+				// the server's VerifyConnection runs when the CLIENT's
+				// certificate arrives, and the client may not have sent
+				// it yet when a fixed sleep expires — the connection was
+				// then closed before the pin could ever run, and the test
+				// reported "the pin never ran" for a handshake that had
+				// simply been cut short. The connection is closed by the
+				// test's own cleanup instead.
+				<-conn.Context().Done()
 			}()
 		}
 	}()
@@ -805,8 +833,15 @@ func TestNewDialerToOldServerWithSNI(t *testing.T) {
 				return
 			}
 			go func() {
-				time.Sleep(300 * time.Millisecond)
-				conn.CloseWithError(0, "")
+				// Do NOT close the connection on a timer: under TLS 1.3
+				// the server's VerifyConnection runs when the CLIENT's
+				// certificate arrives, and the client may not have sent
+				// it yet when a fixed sleep expires — the connection was
+				// then closed before the pin could ever run, and the test
+				// reported "the pin never ran" for a handshake that had
+				// simply been cut short. The connection is closed by the
+				// test's own cleanup instead.
+				<-conn.Context().Done()
 			}()
 		}
 	}()
@@ -851,8 +886,15 @@ func TestNewDialerWithExtraALPNToOldServer(t *testing.T) {
 				return
 			}
 			go func() {
-				time.Sleep(300 * time.Millisecond)
-				conn.CloseWithError(0, "")
+				// Do NOT close the connection on a timer: under TLS 1.3
+				// the server's VerifyConnection runs when the CLIENT's
+				// certificate arrives, and the client may not have sent
+				// it yet when a fixed sleep expires — the connection was
+				// then closed before the pin could ever run, and the test
+				// reported "the pin never ran" for a handshake that had
+				// simply been cut short. The connection is closed by the
+				// test's own cleanup instead.
+				<-conn.Context().Done()
 			}()
 		}
 	}()
@@ -923,8 +965,15 @@ func TestMultiCertFallbackServesWhichCert(t *testing.T) {
 				return
 			}
 			go func() {
-				time.Sleep(300 * time.Millisecond)
-				conn.CloseWithError(0, "")
+				// Do NOT close the connection on a timer: under TLS 1.3
+				// the server's VerifyConnection runs when the CLIENT's
+				// certificate arrives, and the client may not have sent
+				// it yet when a fixed sleep expires — the connection was
+				// then closed before the pin could ever run, and the test
+				// reported "the pin never ran" for a handshake that had
+				// simply been cut short. The connection is closed by the
+				// test's own cleanup instead.
+				<-conn.Context().Done()
 			}()
 		}
 	}()
@@ -1197,8 +1246,15 @@ func TestSessionResumptionBypassesGetCertificate(t *testing.T) {
 				return
 			}
 			go func() {
-				time.Sleep(300 * time.Millisecond)
-				conn.CloseWithError(0, "")
+				// Do NOT close the connection on a timer: under TLS 1.3
+				// the server's VerifyConnection runs when the CLIENT's
+				// certificate arrives, and the client may not have sent
+				// it yet when a fixed sleep expires — the connection was
+				// then closed before the pin could ever run, and the test
+				// reported "the pin never ran" for a handshake that had
+				// simply been cut short. The connection is closed by the
+				// test's own cleanup instead.
+				<-conn.Context().Done()
 			}()
 		}
 	}()
@@ -1422,8 +1478,15 @@ func TestMultiCertSNILessClientGetsDefaultIdentity(t *testing.T) {
 				return
 			}
 			go func() {
-				time.Sleep(300 * time.Millisecond)
-				conn.CloseWithError(0, "")
+				// Do NOT close the connection on a timer: under TLS 1.3
+				// the server's VerifyConnection runs when the CLIENT's
+				// certificate arrives, and the client may not have sent
+				// it yet when a fixed sleep expires — the connection was
+				// then closed before the pin could ever run, and the test
+				// reported "the pin never ran" for a handshake that had
+				// simply been cut short. The connection is closed by the
+				// test's own cleanup instead.
+				<-conn.Context().Done()
 			}()
 		}
 	}()
