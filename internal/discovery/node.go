@@ -161,9 +161,6 @@ func (n *Node) Register(a MemberAnnounce, when time.Time) bool {
 	// calling SetRelayEndpoints would take it again — a self-deadlock on
 	// a non-reentrant mutex. (It hung the whole package under -race,
 	// which is how it was found.)
-	if len(a.RelayEndpoints) > 0 {
-		n.setRelayEndpointsLocked(a.DeviceID, a.RelayEndpoints)
-	}
 	// The presence session advances with every accepted announce: the
 	// newest announce's timestamp defines the session a LEAVE has to name.
 	// It only moves forward — a replayed OLD announce must not roll the
@@ -195,11 +192,34 @@ func (n *Node) Register(a MemberAnnounce, when time.Time) bool {
 		}
 		return false
 	}
-	changed := !equalStrings(n.endpts[a.DeviceID], a.Endpoints)
+	// The change test must cover the RELAY endpoints too.
+	//
+	// It used to compare only the direct ones, which is wrong in the
+	// same-port form (D76): there the trunk shares the direct-link port,
+	// so the anchor's DIRECT endpoints never change — but its RELAY
+	// endpoints appear for the first time when the trunk is switched on.
+	// The comparison said "nothing changed", the view was not pushed, and
+	// every requester kept a snapshot with no relay endpoint — so no
+	// requester could find the trunk at all.
+	//
+	// The real-machine acceptance of round 62 found exactly this: the
+	// anchor logged "the relay protocol shares the direct-link port", and
+	// the member view showed no relay endpoints anywhere.
+	changed := !equalStrings(n.endpts[a.DeviceID], a.Endpoints) ||
+		!equalStrings(n.relayEndpts[a.DeviceID], a.RelayEndpoints)
 	// Copy: the announce's Endpoints slice belongs to the caller (it may be a
 	// buffer the transport reuses), so storing the reference would let a later
 	// message silently rewrite the recorded state.
 	n.endpts[a.DeviceID] = append([]string(nil), a.Endpoints...)
+	// The relay endpoints are written AFTER the change test above, so the
+	// test compares the PREVIOUS relay endpoints against the new ones.
+	// Writing first would make the comparison always say "unchanged" —
+	// which is exactly what the round-62 real-machine acceptance caught:
+	// the anchor announced its relay endpoints, the node recorded them,
+	// and no requester was ever told, because the view was not pushed.
+	if len(a.RelayEndpoints) > 0 {
+		n.relayEndpts[a.DeviceID] = append([]string(nil), a.RelayEndpoints...)
+	}
 	n.lastSeen[a.DeviceID] = when
 	n.lastSeenAt[a.DeviceID] = when
 	if changed || !wasOnline {
