@@ -1550,3 +1550,41 @@ C 用 `--relay-trunk 175.24.139.148:18090 --relay-trunk-id <A的deviceID>` 加�
 ② **诊断文案**：目标没加入干道时的拒绝理由，从无信息的「this node cannot reach <target> right now」改为**说出原因与补救**（「the target has not joined this trunk … join it with --relay-trunk <an address it can reach> …」），并且**这个理由会传到请求方**（红→绿：`TestTheRefusalSaysTheTargetHasNotJoinedTheTrunk` / `TestTheRefusalReachesTheRequester`）。
 
 **测试拓扑的教训（写进主机清单的记忆）**：在一台机器上用 Docker 复现「纯出站双机」拓扑时，**锚点的宣告地址必须用容器可达的私网地址**，否则批量流量走 hairpin，测出来的「性能/可靠性」全是 hairpin 的，不是产品的。
+
+
+---
+
+**★ Round 67：身份模型四件套收口 + 锚点常驻化 + 测试认证制度化**
+
+网主裁定「全部交给你」的四项，全部落地、真机验证、远端 CI 绿（`develop@78add1a` → `87700d5`）。
+
+**① 成员自续期（`b32ac30`）**：成员的 join 进程自带续期循环 —— 在凭证剩余寿命的 1/4 处（间隔限 1h–30d）自动重新 enroll。
+此前证书到期 = 成员**静默掉线**（真机「设备莫名消失」的根因）。锚点侧本就接受续期（`MemberList.Add` 对同设备同账号刷新、配额按名册计数故不重复占位），**缺的只是客户端这半**。凭证过期 = **终态**：循环明确退出并提示，不无限重试（凭证是权限的根）。
+红→绿：进程内真实 enroll 端点下，证书被刷新（单成员、不占新配额）、循环持续续期、过期后终止。
+
+**② 凭证预吊销（`3a95601` + `78add1a`）**：补上 D77 最后一个缺口 —— **「泄漏了但还没人用」的凭证此前无法吊销**（委派记录是 enroll 时才写的，无记录可删）。
+- 名册新增吊销集合 `RevokedCreds`（`json:"revoked_creds,omitempty"`，原子持久化，热重载携带）
+- enroll **先查吊销列表**（排在签名/过期之前 —— 泄漏凭证的签名与有效期都是好的，「网主说了不用」才是更可操作的事实）
+- **防复活三重闸**：吊销即入列表；`AddDelegation` 拒绝为已吊销 ID 重建委派；enroll 查列表
+- **两态统一**：`cred revoke` 对已入网凭证（踢成员）与未入网凭证（只入列表）都可用
+- 快照**不携带**吊销列表：成员只需对「当前成员」按「当前委派」验签，两者已随吊销消失；携带只会扩大 payload 并向全体成员泄露「哪些凭证泄漏」
+- **顺带修了一个真缺陷**：`installEnrollHandler` 捕获启动时的名册**指针**，而热重载会**换对象** → 外部 revoke 后 enroll 仍用旧表，还会把旧状态**覆盖回文件**。改为每请求经 `srv.MeshMembers()` 解析活表。
+
+**③ 锚点常驻化（真机）**：从 `/tmp` nohup 迁到 **systemd**（`cmesh-serve-discovery.service`，User=cmesh，StateDirectory=/var/lib/cmesh，Restart=on-failure）。
+验收：迁移后名册逐位一致（29 成员 / 版本 49 / 成员集哈希相同）、面板 API 正常、优雅停止 exit 0、**kill -9 后 5 秒自愈**、宕机窗口 <5s。回滚点 `/tmp/r65-migrated-backup/`。
+**发现并停用一个 11-17 遗留旧 unit**（`cmesh-discovery.service`，18099 端口，名册只有自连接回环，判定无人使用；备份在 `/var/lib/cmesh-r18099-stale-backup/`）。
+**新形态下的路径变了**：二进制在 `/usr/local/bin/cmesh`，state 在 `/var/lib/cmesh` —— 后续所有真机命令都用新路径。
+
+**④ 测试认证制度化（`.team/hub-certify-loop.sh`）**：网主要求「通过 Hub 通知来定期地实现各方测试单位的测试认证」。
+每轮执行：读水位 → 刷新认证台账（`.team/certification.md`）→ 静默 >6h **具体催办** → **tip 未被四线齐认证就发认证派单**（带每线分工与回报格式）→ 齐了只发心跳 → 推进水位。
+**已真发一轮**：四线收件箱均收到 develop@5b8ec20 的认证派单；kuku（静默 50h+）与 netns（51h+）已收催办。端点：`/hub/report`（频道）与 `/hub/instruct`（收件箱），body 走 POST body —— 我第一次写成 `/hub/send` 被拒（「unknown endpoint」），从 hub-send.sh 里核对了真端点。
+**调度需要新交互会话**（本会话内不能嵌套创建定时任务）；脚本已就绪。
+
+**⑤ 多宿主设计稿（`87700d5`，`docs/design/MULTI-HOMING.md`，505 行）**：网主「进入谁的聊天群就有谁的身份」的产品化形态。
+**三层分开**：身份按目录（`groups/<名>/device.json`，旧布局=单群组不迁移可跑）、连接按参数（每群组一个 discovery 客户端，出站 TLS 身份**天然按连接选**）、监听按证书（**唯一要改的**）。
+已核实两条关键代码事实：出站每次拨号自带 `cfg.Device`（`direct.go:971`/`1522`）；入站今天一张证书服务所有连接（`direct.go:430-444`）。
+**「one machine one announcer」不被违反**：那条决策防的是同机多进程**同一 DeviceID** 抢端点，多宿主是同进程 N 个**不同** DeviceID。
+**最大风险如实写明**：N 个身份共享同一 announce 端点 → **端点隐私无法按群组区分**（外部合作方群组会看到本机地址），阶段二给 per-group 端点覆盖。
+**§4 的 SNI 选证书标了「待实测」**：DeviceID 不是合法 DNS 名，Go 的 crypto/tls 可能在握手阶段就拒绝非法 SNI —— 正在用进程内真实 QUIC 握手验证，若失败改用「合法前缀 SNI」或「ALPN 编码群组身份」两条替代之一。
+
+**本轮边界（如实记下）**：CLI 写文件 → 锚点 2s 重载 tick 之间有窗口，enroll 仍可能按旧内存表放行（文件中介同步的固有竞态，与旧的审批路径同源；命令输出已声明「约一秒内生效」）。拼写错的凭证 ID 现在会**成功**进吊销列表（锚点无法区分「打错字」与「真泄漏」；输出已说明「无设备、已入列」）。
