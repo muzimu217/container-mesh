@@ -461,6 +461,7 @@ func runJoin(args []string) error {
 	// account owner to approve.
 	var inv discovery.Invite
 	var dev *identity.Device
+	var credJoined *credential.Credential
 	if *credStr != "" {
 		cred, err := credential.Decode(*credStr)
 		if err != nil {
@@ -486,6 +487,7 @@ func runJoin(args []string) error {
 		}
 		fmt.Fprintf(os.Stderr, "enrolled as device %s\n", dev.ID())
 		inv = inviteFromCredential(cred)
+		credJoined = cred
 	} else {
 		inv, err = discovery.DecodeInvite(fs.Arg(0))
 		if err != nil {
@@ -719,6 +721,19 @@ func runJoin(args []string) error {
 	runCtx, stopRun := context.WithCancel(context.Background())
 	defer stopRun()
 	go func() { _ = cl.Run(runCtx) }()
+
+	// Certificate renewal: the member keeps its own certificate fresh.
+	//
+	// Before this loop existed, the certificate's expiry was the whole
+	// membership: when it lapsed the anchor rejected the device and it fell
+	// out of the network SILENTLY — no error, no renewal, just gone (the
+	// real-machine finding behind D77). The anchor side already accepted a
+	// renewal (MemberList.Add refreshes a certificate for the same device
+	// key and account — its comment even says "a re-issue after renewal"),
+	// so the missing half was the client: nobody ever asked for a fresh one.
+	if credJoined != nil {
+		go certRenewLoop(runCtx, credJoined, dev, nil)
+	}
 
 	// The relay trunk join: this device stays CONNECTED to the anchor so
 	// that the anchor can reach it for relayed sessions.
@@ -1578,6 +1593,86 @@ func watchApprovals(ctx context.Context, membersPath, certsDir string, start *id
 				srv.SetMeshMembers(cur)
 			}
 		}
+	}
+}
+
+// certRenewIntervalHook is nil in production; a test uses it to compress
+// the renewal interval so a certificate that would renew in months renews
+// in seconds.
+var certRenewIntervalHook func(remaining time.Duration) time.Duration
+
+// certRenewLoop re-enrolls this device before its certificate lapses.
+//
+// The certificate's lifetime used to be the whole membership: when it
+// expired the anchor rejected the device and it fell out of the network
+// SILENTLY — no error, no renewal, just gone (the real-machine finding
+// behind D77). The anchor already accepts a renewal (MemberList.Add
+// refreshes the certificate for the same device key and account, and the
+// quota is counted from the roster, so a renewal does not consume a slot);
+// the missing half was the client: nobody ever asked for a fresh one.
+//
+// The loop re-enrolls at a quarter of the credential's remaining life,
+// bounded to [1 h, 30 d]. Each renewal mints a certificate valid until the
+// CREDENTIAL expires — so a member stays exactly as long as its
+// credential does, and when the owner turns the credential (`cred revoke`
+// or its expiry) the membership really does end, which is the ruling.
+//
+// Renewal is idempotent on the anchor: the roster entry is refreshed and
+// the fresh view is pushed to every member.
+func certRenewLoop(ctx context.Context, cred *credential.Credential, dev *identity.Device, transport http.RoundTripper) {
+	if cred == nil || dev == nil {
+		return
+	}
+	for {
+		remaining := time.Until(cred.Public.ExpiresAt)
+		if remaining <= 0 {
+			// The credential is over. The current certificate still works
+			// until IT lapses; nothing can extend it past its authority.
+			fmt.Fprintf(os.Stderr, "credential expired at %s; this device's membership ends when its certificate lapses\n",
+				cred.Public.ExpiresAt.UTC().Format(time.RFC3339))
+			return
+		}
+		interval := remaining / 4
+		if interval < time.Hour {
+			interval = time.Hour
+		}
+		if interval > 30*24*time.Hour {
+			interval = 30 * 24 * time.Hour
+		}
+		if certRenewIntervalHook != nil {
+			interval = certRenewIntervalHook(remaining)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(interval):
+		}
+		ectx, cancel := context.WithTimeout(ctx, enrollTimeout)
+		err := enrollWithCredentialUsing(ectx, cred, dev, transport)
+		cancel()
+		if ctx.Err() != nil {
+			return
+		}
+		if err != nil {
+			// An expired credential is TERMINAL, not transient: retrying
+			// cannot fix it, and the device's membership now has a definite
+			// end (when its current certificate lapses). Any other failure
+			// is worth a retry.
+			if time.Until(cred.Public.ExpiresAt) <= 0 {
+				fmt.Fprintf(os.Stderr, "credential expired at %s; this device's membership ends when its certificate lapses\n",
+					cred.Public.ExpiresAt.UTC().Format(time.RFC3339))
+				return
+			}
+			fmt.Fprintf(os.Stderr, "certificate renewal failed (%v); will retry\n", err)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(30 * time.Second):
+			}
+			continue
+		}
+		fmt.Fprintf(os.Stderr, "certificate renewed (the credential runs to %s)\n",
+			cred.Public.ExpiresAt.UTC().Format(time.RFC3339))
 	}
 }
 
