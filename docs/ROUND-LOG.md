@@ -1588,3 +1588,32 @@ C 用 `--relay-trunk 175.24.139.148:18090 --relay-trunk-id <A的deviceID>` 加�
 **§4 的 SNI 选证书标了「待实测」**：DeviceID 不是合法 DNS 名，Go 的 crypto/tls 可能在握手阶段就拒绝非法 SNI —— 正在用进程内真实 QUIC 握手验证，若失败改用「合法前缀 SNI」或「ALPN 编码群组身份」两条替代之一。
 
 **本轮边界（如实记下）**：CLI 写文件 → 锚点 2s 重载 tick 之间有窗口，enroll 仍可能按旧内存表放行（文件中介同步的固有竞态，与旧的审批路径同源；命令输出已声明「约一秒内生效」）。拼写错的凭证 ID 现在会**成功**进吊销列表（锚点无法区分「打错字」与「真泄漏」；输出已说明「无设备、已入列」）。
+
+
+---
+
+**★ Round 68 续：吊销竞态闭环 + SNI 机制实测通过**
+
+**① 吊销会被锚点自己的下一次保存抹掉（安全缺陷，真机实测复现）**
+现象：`cred revoke` 写了吊销记录 → 锚点**读不了**那个文件 → 继续用旧内存表 → 下一次保存把吊销**抹掉** → **被吊销的凭证又能入网**（换密码形同虚设）。
+实测：文件里两个吊销 ID → 一次入网 → `revoked_creds` 变成 `[]` → 两个凭证都 `approved: this device is now a member`。
+
+**两个真因**：
+1. **属主**：名册由锚点的 watcher（服务用户 cmesh 写）与运维的 CLI（常以 root 写）**两方写**。root 写的 0600 文件属主是 root，**锚点那个非特权用户读不了** —— 日志里的真凶是 `members file reload failed: open /var/lib/cmesh/members.json: permission denied`。修：**新文件继承所在目录的属主**（目录属主就是服务用户）→ 谁写都服务读得到；权限仍 0600（名册不公开，只共享给必须读它的那一个账号）。
+2. **陈旧保存**：锚点的活表可能比文件旧几秒，普通保存会把陈旧视图写回文件。修：**保存时把文件里的吊销记录合并进来**，且**只增不减**（吊销是永久的，没有「解吊销」）。
+
+**真机复验**：吊销两个 → 立刻入网第三个 → 吊销记录**保住了** → 两个被吊销的凭证入网**被拒**，信息可操作：`credential X has been revoked; ask the owner for a new one`。
+
+**② SNI 选证书机制实测通过（18 个实验全过，`internal/mesh/sni_select_test.go`）**
+多宿主设计的核心机制（监听器按握手选身份）原先靠一个**未验证的假设**支撑，现已实测：
+- **QUIC 下 `GetCertificate` 会被调用，`chi.ServerName` 就是客户端填的 DeviceID**（线级证明：解析原始 ClientHello 拿到 SNI 扩展）。
+- **DeviceID 可以直接当 SNI**：Go 的 crypto/tls **从不校验 SNI 的 DNS 合法性**（客户端只剥 IP 字面量，服务端原样塞进 `chi.ServerName`）。实测下划线/空格/斜杠全部握手成功。
+- **pin 未被削弱**：SNI 指向 A 却拿到 B 的证书 → 握手失败（`pin mismatch: peer CN=...`）。
+- **旧客户端兼容有一个实现细节**：Go 只在「ServerName 非空**或** Certificates 为空」时调 `GetCertificate` → 多身份监听器若把默认证书放进 `Certificates`，旧客户端**根本不会进回调**。**做法：`Certificates` 留空，回调对未命中 SNI 显式返回默认证书。**
+- ⚠️ **必须加固**：**TLS 会话恢复会完全绕过 `GetCertificate`**（恢复连接沿用首次会话的证书 → 身份路由被跳过）。当前不可利用（`deviceTLS` 不设 `ClientSessionCache`），但多宿主形态应显式 `SessionTicketsDisabled = true` —— 恢复对本产品零收益，而它会静默破坏身份路由。
+
+**③ 这轮三个「假红」测试的教训（都是测试自己的问题，不是产品）**
+- SNI 测试的服务端 pin 计数是**普通 int** 被两个 goroutine 共享 → 数据竞争，负载下读到陈旧的 0 → 改原子变量。
+- 同一测试的**客户端握手一成功就关闭连接**，而 TLS 1.3 的客户端证书是**握手之后**才发 → 服务端的 pin 永远等不到 → 改「keep-open」变体。
+- keep-open 变体又 `defer udp.Close()` → **socket 提前关闭**，证书根本发不出去 → 空闲时看不出来（证书已到），一忙就红。**三处连环的时序假设，每一处都要靠「在全量并发下才复现」才暴露。**
+- `internal/relay` 的 shutdown 测试给服务端 2 秒写 close frame → 负载型假红 → 放宽到 20 秒（与此前「join 等待 10s→45s」同一处置）。
