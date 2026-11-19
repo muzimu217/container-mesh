@@ -184,7 +184,15 @@ func sniTestClientKeepOpen(t *testing.T, addr, serverName string, clientCert *tl
 	if err != nil {
 		t.Fatalf("client listen udp: %v", err)
 	}
-	defer udp.Close()
+	if keepOpen {
+		// The socket must outlive this function: the client's
+		// certificate is still travelling when the handshake returns, and
+		// a closed socket cannot carry it. The default path closes it
+		// here, which is why the failure only showed up under load.
+		t.Cleanup(func() { _ = udp.Close() })
+	} else {
+		defer udp.Close()
+	}
 	raddr, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
