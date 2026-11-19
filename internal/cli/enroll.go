@@ -11,14 +11,19 @@ package cli
 //  1. The credential must be signed by the ACCOUNT key. The node holds the
 //     account public key (--account-pub); without that key it cannot tell a
 //     real credential from a made-up one, and it refuses to enroll at all.
-//  2. The credential must not be expired. Expiry bounds how long a leaked
+//  2. The credential's id must not be on the anchor's revocation list.
+//     This check comes before signature and expiry ON PURPOSE: a leaked
+//     credential satisfies both right up to its (year-long) expiry, and the
+//     revocation is the more actionable truth — the owner said no, and no
+//     is not negotiable by re-presenting the string (D77, pre-revocation).
+//  3. The credential must not be expired. Expiry bounds how long a leaked
 //     credential can be used at all.
-//  3. The device certificate must be signed by the credential's DELEGATOR
+//  4. The device certificate must be signed by the credential's DELEGATOR
 //     key — not by the account, and not by anyone else.
-//  4. The certificate must speak for the same account as the credential.
-//  5. The delegation's device quota must not be exhausted. The count comes
+//  5. The certificate must speak for the same account as the credential.
+//  6. The delegation's device quota must not be exhausted. The count comes
 //     from the ROSTER, so revoking a device gives its slot back.
-//  6. The device must not already be a member with a different key.
+//  7. The device must not already be a member with a different key.
 //
 // The delegation record itself is written into the roster, because that is
 // what lets every member verify the delegated certificate (M4-CREDENTIAL.md:
@@ -48,6 +53,17 @@ func enrollDevice(members *identity.MemberList, accountPub ed25519.PublicKey, re
 	pub, err := credential.DecodePublic(req.Credential)
 	if err != nil {
 		return discovery.EnrollResponse{OK: false, Message: "credential is malformed: " + err.Error()}
+	}
+	// The revocation list, FIRST of the credential checks: the id is part
+	// of the account-signed body, so it cannot be swapped by the holder.
+	// A listed id is refused no matter how valid the signature is — the
+	// owner turned this credential off, possibly before anyone ever used
+	// it, and "the signature is fine" is exactly what a leaked credential
+	// looks like. The message tells the joiner what happened and what to
+	// do, because from where they sit the string looked perfectly good.
+	if members.CredentialRevoked(pub.ID) {
+		return discovery.EnrollResponse{OK: false, Message: fmt.Sprintf(
+			"credential %s has been revoked; ask the owner for a new one", pub.ID)}
 	}
 	// The credential's own signature, checked against the ACCOUNT key.
 	if err := pub.Verify(accountPub, now); err != nil {
@@ -117,20 +133,33 @@ func installEnrollHandler(srv *relay.Server, membersPath string, members *identi
 	}
 	account := ed25519.PublicKey(accountPub)
 	srv.SetEnrollHandler(func(req discovery.EnrollRequest) discovery.EnrollResponse {
-		res := enrollDevice(members, account, req, time.Now().UTC())
+		// Resolve the LIVE roster on every request, not the one captured at
+		// startup: watchApprovals replaces the MemberList object whenever it
+		// hot-reloads the file, so a captured pointer would keep honouring a
+		// delegation the owner revoked from another process (`cmesh cred
+		// revoke` writes the file; the reload lands in a NEW list) — and the
+		// next enrollment would then re-save its stale view over the file,
+		// erasing the revocation. MeshMembers() is the list the anchor
+		// currently enforces, hot reload included; the startup pointer is
+		// only a fallback for the window before discovery was enabled.
+		live := srv.MeshMembers()
+		if live == nil {
+			live = members
+		}
+		res := enrollDevice(live, account, req, time.Now().UTC())
 		if !res.OK {
 			fmt.Fprintf(os.Stderr, "enrollment refused: %s\n", res.Message)
 			return res
 		}
 		// Persist before publishing: a member that is announced but not on
 		// disk would vanish on the next reload of the members file.
-		if err := members.SaveMembers(membersPath); err != nil {
+		if err := live.SaveMembers(membersPath); err != nil {
 			fmt.Fprintf(os.Stderr, "enrollment failed to persist: %v\n", err)
 			return discovery.EnrollResponse{OK: false, Message: "could not persist the roster: " + err.Error()}
 		}
-		srv.SetMeshMembers(members)
+		srv.SetMeshMembers(live)
 		fmt.Fprintf(os.Stderr, "enrolled device %s under a team credential (roster v%d)\n",
-			res.DeviceID, members.CurrentVersion())
+			res.DeviceID, live.CurrentVersion())
 		return res
 	})
 }

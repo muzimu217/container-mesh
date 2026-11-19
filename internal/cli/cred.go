@@ -154,13 +154,28 @@ func runCredList(args []string) error {
 	return nil
 }
 
-// runCredRevoke turns a credential off and takes its members out.
+// runCredRevoke turns a credential off — whichever of the TWO states it is
+// in — and takes its members out when it has any.
 //
-// This is the owner's "换密码" switch: every device that joined under the
-// named credential leaves the network on the next roster reload, and the
-// credential can no longer be used to enrol anything. Devices approved by
-// the account itself are untouched, and so are members of other
-// credentials — a rotation is scoped to one credential.
+// This is the owner's "换密码" switch. The credential can be:
+//
+//  1. already used: its delegation record is on the roster (at least one
+//     device enrolled with it). RevokeDelegation kicks every device that
+//     joined under it AND puts the id on the revocation list, so the old
+//     string cannot bring the delegation back by being presented again —
+//     its account signature would still verify, and without the list the
+//     enroll path would happily re-write the record.
+//  2. unused: no delegation on the roster — the anchor only learns a
+//     credential's id at enroll time, so a leaked-but-unused credential
+//     (the D77 gap) and a typo'd id look identical here, and BOTH go onto
+//     the revocation list. Listing a typo harms nothing: no credential will
+//     ever present that id. The old hard failure would have left the
+//     genuinely-leaked case unrevokable until its year ran out.
+//
+// Devices approved by the account itself are untouched in both states, and
+// so are members of other credentials — a rotation is scoped to one
+// credential. There is no un-revoke: a listed id stays refused (re-issuing
+// means a new credential with a new id).
 func runCredRevoke(args []string) error {
 	fs := flag.NewFlagSet("cred revoke", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
@@ -181,22 +196,50 @@ func runCredRevoke(args []string) error {
 	if err != nil {
 		return ExitError{Code: 1, Err: fmt.Errorf("%s: %w", path, err)}
 	}
-	removed, err := m.RevokeDelegation(*credID)
-	if err != nil {
-		return ExitError{Code: 1, Err: err}
+
+	_, onRoster := m.DelegationByID(*credID)
+	var removed []identity.DeviceID
+	alreadyListed := false
+	if onRoster {
+		// State 1: devices came in on it — kick them; the id lands on the
+		// revocation list in the same mutation.
+		removed, err = m.RevokeDelegation(*credID)
+		if err != nil {
+			return ExitError{Code: 1, Err: err}
+		}
+	} else {
+		// State 2: nobody has enrolled with it (or the id never existed) —
+		// pre-revoke it. Both succeed, on purpose.
+		newlyListed, err := m.RevokeCredential(*credID)
+		if err != nil {
+			return ExitError{Code: 1, Err: err}
+		}
+		alreadyListed = !newlyListed
 	}
 	if err := m.SaveMembers(path); err != nil {
 		return ExitError{Code: 1, Err: fmt.Errorf("save %s: %w", path, err)}
 	}
+
 	// What happened, in the operator's terms: the credential is dead, and
-	// HERE is who left the network because of it.
+	// HERE is exactly what the command did about it.
 	fmt.Fprintf(os.Stderr, "credential %s revoked.\n", *credID)
-	if len(removed) == 0 {
-		fmt.Fprintf(os.Stderr, "  no devices were enrolled under it.\n")
+	if onRoster {
+		if len(removed) == 0 {
+			fmt.Fprintf(os.Stderr, "  no devices were enrolled under it.\n")
+		} else {
+			fmt.Fprintf(os.Stderr, "  %d device(s) left the network:\n", len(removed))
+			for _, id := range removed {
+				fmt.Fprintf(os.Stderr, "    %s\n", id)
+			}
+		}
+		fmt.Fprintf(os.Stderr, "  its id is on the revocation list: even the original string cannot enrol anything with it again.\n")
 	} else {
-		fmt.Fprintf(os.Stderr, "  %d device(s) left the network:\n", len(removed))
-		for _, id := range removed {
-			fmt.Fprintf(os.Stderr, "    %s\n", id)
+		fmt.Fprintf(os.Stderr, "  no delegation on the roster — no device has enrolled with it yet.\n")
+		if alreadyListed {
+			fmt.Fprintf(os.Stderr, "  it was already on the revocation list and stays there; nothing changed.\n")
+		} else {
+			fmt.Fprintf(os.Stderr, "  its id went onto the revocation list: any future enrolment presenting a credential\n")
+			fmt.Fprintf(os.Stderr, "  with this id is refused, signature and expiry notwithstanding.\n")
 		}
 	}
 	fmt.Fprintf(os.Stderr, "  the discovery node picks the change up from %s within a second (it hot-reloads the file).\n", path)

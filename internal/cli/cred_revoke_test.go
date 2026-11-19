@@ -90,21 +90,15 @@ func TestCredRevokeRemovesTheMembersFromTheRoster(t *testing.T) {
 	}
 }
 
-// TestCredRevokeAnUnknownCredentialFailsWithExitOne: the owner must not
-// walk away believing devices were kicked when the id was a typo.
-func TestCredRevokeAnUnknownCredentialFailsWithExitOne(t *testing.T) {
-	dir := t.TempDir()
-	credRevokeRoster(t, dir)
-
-	err := runCred([]string{"revoke", "--state", dir, "--cred-id", "typo"})
-	exit, ok := err.(ExitError)
-	if !ok {
-		t.Fatalf("the error is %T, want ExitError", err)
-	}
-	if exit.Code != 1 {
-		t.Fatalf("the exit code is %d, want 1", exit.Code)
-	}
-}
+// TestCredRevokeAnUnknownCredentialFailsWithExitOne used to pin "revoke a
+// typo'd id → exit 1". It is superseded by
+// TestCredRevokeOfAnUnenrolledIdSucceedsAndIsRecorded (cred_prerevoke_test.go):
+// the anchor only learns a credential's id when a device first enrolls with
+// it, so a leaked-but-unused credential and a typo are indistinguishable on
+// the roster — and hard-failing would have left the leaked case unrevokable.
+// The old danger ("the owner believes devices were kicked when they were
+// not") is covered by the output instead: the command now says explicitly
+// that nothing was enrolled and the id went onto the revocation list.
 
 // TestCredRevokeNeedsACredentialID: without an id the command would have
 // to guess, and guessing with a revocation is how everything gets kicked.
