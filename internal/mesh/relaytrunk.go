@@ -831,10 +831,28 @@ func (t *RelayTrunk) dialTarget(ctx context.Context, target identity.DeviceID, k
 		}
 	}
 	if t.dial == nil {
-		return nil, fmt.Errorf("%w: mesh: relay trunk: this node cannot reach members (no dialer installed)",
-			ErrRelayUnavailable)
+		return nil, t.unreachableTarget(target)
 	}
 	return t.dial(ctx, target, kind)
+}
+
+// unreachableTarget explains why the trunk cannot open a session to a
+// member.
+//
+// The wording matters more than it looks. The old text — "this node
+// cannot reach <target> right now" — is true and says nothing, and an
+// operator cannot tell "the network is down" from "the target never
+// joined the trunk". On the real machine the second case looked like a
+// TRANSFER hang: the requester waited for the target's hello until the
+// handshake timed out, so the symptom pointed at the transport while
+// the cause was one step earlier.
+//
+// So the refusal names the cause and the remedy.
+func (t *RelayTrunk) unreachableTarget(target identity.DeviceID) error {
+	return fmt.Errorf("%w: mesh: relay trunk: the target %s has not joined this trunk "+
+		"(a pure-outbound member must join it with --relay-trunk <an address it can reach>, "+
+		"and if that address is a NAT-mapped public one the reply may not find its way back)",
+		ErrRelayUnavailable, target)
 }
 
 // dialTargetWith opens a DEDICATED session to the target, falling back to
@@ -856,8 +874,9 @@ func (t *RelayTrunk) dialTargetWith(ctx context.Context, target identity.DeviceI
 		}
 	}
 	if t.dial == nil {
-		return nil, fmt.Errorf("%w: mesh: relay trunk: this node cannot reach members (no dialer installed)",
-			ErrRelayUnavailable)
+		// The joiners table is the ONLY way a pure-outbound member is
+		// reachable, so its being empty is the whole story. Say so.
+		return nil, t.unreachableTarget(target)
 	}
 	return t.dial(ctx, target, kind)
 }
@@ -898,7 +917,12 @@ func (t *RelayTrunk) OpenFlow(ctx context.Context, open RelayOpen, req Session) 
 			ErrRelayTrunkDisabled)
 	}
 	if t.dial == nil && t.joiners == nil {
-		return 0, fmt.Errorf("%w: mesh: relay trunk: this node cannot reach members (no dialer installed)",
+		// The trunk has no way to reach ANY member. That is a
+		// misconfiguration, and it is worth naming as one — the old
+		// wording ("this node cannot reach members") reads like a
+		// network fact.
+		return 0, fmt.Errorf("%w: mesh: relay trunk: this node has no way to reach members "+
+			"(no joiners table and no dialer installed: the trunk cannot open a session to a member)",
 			ErrRelayUnavailable)
 	}
 	// ④ the quota has room
