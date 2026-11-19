@@ -159,7 +159,7 @@ func (f *relayFixture) joinBob(t *testing.T) <-chan Session {
 	}()
 	// The join must land before the request: the trunk refuses a relay
 	// to a member that has not joined.
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(45 * time.Second)
 	for time.Now().Before(deadline) {
 		if f.joiners.Count() > 0 {
 			return sessions

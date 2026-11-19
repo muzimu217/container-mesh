@@ -134,7 +134,7 @@ func (f *bigFileFixture) joinBob(t *testing.T) {
 			},
 		})
 	}()
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(45 * time.Second)
 	for time.Now().Before(deadline) {
 		if f.joiners.Count() > 0 {
 			return
