@@ -68,6 +68,20 @@ type discoveryClientTransport struct {
 // certificate against.
 var joinResolverHook func(*liveViewResolver)
 
+// joinLifetimeHook is intentionally nil in production. CLI tests use it to
+// give an in-process join a LIFETIME they control.
+//
+// It exists because an APPROVED join is RESIDENT: it runs until it is
+// interrupted, so a test that starts one in-process has to be able to end
+// it. A real SIGINT would hit the whole test binary (every other join in
+// the process would leave the network too), so the test supplies its own
+// context instead.
+//
+// The hook REPLACES the signal context: a test that uses it gives up the
+// Ctrl-C handling, which is fine — the signal path has its own
+// process-level acceptance test.
+var joinLifetimeHook func() (context.Context, context.CancelFunc)
+
 var discoveryClientTransportHook discoveryClientTransport
 
 func withDiscoveryClientTransport(cfg discovery.ClientConfig) discovery.ClientConfig {
@@ -398,7 +412,15 @@ func runJoin(args []string) error {
 	var listen stringSlice
 	fs.Var(&listen, "listen", "bind UDP endpoint(s) for direct links and answer them, repeatable host:port (port 0 = auto; the bound ports are what gets announced)")
 	once := fs.Bool("once", false, "exit as soon as this device is a member")
-	timeout := fs.Duration("timeout", 10*time.Minute, "how long to wait for approval before giving up (0 = forever)")
+	// The timeout bounds the APPROVAL WAIT and nothing else. It used to be
+	// wrapped onto the signal context, which is the whole member process's
+	// lifetime — so an approved member was torn down by the deadline and
+	// broadcast a LEAVE (the real-machine finding: `join --timeout 5m` left
+	// the network on its own after five minutes, and every later relay
+	// request answered "this node cannot reach <target> right now"). A
+	// member process is resident: once it is in, it stays in until it is
+	// interrupted.
+	timeout := fs.Duration("timeout", 10*time.Minute, "how long to wait for approval before giving up (0 = forever); the member keeps running after the approval lands")
 	credStr := fs.String("cred", "", "team credential: join with this string instead of an invite (no per-device approval needed)")
 	relayTrunk := fs.String("relay-trunk", "", "address of the relay trunk to join (host:port): this device stays connected to it so it can RECEIVE relayed sessions")
 	relayTrunkID := fs.String("relay-trunk-id", "", "device ID of the relay trunk (required with --relay-trunk: the join is pinned against it)")
@@ -408,6 +430,12 @@ func runJoin(args []string) error {
 	if *once && len(listen) > 0 {
 		return ExitError{Code: 2, Err: errors.New(
 			"--once exits after approval; --listen needs a serving process (drop --once)")}
+	}
+	if *timeout < 0 {
+		// 0 means "wait forever"; a negative value is a usage error, not a
+		// silent "forever".
+		return ExitError{Code: 2, Err: errors.New(
+			"--timeout cannot be negative (0 means wait forever)")}
 	}
 	if *credStr == "" && fs.NArg() != 1 {
 		return ExitError{Code: 2, Err: errors.New(
@@ -634,13 +662,54 @@ func runJoin(args []string) error {
 	// "leave the network gracefully" (P-5b): the departure is BROADCAST, so
 	// the other members' views say offline right away instead of waiting
 	// for this process's socket to die.
+	//
+	// This context is the PROCESS lifetime, and only that. The approval
+	// deadline used to be wrapped onto it, which made --timeout the whole
+	// member's lifetime: an approved member was torn down by the deadline
+	// and broadcast a LEAVE, so it vanished from the roster's reachability
+	// view and the anchor could not reach it any more. The deadline is a
+	// property of the WAIT, so it lives on its own context below.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	if *timeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, *timeout)
-		defer cancel()
+	if joinLifetimeHook != nil {
+		// A test supplies the member's lifetime (see joinLifetimeHook).
+		// The signal context is released right away: the test's context is
+		// the one that ends this join.
+		testCtx, testCancel := joinLifetimeHook()
+		stop()
+		ctx, stop = testCtx, testCancel
 	}
+
+	// The approval deadline: how long the join waits for the account owner
+	// to approve this device.
+	//
+	// It is a property of the WAIT, not of the process: the loop stops
+	// watching it the moment the approval lands, so an approved member runs
+	// until it is interrupted. A timeout of 0 means "wait forever", which
+	// is the shape the flag has always had.
+	//
+	// The channel is nil when there is no deadline (a nil channel blocks
+	// forever in a select, which is exactly "wait forever"), and it is set
+	// back to nil when the approval lands — that is the disarm.
+	//
+	// armDeadline is a closure because the wait can START TWICE: a device
+	// that is revoked while it is a member starts waiting for the approval
+	// again, and that second wait is bounded by the same flag.
+	var deadlineCancels []context.CancelFunc
+	armDeadline := func() <-chan struct{} {
+		if *timeout <= 0 {
+			return nil
+		}
+		approvalCtx, cancelDeadline := context.WithTimeout(context.Background(), *timeout)
+		deadlineCancels = append(deadlineCancels, cancelDeadline)
+		return approvalCtx.Done()
+	}
+	defer func() {
+		for _, cancelDeadline := range deadlineCancels {
+			cancelDeadline()
+		}
+	}()
+	deadlineCh := armDeadline()
 
 	// The client's own lifetime is NOT the signal context. The graceful
 	// departure has to run BEFORE the run loop is torn down: if the signal
@@ -746,6 +815,15 @@ func runJoin(args []string) error {
 					fmt.Fprintf(os.Stderr, "approved: this device is now a member\n")
 					printSnapshot()
 					lastSig = viewSig()
+					// The approval landed: the deadline has done its job and
+					// is DISARMED. From here on this process is a resident
+					// member and it runs until it is interrupted — the
+					// deadline must not be able to take an approved member
+					// out of the network (the real-machine finding: a join
+					// with --timeout 5m left the network by itself after
+					// five minutes and the anchor could not reach it any
+					// more).
+					deadlineCh = nil
 					if *once {
 						// The process is about to exit while it is a
 						// member: say goodbye to the network instead of
@@ -764,18 +842,39 @@ func runJoin(args []string) error {
 				// sessions; here the honest CLI response is to say so).
 				fmt.Fprintf(os.Stderr, "membership lost: this device is no longer in the member list\n")
 				approvedAt = time.Time{}
+				// The device is a PENDING member again, so the approval
+				// wait starts over — and it is bounded again: a join that
+				// waits forever for a re-approval would hang a shell
+				// prompt just like the first wait did.
+				deadlineCh = armDeadline()
 			}
+		case <-deadlineCh:
+			// The approval wait is over: the deadline expired.
+			//
+			// A member that is IN is never affected by the deadline — the
+			// approval disarms it — so this arm can only fire while the
+			// join is still a PENDING member. The one exception is a race
+			// between the deadline firing and the approval being observed:
+			// then the device IS a member, and it stays one (the loop
+			// disarms the deadline and carries on).
+			if cl.Joined() {
+				deadlineCh = nil
+				continue
+			}
+			// Give up with an error the operator can act on. The device was
+			// never a member, so there is nothing to clean up: the announce
+			// was refused by the node all along, and no half-member state
+			// exists on the discovery host.
+			return ExitError{Code: 1, Err: fmt.Errorf(
+				"not approved within %s; the account owner must add this device's certificate to the member list on the discovery host", *timeout)}
 		case <-ctx.Done():
+			// SIGINT/SIGTERM: the process lifetime is over.
 			if cl.Joined() {
 				// Graceful departure (P-5b): broadcast the LEAVE so the
 				// other members' views say offline now, then let the run
 				// loop go.
 				gracefulLeave()
 				return nil
-			}
-			if ctx.Err() == context.DeadlineExceeded {
-				return ExitError{Code: 1, Err: fmt.Errorf(
-					"not approved within %s; the account owner must add this device's certificate to the member list on the discovery host", *timeout)}
 			}
 			return nil
 		}

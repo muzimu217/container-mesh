@@ -254,6 +254,17 @@ func TestMeshBootstrapApprovalFlow(t *testing.T) {
 	// link, endpoints resolved from the member view.
 	ownerDev := loadJoinerDevice(t, ownerDir, pass)
 	ownerJoined := make(chan struct{})
+	// The owner join is a RESIDENT member: it has to stay up for the direct
+	// link below. It used to stop by itself at its --timeout deadline,
+	// which is exactly the defect this branch fixes — a member must not be
+	// torn down by the approval-wait timeout (the real machine saw two
+	// approved members leave the network by themselves after five
+	// minutes). The timeout still bounds the APPROVAL WAIT; the member's
+	// lifetime now ends only when the test ends it.
+	ownerLifeCtx, ownerLifeCancel := context.WithCancel(context.Background())
+	oldOwnerHook := joinLifetimeHook
+	joinLifetimeHook = func() (context.Context, context.CancelFunc) { return ownerLifeCtx, ownerLifeCancel }
+	t.Cleanup(func() { joinLifetimeHook = oldOwnerHook })
 	go func() {
 		defer close(ownerJoined)
 		// The endpoint carries port zero on purpose: it means "use whatever
@@ -268,9 +279,10 @@ func TestMeshBootstrapApprovalFlow(t *testing.T) {
 	// Reap the join goroutine before the test ends: it prints view blocks
 	// via fmt.Fprintf(os.Stderr, …), which races with the NEXT test's
 	// stderr capture if still running (netns-probe round 21, O-B1 — the
-	// failure surfaced under TestCLIAccountWorkflow's name). 15 s bounds
-	// the goroutine while leaving 3-4× margin over legs 3-4.
-	t.Cleanup(func() { <-ownerJoined })
+	// failure surfaced under TestCLIAccountWorkflow's name). The join is
+	// ended explicitly here (the member is resident), so the reap waits for
+	// the graceful LEAVE and not for a deadline.
+	t.Cleanup(func() { ownerLifeCancel(); <-ownerJoined })
 	time.Sleep(1500 * time.Millisecond) // owner announces; endpoints propagate
 
 	// The owner's configuration must carry the RESOLVED endpoint, not the

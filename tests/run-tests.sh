@@ -521,10 +521,16 @@ if [ -n "$ACCT_PUB" ]; then
         esac
         # The joiner has NO identity file: the credential path must create it.
         # ONE command, no manual approval: self-minted certificate enrollment,
-        # then announce + members stream. --timeout bounds the run; a joined
-        # device exits 0 at the deadline, a rejected one exits non-zero.
+        # then announce + members stream.
+        #
+        # --timeout bounds the APPROVAL WAIT (how long the join waits for the
+        # owner to approve it), not the member's lifetime: an approved member
+        # is RESIDENT and runs until it is interrupted (systemd/docker stop
+        # it). So the script asks for the resident shape explicitly with
+        # --once (exit as soon as the device is a member); a device that is
+        # never approved still gives up at the deadline with exit != 0.
         JOIN_LOG="$TMP/cred-join.log"
-        "$BIN" join --state "$CJOINER" --device-passphrase "$CPASS" --cred "$CRED" --timeout 15s \
+        "$BIN" join --state "$CJOINER" --device-passphrase "$CPASS" --cred "$CRED" --once --timeout 15s \
             > "$JOIN_LOG" 2>&1
         JOIN_RC=$?
         assert_eq "join 子进程退出码" "0" "$JOIN_RC"
