@@ -153,7 +153,15 @@ func installEnrollHandler(srv *relay.Server, membersPath string, members *identi
 		}
 		// Persist before publishing: a member that is announced but not on
 		// disk would vanish on the next reload of the members file.
-		if err := live.SaveMembers(membersPath); err != nil {
+		//
+		// The MERGED save is the point: the live list can be up to a couple
+		// of seconds behind the file (the anchor reloads it on a tick), and
+		// a plain save would write that stale view back over the file —
+		// erasing a revocation the operator had just recorded and letting
+		// the revoked credential enrol again. Measured on the real
+		// machine: two revoked ids in the file, one enrolment, and the
+		// revocation list was gone.
+		if err := live.SaveMembersMerged(membersPath); err != nil {
 			fmt.Fprintf(os.Stderr, "enrollment failed to persist: %v\n", err)
 			return discovery.EnrollResponse{OK: false, Message: "could not persist the roster: " + err.Error()}
 		}

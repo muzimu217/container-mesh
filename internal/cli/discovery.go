@@ -1584,7 +1584,15 @@ func watchApprovals(ctx context.Context, membersPath, certsDir string, start *id
 				changed = true
 			}
 			if changed {
-				if err := cur.SaveMembers(membersPath); err != nil {
+				// The MERGED save: `cur` is this watcher's in-memory roster,
+				// and it can be a couple of seconds BEHIND the file — the
+				// operator's `cmesh cred revoke` writes the file from
+				// another process. A plain save would write that stale
+				// view back over the file and ERASE the revocation, and
+				// the revoked credential could enrol again. Measured on the
+				// real machine: two revoked ids in the file, one
+				// enrolment, and the revocation list was gone.
+				if err := cur.SaveMembersMerged(membersPath); err != nil {
 					fmt.Fprintf(os.Stderr, "members save failed: %v\n", err)
 				}
 				// Our own save refreshed the file's mtime: record it, or the

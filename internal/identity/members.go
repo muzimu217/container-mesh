@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -218,6 +219,27 @@ func (m *MemberList) RevokeCredential(id string) (bool, error) {
 	return true, nil
 }
 
+// mergeRevocations adds revocations that are not in the list yet.
+//
+// It only ever ADDS. A revocation is permanent: the owner's decision to
+// turn a key off is not undone by a stale copy of the list, and there is
+// no command that un-revokes one.
+func (m *MemberList) mergeRevocations(extra map[string]time.Time) {
+	if len(extra) == 0 {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.RevokedCreds == nil {
+		m.RevokedCreds = make(map[string]time.Time)
+	}
+	for id, when := range extra {
+		if _, seen := m.RevokedCreds[id]; !seen {
+			m.RevokedCreds[id] = when
+		}
+	}
+}
+
 // CredentialRevoked reports whether a credential id is on the revocation
 // list. This is the check the enroll path runs FIRST — before signature and
 // expiry, which a leaked credential still satisfy.
@@ -384,7 +406,47 @@ func (m *MemberList) IDs() []DeviceID {
 // SaveMembers writes the member list. It contains no secrets (certs are
 // public), but it is written under the state dir with 0600 anyway so the
 // state directory has one permission story.
+//
+// It saves exactly what the list holds. Use SaveMembersMerged where the
+// list may be STALE relative to the file (the anchor's own path: the
+// operator's revoke lands in the file, and the anchor's in-memory list
+// only catches up on its next reload).
 func (m *MemberList) SaveMembers(path string) error {
+	return m.saveMembers(path, false)
+}
+
+// SaveMembersMerged writes the member list and KEEPS the revocations the
+// file already records.
+//
+// The anchor saves the roster from its in-memory list, and that list only
+// catches up with the file every couple of seconds. So between "cred
+// revoke wrote the file" and "the anchor reloaded it" there is a window
+// in which the anchor's live list does not know about the revocation —
+// and any save in that window (an enrolment does one) writes the stale
+// view back over the file, ERASING the revocation.
+//
+// Measured on the real machine: two revoked ids were in the file, one
+// enrolment happened, and the file came back with no revocation list at
+// all. Both credentials could enrol again — a rotation that is not
+// atomic is not a rotation.
+//
+// The file is the external authority here (the operator edits it, the
+// CLI writes it), so the file's revocations are merged IN on the way
+// out. The merge only ever ADDS: a revocation is permanent, and there
+// is no command that un-revokes one.
+func (m *MemberList) SaveMembersMerged(path string) error {
+	return m.saveMembers(path, true)
+}
+
+func (m *MemberList) saveMembers(path string, mergeFileRevocations bool) error {
+	if mergeFileRevocations {
+		// Read the file's revocations FIRST, before taking the lock: the
+		// file is the authority for them, and the in-memory list may be
+		// behind it.
+		if onDisk, err := LoadMembers(path); err == nil {
+			m.mergeRevocations(onDisk.RevokedCreds)
+		}
+	}
 	m.mu.Lock()
 	snapshot := MemberList{AccountID: m.AccountID, Version: m.Version,
 		Members: make(map[DeviceID]Member, len(m.Members))}
@@ -440,7 +502,44 @@ func (m *MemberList) SaveMembers(path string) error {
 	if err := os.Chmod(tmpName, 0o600); err != nil {
 		return err
 	}
+	// The roster must stay READABLE BY THE SERVICE THAT SERVES IT.
+	//
+	// The roster is written from several places: the anchor's own watcher
+	// (as the service user) and the operator's CLI (often as root, from a
+	// different shell). A root-written file with 0600 is owned by root, and
+	// the anchor — running as its own unprivileged user — then cannot read
+	// it. Measured on the real machine: `cmesh cred revoke` (root) wrote the
+	// roster, the anchor's reload failed with "permission denied", the
+	// anchor kept its stale in-memory roster, and the next save ERASED the
+	// revocation. A rotation that the service cannot read is not a
+	// rotation.
+	//
+	// So the new file inherits the OWNERSHIP OF THE DIRECTORY it lives in
+	// — the directory is owned by the service user, so the roster stays
+	// readable by the service whoever wrote it. The mode stays 0600: the
+	// roster is not public, it is SHARED with the one account that has to
+	// read it.
+	if dirStat, err := os.Stat(dir); err == nil {
+		if dirUID, dirGID, ok := ownerOf(dirStat); ok {
+			if err := os.Chown(tmpName, dirUID, dirGID); err != nil {
+				// Not fatal: the file is still correct, only its owner
+				// may be wrong. The caller decides whether that matters;
+				// the anchor logs its own read failures.
+				return os.Rename(tmpName, path)
+			}
+		}
+	}
 	return os.Rename(tmpName, path)
+}
+
+// ownerOf reports the uid and gid that own a file, when the platform
+// exposes them.
+func ownerOf(fi os.FileInfo) (int, int, bool) {
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, 0, false
+	}
+	return int(st.Uid), int(st.Gid), true
 }
 
 // LoadMembers reads a member list written by SaveMembers.
