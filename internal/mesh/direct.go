@@ -267,10 +267,53 @@ func (a SnapshotAdapter) KeyFor(id identity.DeviceID) (ed25519.PublicKey, error)
 // and it is shared by quic.Dial (direct.go:838) and quic.Listen
 // (direct.go:373) — so both ends of a direct link are instrumented by one
 // hook, and the relay path (WebSocket, no QUIC) is untouched by it.
+//
+// THE FLOW CONTROL WINDOWS ARE SET HERE ON PURPOSE.
+//
+// quic-go's defaults are a 512 KiB initial stream window and a 768 KiB
+// initial CONNECTION window (1.5 times the stream one). Both are too
+// small for this product:
+//
+//   - A relay record is JSON, and JSON carries a []byte as base64, so a
+//     megabyte of payload becomes about 1.4 megabytes on the wire, plus
+//     the end-to-end seal's nonce and tag. ONE relay record is therefore
+//     BIGGER than the default stream window.
+//   - The window only grows when the receiver consumes more than half a
+//     window per RTT (quic-go's maybeAdjustWindowSize). The trunk's
+//     forwarding loop pulls records ON DEMAND, so the window does not
+//     grow on its own, and the sender blocks on its rolling write
+//     deadline: "mesh: send body: mesh: relay: write: deadline
+//     exceeded". The real machine showed it exactly that way — the same
+//     file, right after a failed attempt, went through.
+//
+// The connection window is the one that matters most: the trunk's join
+// connection is LONG-LIVED and carries EVERY relayed session, so the
+// connection-level window is what actually runs out.
+//
+// These are RECEIVE windows (they say how much the peer may send us).
+// The peer's send side is bounded by what we grant, and the window grows
+// towards the maximum as the peer consumes.
+const (
+	// relayStreamReceiveWindow is the initial per-stream receive window.
+	// It holds one relay record with room to spare.
+	relayStreamReceiveWindow = 2 << 20
+	// relayConnectionReceiveWindow is the initial connection-level
+	// receive window. It holds several relayed sessions' worth of
+	// records, because the trunk multiplexes them over one connection.
+	relayConnectionReceiveWindow = 16 << 20
+	// relayMaxReceiveWindow is the ceiling the window grows towards.
+	relayMaxReceiveWindow = 64 << 20
+)
+
 func quicConfig() *quic.Config {
 	return tracingConfig(&quic.Config{
 		MaxIdleTimeout:  10 * time.Second,
 		KeepAlivePeriod: 3 * time.Second,
+		// The flow control windows — see the comment above.
+		InitialStreamReceiveWindow:     relayStreamReceiveWindow,
+		MaxStreamReceiveWindow:         relayMaxReceiveWindow,
+		InitialConnectionReceiveWindow: relayConnectionReceiveWindow,
+		MaxConnectionReceiveWindow:     relayMaxReceiveWindow,
 	})
 }
 
