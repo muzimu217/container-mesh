@@ -112,6 +112,39 @@ func (m *MemberList) RemoveDelegation(id string) error {
 	return nil
 }
 
+// RevokeDelegation drops an authorisation AND every device that enrolled
+// under it.
+//
+// This is the owner's credential rotation: "除非我自己改密钥，然后其他会掉线".
+// A team credential is a key the owner hands out, and turning it must take
+// the people who came in on it out of the network — RemoveDelegation only
+// stopped NEW enrolments, which meant the holder of a leaked password
+// stayed inside even after the password had been turned.
+//
+// Members approved by the account itself (SignerPub empty) and members of
+// OTHER delegations are untouched: a rotation is scoped to one credential.
+//
+// It returns the device ids it removed, so the caller can say what
+// happened instead of leaving the owner to diff the roster by hand.
+func (m *MemberList) RevokeDelegation(id string) ([]DeviceID, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	d, ok := m.Delegations[id]
+	if !ok {
+		return nil, fmt.Errorf("identity: no delegation %s", id)
+	}
+	removed := make([]DeviceID, 0, 4)
+	for devID, mm := range m.Members {
+		if len(mm.Cert.SignerPub) > 0 && mm.Cert.SignerPub.Equal(d.DelegatorPub) {
+			removed = append(removed, devID)
+			delete(m.Members, devID)
+		}
+	}
+	delete(m.Delegations, id)
+	m.Version++
+	return removed, nil
+}
+
 // DelegationFor finds the authorisation that covers a signing key.
 func (m *MemberList) DelegationFor(pub ed25519.PublicKey) (Delegation, bool) {
 	m.mu.Lock()
