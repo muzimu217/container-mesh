@@ -13,7 +13,8 @@ cd "$(dirname "$0")/.." || exit 1
 
 HUB=https://new.blackevil.cn/hub
 ANCHOR=root@175.24.139.148
-AGENTS="doubao-cloud-vm-01 kuku-sandbox-01 netns-probe oh-no-agent"
+# The four core agents, plus the ones that have joined since.
+AGENTS="doubao-cloud-vm-01 kuku-sandbox-01 netns-probe oh-no-agent muse-licheng-test1"
 LEDGER=.team/certification.md
 WATERMARK=.team/hub-watermark
 DRY=0
@@ -99,15 +100,48 @@ for a in '$AGENTS'.split():
 " > /tmp/hub-last-reports.$$ 2>/dev/null
 
 # 3. Update the ledger (only when something changed).
+#
+# The ledger keeps MORE than this script can know: the SHA an agent
+# actually certified, and the notes the coordinator wrote. So the update
+# is a MERGE — the existing SHA column and the trailing notes survive —
+# not a rewrite. (The first version of this script rewrote the file and
+# silently dropped the coordinator's notes; the loop must not erase what
+# it did not write.)
 if [ ! -f "$LEDGER" ] || ! diff -q <(sort /tmp/hub-last-reports.$$) \
-    <(grep -E "^(doubao|kuku|netns|ohno|muse)" "$LEDGER" 2>/dev/null | awk '{print $1, $2}' | sort) >/dev/null 2>&1; then
+    <(grep -E "^(doubao|kuku|netns|ohno|oh-no|muse)" "$LEDGER" 2>/dev/null | awk '{print $1, $2}' | sort) >/dev/null 2>&1; then
   {
-    echo "# 测试认证台账（hub-certify-loop 自动维护）"
-    echo "# 格式: <代理> <最后一报UTC> <是否已认证 tip>"
+    echo "# 测试认证台账（hub-certify-loop 自动维护 + 值守补记）"
+    echo "# 格式: <代理> <最后一报UTC> <已认证的SHA> <当前tip是否已认证>"
+    echo "# 「已认证的 SHA」= 这个代理实际复测过并回报 PASS 的提交。"
     echo "# tip: $TIP  更新: $(date -u +%FT%TZ)"
     while read -r a t; do
-      echo "$a $t pending"
+      # Keep the SHA the coordinator recorded, if any.
+      sha=$(awk -v ag="$a" '$1==ag {print $3}' "$LEDGER" 2>/dev/null | head -1)
+      [ -z "$sha" ] && sha="—"
+      # The tip counts as certified when the recorded SHA IS the tip.
+      state="no"
+      [ "$sha" = "$TIP" ] && state="yes"
+      echo "$a $t $sha $state"
     done < /tmp/hub-last-reports.$$
+    # The coordinator's notes and the agents the loop does not track (the
+    # list is the four core agents; a new member arrives with its own
+    # entries) must survive.
+    if [ -f "$LEDGER" ]; then
+      echo ""
+      echo "# --- 值守补记（脚本不会覆盖以下内容）---"
+      grep -E "^#" "$LEDGER" 2>/dev/null | grep -vE "^# (测试认证台账|格式|「已认证|tip:|--- 值守补记)" || true
+      # Agents the loop does not track.
+      for a in $(awk '{print $1}' "$LEDGER" 2>/dev/null | grep -vE "^(doubao|kuku|netns|ohno|oh-no|muse|#|格式|「已认证|tip:)" | sort -u); do
+        line=$(grep -E "^$a " "$LEDGER" 2>/dev/null | head -1)
+        if [ -n "$line" ]; then
+          # Normalise to the four-column shape.
+          set -- $line
+          sha="${3:-—}"
+          [ "$4" = "yes" ] || [ "$3" = "yes" ] && sha="$3"
+          echo "$a $2 $sha no"
+        fi
+      done
+    fi
   } > "$LEDGER.tmp"
   mv "$LEDGER.tmp" "$LEDGER"
   echo "ledger updated: $LEDGER"
