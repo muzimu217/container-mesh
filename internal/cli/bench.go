@@ -58,15 +58,44 @@ func runBench(args []string) error {
 	if err != nil {
 		return ExitError{Code: 1, Err: err}
 	}
+	// The target must be a member of the network before anything else:
+	// the membership check is what keeps a stranger's identity from
+	// being handed to a relay. The ENDPOINTS come with it: the direct
+	// path needs them, and the picker does not supply them (the picker's
+	// direct path carries no endpoints of its own).
+	//
+	// The endpoints used to be dropped here, and that made the DIRECT
+	// path dead: the picker offered a direct path with no address to
+	// dial, DialDirect refused it with "no reachable endpoints", and
+	// every bench run took the relay instead. So bench could not
+	// produce a direct baseline at all — every number it ever printed
+	// was a relay number (measured by the performance agent: the "direct
+	// vs relay" comparison it first ran was two measurements of the
+	// relay).
 	eps, err := sess.resolveTarget(hctx, target)
 	if err != nil {
 		return ExitError{Code: 1, Err: err}
 	}
 	started := time.Now()
-	stats, err := mesh.RunBench(hctx, mesh.DialConfig{
-		Device:    sess.dev,
-		Resolver:  sess.resolver,
-		Target:    target,
+	stats, linkKind, err := mesh.RunBenchWithPath(hctx, mesh.DialConfig{
+		Device:   sess.dev,
+		Resolver: sess.resolver,
+		Target:   target,
+		// The picker is what makes the RELAY path reachable from this
+		// command: it offers the direct path first and the relay
+		// candidates after. Without it the dial is always direct, and a
+		// pure-outbound member — a member with NO endpoints, which is
+		// exactly the member the trunk exists for — reads as
+		// "unreachable" (defect reported by netns-probe on a real SNAT
+		// lab: in the same minute ping/msg/send-to went over the relay
+		// while bench alone answered "has no reachable endpoints in the
+		// current view").
+		//
+		// It also means bench measures what it is supposed to measure:
+		// it is the product's own throughput tool, so without the relay
+		// path the relay's throughput could only be timed by hand with
+		// send-to and a stopwatch.
+		Picker:    sess.picker(),
 		Endpoints: eps,
 	}, mesh.BenchConfig{Size: size, RateBytesPerSecond: rate})
 	if err != nil {
@@ -76,6 +105,11 @@ func runBench(args []string) error {
 		stats.Duration = time.Since(started)
 	}
 	fmt.Printf("peer=%s\n", target)
+	// Which path the measurement was taken over. Without it a number
+	// printed by the product's own throughput tool cannot be attributed
+	// to a route — and the "direct vs relay" comparison is the whole
+	// point of a throughput tool.
+	fmt.Printf("link=%s\n", linkKind)
 	fmt.Printf("direction=both size_each=%d sent=%d received=%d\n", size, stats.SentBytes, stats.ReceivedBytes)
 	fmt.Printf("duration=%s throughput_each=%s packets_lost=%s\n",
 		stats.Duration.Round(time.Millisecond), rateString(size, stats.Duration),
