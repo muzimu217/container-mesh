@@ -309,6 +309,17 @@ func quicConfig() *quic.Config {
 	return tracingConfig(&quic.Config{
 		MaxIdleTimeout:  10 * time.Second,
 		KeepAlivePeriod: 3 * time.Second,
+		// The HANDSHAKE has its own timeout, and quic-go's default for it
+		// is FIVE SECONDS (MaxIdleTimeout does not cover it — that one
+		// applies only AFTER the handshake completes). On a loaded machine
+		// a handshake can take longer than that, and the attempt dies with
+		// "timeout: no recent network activity" — a false failure that
+		// looks like an unreachable peer.
+		//
+		// It is doubled relative to MaxIdleTimeout, which keeps the
+		// relationship the same shape quic-go documents: the attempt is
+		// aborted if the handshake does not complete in twice this time.
+		HandshakeIdleTimeout: 20 * time.Second,
 		// The flow control windows — see the comment above.
 		InitialStreamReceiveWindow:     relayStreamReceiveWindow,
 		MaxStreamReceiveWindow:         relayMaxReceiveWindow,
@@ -777,14 +788,30 @@ func readMsgFrame(br *bufio.Reader, capBytes int64) (frame []byte, cleanEnd bool
 		return nil, false, fmt.Errorf("mesh: frame of %d bytes exceeds the %d byte cap", size, capBytes)
 	}
 	body := make([]byte, size)
-	if _, err := io.ReadFull(br, body); err != nil {
+	got, err := io.ReadFull(br, body)
+	if err != nil {
 		// The body MUST arrive in full. io.EOF here means the stream
 		// ended after the header: the frame is truncated, not
 		// finished — so this is a failure, never a clean end.
-		return nil, false, fmt.Errorf("mesh: truncated frame (%d bytes announced): %w", size, err)
+		//
+		// The error is errTruncatedFrame, and the underlying io.EOF is
+		// NOT wrapped: an errors.Is(err, io.EOF) that returns true would
+		// let every "EOF means the sender finished" caller treat a
+		// truncation as a graceful finish — exactly the silent-tail-drop
+		// this function exists to prevent. The cause is reported with %v
+		// (in the text, not the chain).
+		return nil, false, fmt.Errorf("%w: mesh: %d of %d announced bytes arrived: %v", errTruncatedFrame, got, size, err)
 	}
 	return body, false, nil
 }
+
+// errTruncatedFrame says a length prefix promised bytes that never came.
+//
+// It exists so that a truncation can be told from a clean end WITHOUT
+// wrapping io.EOF: a wrapped io.EOF would flow through every
+// errors.Is(err, io.EOF) check in the relay and the message paths and be
+// mistaken for a graceful finish.
+var errTruncatedFrame = errors.New("truncated frame")
 
 // writeMsgFailure writes the receiver's failure line and returns the
 // error that caused it.

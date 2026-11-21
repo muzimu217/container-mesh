@@ -664,7 +664,20 @@ func newPipeSessionPair() (*pipeSession, *pipeSession) {
 }
 
 // Write puts bytes on the wire (into the peer's inbound queue).
+//
+// A session that has been ABORTED refuses writes DETERMINISTICALLY. The
+// check used to live inside the select, next to the delivery case — and
+// a select with two ready arms picks at RANDOM, so a write onto an
+// aborted session sometimes landed in the peer's buffer anyway. A test
+// that needs "the write to the target failed" cannot tolerate a coin
+// flip; neither can a protocol (on the real stream a cancelled session
+// fails every subsequent write, promptly).
 func (p *pipeSession) Write(b []byte) (int, error) {
+	select {
+	case <-p.closed:
+		return 0, errors.New("pipe session closed")
+	default:
+	}
 	cp := make([]byte, len(b))
 	copy(cp, b)
 	p.record(cp)
@@ -710,6 +723,22 @@ func (p *pipeSession) Read(b []byte) (int, error) {
 		defer timer.Stop()
 		timeout = timer.C
 	}
+	// An ABORT outranks a FIN. Abort() closes BOTH of the peer's end
+	// signals (the session's close and its send side), and a select with
+	// two ready arms picks at random — so a reader could see a graceful
+	// EOF for an aborted stream half the time. On the real stream a
+	// RESET_STREAM makes the read fail even when a FIN was also sent, so
+	// the abort is checked FIRST, deterministically.
+	select {
+	case <-p.peer.closed:
+		// The peer was ABORTED, not half-closed: on the real stream this
+		// is a RESET_STREAM, and a reset makes the reader FAIL, not reach
+		// a clean end. The double used to report io.EOF here — which made
+		// an aborted session indistinguishable from a graceful finish,
+		// and a truncation dressed up as a completion could not be seen.
+		return 0, errPeerAborted
+	default:
+	}
 	select {
 	case chunk, ok := <-p.in:
 		if !ok {
@@ -720,17 +749,30 @@ func (p *pipeSession) Read(b []byte) (int, error) {
 		return 0, io.EOF
 	case <-timeout:
 		return 0, os.ErrDeadlineExceeded
-	case <-p.peer.closed:
-		// The peer ended its send side. Drain what it already sent,
-		// then EOF.
-		return p.drainThenEOF(b)
 	case <-p.peer.sendClosed:
 		// The peer HALF-closed: it will send nothing more, but it is
 		// still listening. This is the end of the request, not the end
 		// of the conversation.
+		//
+		// RE-CHECK the abort: this reader may have gone to sleep while
+		// only the FIN was visible, and the abort then landed — a select
+		// blocked on two ready arms picks at random, so without the
+		// re-check an aborted stream would read as a graceful end about
+		// half the time. Abort closes the session channel FIRST, so a
+		// send-side close that was not an abort never has the session
+		// channel closed behind it.
+		select {
+		case <-p.peer.closed:
+			return 0, errPeerAborted
+		default:
+		}
 		return p.drainThenEOF(b)
 	}
 }
+
+// errPeerAborted is what a reader sees when the PEER's session was
+// aborted (a RESET_STREAM on the real wire).
+var errPeerAborted = errors.New("pipe session: the peer aborted the stream")
 
 // drainThenEOF hands back the bytes that are already queued and then
 // reports the end of the stream.
@@ -1908,16 +1950,30 @@ func TestPickerWiringDoesNotBreakTheDirectPath(t *testing.T) {
 	}
 }
 
-// TestTrunkQuotaRateLimitStopsAnOverRateFlow: P-7's throughput limit.
+// TestTrunkQuotaRateLimitSlowsAnOverRateFlow: P-7's throughput limit.
 //
-// The limit is a SUSTAINED RATE over a one-second window, not a lifetime
-// total: a cumulative cap would eventually kill every long transfer, and
-// P-7 says explicitly that exceeding the limit must only refuse NEW
-// requests, not kill the ones already running.
-func TestTrunkQuotaRateLimitStopsAnOverRateFlow(t *testing.T) {
+// The limit is a SUSTAINED RATE, and exceeding it SLOWS a running
+// transfer to the cap — it must not kill it. The forward loop used to
+// tear an over-rate flow down at the first dry bucket, which made the
+// cap a kill switch: a transfer faster than the cap DIED instead of
+// being slowed, and the test asserted exactly that. The test's own
+// comment said the opposite ("not kill the ones already running") —
+// the assertion and the requirement had drifted apart, and the
+// requirement is what TestTheRateQuotaThrottlesInsteadOfKilling now
+// pins in the forward loop.
+//
+// What is asserted HERE is the shape of the throttle end to end: all
+// the bytes arrive, the flow ends CLEANLY (a forwarded FIN, not a
+// teardown), and the cap actually held — the transfer took at least the
+// time the deficit implies.
+func TestTrunkQuotaRateLimitSlowsAnOverRateFlow(t *testing.T) {
 	f := newTrunkFixture(t)
 	aRead, aWrite := newPipeSessionPair()
 	tRead, cRead := newPipeSessionPair()
+
+	const capPerSec = 4 << 10 // 4 KiB/s
+	const records = 8
+	const size = 1 << 10 // 1 KiB each: 8 KiB total, 4 s of budget at the cap
 
 	trunk, err := NewRelayTrunk(RelayTrunkConfig{
 		Self:    f.hub.ID(),
@@ -1925,7 +1981,7 @@ func TestTrunkQuotaRateLimitStopsAnOverRateFlow(t *testing.T) {
 		Enabled: true,
 		Quota: RelayQuota{
 			MaxStreams:     DefaultRelayMaxStreams,
-			MaxBytesPerSec: 1024, // 1 KiB/s
+			MaxBytesPerSec: capPerSec,
 		},
 		Dial: func(ctx context.Context, target identity.DeviceID, kind string) (Session, error) {
 			return tRead, nil
@@ -1942,34 +1998,51 @@ func TestTrunkQuotaRateLimitStopsAnOverRateFlow(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Push far more than the rate limit in one window. The flow must be
-	// torn down rather than allowed to run over the limit.
-	//
-	// The writer runs in its own goroutine and IGNORES the write error:
-	// once the trunk tears the flow down, the write fails, and that is
-	// the expected outcome — not a failure of the test.
+	start := time.Now()
 	go func() {
-		for i := 0; i < 200; i++ {
+		for i := 0; i < records; i++ {
 			if err := writeRelayRecord(aWrite, relayRecord{
 				Type: uint8(wire.FrameMeshRelayData),
-				Data: make([]byte, 4096),
+				Data: make([]byte, size),
 			}); err != nil {
 				return
 			}
 		}
+		_ = aWrite.Close()
 	}()
 
-	// The target's side must see the flow end: the trunk closes the
-	// target's stream when it tears the flow down.
+	// Every record arrives — the cap slowed the transfer, it did not cut
+	// it — and the stream ends with the requester's FIN.
 	br := bufio.NewReader(cRead)
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		if _, err := readRelayRecord(br); err != nil {
-			return // the flow ended, as it must
+	deadline := time.Now().Add(30 * time.Second)
+	open, err := readRelayRecord(br)
+	if err != nil {
+		t.Fatalf("the target received nothing: %v", err)
+	}
+	if open.Type != uint8(wire.FrameMeshRelayOpen) {
+		t.Fatalf("the target's first record is type %d, want the open record", open.Type)
+	}
+	for i := 0; i < records; i++ {
+		_ = cRead.SetReadDeadline(deadline)
+		rec, err := readRelayRecord(br)
+		if err != nil {
+			t.Fatalf("record %d of %d never arrived: %v — the cap killed a transfer it should have slowed", i+1, records, err)
 		}
-		if time.Now().After(deadline) {
-			t.Fatal("the over-rate flow was not torn down: the rate quota did not stop it")
+		if rec.Type == uint8(wire.FrameMeshRelayClose) {
+			t.Fatalf("record %d of %d was followed by a CLOSE: the quota tore the flow down", i+1, records)
 		}
+	}
+	_ = cRead.SetReadDeadline(deadline)
+	if _, err := readRelayRecord(br); !errors.Is(err, io.EOF) {
+		t.Fatalf("after all the data the target saw %v, want the forwarded FIN", err)
+	}
+
+	// The cap HELD: the first second's budget (the full bucket) covers
+	// the first 4 records; the remaining 4 KiB must have taken about a
+	// second. A floor with slack, because the assertion is "slower than
+	// the wire", not a stopwatch.
+	if elapsed := time.Since(start); elapsed < 700*time.Millisecond {
+		t.Fatalf("the whole transfer took %s: the cap did not slow it at all", elapsed)
 	}
 }
 

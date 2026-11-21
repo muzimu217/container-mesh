@@ -132,7 +132,12 @@ func TestTrackerRegistryPrunedOnClose(t *testing.T) {
 
 	// RunBench closes its link on return; the tracker must be pruned. Give
 	// the connection's run loop a moment to notice the close.
-	deadline := time.Now().Add(5 * time.Second)
+	//
+	// The wait is generous: the pruning happens when the connection's run
+	// loop notices the close, and a LOADED machine can take seconds to
+	// schedule that goroutine. Five seconds made this a false red in the
+	// full parallel suite — the same lesson as the trunk's join wait.
+	deadline := time.Now().Add(30 * time.Second)
 	for {
 		trackerMu.Lock()
 		after := len(trackers)

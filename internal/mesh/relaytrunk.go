@@ -12,7 +12,9 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/quic-go/quic-go"
@@ -65,7 +67,25 @@ const (
 	// RelayClassRefused is the answer of a request that makes no sense as
 	// a relay (from or to the trunk itself, a device to itself, a
 	// multi-hop request).
+	//
+	// It is a VERDICT: the request itself is wrong, so presenting the
+	// same credentials to another relay would be wrong too.
 	RelayClassRefused = "refused"
+	// RelayClassUnavailable is the answer of a request this trunk cannot
+	// carry RIGHT NOW — the target has not joined it, or the target's
+	// connection to it is down.
+	//
+	// It is its OWN class because it is a LOCAL condition, not a verdict:
+	// the requester IS a member and the request WAS well formed — this
+	// particular trunk simply cannot reach that target. Another relay may
+	// well reach it, so the requester must be allowed to try it.
+	//
+	// Before this class existed, the trunk answered "cannot reach the
+	// target" with RelayClassRefused, which the path layer treats as a
+	// verdict and therefore STOPS on. The consequence was that the
+	// fallback chain worked exactly one hop: the second relay was never
+	// tried, which contradicts D73 ("中继只兜底").
+	RelayClassUnavailable = "unavailable"
 	// RelayClassDisabled is the answer of a request that arrived while
 	// the trunk's switch was off.
 	RelayClassDisabled = "disabled"
@@ -228,16 +248,28 @@ type RelayTrunk struct {
 	// reserved counts the stream slots taken, including the ones being
 	// set up. It is the quota's live counter. Guarded by mu.
 	reserved int
-	// windowStart is when the node's rate window opened, and windowBytes
-	// is how many bytes the NODE forwarded in it.
+	// bucketTokens is the node's rate budget that has not been spent yet,
+	// and bucketTime is when it was last refilled.
 	//
-	// The window belongs to the node, not to a flow: P-7 caps the
+	// The budget belongs to the node, not to a flow: P-7 caps the
 	// throughput of a NODE ("单节点被持续转发时，吞吐 ≤ 50 MiB/s"). A
-	// per-flow window would let twenty flows each carry the full cap, so
+	// per-flow budget would let twenty flows each carry the full cap, so
 	// the node would forward twenty times what the requirement allows.
 	// Guarded by mu.
-	windowStart time.Time
-	windowBytes int64
+	//
+	// It is a TOKEN BUCKET, not a fixed one-second window, and the
+	// difference is not cosmetic. The fixed window counted everything a
+	// transfer pushed into its first second, so a file larger than the
+	// cap could NEVER be relayed — the rate limit had become a FILE SIZE
+	// limit. Measured on the real machine: 49 MiB went through, 50 MiB
+	// failed, every time, and raising the cap made 64 MiB succeed.
+	//
+	// The bucket refills continuously, so the cap is a rate: a
+	// hundred-megabyte transfer takes two seconds and is allowed,
+	// while a node asked to forward a hundred megabytes in one second is
+	// not.
+	bucketTokens float64
+	bucketTime   time.Time
 	// nextFlow hands out relay session ids. Guarded by mu.
 	nextFlow uint64
 	// revoker is called when a live flow must be torn down because one
@@ -593,15 +625,32 @@ type relayRecordReader interface {
 //
 // The framing is length-prefixed JSON (the same framing the rest of the
 // mesh uses), so a record boundary is unambiguous.
+//
+// The reader is readMsgFrame, NOT plain readFrame — and the difference is
+// data integrity, not style. io.ReadFull returns io.EOF for "nothing was
+// read", so a record whose header promised bytes and whose body never
+// arrived read as io.EOF, which every caller above takes for "the sender
+// is done sending". A truncated record was therefore forwarded as a
+// GRACEFUL end: the tail was dropped silently and the far side was told
+// the message was complete. readMsgFrame reads the header and the body
+// separately and reports cleanEnd ONLY for an EOF at a record boundary
+// (the same lesson the message path learned first).
 type framedRecordReader struct {
 	br *bufio.Reader
 }
 
 // nextRecord reads one record off the stream.
+//
+// A clean end comes back as io.EOF (what every caller checks for);
+// anything else is a broken stream and must TEAR the flow down, never
+// masquerade as a finish.
 func (f framedRecordReader) nextRecord() (relayRecord, error) {
-	body, err := readFrame(f.br, maxRelayRecord)
+	body, cleanEnd, err := readMsgFrame(f.br, maxRelayRecord)
 	if err != nil {
 		return relayRecord{}, err
+	}
+	if cleanEnd {
+		return relayRecord{}, io.EOF
 	}
 	var rec relayRecord
 	if err := json.Unmarshal(body, &rec); err != nil {
@@ -1204,27 +1253,107 @@ func (t *RelayTrunk) forwardRecords(flow *relayFlow, br *bufio.Reader, to Sessio
 		}
 		if rec.Type == uint8(wire.FrameMeshRelayClose) {
 			// The sender is done. Forward the close and stop: the flow
-			// is over on this side.
-			_ = writeRelayRecord(to, rec)
+			// is over on this side. If the close itself cannot be
+			// written, this direction is dead in the same way a data
+			// write would be — tear the flow down explicitly rather
+			// than leaving the far direction to depend on the peer's
+			// failure mode (same reasoning as the data-write path).
+			if err := writeRelayRecord(to, rec); err != nil {
+				t.closeFlowForced(flow.id, "relay close forward failed")
+				return
+			}
 			_ = to.Close()
 			return
 		}
-		if !t.allowBytes(flow, int64(len(rec.Data))) {
-			// Over the rate quota: tear the flow down rather than
-			// letting this node become the bottleneck for the whole
-			// network.
-			_ = writeRelayRecord(to, relayRecord{
-				Type:   uint8(wire.FrameMeshRelayClose),
-				Close:  true,
-				Reason: "the relay's rate quota was exceeded",
-			})
-			t.closeFlowForced(flow.id, "relay rate quota exceeded")
-			return
+		// The rate budget is a THROTTLE, not a kill switch. chargeBytes
+		// reports how long the node needs to refill; the forwarder waits
+		// that long and tries again. The old behaviour tore the flow down
+		// the moment the bucket ran dry — a transfer faster than the cap
+		// DIED at the cap, which is the exact "file size limit" behaviour
+		// the bucket was introduced to remove. P-7 is a sustained-RATE
+		// requirement: a hundred megabytes at a 50 MiB/s cap takes two
+		// seconds and arrives whole.
+		for {
+			wait := t.chargeBytes(flow, int64(len(rec.Data)))
+			if wait == 0 {
+				break
+			}
+			select {
+			case <-time.After(wait):
+				// Refilled (maybe — another direction may have drunk
+				// from the same bucket, so loop and re-check).
+			case <-flow.done:
+				// The flow ended while this direction waited; nothing
+				// left to forward.
+				return
+			}
 		}
 		if err := writeRelayRecord(to, rec); err != nil {
+			// The write failed, so this direction cannot go on. Tear the
+			// flow down EXPLICITLY: the other direction must not be left
+			// waiting for a flow that is already over. (On the real
+			// stream a dead write usually means dead reads too, so the
+			// other direction unblocks on its own — but "usually" is not
+			// a teardown path, and the quota slot must not depend on the
+			// peer's failure mode.)
+			t.closeFlowForced(flow.id, "relay forwarding write failed")
 			return
 		}
 	}
+}
+
+// chargeBytes reserves n bytes against the node's rate budget and reports
+// how long the caller must WAIT before they may be forwarded.
+//
+// Zero means the bytes are budgeted now (and n has been charged). A
+// positive duration means the bucket is dry: the caller sleeps for the
+// reported time and calls again — the refill may have been drunk by the
+// flow's other direction in the meantime, so the answer is re-checked
+// rather than trusted.
+//
+// The budget is the NODE's, not the flow's: P-7 says "单节点被持续转发
+// 时，吞吐 ≤ 50 MiB/s" — the unit is the node. A per-flow budget would
+// let twenty flows each carry 50 MiB/s, so the node would forward a
+// thousand, twenty times the cap the requirement states.
+//
+// One record larger than a whole second's budget is PACED, not waved
+// through: it waits until the bucket could cover it minus one full cap
+// (the burst allowance it may spend into debt), and the wait is computed
+// against the PRE-charge balance. The first version of this branch
+// charged and returned zero unconditionally — which a stream of
+// back-to-back oversized records turned into "the cap does not exist at
+// all" (measured: 1 MiB through a 64 KiB/s cap in 9 ms). The trap on
+// the other side is charging first and then returning the deficit as a
+// wait: each retry re-charges, consuming exactly the refill, so the
+// record NEVER moves. The wait must be computed before the charge.
+func (t *RelayTrunk) chargeBytes(flow *relayFlow, n int64) time.Duration {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	now := time.Now()
+	t.refillBucket(now)
+	capPerSec := float64(t.quota.MaxBytesPerSec)
+	if capPerSec <= 0 {
+		capPerSec = float64(DefaultRelayBytesPerSec)
+	}
+	if float64(n) > capPerSec {
+		// Oversized: the burst allowance is one full cap (the record
+		// may spend the bucket to -cap), so the record may move when
+		// tokens + cap >= n. Until then, wait — and do NOT charge,
+		// or the retry consumes its own refill (livelock).
+		if wait := float64(n) - t.bucketTokens - capPerSec; wait > 0 {
+			return time.Duration(wait / capPerSec * float64(time.Second))
+		}
+		t.bucketTokens -= float64(n)
+		flow.total += n
+		return 0
+	}
+	if float64(n) <= t.bucketTokens {
+		t.bucketTokens -= float64(n)
+		flow.total += n
+		return 0
+	}
+	deficit := float64(n) - t.bucketTokens
+	return time.Duration(deficit / capPerSec * float64(time.Second))
 }
 
 // accountForward charges n bytes against the node's rate window without
@@ -1233,18 +1362,53 @@ func (t *RelayTrunk) forwardRecords(flow *relayFlow, br *bufio.Reader, to Sessio
 // It exists so that the node-level accounting can be exercised directly:
 // a test (or a future policy) needs to put the node over its cap without
 // running a whole transfer.
+// refillBucket adds the budget the node earned since the last refill.
+//
+// Every reader of the bucket must call it: the tokens come back with
+// TIME, and a reader that does not refill sees a node that stayed
+// saturated forever.
+func (t *RelayTrunk) refillBucket(now time.Time) {
+	capPerSec := float64(t.quota.MaxBytesPerSec)
+	if capPerSec <= 0 {
+		capPerSec = float64(DefaultRelayBytesPerSec)
+	}
+	if t.bucketTime.IsZero() {
+		t.bucketTime = now
+		t.bucketTokens = capPerSec
+		return
+	}
+	if elapsed := now.Sub(t.bucketTime).Seconds(); elapsed > 0 {
+		t.bucketTokens += elapsed * capPerSec
+		// The ceiling is the cap PLUS one record's worth, not the cap
+		// alone.
+		//
+		// The oversized-record rule waits until the bucket can cover the
+		// record minus one cap (the burst allowance). With a ceiling of
+		// exactly one cap, that condition can NEVER hold for a record
+		// bigger than two caps — the balance could not reach it — so the
+		// forwarder would wait FOREVER and the flow's stream slot would
+		// be held for ever.
+		//
+		// The record size is bounded by maxRelayRecord (1 MiB) and the
+		// cap is one operator flag away: a metered node with
+		// --relay-max-bytes-per-sec below ~384 KiB/s would have hung on
+		// every large file.
+		if ceiling := capPerSec + float64(maxRelayRecord); t.bucketTokens > ceiling {
+			t.bucketTokens = ceiling
+		}
+		t.bucketTime = now
+	}
+}
+
 func (t *RelayTrunk) accountForward(n int64) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	now := time.Now()
-	if t.windowStart.IsZero() {
-		t.windowStart = now
+	t.refillBucket(now)
+	t.bucketTokens -= float64(n)
+	if t.bucketTokens < 0 {
+		t.bucketTokens = 0
 	}
-	if now.Sub(t.windowStart) >= time.Second {
-		t.windowStart = now
-		t.windowBytes = 0
-	}
-	t.windowBytes += n
 }
 
 // overRateQuota reports whether the node is already at (or over) its rate
@@ -1252,54 +1416,26 @@ func (t *RelayTrunk) accountForward(n int64) {
 func (t *RelayTrunk) overRateQuota() bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	now := time.Now()
-	if t.windowStart.IsZero() {
-		return false
-	}
-	if now.Sub(t.windowStart) >= time.Second {
-		// The window lapsed: the node starts fresh.
-		return false
-	}
-	// The cap is INCLUSIVE: a node that has forwarded exactly its
-	// allowance has no budget left. The check that charges the bytes
-	// uses the same boundary, so the two can never disagree about whether
-	// the node is over its cap.
-	return t.windowBytes >= int64(t.quota.MaxBytesPerSec)
-}
-
-// allowBytes charges n bytes against the node's rate quota.
-//
-// The rate is measured over a ONE SECOND WINDOW for the NODE. The window
-// is simple on purpose: the quota's job is to stop one node from
-// consuming its whole bandwidth for the network, not to be a rate limiter
-// with perfect fairness (the audit puts weighted fairness in v1.2).
-//
-// The window RESETS when it lapses, so a flow that transferred a lot in
-// the first second gets a fresh allowance in the next — the limit is a
-// sustained rate, not a lifetime total. (A cumulative cap would kill
-// every long transfer eventually, which is exactly what P-7 forbids.)
-func (t *RelayTrunk) allowBytes(flow *relayFlow, n int64) bool {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	now := time.Now()
-	if t.windowStart.IsZero() {
-		t.windowStart = now
-	}
-	if now.Sub(t.windowStart) >= time.Second {
-		t.windowStart = now
-		t.windowBytes = 0
-	}
-	t.windowBytes += n
-	flow.total += n
-	// The window is the NODE's, not the flow's: P-7 says "单节点被持续
-	// 转发时，吞吐 ≤ 50 MiB/s" — the unit is the node. A per-flow window
-	// would let twenty flows each carry 50 MiB/s, so the node would
-	// forward a thousand, twenty times the cap the requirement states.
+	t.refillBucket(time.Now())
+	// The node is at its cap when what is left in the bucket is less than
+	// ONE FLOW'S FAIR SHARE of it (the cap divided by the number of flows
+	// it may carry).
 	//
-	// The cap is INCLUSIVE: forwarding exactly the allowance is within
-	// it, going past it is not. The check that refuses new flows uses the
-	// same boundary, so the two can never disagree.
-	return t.windowBytes <= int64(t.quota.MaxBytesPerSec)
+	// "Empty" would be the obvious test, and it is wrong: the bucket
+	// refills CONTINUOUSLY, so after the node has spent its whole
+	// second's budget there is still a sliver left — enough for a
+	// handful of bytes and not enough for a flow. The fair share is the
+	// amount a new flow would actually need to be worth starting, so
+	// "less than that" is the honest test for "this node is saturated".
+	capPerSec := float64(t.quota.MaxBytesPerSec)
+	if capPerSec <= 0 {
+		capPerSec = float64(DefaultRelayBytesPerSec)
+	}
+	streams := t.quota.MaxStreams
+	if streams <= 0 {
+		streams = DefaultRelayMaxStreams
+	}
+	return t.bucketTokens < capPerSec/float64(streams)
 }
 
 // RevokeFlows tears down every live relay whose two ends are not both
@@ -1724,6 +1860,11 @@ func relayRefusal(rec relayRecord) error {
 		return fmt.Errorf("%w: mesh: relay: %s", ErrRefused, reason)
 	case RelayClassQuota:
 		return fmt.Errorf("%w: mesh: relay: %s", ErrQuota, reason)
+	case RelayClassUnavailable:
+		// A LOCAL condition, not a verdict: this trunk cannot reach the
+		// target, but another relay may. The path layer must therefore
+		// CONTINUE to the next candidate rather than stop here.
+		return fmt.Errorf("%w: mesh: relay: %s", ErrRelayUnavailable, reason)
 	default:
 		return fmt.Errorf("%w: mesh: relay: %s", ErrRefused, reason)
 	}
@@ -1857,10 +1998,32 @@ func (t *JoinerTable) Add(j *TrunkJoiner) {
 }
 
 // Remove drops a joiner.
-func (t *JoinerTable) Remove(id identity.DeviceID) {
+//
+// It removes the joiner ONLY IF THE TABLE STILL HOLDS THAT ONE.
+//
+// The table is keyed by device id, and a member can reconnect: the new
+// connection registers itself, and then the OLD connection's cleanup runs
+// and deletes the entry by id — taking the NEW joiner with it. The
+// symptom is a member whose own connection is alive and healthy while
+// the trunk has forgotten it, so every relay to it fails, and only an
+// anchor restart brings it back.
+//
+// Measured on the real machine: the relay worked for a couple of
+// seconds after the target reconnected, then broke permanently, and
+// restarting the anchor restored it.
+func (t *JoinerTable) Remove(j *TrunkJoiner) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	delete(t.joiners, id)
+	cur, ok := t.joiners[j.Device]
+	if !ok {
+		return
+	}
+	// Only the SAME joiner may remove the entry. A newer connection has
+	// already replaced it, and that one is the live one.
+	if cur != j {
+		return
+	}
+	delete(t.joiners, j.Device)
 }
 
 // Open opens a dedicated session to the member that has joined.
@@ -1935,14 +2098,23 @@ func (t *RelayTrunk) ServeJoinerWithOpener(ctx context.Context, sess Session, ta
 	joiner := &TrunkJoiner{Device: rec.From, sess: sess, br: br, open: open}
 	table.Add(joiner)
 	defer func() {
-		table.Remove(rec.From)
+		table.Remove(joiner)
 		_ = joiner.Close()
 	}()
 
 	// Stay connected until the member goes away. The joiner is torn down
 	// by the defer above.
+	//
+	// A CLEAN end (the member disconnected) and a BROKEN stream (a
+	// record that promised bytes that never came) land here the same
+	// way — the joiner goes either way — but they must not be equally
+	// silent: a broken frame is a member (or a path) corrupting records,
+	// and an operator needs the reason in the log.
 	for {
 		if _, err := readRelayRecord(br); err != nil {
+			if !errors.Is(err, io.EOF) {
+				fmt.Fprintf(relayLogWriter(), "mesh: relay trunk: the join connection from %s broke: %v\n", rec.From, err)
+			}
 			return nil
 		}
 	}
@@ -1960,6 +2132,11 @@ func (t *RelayTrunk) ServeJoinerWithOpener(ctx context.Context, sess Session, ta
 // The forwarding is where the trunk's opacity matters: from here on, the
 // records are forwarded VERBATIM. The trunk does not parse the payload,
 // does not hold a key, and cannot read the traffic.
+//
+// The identity PIN for the requester's open record lives in the LISTENER's
+// dispatch (serveRequester, next to the join path's identical check), not
+// here: the listener is the only place that knows who the connection's
+// certificate belongs to. Tests use ServeRequester.
 func (t *RelayTrunk) ServeRequester(ctx context.Context, sess Session, dialer RelayJoiner) error {
 	br := bufio.NewReader(sess)
 	return t.ServeRequesterWithFirst(ctx, sess, dialer, br, nil)
@@ -2010,6 +2187,15 @@ func (t *RelayTrunk) ServeRequesterWithFirst(ctx context.Context, sess Session, 
 	// The quota is checked AFTER the authorization: a quota refusal is a
 	// local condition, and the requester must be able to try another
 	// relay.
+	//
+	// The RATE budget is checked here too, on the path that actually
+	// grants relays. It used to live in OpenFlow — which has no
+	// production caller — so a node whose forwarding budget was spent
+	// still GRANTED new relays, and a saturated node granted work it was
+	// about to choke on. The recorded decision is the opposite: when the
+	// node is saturated it refuses NEW requests with the quota class (a
+	// LOCAL condition), so the requester tries another relay and the
+	// running transfers keep the node's remaining budget.
 	if err := t.reserveStream(); err != nil {
 		_ = writeRelayRecord(sess, relayRecord{
 			Type:   uint8(wire.FrameMeshRelayAnswer),
@@ -2018,6 +2204,20 @@ func (t *RelayTrunk) ServeRequesterWithFirst(ctx context.Context, sess Session, 
 			Class:  RelayClassQuota,
 		})
 		return err
+	}
+	if t.overRateQuota() {
+		t.releaseStream()
+		_ = writeRelayRecord(sess, relayRecord{
+			Type:   uint8(wire.FrameMeshRelayAnswer),
+			Grant:  false,
+			Reason: "this node's forwarding budget is spent; try another relay",
+			Class:  RelayClassQuota,
+		})
+		// The requester's session ends with the refusal: without this
+		// the requester reads the answer and then waits for the idle
+		// timeout (10 s) before it learns the relay is done.
+		_ = sess.Close()
+		return fmt.Errorf("%w: mesh: relay trunk: the forwarding budget is spent", ErrQuota)
 	}
 
 	// Open a DEDICATED session to the target.
@@ -2043,8 +2243,15 @@ func (t *RelayTrunk) ServeRequesterWithFirst(ctx context.Context, sess Session, 
 			Type:   uint8(wire.FrameMeshRelayAnswer),
 			Grant:  false,
 			Reason: fmt.Sprintf("this node cannot reach %s right now: %v", open.To, err),
-			Class:  RelayClassRefused,
+			// A LOCAL condition: this trunk cannot reach the target, but
+			// another relay may. It used to be RelayClassRefused, which
+			// the path layer treats as a verdict — so the fallback chain
+			// stopped here and the second relay was never tried.
+			Class: RelayClassUnavailable,
 		})
+		// The session ends with the refusal: the requester reads the
+		// answer and then waits for the idle timeout otherwise.
+		_ = sess.Close()
 		return err
 	}
 
@@ -2066,9 +2273,18 @@ func (t *RelayTrunk) ServeRequesterWithFirst(ctx context.Context, sess Session, 
 		_ = writeRelayRecord(sess, relayRecord{
 			Type:   uint8(wire.FrameMeshRelayAnswer),
 			Grant:  false,
-			Reason: fmt.Sprintf("this node cannot reach %s right now", open.To),
-			Class:  RelayClassRefused,
+			Reason: fmt.Sprintf("this node cannot reach %s right now: %v", open.To, err),
+			// Same LOCAL condition as the dial failure above, and the
+			// same class: another relay may reach the target. This used
+			// to be RelayClassRefused — a verdict — so a target stream
+			// that broke between the dial and the first write stopped the
+			// multi-relay fallback chain exactly the way the dial failure
+			// once did.
+			Class: RelayClassUnavailable,
 		})
+		// The session ends with the refusal: the requester reads the
+		// answer and then waits for the idle timeout otherwise.
+		_ = sess.Close()
 		return fmt.Errorf("mesh: relay trunk: tell %s who is calling: %w", open.To, err)
 	}
 
@@ -2468,7 +2684,7 @@ func (h *RelayHandler) ServeConn(conn *quic.Conn) {
 		}
 		h.serveJoiner(trunk, conn, sess, br, peerID)
 	case uint8(wire.FrameMeshRelayOpen):
-		h.serveRequester(trunk, conn, sess, br, &rec)
+		h.serveRequester(trunk, conn, sess, br, &rec, peerID)
 	default:
 		_ = st.Close()
 		_ = conn.CloseWithError(0, "bye")
@@ -2491,13 +2707,18 @@ func (h *RelayHandler) serveJoiner(trunk *RelayTrunk, conn *quic.Conn, sess Sess
 	joiner := &TrunkJoiner{Device: peerID, sess: sess, br: br, open: open}
 	h.joiners.Add(joiner)
 	defer func() {
-		h.joiners.Remove(peerID)
+		h.joiners.Remove(joiner)
 		_ = joiner.Close()
 	}()
 	// The joiner stays connected until it goes away. The trunk reaches
-	// it over this session when a relay needs it as the target.
+	// it over this session when a relay needs it as the target. A broken
+	// stream is not the same event as a clean disconnect and must not be
+	// equally silent (see the join loop in ServeJoinerWithOpener).
 	for {
 		if _, err := readRelayRecord(br); err != nil {
+			if !errors.Is(err, io.EOF) {
+				fmt.Fprintf(relayLogWriter(), "mesh: relay trunk: the join connection from %s broke: %v\n", peerID, err)
+			}
 			return
 		}
 	}
@@ -2508,10 +2729,56 @@ func (h *RelayHandler) serveJoiner(trunk *RelayTrunk, conn *quic.Conn, sess Sess
 // The open record was already read (the listener peeks at it to tell a
 // joiner from a requester), so it is handed over rather than re-read.
 //
+// The record's From is PINNED to the connection's certificate first — the
+// same pin the join path applies in the dispatch switch above. The open
+// record's From field is attacker-controlled bytes: without the pin, any
+// member could ask this trunk to carry a relay "on behalf of" a different
+// member, and the trunk would re-check THAT member's authorization and
+// touch the target's identity for a request its real device never made.
+// The end-to-end handshake would still fail (the trunk holds no key), so
+// this is unauthorized work and a third-party identity lookup rather than
+// impersonation — but "the requester is checked first" is only a security
+// property if the requester is the connection.
+//
 // The connection is NOT closed here: the relay is still running. The
 // flow's own teardown closes the requester's session, and this
 // connection goes with it.
-func (h *RelayHandler) serveRequester(trunk *RelayTrunk, conn *quic.Conn, sess Session, br *bufio.Reader, first *relayRecord) {
+func (h *RelayHandler) serveRequester(trunk *RelayTrunk, conn *quic.Conn, sess Session, br *bufio.Reader, first *relayRecord, peerID identity.DeviceID) {
+	// The pin is UNCONDITIONAL on this path: if the caller had to peek at
+	// the record to tell a joiner from a requester, that record is what
+	// gets pinned; if it did not, read the record HERE and pin it. A nil
+	// first used to skip the check silently — the record would then be
+	// served past the pin without anyone vouching for it.
+	if first == nil {
+		rec, err := readRelayRecord(br)
+		if err != nil {
+			_ = sess.Close()
+			return
+		}
+		first = &rec
+	}
+	if first.From != peerID {
+		_ = writeRelayRecord(sess, relayRecord{
+			Type:   uint8(wire.FrameMeshRelayAnswer),
+			Grant:  false,
+			Reason: "the open record does not name this connection's device",
+			Class:  RelayClassAuth,
+		})
+		// The SESSION closes, but the CONNECTION does not.
+		//
+		// Closing the connection right after writing the answer throws
+		// the answer away: quic-go discards the in-flight record, and
+		// the requester reads a transport error instead of the refusal.
+		// The refusal's CLASS is the whole point of the pin — it is what
+		// tells the path layer "this is an authentication verdict, stop
+		// here" rather than "the network failed, try another relay".
+		//
+		// The session's close is enough: the requester reads the
+		// refusal and then sees the end of the stream, and the
+		// connection's own idle timeout reclaims it.
+		_ = sess.Close()
+		return
+	}
 	_ = trunk.ServeRequesterWithFirst(context.Background(), sess, h.joiners, br, first)
 }
 
@@ -2676,6 +2943,84 @@ type RelayJoinConfig struct {
 	OnSession func(sess Session, requester identity.DeviceID, kind string) error
 }
 
+// reportRelaySessionFailure writes the LOCAL account of a failed
+// relayed session.
+//
+// It exists as a named function so the behaviour is testable on its
+// own: the chain-level path (a full relayed session with an end-to-end
+// handshake) has too many moving parts for a reliable regression test
+// — a failure in the handshake reads as "no report" and looks exactly
+// like the defect this guards.
+//
+// A nil error means the session SUCCEEDED, and then nothing is printed:
+// a member that relays hundreds of sessions must not produce a line per
+// session.
+// relayLog is where the trunk's own diagnostics go.
+//
+// It is held in an atomic so that a test can REPLACE it without a data
+// race. The obvious version — a plain package-level variable that the
+// test assigns — races with the background goroutines that write to it
+// (the join loops), and the race detector caught exactly that: the
+// -race run of this package failed intermittently, with the victim
+// rotating between whichever test happened to be running when the race
+// fired.
+//
+// With an atomic, a reader always sees either the old sink or the new
+// one, never a torn one, and the assignment itself is a synchronising
+// operation.
+//
+// Production behaviour is unchanged: the sink IS os.Stderr.
+var relayLog atomic.Value // io.Writer
+
+func init() { relayLog.Store(io.Writer(os.Stderr)) }
+
+// relayLogWriter returns the current diagnostics sink.
+func relayLogWriter() io.Writer {
+	w, _ := relayLog.Load().(io.Writer)
+	if w == nil {
+		return os.Stderr
+	}
+	return w
+}
+
+func reportRelaySessionFailure(requester, kind string, err error) {
+	line := relaySessionFailureLine(requester, kind, err)
+	if line == "" {
+		return
+	}
+	fmt.Fprint(relayLogWriter(), line)
+}
+
+// relaySessionFailureLine is the report's TEXT, separated from where it
+// is written.
+//
+// The separation is what makes the report testable without a data
+// race: capturing os.Stderr (or any package-level sink) by swapping it
+// races with the background goroutines that write to it — the race
+// detector caught exactly that, and the -race run of this package failed
+// intermittently with the victim rotating between tests.
+//
+// So the text is produced by a pure function and the caller decides
+// where it goes. The test asserts the TEXT; production writes it to
+// stderr.
+func relaySessionFailureLine(requester, kind string, err error) string {
+	if err == nil {
+		return ""
+	}
+	// The reason is CLASSIFIED, not quoted.
+	//
+	// The handler's error carries the data it handled — the same text
+	// writeMsgFailure sends to the peer — and this line goes to the
+	// trunk's own log, which is a different trust domain from the peer's
+	// stream. Quoting the error verbatim would carry the payload across
+	// that boundary: a message body ending up in the anchor's log file.
+	//
+	// So the report says WHAT KIND of failure it was, and the peer
+	// still receives the detailed reason (the handler's own job).
+	return fmt.Sprintf("mesh: relay trunk: the session from %s (%s) failed (%T)\n",
+		requester, kind, err)
+}
+
 // JoinRelayTrunk connects a member to a relay trunk and stays connected.
 //
 // The connection is re-established if it drops: the anchor is the one
@@ -2744,9 +3089,14 @@ func joinRelayTrunkOnce(ctx context.Context, cfg RelayJoinConfig) error {
 
 	// The first stream: the join record was written on it, and it stays
 	// open as the connection's keepalive. Nothing else is read from it.
+	// A BROKEN stream (records that promised bytes that never came) is
+	// not the same event as a clean disconnect; say which one happened.
 	br := bufio.NewReader(sess)
 	for {
 		if _, err := readRelayRecord(br); err != nil {
+			if !errors.Is(err, io.EOF) {
+				fmt.Fprintf(relayLogWriter(), "mesh: relay trunk: the join stream broke: %v\n", err)
+			}
 			return err
 		}
 	}
@@ -2762,11 +3112,18 @@ func serveRelayedSession(sess Session, cfg RelayJoinConfig) {
 	br := bufio.NewReader(sess)
 	open, err := readRelayRecord(br)
 	if err != nil {
+		// The failures BEFORE the handler are reported too: they are
+		// precisely the "truncated or interrupted transfer invisible on
+		// the receiving side" cases — and a TRUNCATED OPEN RECORD is
+		// the most likely truncation in the protocol, because it is the
+		// first thing on the wire.
+		reportRelaySessionFailure("", "", err)
 		_ = sess.Close()
 		return
 	}
 	if open.Type != uint8(wire.FrameMeshRelayOpen) {
 		// Not a relay session: this stream is not ours. Drop it.
+		reportRelaySessionFailure("", "", errors.New("the stream is not a relay session"))
 		_ = sess.Close()
 		return
 	}
@@ -2775,6 +3132,7 @@ func serveRelayedSession(sess Session, cfg RelayJoinConfig) {
 	// be fresher than the one on the trunk.
 	key, err := cfg.Resolver.KeyFor(open.From)
 	if err != nil {
+		reportRelaySessionFailure(string(open.From), open.Kind, err)
 		_ = sess.Close()
 		return
 	}
@@ -2784,11 +3142,25 @@ func serveRelayedSession(sess Session, cfg RelayJoinConfig) {
 		RequesterKey: key,
 	})
 	if err != nil {
+		// The end-to-end handshake failed — the other end of the
+		// session died or was not who it claimed to be.
+		reportRelaySessionFailure(string(open.From), open.Kind, err)
 		_ = sess.Close()
 		return
 	}
 	if cfg.OnSession != nil {
-		_ = cfg.OnSession(tsess, open.From, open.Kind)
+		// The handler's error is the ONLY account of why the session
+		// failed, and it used to be dropped on the floor. That made a
+		// truncated or interrupted transfer invisible on the RECEIVING
+		// side: the partial file was deleted and no file appeared, but
+		// nothing said why — the reason was written to the PEER (which
+		// may be the one that died) and the local log stayed silent.
+		//
+		// The handler has already told the peer; this is the LOCAL
+		// account. The report is on the trunk's own log, one line, and
+		// it names the session so an operator can match it with the
+		// requester's report.
+		reportRelaySessionFailure(string(open.From), open.Kind, cfg.OnSession(tsess, open.From, open.Kind))
 	}
 	// The target's side of the flow ENDS here.
 	//

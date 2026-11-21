@@ -238,13 +238,27 @@ func cwndMean(s lossSnapshot) uint64 {
 // application's file/message streams, so the benchmark has no business-level
 // side effects.
 func RunBench(ctx context.Context, cfg DialConfig, bench BenchConfig) (BenchStats, error) {
+	stats, _, err := RunBenchWithPath(ctx, cfg, bench)
+	return stats, err
+}
+
+// RunBenchWithPath is RunBench, and it also reports which PATH the
+// session was established over.
+//
+// The path kind used to be dropped on the floor (`link, _, err :=`), so
+// a bench result could not be attributed to a route: a number printed by
+// the product's own throughput tool did not say whether it measured the
+// direct link or the relay. That matters most now that bench can take
+// the relay path at all — and it matters for the "direct vs relay"
+// comparison, which is the whole point of a throughput tool.
+func RunBenchWithPath(ctx context.Context, cfg DialConfig, bench BenchConfig) (BenchStats, PathKind, error) {
 	if err := validateBenchConfig(bench); err != nil {
-		return BenchStats{}, err
+		return BenchStats{}, PathDirect, err
 	}
 	cfg.Kind = KindBench
-	link, _, err := dialViaPicker(ctx, cfg)
+	link, kind, err := dialViaPicker(ctx, cfg)
 	if err != nil {
-		return BenchStats{}, err
+		return BenchStats{}, kind, err
 	}
 	defer link.Close()
 
@@ -253,24 +267,24 @@ func RunBench(ctx context.Context, cfg DialConfig, bench BenchConfig) (BenchStat
 		RateBytesPerSecond: bench.RateBytesPerSecond,
 	})
 	if err != nil {
-		return BenchStats{}, err
+		return BenchStats{}, kind, err
 	}
 	if _, err := fmt.Fprintf(link.Session(), "%s\n", req); err != nil {
-		return BenchStats{}, fmt.Errorf("mesh: send bench request: %w", err)
+		return BenchStats{}, kind, fmt.Errorf("mesh: send bench request: %w", err)
 	}
 	_ = link.Session().SetReadDeadline(time.Now().Add(10 * time.Second))
 	ack, err := readLine(link.br, MaxHelloBytes)
 	if err != nil {
-		return BenchStats{}, fmt.Errorf("mesh: read bench ack: %w", err)
+		return BenchStats{}, kind, fmt.Errorf("mesh: read bench ack: %w", err)
 	}
 	if string(ack) != "ok" {
-		return BenchStats{}, fmt.Errorf("mesh: bench refused: %s", ack)
+		return BenchStats{}, kind, fmt.Errorf("mesh: bench refused: %s", ack)
 	}
 	_ = link.Session().SetReadDeadline(time.Time{})
 
 	stats, err := runBenchStream(ctx, link.Session(), link.br, bench)
 	if err != nil {
-		return BenchStats{}, err
+		return BenchStats{}, kind, err
 	}
 	// The loss picture is read AFTER the transfer, so it covers every
 	// retransmission the transfer needed.
@@ -283,7 +297,7 @@ func RunBench(ctx context.Context, cfg DialConfig, bench BenchConfig) (BenchStat
 		lost := stats.Loss.PacketsLost
 		stats.PacketsLost = &lost
 	}
-	return stats, nil
+	return stats, kind, nil
 }
 
 func validateBenchConfig(cfg BenchConfig) error {
