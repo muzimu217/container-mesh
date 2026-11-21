@@ -550,7 +550,30 @@ func TestAnExpiredMemberCertificatePoisonsTheRelay(t *testing.T) {
 		t.Fatalf("the transfer failed BEFORE the expiry (took %s): %v", took, err)
 	}
 	t.Log("the relay works while the certificate is still valid")
-	time.Sleep(1100 * time.Millisecond)
+
+	// Wait for the expiry — by WAITING FOR IT, not by sleeping a fixed
+	// amount.
+	//
+	// The fixed sleep (1100 ms for a 900 ms certificate) was a timing
+	// assumption, and the whole package runs under -race with dozens of
+	// QUIC handshakes in parallel: on a loaded machine the sleep was
+	// already past the expiry when the next transfer started, and the
+	// test failed on a TIMEOUT in a place it did not mean to test. It
+	// passed alone every time and failed in the full-package run — the
+	// signature of a load-sensitive test, not of a product defect.
+	//
+	// Polling for the certificate to lapse is both slower-proof and
+	// faster: the test proceeds the moment the state it needs exists.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if _, lerr := (MemberListAdapter{List: f.members}).KeyFor(f.bob.ID()); lerr != nil {
+			break // the certificate has lapsed
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the certificate never lapsed")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 
 	// The trunk's authorization now refuses the member. This is the
 	// FIRST thing that breaks, and it breaks it visibly.
