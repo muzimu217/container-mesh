@@ -199,8 +199,22 @@ func (s *Server) handleAPIMesh(w http.ResponseWriter, r *http.Request) {
 	ids := members.IDs()
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 	for _, id := range ids {
-		if _, ok := members.Get(id); !ok {
+		mm, ok := members.Get(id)
+		if !ok {
 			continue // the list changed under us; the next poll is correct
+		}
+		// An EXPIRED certificate is not a member any more, and the
+		// member view already agrees: the snapshot leaves expired
+		// certificates out (internal/discovery/snapshot.go). The panel
+		// used to count them, so it reported a network bigger than the
+		// one the members actually see — measured on the real machine:
+		// the panel said 51 members while the members' own view said
+		// 23, because 28 of the roster's certificates had lapsed.
+		//
+		// The two numbers must not disagree: the operator asks the panel
+		// how big the network is, and that is the number they get.
+		if mm.Cert.Expired(time.Now()) {
+			continue
 		}
 		row := PanelMember{
 			DeviceID:  id,

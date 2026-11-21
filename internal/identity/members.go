@@ -5,6 +5,7 @@ package identity
 
 import (
 	"crypto/ed25519"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -80,6 +81,33 @@ type MemberList struct {
 	// an empty list must not grow one — the file shape stays readable by
 	// whatever wrote it last.
 	RevokedCreds map[string]time.Time `json:"revoked_creds,omitempty"`
+
+	// RevokedSigners is the set of delegator keys whose credential has
+	// been turned off, base64-encoded.
+	//
+	// It exists because a revocation does two things and the list above
+	// can only carry one of them. The list records the CREDENTIAL ID (so
+	// the credential string can never enrol again); but a revocation also
+	// REMOVES the devices that enrolled under that credential — and
+	// without this set, the removal cannot be recognised afterwards: the
+	// delegation record is deleted with it, so the key that signed those
+	// devices is no longer anywhere in the roster.
+	//
+	// The anchor's in-memory roster can be two seconds behind the file
+	// (it hot-reloads on a tick), and every write-back of the in-memory
+	// roster put the revoked devices BACK. Measured by kuku-sandbox-01
+	// with an ordered reproduction: a revoke and an enrolment issued
+	// together → the revoke reported "1 device(s) left the network", the
+	// enrolment with the SAME revoked credential was ACCEPTED, and the
+	// roster went back UP.
+	//
+	// So the set is the durable record of "these devices left", and it is
+	// merged on every write-back for the same reason the revocation list
+	// is: the file is the authority on what was turned off.
+	//
+	// omitempty, for the same reason as the list above: a roster written
+	// before this field existed must not grow one.
+	RevokedSigners map[string]string `json:"revoked_signers,omitempty"`
 
 	mu sync.Mutex
 }
@@ -172,6 +200,16 @@ func (m *MemberList) RevokeDelegation(id string) ([]DeviceID, error) {
 			delete(m.Members, devID)
 		}
 	}
+	// The delegator KEY goes on the revoked-signer set: the delegation
+	// record is about to be deleted, and without this the removal of the
+	// devices above could not be recognised afterwards (the key is the
+	// only thing that says which devices those were).
+	if m.RevokedSigners == nil {
+		m.RevokedSigners = make(map[string]string)
+	}
+	if len(d.DelegatorPub) > 0 {
+		m.RevokedSigners[base64.StdEncoding.EncodeToString(d.DelegatorPub)] = id
+	}
 	delete(m.Delegations, id)
 	// The id goes on the revocation list as part of the same mutation: the
 	// credential's account signature outlives the delegation record, so
@@ -217,6 +255,117 @@ func (m *MemberList) RevokeCredential(id string) (bool, error) {
 	m.RevokedCreds[id] = time.Now().UTC()
 	m.Version++
 	return true, nil
+}
+
+// mergeAccountID adopts the account id from a roster on disk, when this
+// list has none.
+//
+// The account id is what the anchor checks its roster against, and a
+// roster written without it is refused ("members file reload refused:
+// file is for account X, network is Y"). An empty list — the one a fresh
+// anchor's operator builds with `cred revoke` — has no account id of its
+// own, so it takes the one the file already records.
+func (m *MemberList) mergeAccountID(id DeviceID) {
+	if id == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.AccountID == "" {
+		m.AccountID = id
+	}
+}
+
+// mergeRevokedSigners adds the revoked delegator keys that the list does
+// not have yet.
+//
+// Like the revocation list, it only ever ADDS: a revocation is
+// permanent, and there is no command that un-revokes one.
+func (m *MemberList) mergeRevokedSigners(extra map[string]string) {
+	if len(extra) == 0 {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.RevokedSigners == nil {
+		m.RevokedSigners = make(map[string]string)
+	}
+	for k, v := range extra {
+		if _, seen := m.RevokedSigners[k]; !seen {
+			m.RevokedSigners[k] = v
+		}
+	}
+}
+
+// dropMembersOfRevokedSigners removes the members whose credential was
+// revoked and whose removal the in-memory list has not caught up with.
+//
+// A revocation does two things: it records the credential id, and it
+// REMOVES the devices that enrolled under that credential — the "the
+// devices left the network" the operator is told about. The anchor's
+// in-memory roster can be two seconds behind the file, so those removed
+// devices are still in it, and the next write-back would put them back:
+// the revocation would be recorded (that list is merged) while its
+// EFFECT was undone (the members were not).
+//
+// Measured by kuku-sandbox-01 with an ordered reproduction: a revoke and
+// an enrolment issued together → the revoke reported "1 device(s) left the
+// network", the enrolment with the SAME revoked credential was ACCEPTED,
+// and the roster went back UP.
+//
+// The revoked SIGNER KEY is what identifies those members: the
+// delegation record is deleted by the revocation, so the credential id
+// alone cannot say which devices were signed under it.
+//
+// The scope is deliberately narrow, because the in-memory list is
+// otherwise RIGHT about who joined: a device that enrolled a moment ago
+// is never dropped (its credential is not revoked), and a device the
+// ACCOUNT approved directly is never dropped either — the account is not
+// a credential.
+func (m *MemberList) dropMembersOfRevokedSigners() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.Members) == 0 || len(m.RevokedSigners) == 0 {
+		return
+	}
+	dropped := 0
+	for id, mem := range m.Members {
+		sp := mem.Cert.SignerPub
+		if len(sp) == 0 {
+			continue // directly approved by the account: not a credential's member
+		}
+		if _, revoked := m.RevokedSigners[base64.StdEncoding.EncodeToString(sp)]; revoked {
+			delete(m.Members, id)
+			dropped++
+		}
+	}
+	if dropped == 0 {
+		return
+	}
+	// The DELEGATION RECORD goes too.
+	//
+	// A revocation deletes it (RevokeDelegation), and the anchor's
+	// in-memory copy still has it — so the next write-back would put it
+	// back, and the delegation record is exactly what travels in the
+	// SNAPSHOT. Every member would then be told that a revoked
+	// delegator key is still authorised to sign certificates.
+	for id, d := range m.Delegations {
+		if len(d.DelegatorPub) == 0 {
+			continue
+		}
+		if _, revoked := m.RevokedSigners[base64.StdEncoding.EncodeToString(d.DelegatorPub)]; revoked {
+			delete(m.Delegations, id)
+		}
+	}
+	// The VERSION moves forward.
+	//
+	// The version is what orders the updates: a client ignores a
+	// snapshot whose version is not newer than the one it has. A drop
+	// that did not bump it would write the roster's version BACKWARDS
+	// (the file was already at a higher one), every client would treat
+	// the snapshot as stale and IGNORE it — and the revocation would
+	// never reach the network, even though it was in the file.
+	m.Version++
 }
 
 // mergeRevocations adds revocations that are not in the list yet.
@@ -415,8 +564,9 @@ func (m *MemberList) SaveMembers(path string) error {
 	return m.saveMembers(path, false)
 }
 
-// SaveMembersMerged writes the member list and KEEPS the revocations the
-// file already records.
+// SaveMembersMerged writes the member list and KEEPS what the file
+// already records: the revocations, the account id, and the MEMBERS the
+// file has dropped.
 //
 // The anchor saves the roster from its in-memory list, and that list only
 // catches up with the file every couple of seconds. So between "cred
@@ -430,10 +580,25 @@ func (m *MemberList) SaveMembers(path string) error {
 // all. Both credentials could enrol again — a rotation that is not
 // atomic is not a rotation.
 //
-// The file is the external authority here (the operator edits it, the
-// CLI writes it), so the file's revocations are merged IN on the way
-// out. The merge only ever ADDS: a revocation is permanent, and there
-// is no command that un-revokes one.
+// The MEMBERS were the second half of the same defect, and it is the
+// one that actually undoes the revocation's EFFECT. A revocation does
+// not only record an id: it also REMOVES the devices that enrolled under
+// that credential — that is the "the devices left the network" the
+// operator is told about. Those devices were still in the anchor's
+// in-memory list, so the next write-back put them BACK on the file.
+//
+// Measured by kuku-sandbox-01 (ordered reproduction): a revoke and an
+// enrolment issued together → the revoke reported "1 device(s) left the
+// network", the enrolment with the SAME revoked credential was ACCEPTED,
+// and the roster went back UP to 3 members.
+//
+// So the rule is: the FILE is the authority for what the roster
+// CONTAINS. A member the file has dropped does not come back because
+// the in-memory list still had it.
+//
+// The merge only ever REMOVES members (the file's view wins) and only
+// ever ADDS revocations (a revocation is permanent, and there is no
+// command that un-revokes one).
 func (m *MemberList) SaveMembersMerged(path string) error {
 	return m.saveMembers(path, true)
 }
@@ -443,8 +608,17 @@ func (m *MemberList) saveMembers(path string, mergeFileRevocations bool) error {
 		// Read the file's revocations FIRST, before taking the lock: the
 		// file is the authority for them, and the in-memory list may be
 		// behind it.
+		//
+		// The file's ACCOUNT ID comes along for the same reason: a fresh
+		// anchor has no roster, so the list the operator just built has
+		// no account id — and writing it back with an empty one would
+		// make the anchor refuse its own roster ("members file reload
+		// refused: file is for account X, network is Y").
 		if onDisk, err := LoadMembers(path); err == nil {
 			m.mergeRevocations(onDisk.RevokedCreds)
+			m.mergeAccountID(onDisk.AccountID)
+			m.mergeRevokedSigners(onDisk.RevokedSigners)
+			m.dropMembersOfRevokedSigners()
 		}
 	}
 	m.mu.Lock()
@@ -469,6 +643,15 @@ func (m *MemberList) saveMembers(path string, mergeFileRevocations bool) error {
 		snapshot.RevokedCreds = make(map[string]time.Time, len(m.RevokedCreds))
 		for k, v := range m.RevokedCreds {
 			snapshot.RevokedCreds[k] = v
+		}
+	}
+	// The revoked signer keys travel with them: they are what says which
+	// devices left the network, and without them the next write-back
+	// would put those devices back (see RevokedSigners).
+	if len(m.RevokedSigners) > 0 {
+		snapshot.RevokedSigners = make(map[string]string, len(m.RevokedSigners))
+		for k, v := range m.RevokedSigners {
+			snapshot.RevokedSigners[k] = v
 		}
 	}
 	m.mu.Unlock()
@@ -550,10 +733,96 @@ func LoadMembers(path string) (*MemberList, error) {
 	}
 	var m MemberList
 	if err := json.Unmarshal(blob, &m); err != nil {
+		// A hand-written roster is a normal thing for an operator to do,
+		// and "revoked_creds": [] is what a person writes to mean "no
+		// revocations" — but the field is a map, so the roster used to
+		// fail to load and EVERY command that reads it became unusable.
+		// (Found by the external tester, who wrote one.)
+		//
+		// The shape is repaired rather than refused: the content of the
+		// roster is still the operator's, and a roster that cannot be
+		// loaded is a roster that cannot be repaired either.
+		if repaired, ok := repairRosterShape(blob); ok {
+			if err := json.Unmarshal(repaired, &m); err == nil {
+				if m.Members == nil {
+					m.Members = make(map[DeviceID]Member)
+				}
+				return &m, nil
+			}
+		}
 		return nil, fmt.Errorf("identity: %s: not a member list: %w", path, err)
 	}
 	if m.Members == nil {
 		m.Members = make(map[DeviceID]Member)
 	}
 	return &m, nil
+}
+
+// repairRosterShape rewrites the two collections an operator is likely to
+// write in the wrong JSON shape: an empty ARRAY where a map belongs.
+//
+// Only the EMPTY case is repaired: "[]" means "none of them", and a
+// non-empty array carries ids that would have to be reinterpreted —
+// that is a roster the operator should look at, not one to guess at.
+func repairRosterShape(blob []byte) ([]byte, bool) {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(blob, &raw); err != nil {
+		return nil, false
+	}
+	changed := false
+	// The list covers every map-shaped field of the roster. A field
+	// added later must be added here too: a hand-written roster with
+	// `"revoked_signers": []` would otherwise fail to load AT ALL, and
+	// the anchor would refuse its own roster — the exact defect class
+	// this repair exists for (an external tester hand-wrote
+	// `"revoked_creds": []` and broke every cred command).
+	for _, key := range []string{"revoked_creds", "revoked_signers", "delegations"} {
+		v, ok := raw[key]
+		if !ok {
+			continue
+		}
+		var arr []json.RawMessage
+		if err := json.Unmarshal(v, &arr); err != nil {
+			continue // not an array: leave it alone
+		}
+		if len(arr) != 0 {
+			continue // a non-empty array is not something to guess at
+		}
+		raw[key] = json.RawMessage(`{}`)
+		changed = true
+	}
+	if !changed {
+		return nil, false
+	}
+	out, err := json.Marshal(raw)
+	if err != nil {
+		return nil, false
+	}
+	return out, true
+}
+
+// LoadMembersOrEmpty loads the roster, and treats a MISSING roster as an
+// empty one.
+//
+// A fresh anchor has no roster: no member has ever joined, so nothing has
+// ever been written. That is the normal state of a newly installed
+// anchor, and the operator's commands must work there — `cred revoke`
+// in particular, because "a credential that leaked before anyone used
+// it" is exactly the case a fresh anchor is in.
+//
+// The account id is a hint, not a requirement: an empty roster has no
+// members to attribute, and the one thing an empty roster must be able
+// to carry is a revocation.
+//
+// A roster that exists but does not parse is still an error: the
+// operator must see it, not have it papered over.
+func LoadMembersOrEmpty(path, accountID string) (*MemberList, error) {
+	m, err := LoadMembers(path)
+	if err == nil {
+		return m, nil
+	}
+	if !os.IsNotExist(err) {
+		return nil, err
+	}
+	return NewMemberList(DeviceID(accountID)), nil
 }

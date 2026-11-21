@@ -137,6 +137,179 @@ func discoveryAllowPrivate() bool {
 	return false
 }
 
+// resolvePanelToken decides the panel's data-endpoint token.
+//
+// The order is: the flag, then the ENVIRONMENT, then a generated one.
+//
+// The environment fallback matters for SECURITY, not for convenience: a
+// token on the command line is visible to every local user through
+// /proc/<pid>/cmdline, and the panel's data endpoint hands out the whole
+// roster. Measured on the real machine: with the token on the command
+// line, an unprivileged local user read it out of /proc and pulled the
+// full roster with it. A systemd unit can pass the token in the
+// environment instead, where only the account that owns the process can
+// read it.
+//
+// The second return value says whether the token was GENERATED here.
+// A generated token is printed once (the operator has no other way to
+// learn it); a supplied one is not (it is already in the operator's
+// hands, and printing it would put it into the journal).
+func resolvePanelToken(flagValue string) (string, bool) {
+	tok, generated, err := resolvePanelTokenFrom(flagValue, "")
+	if err != nil {
+		// resolvePanelToken is the no-file form: there is no file to
+		// misconfigure, so it cannot fail.
+		panic("cmesh: panel token resolution failed without a token file: " + err.Error())
+	}
+	return tok, generated
+}
+
+// resolvePanelTokenFrom decides the panel's data-endpoint token.
+//
+// The order is: the file, the flag, the ENVIRONMENT, then a generated
+// one.
+//
+// The FILE comes first because it is the only source that keeps the
+// token out of BOTH the command line and the process environment. A
+// token on the command line is visible to every local user through
+// /proc/<pid>/cmdline; a token in the environment is visible to every
+// process running as the same user (the service's own children
+// included). systemd's LoadCredential puts the file in a private
+// directory that only the service's own process can read, so neither
+// applies.
+//
+// Measured on the real machine: with the token on the command line, an
+// unprivileged local user read it and pulled the full roster with it.
+//
+// A file that was CONFIGURED but cannot be read — or that holds nothing
+// — is an ERROR, never a fall-through.
+//
+// It used to fall through, and that is worse here than it is for the
+// credential: the operator configured --panel-token-file, the file was
+// missing or empty, and the node started with a DIFFERENT token — the
+// environment's, the flag's, or a freshly generated one. The dashboard's
+// saved token then silently stopped working, and the operator's panel
+// went blank with no error anywhere. A token in the ENVIRONMENT is a
+// DOWNGRADE, not a clean zero: the value is there, but every process
+// running as the same user can read it out of /proc/<pid>/environ — so
+// falling back to it is not "no token", it is "a token with a worse
+// exposure", and the operator never asked for that.
+func resolvePanelTokenFrom(flagValue, fileValue string) (string, bool, error) {
+	if fileValue != "" {
+		tok, err := readTokenFile(fileValue)
+		if err != nil {
+			return "", false, fmt.Errorf("read the panel token file %s: %w", fileValue, err)
+		}
+		if tok == "" {
+			return "", false, fmt.Errorf(
+				"the panel token file %s is empty: the token opens the whole roster, "+
+					"and an empty file must not fall back to another source", fileValue)
+		}
+		return tok, false, nil
+	}
+	if tok := strings.TrimSpace(flagValue); tok != "" {
+		return tok, false, nil
+	}
+	if tok := strings.TrimSpace(os.Getenv("CMESH_PANEL_TOKEN")); tok != "" {
+		return tok, false, nil
+	}
+	// Generated, not defaulted: a fixed or guessable token would make
+	// the roster readable by anyone who finds the port.
+	return randomToken(), true, nil
+}
+
+// readTokenFile reads a token from a file.
+//
+// The file is read whole and trimmed: systemd's credential files carry
+// the value with a trailing newline.
+func readTokenFile(path string) (string, error) {
+	blob, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(blob)), nil
+}
+
+// resolveCredential decides where the team credential comes from.
+//
+// The order is: the FILE, the FLAG, the ENVIRONMENT.
+//
+// The FILE comes first for the same reason the panel token's file does:
+// it is the only source that keeps the credential out of BOTH the
+// command line and the process environment.
+//
+// This matters more for the credential than for the panel token. The
+// credential IS the authority to join the network — it is not a
+// read-only key. The panel token only opens the roster for reading;
+// the credential lets a holder mint a device certificate under the
+// account. So:
+//
+//   - on the command line → every local user reads it through
+//     /proc/<pid>/cmdline (measured on the real machine: `ps` printed
+//     the full credential string);
+//   - in the environment → every process running as the same user
+//     reads it (the service's own children included).
+//
+// systemd's LoadCredential puts the file in a private directory that
+// only the service's own process can read, so neither applies.
+//
+// The FLAG beats the ENVIRONMENT: a flag on the command line is a
+// deliberate choice by the operator who typed it, while an ambient
+// variable may have been exported for a completely different purpose —
+// a wrapper script, a CI job, a shell profile — and says nothing about
+// what THIS command should do.
+func resolveCredential(flagValue, fileValue string) (string, error) {
+	return resolveCredentialFrom(flagValue, fileValue, true)
+}
+
+// resolveCredentialFrom is resolveCredential with the environment
+// switchable.
+//
+// useEnv says whether the ambient environment may be consulted AT ALL.
+// The join turns it off on the invite path, and that is the whole point
+// of the switch: an exported CMESH_CRED must not decide which way the
+// operator is entering the network.
+//
+// It used to. The credential was resolved before the "either a
+// credential or an invite" check, so on a host that exported CMESH_CRED
+// globally — a wrapper script, a CI runner, a shell profile — `cmesh
+// join <invite>` failed with "pass either --cred or an invite string,
+// not both". The operator's invite was perfectly good; the ambient
+// variable broke it.
+//
+// A FILE that was configured but cannot be read — or that holds nothing
+// — is an ERROR, never a fall-through. A fall-through does not just hide
+// the mistake: it joins the network with a DIFFERENT credential than the
+// operator asked for, and the operator never finds out. The empty file
+// is the sharpest case: the secret was truncated or rotated away, and
+// the join would quietly use the ambient credential (or none).
+func resolveCredentialFrom(flagValue, fileValue string, useEnv bool) (string, error) {
+	if fileValue != "" {
+		tok, err := readTokenFile(fileValue)
+		if err != nil {
+			return "", fmt.Errorf("read the credential file %s: %w", fileValue, err)
+		}
+		if tok == "" {
+			return "", fmt.Errorf(
+				"the credential file %s is empty: the credential IS the authority to join, "+
+					"and an empty file must not fall back to another source", fileValue)
+		}
+		return tok, nil
+	}
+	if tok := strings.TrimSpace(flagValue); tok != "" {
+		return tok, nil
+	}
+	if useEnv {
+		// The environment is the LAST source, and it is a DOWNGRADE, not a
+		// clean zero: the token is there, but every process running as the
+		// same user can read it out of /proc/<pid>/environ.
+		if tok := strings.TrimSpace(os.Getenv("CMESH_CRED")); tok != "" {
+			return tok, nil
+		}
+	}
+	return "", nil
+}
+
 // randomToken returns a fresh panel token.
 //
 // A token is a bearer secret for the roster, so it is generated from the
@@ -214,9 +387,26 @@ func runInvite(args []string) error {
 		DiscoveryAddrs: []string(disc),
 		IssuedAt:       time.Now(),
 	}
+	// The addresses are VALIDATED before the invite is printed.
+	//
+	// Without this the invite could name an address that no joiner can
+	// ever reach ("malformed endpoint" on the far side), and the
+	// operator only found out when a joiner failed — the invite had
+	// looked perfectly fine while it was being handed out.
+	//
+	// The private-deployment switch applies here for the same reason it
+	// applies to the invite's own decoding: a LAN anchor is a legitimate
+	// anchor, and the operator has said so with the switch.
 	s, err := discovery.EncodeInvite(inv)
 	if err != nil {
 		return ExitError{Code: 1, Err: err}
+	}
+	// Round-trip it through the decoder: that is the joiner's own view of
+	// the invite, so if the joiner would refuse it, the operator finds
+	// out HERE rather than when a device fails to join.
+	if _, err := discovery.DecodeInviteWith(s, discoveryAllowPrivate()); err != nil {
+		return ExitError{Code: 1, Err: fmt.Errorf(
+			"the discovery address cannot be used by a joiner: %w", err)}
 	}
 	fmt.Fprintf(os.Stderr, "invite for account %s (valid advice for ~%s):\n\n", acc.ID(), *ttl)
 	fmt.Println(s)
@@ -262,7 +452,10 @@ func (c discoveryConfig) invite() (discovery.Invite, error) {
 	if c.Invite == "" {
 		return discovery.Invite{}, errors.New("this device has no saved discovery configuration")
 	}
-	return discovery.DecodeInvite(c.Invite)
+	// The private-deployment switch applies here too: an invite saved
+	// before the switch was set still names a private anchor, and the
+	// later commands (ping, msg, send-to) must be able to reach it.
+	return discovery.DecodeInviteWith(c.Invite, discoveryAllowPrivate())
 }
 
 // parsePubKeyString accepts a 32-byte public key as either base64 (what
@@ -358,7 +551,41 @@ func relayAnnounceHost(announce, addr string) string {
 	return host
 }
 
+// saveDiscoveryConfig writes the join configuration into the state
+// directory.
+//
+// The file carries the account key and the discovery addresses of the
+// network, so it is written with mode 0600.
+//
+// The mode is FIXED, not merely requested. os.WriteFile does NOT change
+// the mode of a file that ALREADY EXISTS: it only applies the mode when
+// it creates the file. So a discovery.json restored from a backup with
+// mode 0644 stayed world-readable — and every local user could read the
+// network's account key and addresses. The write therefore goes through
+// a temp file and a rename (the same shape as identity.SaveMembers),
+// and the mode is set on the temp file before the rename makes it
+// visible.
+//
+// The rename is also atomic, so a crash mid-write cannot leave a
+// truncated configuration behind: a half-written file would fail to
+// parse, and every later command (ping, msg, send-to) would refuse to
+// run on this device.
+//
+// The INVITE field is scrubbed of anything that looks like a credential.
+//
+// The credential path used to store the raw credential string there, and
+// the string carries the DELEGATOR PRIVATE KEY (the encoded credential is
+// `pub.secret`). It is the most sensitive secret in the project, and it
+// was written into a file that stays on disk indefinitely — outliving the
+// credential's revocation, and landing in every backup of the state
+// directory.
+//
+// The scrub is HERE, at the writer, rather than only at the call site:
+// the writer is the last place that can guarantee the file never holds
+// the secret, and a future caller that forgets will not silently write a
+// private key to disk.
 func saveDiscoveryConfig(dir string, cfg discoveryConfig) (string, error) {
+	cfg.Invite = scrubCredentialFromEntry(cfg.Invite)
 	b, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return "", err
@@ -367,7 +594,51 @@ func saveDiscoveryConfig(dir string, cfg discoveryConfig) (string, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}
-	return path, os.WriteFile(path, b, 0o600)
+	tmp, err := os.CreateTemp(dir, ".discovery.json.tmp")
+	if err != nil {
+		return "", err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // no-op after a successful rename
+	if _, err := tmp.Write(b); err != nil {
+		tmp.Close()
+		return "", err
+	}
+	if err := tmp.Close(); err != nil {
+		return "", err
+	}
+	if err := os.Chmod(tmpName, 0o600); err != nil {
+		return "", err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+// credentialMarker is what the configuration carries instead of a
+// credential: it says HOW the device joined, and it grants nothing.
+const credentialMarker = "credential"
+
+// looksLikeCredential reports whether a string is an encoded team
+// credential.
+//
+// The check is on the PREFIX, which is what credential.Encode writes, so
+// a credential cannot slip past by being formatted differently.
+func looksLikeCredential(s string) bool {
+	return strings.HasPrefix(strings.TrimSpace(s), credential.Prefix+".")
+}
+
+// scrubCredentialFromEntry replaces a credential with the marker.
+//
+// The marker is not a secret and not an invite: it is a note for whoever
+// reads the file. The derived fields (account id + discovery addresses)
+// are what every later command actually uses, so nothing is lost.
+func scrubCredentialFromEntry(entry string) string {
+	if looksLikeCredential(entry) {
+		return credentialMarker
+	}
+	return entry
 }
 
 // endpointsToSave returns the endpoint list to write into the device's
@@ -421,7 +692,8 @@ func runJoin(args []string) error {
 	// member process is resident: once it is in, it stays in until it is
 	// interrupted.
 	timeout := fs.Duration("timeout", 10*time.Minute, "how long to wait for approval before giving up (0 = forever); the member keeps running after the approval lands")
-	credStr := fs.String("cred", "", "team credential: join with this string instead of an invite (no per-device approval needed)")
+	credStr := fs.String("cred", "", "team credential: join with this string instead of an invite (no per-device approval needed). --cred-file and CMESH_CRED are the other sources, in that order of strength, so the credential need not be on the command line")
+	credFile := fs.String("cred-file", "", "read the team credential from this file (the credential is authority to join, so it is worth keeping out of the process list); a file that cannot be read or is empty is an error, never a fallback")
 	relayTrunk := fs.String("relay-trunk", "", "address of the relay trunk to join (host:port): this device stays connected to it so it can RECEIVE relayed sessions")
 	relayTrunkID := fs.String("relay-trunk-id", "", "device ID of the relay trunk (required with --relay-trunk: the join is pinned against it)")
 	if err := fs.Parse(args); err != nil {
@@ -437,13 +709,51 @@ func runJoin(args []string) error {
 		return ExitError{Code: 2, Err: errors.New(
 			"--timeout cannot be negative (0 means wait forever)")}
 	}
+	// The two ways in are exclusive: an invite positional argument, or a
+	// team credential.
+	//
+	// The check comes BEFORE the credential is resolved, and that order is
+	// the fix for the ambient-variable defect. It used to come after, so
+	// an exported CMESH_CRED decided which way the operator was entering
+	// the network: on a host that exports the variable globally — a
+	// wrapper script, a CI runner, a shell profile — `cmesh join <invite>`
+	// failed with "pass either --cred or an invite string, not both". The
+	// operator's invite was perfectly good; the ambient variable broke
+	// it.
+	hasInvite := fs.NArg() >= 1
+	explicitCred := strings.TrimSpace(*credStr) != "" || *credFile != ""
+	if hasInvite && explicitCred {
+		return ExitError{Code: 2, Err: errors.New(
+			"pass either --cred (or --cred-file) or an invite string, not both")}
+	}
+	// The credential can come from the environment or from a file, not
+	// only from the command line.
+	//
+	// The credential IS the authority to join, and a command line is
+	// visible to every local user through /proc/<pid>/cmdline — so
+	// `cmesh join --cred <string>` handed the network's front door to
+	// anyone on the machine. (Measured on the real machine: `ps` showed
+	// the full credential string.)
+	//
+	// The file is the strongest source: systemd's LoadCredential hands
+	// the service a private copy that only its own process can read, so
+	// the credential is in neither the process list nor the environment.
+	//
+	// The ENVIRONMENT is consulted only on the credential path: no invite
+	// was given, and no credential source was named on the command line.
+	// An ambient variable is a DOWNGRADE, not a clean zero — every
+	// process running as the same user can read it out of
+	// /proc/<pid>/environ — so it is the last source, and it never
+	// overrides what the operator asked for.
+	useEnv := !hasInvite && !explicitCred
+	cred, err := resolveCredentialFrom(*credStr, *credFile, useEnv)
+	if err != nil {
+		return ExitError{Code: 1, Err: err}
+	}
+	*credStr = cred
 	if *credStr == "" && fs.NArg() != 1 {
 		return ExitError{Code: 2, Err: errors.New(
 			"usage: cmesh join [flags] <invite-string> | cmesh join --cred <credential> (the invite goes last: flag parsing stops at the first positional argument)")}
-	}
-	if *credStr != "" && fs.NArg() != 0 {
-		return ExitError{Code: 2, Err: errors.New(
-			"pass either --cred or an invite string, not both")}
 	}
 
 	dir, err := stateDir(*state)
@@ -489,7 +799,13 @@ func runJoin(args []string) error {
 		inv = inviteFromCredential(cred)
 		credJoined = cred
 	} else {
-		inv, err = discovery.DecodeInvite(fs.Arg(0))
+		// The private-deployment switch reaches the INVITE's addresses
+		// too, not just the client's own configuration. Without this, a
+		// LAN deployment could use a credential but never an invite —
+		// and the error ("bad invite: malformed endpoint") pointed at
+		// the invite's shape instead of at the switch that would have
+		// allowed it.
+		inv, err = discovery.DecodeInviteWith(fs.Arg(0), discoveryAllowPrivate())
 		if err != nil {
 			return ExitError{Code: 1, Err: fmt.Errorf("bad invite: %w", err)}
 		}
@@ -627,10 +943,27 @@ func runJoin(args []string) error {
 	// these instead of re-parsing the raw string: `join --cred` stores a
 	// cmesh1. credential, which DecodeInvite cannot read, and re-parsing it
 	// broke every follow-up command (oh-no-agent, defect B-3).
+	//
+	// The CREDENTIAL itself is NOT stored.
+	//
+	// It used to be: the credential path put the raw string into the
+	// "invite" field, and the string carries the DELEGATOR PRIVATE KEY
+	// (the encoded credential is `pub.secret`). So the most sensitive
+	// secret in the project sat in a file on disk indefinitely — it
+	// outlived the credential's revocation (nothing removed it), and it
+	// landed in every backup or snapshot of the state directory.
+	//
+	// Nothing needs it there. The derived fields ARE what every later
+	// command reads: discoveryConfig.invite() returns them directly when
+	// they are set, and the credential path sets them. The raw string was
+	// dead weight, and it was the heaviest kind of dead weight.
 	entry := fs.Arg(0)
 	viaCredential := *credStr != ""
 	if viaCredential {
-		entry = *credStr
+		// A marker, not the secret: it says HOW this device joined, so an
+		// operator reading the file can tell the two entry paths apart
+		// without the file holding anything that grants access.
+		entry = credentialMarker
 	}
 	cfgPath, err := saveDiscoveryConfig(dir, discoveryConfig{
 		Invite:         entry,
@@ -928,7 +1261,8 @@ func runServeDiscovery(args []string) error {
 	// It is OFF unless asked for, and its data endpoint is protected by a
 	// token — the page itself is a static shell that carries no state.
 	panel := fs.Bool("panel", false, "serve the visualization panel at /panel (its data endpoint /api/mesh needs the panel token)")
-	panelToken := fs.String("panel-token", "", "token for the panel's data endpoint; generated and printed when --panel is set and this is empty")
+	panelToken := fs.String("panel-token", "", "token for the panel's data endpoint; generated and printed when --panel is set and this is empty. CMESH_PANEL_TOKEN is the fallback, so a service can keep the token OUT of its command line")
+	panelTokenFile := fs.String("panel-token-file", "", "read the panel token from this file (the systemd credential way: the token is in neither the command line nor the process environment)")
 	// The relay trunk: this node carries relays between two OTHER members
 	// when somebody asks it to (D73). It is off unless it is asked for —
 	// an anchor that relays for the whole network without being told is a
@@ -1022,11 +1356,20 @@ func runServeDiscovery(args []string) error {
 		Logger:  setupLogging(*verbose),
 	})
 	if *panel {
-		tok := *panelToken
-		if tok == "" {
-			// Generated, not defaulted: a fixed or guessable token would
-			// make the roster readable by anyone who finds the port.
-			tok = randomToken()
+		tok, generated, err := resolvePanelTokenFrom(*panelToken, *panelTokenFile)
+		if err != nil {
+			// A token file that was CONFIGURED but cannot be read is a
+			// mistake to report, not a reason to guess: the node would
+			// otherwise run with a DIFFERENT token and the dashboard's
+			// saved token would silently stop working.
+			return ExitError{Code: 2, Err: err}
+		}
+		if generated {
+			// The generated token is printed ONCE, because the operator
+			// has no other way to learn it. It is printed to STDERR, and a
+			// service that wants it out of the log entirely can set
+			// CMESH_PANEL_TOKEN instead.
+			fmt.Fprintf(os.Stderr, "  panel token: %s  (keep it private; the data endpoint rejects anything else)\n", tok)
 		}
 		srv.SetPanelToken(tok)
 		srv.SetAnchorDeviceID(dev.ID())
@@ -1037,8 +1380,14 @@ func runServeDiscovery(args []string) error {
 		if h, _, err := net.SplitHostPort(*addr); err == nil && h != "" && h != "0.0.0.0" && h != "::" {
 			panelHost = h
 		}
-		fmt.Fprintf(os.Stderr, "  panel: %s://%s/panel   (paste the token below into the page)\n", httpScheme, net.JoinHostPort(panelHost, portOf(*addr)))
-		fmt.Fprintf(os.Stderr, "  panel token: %s  (keep it private; the data endpoint rejects anything else)\n", tok)
+		fmt.Fprintf(os.Stderr, "  panel: %s://%s/panel   (paste the token into the page)\n", httpScheme, net.JoinHostPort(panelHost, portOf(*addr)))
+		if !generated {
+			// A token that came from the operator (flag or environment)
+			// is NOT printed: it is already in the operator's hands, and
+			// printing it puts it into the journal — which the
+			// systemd-journal group can read.
+			fmt.Fprintf(os.Stderr, "  panel token: set (kept out of this log; the data endpoint rejects anything else)\n")
+		}
 	}
 	srv.EnableDiscovery(members)
 

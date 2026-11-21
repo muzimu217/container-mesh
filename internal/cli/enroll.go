@@ -165,6 +165,21 @@ func installEnrollHandler(srv *relay.Server, membersPath string, members *identi
 			fmt.Fprintf(os.Stderr, "enrollment failed to persist: %v\n", err)
 			return discovery.EnrollResponse{OK: false, Message: "could not persist the roster: " + err.Error()}
 		}
+		// The device must still be on the roster AFTER the save.
+		//
+		// The merged save drops the members whose credential was
+		// revoked, and a credential revoked in the last couple of
+		// seconds (the window between the anchor's hot reload and this
+		// request) is exactly the case where the device this request
+		// just admitted is dropped by its own save.
+		//
+		// Without this check the anchor would answer "enrolled", log
+		// "enrolled device X", and the device would silently vanish —
+		// a joiner that believes it joined and is not a member.
+		if !live.Contains(res.DeviceID) {
+			fmt.Fprintf(os.Stderr, "enrollment of %s was dropped by the save: its credential has been revoked\n", res.DeviceID)
+			return discovery.EnrollResponse{OK: false, Message: "credential has been revoked; ask the owner for a new one"}
+		}
 		srv.SetMeshMembers(live)
 		fmt.Fprintf(os.Stderr, "enrolled device %s under a team credential (roster v%d)\n",
 			res.DeviceID, live.CurrentVersion())
