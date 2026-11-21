@@ -24,7 +24,32 @@ StateDirectoryMode=0750
 # environment file. ${CMESH_ACCOUNT_PUB} is not optional in practice:
 # without --account-pub the node does not mount the enrollment endpoint at
 # all, so a member cannot join with a team credential.
-ExecStart=/opt/container-mesh/current/cmesh serve-discovery --state ${CMESH_STATE} --addr ${CMESH_ADDR} --announce ${CMESH_ANNOUNCE} --account-pub ${CMESH_ACCOUNT_PUB}
+# --relay-trunk makes this node carry RELAYED sessions between members
+# that have no inbound port of their own — the shape the whole trunk
+# exists for. Without it, a pure-outbound member cannot be reached at
+# all.
+#
+# --panel serves the operator's dashboard and its data endpoint. Without
+# it there is no way to see the roster.
+#
+# The PANEL TOKEN is in neither the command line nor the environment.
+#
+# A token in the argument list is visible to every local user through
+# /proc/<pid>/cmdline. A token in the environment is visible to every
+# process running as the same user — the service's own children
+# included. The data endpoint hands out the WHOLE roster, so the token
+# is worth protecting properly.
+#
+# LoadCredential gives the service a private copy of a root-owned file
+# (mode 0600), readable by the service's process and by nobody else.
+# Put the token in /etc/cmesh/panel-token and point
+# LoadCredential at it; the CLI reads it with --panel-token-file.
+#
+# Measured on the real machine: with the token on the command line, an
+# unprivileged local user read it out of /proc and pulled the full
+# roster with it.
+LoadCredential=panel-token:/etc/cmesh/panel-token
+ExecStart=/opt/container-mesh/current/cmesh serve-discovery --state ${CMESH_STATE} --addr ${CMESH_ADDR} --announce ${CMESH_ANNOUNCE} --account-pub ${CMESH_ACCOUNT_PUB} --relay-trunk --panel --panel-token-file ${CREDENTIALS_DIRECTORY}/panel-token
 
 Restart=on-failure
 RestartSec=5s
@@ -32,6 +57,12 @@ RestartSec=5s
 # The relay drains on SIGTERM: the HTTP listener closes and pairing rooms
 # unwind before the process exits. Allow that drain to finish instead of
 # being killed mid-way, and make the stop signal explicit.
+#
+# NOTE, measured on the real machine: the ANCHOR does not broadcast a
+# LEAVE when it stops. The graceful-departure broadcast belongs to the
+# MEMBER side (the join process announces its own departure); the anchor
+# shuts its HTTP listener down and the members see the anchor go quiet.
+# Do not read a missing LEAVE here as a bug — there is none to send.
 KillSignal=SIGTERM
 TimeoutStopSec=15s
 

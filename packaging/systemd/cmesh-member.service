@@ -1,0 +1,173 @@
+[Unit]
+Description=container-mesh member (joins with a team credential)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=cmesh
+Group=cmesh
+
+# The environment file is NOT optional. The leading "-" would let systemd
+# start the unit with every variable empty, and an empty ${CMESH_STATE}
+# then reaches the CLI as an empty --state, which silently falls back to
+# ~/.cmesh -- a path the hardening below makes read-only, and the wrong
+# place for the node's state anyway. A missing file must fail loudly.
+#
+# Measured on a real Linux systemd host: with a missing EnvironmentFile
+# the unit fails with Result=resources and
+# "Failed to load environment files: No such file or directory".
+EnvironmentFile=/etc/cmesh/member.env
+
+# The member gets its OWN state directory. It must not share one with the
+# anchor (cmesh-discovery.service).
+#
+# StateDirectory=cmesh maps to /var/lib/cmesh, and the anchor already
+# claims exactly that name. Two units naming the same StateDirectory
+# share ONE directory, so the member's device identity (device.json, the
+# private key) and its inbox would land inside the directory the anchor
+# service also owns and writes to. That is a shared blast radius for two
+# different trust domains, for no reason.
+#
+# The member's state holds a DEVICE PRIVATE KEY and the credential
+# material, so the directory is 0700 rather than the anchor's 0750: the
+# anchor's directory is readable by the cmesh group for the operator's
+# convenience, the member's is not.
+#
+# Measured on a real Linux systemd host: StateDirectory=cmesh-member
+# StateDirectoryMode=0700 with User=cmesh Group=cmesh yields
+# "700 cmesh:cmesh /var/lib/cmesh-member", while the anchor's
+# /var/lib/cmesh is "750 cmesh:cmesh". They are different directories.
+StateDirectory=cmesh-member
+StateDirectoryMode=0700
+
+# The TEAM CREDENTIAL is the authority to join: whoever holds it can mint a
+# device certificate under the account. It is the most sensitive secret this
+# project has -- more so than the panel token, which only opens the roster
+# for reading.
+#
+# Do not put it on the command line. A command line is visible to every
+# local user through /proc/<pid>/cmdline. Do not put it in the
+# environment file either: EnvironmentFile variables DO land in the
+# service's environ, where every process running as the same user (the
+# service's own children included) can read them.
+#
+# LoadCredential gives the service a private copy of a root-owned file
+# (mode 0600), readable by the service's process and by nobody else. Put
+# the credential in /etc/cmesh/cred and point LoadCredential at it; the
+# CLI reads it with --cred-file.
+#
+# The credential is MANDATORY here, and the unit says so on purpose. The
+# no-"-" prefix on LoadCredential= is what makes it mandatory: a missing
+# /etc/cmesh/cred makes the unit FAIL TO START before ExecStart ever
+# runs. That is the correct behaviour for the member -- it cannot join
+# without the credential, and a member that starts without one and then
+# retries forever is a much worse failure than a unit that refuses to
+# start with a clear error. (The anchor's panel token is the same story:
+# a node whose panel token file is missing must not come up.)
+#
+# NOTE on the "-" prefix, MEASURED on the real systemd host (175,
+# systemd 255): a missing credential fails the unit with
+# "Failed to set up credentials" and status 243/CREDENTIALS -- and where
+# the dash stands decides WHERE it may go, not whether the file is
+# required:
+#
+#   LoadCredential=cred:/etc/cmesh/missing   -> FAILS (243, measured)
+#   LoadCredential=-cred:/etc/cmesh/missing  -> FAILS (243, measured):
+#       the dash becomes part of the NAME; it does NOT make the file optional
+#   LoadCredential=cred:-/etc/cmesh/missing  -> STARTS (measured,
+#       Result=success): the dash before the PATH is what makes the file
+#       optional
+#
+# The unit deliberately does NOT use the dash-before-path form: the member
+# cannot join without the credential, and starting without one to retry
+# forever is a worse failure than refusing to start with a clear error.
+# (The anchor's panel token is the same story: a node whose panel token
+# file is missing must not come up.)
+#
+# Measured on the real machine: with the credential on the command line, ps
+# printed the whole credential string.
+LoadCredential=cred:/etc/cmesh/cred
+ExecStart=/opt/container-mesh/current/cmesh join --state ${CMESH_STATE} --cred-file ${CREDENTIALS_DIRECTORY}/cred --listen ${CMESH_LISTEN} $CMESH_TRUNK_ARGS
+
+# The relay trunk is OPTIONAL for the CLI and MANDATORY for the
+# deployment, and those are different things, so the unit checks it
+# itself.
+#
+# Why the check is here: the CLI treats --relay-trunk as "if this is
+# non-empty, join that trunk". An EMPTY --relay-trunk makes the CLI skip
+# the whole relay-trunk block silently (verified against the real binary
+# and against the flag definitions in internal/cli/discovery.go runJoin).
+# The member then comes up healthy and stays healthy forever, and it is
+# pure-outbound: it can dial the anchor, but nothing can reach it back.
+# That is exactly the failure the trunk exists to prevent, and it is
+# invisible -- no error, no failed start, just a member that is never
+# reachable. A pure-outbound member is a valid configuration, so this
+# unit cannot simply require the trunk; it has to be loud about it.
+#
+# The check reads the SAME two variables the CLI would have read, so what
+# is validated is exactly what is used.
+#
+# "$$" is systemd's escape for a literal dollar sign: without it systemd
+# would expand ${CMESH_RELAY_TRUNK} ITSELF (to the empty string) before
+# /bin/sh ever sees it, and the shell would test the wrong thing.
+# Measured on a real Linux systemd host: with CMESH_RELAY_TRUNK empty in
+# the environment file, the guard below prints
+# "cmesh-member: CMESH_RELAY_TRUNK is not set" and the unit fails with
+# Result=exit-code, status=1/FAILURE.
+ExecStartPre=/bin/sh -c 'if [ -z "$${CMESH_RELAY_TRUNK}" ] || [ -z "$${CMESH_RELAY_TRUNK_ID}" ]; then echo "cmesh-member: CMESH_RELAY_TRUNK and CMESH_RELAY_TRUNK_ID must both be set: without a relay trunk this member is pure-outbound and can never RECEIVE a relayed session (see the member env example)" >&2; exit 1; fi'
+
+# The trunk flags travel in ONE variable, not as two separate ${VAR}
+# expansions, and this is a correctness requirement, not a style choice.
+#
+# Go's flag package consumes the NEXT argument as the value of a flag
+# that needs one. If the trunk flags were spelled out as two separate
+# expansions and the variables were empty, the CLI would receive
+# "--relay-trunk --relay-trunk-id" and take the literal string
+# "--relay-trunk-id" as the VALUE of --relay-trunk. Measured with the
+# real flag definitions: --relay-trunk then holds "--relay-trunk-id" and
+# --relay-trunk-id stays empty, and the CLI's own check ("--relay-trunk
+# needs --relay-trunk-id") never fires because the first one looks set.
+#
+# systemd's expansion is what makes this reachable. Measured on a real
+# Linux systemd host:
+#   - "${VAR} unset" expands to exactly ONE EMPTY argument, so the CLI
+#     sees --relay-trunk "" --relay-trunk-id "". The empty value is
+#     harmless: the CLI skips the relay-trunk block, and the guard above
+#     refuses to start before that.
+#   - "$VAR unset" (UNBRACED) expands to ZERO arguments, so the CLI sees
+#     "--relay-trunk --relay-trunk-id" and the mis-parse happens.
+#   - "$VAR set to 'one two'" splits into two arguments.
+# So an unbraced $VAR is both the dangerous form and the form that
+# splits, and a braced ${VAR} cannot carry the two flags as two
+# arguments at all (it is always exactly one argument).
+#
+# One variable, expanded unbraced, is the only shape that satisfies all
+# three requirements at once: it disappears entirely when unset (so no
+# flag is ever half-present), it splits into several arguments when set,
+# and it carries a whole flag list. Measured on a real Linux systemd
+# host: unset -> the program sees 2 arguments; set to
+# "--relay-trunk 10.0.0.1:18090 --relay-trunk-id abcdefghijklmnop" ->
+# the program sees 6 arguments with the values intact.
+Environment=CMESH_TRUNK_ARGS=
+
+Restart=on-failure
+RestartSec=5s
+
+# The member announces its own departure on SIGTERM, so the anchor and the
+# other members see it go. Give that broadcast a moment to leave.
+KillSignal=SIGTERM
+TimeoutStopSec=15s
+
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+# StateDirectory= above already excludes /var/lib/cmesh-member from
+# ProtectSystem=strict, so this line is belt and braces: it names the
+# member's OWN directory, not the anchor's.
+ReadWritePaths=/var/lib/cmesh-member
+
+[Install]
+WantedBy=multi-user.target

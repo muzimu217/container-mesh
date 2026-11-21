@@ -192,7 +192,22 @@ replace_link() {
     fi
     # BSD mv has no -T and follows a directory symlink. Remove only the
     # managed link after the new link is ready, then rename it into place.
-    rm -f "$link"
+    #
+    # The removal is -rf, not -f: `current` can be a DIRECTORY (a
+    # half-finished earlier install, or somebody's own directory), and
+    # `rm -f` on a directory fails — the install then died with "cannot
+    # remove: Is a directory" and left the staged link behind as an
+    # orphan, with `current/cmesh` still pointing at nothing.
+    #
+    # The -rf is safe because `link` is the MANAGED name inside the
+    # install root, and the root is checked to be a cmesh install root
+    # (with its marker file) before this runs. The guard below refuses
+    # the one path that would be catastrophic: removing the root itself.
+    case "$link" in
+        "$INSTALL_DIR"/*) ;;
+        *) die "refusing to replace a link outside the install root: $link" ;;
+    esac
+    rm -rf "$link"
     mv -f "$tmp" "$link"
 }
 cp "$tmpdir/$asset_base" "$stage/cmesh"

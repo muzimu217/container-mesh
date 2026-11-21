@@ -364,7 +364,35 @@ func EncodeInvite(inv Invite) (string, error) {
 
 // DecodeInvite parses an invite string. Malformed input yields an error
 // rather than a partial invite.
+//
+// The addresses in an invite are validated under the STRICT origin
+// policy: an invite is attacker-controllable input, so a private address
+// in one is refused. Use DecodeInviteWith when the caller has the
+// operator's private-deployment switch on.
 func DecodeInvite(s string) (Invite, error) {
+	return DecodeInviteWith(s, false)
+}
+
+// DecodeInviteWith parses an invite string, with the private-address
+// policy switched.
+//
+// The private-deployment switch (CMESH_ALLOW_PRIVATE_DISCOVERY) relaxes
+// the outbound address policy so a LAN anchor can be reached. It used to
+// apply ONLY to the client's own configuration — the addresses it was
+// given — and NOT to the addresses inside an INVITE, because the invite
+// was decoded through the unswitchable form.
+//
+// That left a private deployment half-broken: the switch was exported,
+// the credential join worked, and the INVITE join still refused the very
+// address the operator had just configured ("bad invite: discovery:
+// malformed endpoint"). The error pointed at the invite's shape, not at
+// the switch that would have allowed it.
+//
+// The two forms are genuinely different inputs: the client's own
+// configuration comes from the operator, while an invite can be
+// forwarded or pasted anywhere. So the invite keeps the strict policy by
+// default, and the operator's explicit switch is what relaxes it.
+func DecodeInviteWith(s string, privateAllowed bool) (Invite, error) {
 	if !strings.HasPrefix(s, "cmesh://join?") {
 		return Invite{}, errors.New("discovery: not a cmesh invite")
 	}
@@ -397,7 +425,7 @@ func DecodeInvite(s string) (Invite, error) {
 		// Discovery addresses are server origins, so they use the stricter
 		// origin policy applied by the client. Keep the original spelling in
 		// the invite after validating it.
-		if _, err := normalizeBaseURL(a); err != nil {
+		if _, err := normalizeBaseURLWith(a, privateAllowed); err != nil {
 			return Invite{}, fmt.Errorf("%w: %q", ErrAnnounceBadEndpoint, a)
 		}
 		inv.DiscoveryAddrs = append(inv.DiscoveryAddrs, a)

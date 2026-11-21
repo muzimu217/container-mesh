@@ -87,6 +87,36 @@ type MemberSnapshot struct {
 	Delegations []identity.Delegation            `json:"delegations,omitempty"`
 }
 
+// liveDelegations lists the delegations that are still usable.
+//
+// The expired ones are left out, exactly as the expired CERTIFICATES are.
+// A lapsed delegation authorises nothing: every client that receives it
+// rejects it and logs a warning — and since the roster keeps the record
+// (nothing reaps it), EVERY client logged that warning on EVERY snapshot,
+// for every lapsed credential, forever.
+//
+// The external tester saw it plainly: a forty-member network carried four
+// stale delegations, and every snapshot produced four warnings that said
+// nothing an operator could act on.
+//
+// The roster still keeps the record — this only decides what TRAVELS.
+func liveDelegations(members *identity.MemberList, now time.Time) []identity.Delegation {
+	all := members.DelegationList()
+	out := make([]identity.Delegation, 0, len(all))
+	for _, d := range all {
+		if d.ExpiresAt.IsZero() {
+			// No expiry recorded: it never lapses.
+			out = append(out, d)
+			continue
+		}
+		if now.After(d.ExpiresAt) {
+			continue
+		}
+		out = append(out, d)
+	}
+	return out
+}
+
 // BuildSnapshot combines the member list (who belongs) with the node's
 // liveness view (who announced recently). Members with no recorded heartbeat
 // appear with Online=false and no endpoints: they are part of the network —
@@ -96,7 +126,7 @@ func BuildSnapshot(members *identity.MemberList, n *Node, now time.Time) *Member
 		AccountID:   members.AccountID,
 		Version:     members.CurrentVersion(),
 		Members:     make(map[identity.DeviceID]MemberView, members.Count()),
-		Delegations: members.DelegationList(),
+		Delegations: liveDelegations(members, now),
 	}
 	for _, id := range members.IDs() {
 		mm, ok := members.Get(id)

@@ -103,6 +103,14 @@ cmesh join --cred <凭证串> --device-passphrase <口令> --listen 0.0.0.0:1809
 #   凭证串由锚点机器 `cmesh cred create --disc <锚点IP>:18090 --ttl 24h \
 #     --max-devices 10 --account-passphrase <口令>` 打印（一行，cmesh1. 开头）。
 #   注意：锚点必须带 --account-pub 启动，否则准入端点不开启（join 会收到 404）。
+#   凭证串等价于「入网资格」，所以别把它留在命令行里（同机任何用户都能从
+#     /proc/<pid>/cmdline 读到）。三个来源，优先级从高到低：
+#       --cred-file <文件>   最强：文件可由 systemd LoadCredential 私有交付
+#       --cred <串>          次之：命令行上明确敲进去的选择
+#       CMESH_CRED=<串>      最弱：环境变量，同 uid 进程可见
+#     读不到文件（或文件是空的）就是错误，不会退回别的来源——那会悄悄用
+#     **另一把**凭证入网。CMESH_CRED 只在没有邀请串、也没有 --cred/--cred-file
+#     时才被读取，所以全局导出它不会弄坏邀请串路径。
 
 # ②' 方式 B：逐台审批（邀请串路径）
 cmesh init --passphrase <口令>
