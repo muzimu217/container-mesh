@@ -71,8 +71,16 @@ func newCLIRelayFixture(t *testing.T) *cliRelayFixture {
 		"--device-passphrase", pass, "--account-passphrase", pass)
 
 	discAddr := freePort(t)
+	// The anchor serves the RELAY protocol too, and announces the port
+	// it accepts relayed sessions on. Without --relay-trunk the anchor
+	// announces NO relay endpoints, so it is not a relay candidate and
+	// the relay path is unreachable — which is the shape the bench
+	// defect needs (the relay must be a CANDIDATE, not just present).
+	_, udpPort, _ := net.SplitHostPort(discAddr)
+	announce := net.JoinHostPort("127.0.0.1", udpPort)
 	go func() {
 		_ = Run([]string{"serve-discovery", "--state", ownerDir, "--addr", discAddr,
+			"--announce", announce, "--relay-trunk",
 			"--device-passphrase", pass})
 	}()
 	base := "http://" + discAddr
