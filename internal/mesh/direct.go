@@ -303,6 +303,21 @@ const (
 	relayConnectionReceiveWindow = 16 << 20
 	// relayMaxReceiveWindow is the ceiling the window grows towards.
 	relayMaxReceiveWindow = 64 << 20
+
+	// quicHandshakeTimeout is how long a handshake may take before the
+	// attempt is abandoned.
+	//
+	// It is the ONE number both the QUIC config and the dialers use, on
+	// purpose. quic-go's own default is five seconds, which is too short
+	// on a loaded machine; this project raised it to twenty. But a dialer
+	// whose CONTEXT is shorter than the handshake it waits for cancels
+	// the handshake before it can finish — the peer is ready and the
+	// dialer has already given up. That showed up as
+	// "quic dial relay …: context deadline exceeded" on a busy machine,
+	// with nothing wrong at either end.
+	//
+	// So: one constant, and every dial budget is derived from it.
+	quicHandshakeTimeout = 20 * time.Second
 )
 
 func quicConfig() *quic.Config {
@@ -319,7 +334,7 @@ func quicConfig() *quic.Config {
 		// It is doubled relative to MaxIdleTimeout, which keeps the
 		// relationship the same shape quic-go documents: the attempt is
 		// aborted if the handshake does not complete in twice this time.
-		HandshakeIdleTimeout: 20 * time.Second,
+		HandshakeIdleTimeout: quicHandshakeTimeout,
 		// The flow control windows — see the comment above.
 		InitialStreamReceiveWindow:     relayStreamReceiveWindow,
 		MaxStreamReceiveWindow:         relayMaxReceiveWindow,
@@ -975,7 +990,10 @@ func DialDirect(ctx context.Context, cfg DialConfig) (*Link, error) {
 		return nil, fmt.Errorf("%w: mesh: %s has no reachable endpoints in the current view", ErrNoRoute, cfg.Target)
 	}
 	if cfg.HandshakeTimeout <= 0 {
-		cfg.HandshakeTimeout = 10 * time.Second
+		// The budget must outlast the handshake quicConfig allows
+		// (quicHandshakeTimeout). A shorter one cancels the handshake
+		// before it can finish.
+		cfg.HandshakeTimeout = quicHandshakeTimeout + 10*time.Second
 	}
 	// Defense in depth for D-1: a wildcard endpoint in the member view can
 	// only come from a peer that announced 0.0.0.0 — dialing it would hit
@@ -1589,7 +1607,19 @@ func dialRelayOne(ctx context.Context, addr *net.UDPAddr, dev *identity.Device, 
 	if err != nil {
 		return nil, fmt.Errorf("mesh: local udp bind: %w", err)
 	}
-	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	// The dial's budget must OUTLAST the handshake it is waiting for.
+	//
+	// quicConfig sets HandshakeIdleTimeout to 20 s (the handshake needs
+	// that long on a slow or loaded machine), and a dial context
+	// shorter than the handshake cancels the handshake before it can
+	// finish — the peer is ready and the dialer has already given up.
+	// That produced "quic dial relay …: context deadline exceeded" on
+	// a loaded machine, with nothing wrong with either end.
+	//
+	// So the budget is the handshake timeout PLUS a margin for the
+	// stream opening that follows it.
+	dialBudget := quicHandshakeTimeout + 10*time.Second
+	cctx, cancel := context.WithTimeout(ctx, dialBudget)
 	defer cancel()
 	qc, err := quic.Dial(cctx, udp, addr, tlsCfg, quicConfig())
 	if err != nil {
