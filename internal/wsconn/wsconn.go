@@ -68,6 +68,24 @@ type Conn struct {
 	closed  bool
 	closeMu sync.Mutex
 
+	// readErr remembers that a read on this connection has already
+	// failed. ★ A FAILED CONNECTION MUST NOT BE READ AGAIN.
+	//
+	// gorilla/websocket returns the cached error INSTANTLY on the next
+	// read, and after 1000 such reads it PANICS with "repeated read on
+	// failed websocket connection". Its own comment says what that
+	// means: "Applications that do handle the error returned from this
+	// method spin in tight loop on connection failure."
+	//
+	// So the panic is not gorilla's defect — it is gorilla telling us
+	// that a caller kept reading a dead connection. Our Conn let it.
+	//
+	// With this field, a dead connection returns the SAME error
+	// instantly, forever, and gorilla never sees another read.
+	// (CI caught the panic in TestParkedPeerDeathIsNoticed, on a commit
+	// that changed only a README.)
+	readErr error
+
 	live Liveness
 	// stopLive shuts the ping ticker down; liveDone reports its exit.
 	stopLive chan struct{}
@@ -265,12 +283,19 @@ func (c *Conn) Send(b []byte) error {
 func (c *Conn) Recv() ([]byte, error) {
 	c.readMu.Lock()
 	defer c.readMu.Unlock()
+	// ★ A connection that has already failed stays failed. See the
+	// readErr field: reading it again would spin (gorilla answers
+	// instantly) and eventually panic.
+	if c.readErr != nil {
+		return nil, c.readErr
+	}
 	for {
 		if c.live.PingEvery > 0 {
 			_ = c.ws.SetReadDeadline(time.Now().Add(c.live.timeout()))
 		}
 		mt, data, err := c.ws.ReadMessage()
 		if err != nil {
+			c.readErr = err
 			c.markGone()
 			return nil, err
 		}
@@ -282,27 +307,41 @@ func (c *Conn) Recv() ([]byte, error) {
 	}
 }
 
-// RecvWithDeadline reads one binary message after setting an explicit read
-// deadline. It is meant for callers that own the socket's read side and need
-// their own timeout semantics (the relay's parked-peer probe); it must not be
-// mixed with Recv on the same connection. A timeout returns a net.Error whose
-// Timeout() is true and leaves the connection usable for the next call.
-func (c *Conn) RecvWithDeadline(deadline time.Time) ([]byte, error) {
-	c.readMu.Lock()
-	defer c.readMu.Unlock()
-	if err := c.ws.SetReadDeadline(deadline); err != nil {
-		return nil, err
-	}
-	for {
-		mt, data, err := c.ws.ReadMessage()
-		if err != nil {
-			return nil, err
-		}
-		if mt == websocket.BinaryMessage {
-			return data, nil
-		}
-	}
-}
+// ★ RecvWithDeadline WAS REMOVED. (Round 102.)
+//
+// It read one message with an explicit deadline, and its comment said it
+// was "meant for callers that own the socket's read side" — naming "the
+// relay's parked-peer probe" as the user. NOBODY called it: the relay
+// never did, and the comment was wrong about that.
+//
+// It was left over from commit 28c21f8 ("relay crash, reconnect
+// live-lock and misleading egress verdict"), which found — by
+// deploying to a real cloud server, not by the test suite — that
+// probing a parked connection by reading it kills the relay:
+//
+//   "gorilla latches the first read error and panics after a bounded
+//    number of retries, so both 'read with a deadline' variants
+//    eventually killed the relay ('repeated read on failed websocket
+//    connection')."
+//
+// The fix in that commit was to stop reading parked connections at all
+// and notice death through the transport's liveness ticker instead.
+// The method stayed behind, and its comment kept naming the one
+// caller that must never read a parked socket.
+//
+// Its other promise was impossible too: "a timeout ... leaves the
+// connection usable for the next call". gorilla latches EVERY read
+// error, timeouts included — its own documentation says "Errors
+// returned from this method are permanent" — so a connection that has
+// timed out is dead for reading.
+//
+// So it was a footgun with no user: an exported method whose documented
+// purpose is a known way to crash the relay. It is deleted rather than
+// left for the next person to reach for.
+//
+// If a deadline read is ever genuinely needed, it has to be a NEW
+// connection's first and only read — a gorilla connection gets exactly
+// one read error, ever.
 
 // Ping sends a WebSocket ping and reports whether the write succeeded.
 //
