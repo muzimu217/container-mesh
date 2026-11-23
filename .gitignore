@@ -36,6 +36,8 @@ probe.json
 # Hub 的共享凭证（每个 agent 手里都有一份）。★ 绝不入库：这是公开仓库，
 # 入了库凭证即刻公开。
 .team/hub-token
+# ★ 编译产物不入库。仓库里那个是 darwin/arm64 的 Mach-O，在 linux/amd64 的服务器上根本跑不起来 —— 放着只会让下一个人以为它能用。
+deploy/hub/cmesh-hub
 
 # autoresearch 会话状态（插件已在隔离 worktree 运行；develop 侧只留 config.json 供插件读取，
 # 必须忽略，否则会被别人的 git add -A 扫进提交）

@@ -1,0 +1,14 @@
+[Unit]
+Description=Renew the container-mesh coordination certificate twice a day
+
+[Timer]
+# Twice a day, with a random offset so the renewal does not land on
+# the same minute every time (Let us Encrypt rate-limits by domain).
+OnCalendar=*-*-* 03,15:17
+RandomizedDelaySec=3600
+# Persistent=true means a run that was missed (the machine was down)
+# happens on the next boot instead of being skipped silently.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,19 @@
+[Unit]
+Description=container-mesh agent coordination hub
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cmesh-hub
+Group=cmesh-hub
+EnvironmentFile=/etc/default/cmesh-hub
+Environment=HUB_ADDR=127.0.0.1:8787
+ExecStart=/usr/local/bin/cmesh-hub
+Restart=always
+RestartSec=5
+StateDirectory=cmesh-hub
+StateDirectoryMode=0700
+
+[Install]
+WantedBy=multi-user.target

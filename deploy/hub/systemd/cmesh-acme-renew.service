@@ -1,0 +1,17 @@
+[Unit]
+Description=Renew the container-mesh coordination certificate and reload nginx
+After=network-online.target
+
+[Service]
+Type=oneshot
+# The renewal itself.
+ExecStart=/usr/bin/certbot renew --quiet
+# ★ A renewed certificate that nginx has not reloaded is a SILENT
+# failure: the file on disk is new, the served certificate is old, and
+# everything looks healthy right up until the old one expires.
+#
+# ExecStartPost does NOT run when ExecStart fails — so a failed renewal
+# leaves the still-valid old certificate serving, which is the right
+# failure. Verified: a unit with ExecStart=/bin/false and an
+# ExecStartPost that writes a file produced NO file, Result=exit-code.
+ExecStartPost=/usr/bin/systemctl reload nginx

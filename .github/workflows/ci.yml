@@ -74,6 +74,36 @@ jobs:
             -trimpath -ldflags "-X github.com/muzimu217/container-mesh/internal/cli.Version=${GITHUB_REF_NAME}" \
             -o /tmp/cmesh-linux-arm64 ./cmd/cm
 
+      - name: 协调 Hub 的单元测试
+        # ★ The hub is a SEPARATE Go module (deploy/hub/go.mod), so
+        # `go test ./...` at the repo root never runs its tests — a
+        # green CI said nothing about the code the agents talk to.
+        #
+        # That is the "capability with no caller" shape: the test
+        # exists, the test is green locally, and nobody runs it. The
+        # body-limit regression (a rejected report must not look like
+        # a delivered one) would have shipped without ever executing
+        # on the remote.
+        working-directory: deploy/hub
+        run: |
+          go mod download
+          go vet ./...
+          go test ./... -race -count=1
+
+      - name: 协调 Hub 必须能交叉编译到服务器的平台
+        # The repo used to carry a darwin/arm64 binary, which cannot run
+        # on the linux/amd64 host the hub actually runs on.
+        working-directory: deploy/hub
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /tmp/cmesh-hub-linux-amd64 .
+          file /tmp/cmesh-hub-linux-amd64
+          # A Mach-O binary on a linux server is the exact trap that
+          # binary was. Assert the format, do not just print it.
+          if file /tmp/cmesh-hub-linux-amd64 | grep -q "Mach-O"; then
+            echo "the hub binary is a Mach-O file — it will not run on linux" >&2
+            exit 1
+          fi
+
       - name: 发布资产的版本号必须是真版本，不是 dev
         # The published binaries are what users install, so a "dev" version
         # string reaches every user who follows the README. This step
