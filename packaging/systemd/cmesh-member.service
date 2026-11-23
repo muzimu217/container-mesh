@@ -3,6 +3,25 @@ Description=container-mesh member (joins with a team credential)
 Wants=network-online.target
 After=network-online.target
 
+# ★ THE START LIMIT BELONGS TO [Unit], NOT TO [Service].
+#
+# It used to sit in [Service], and systemd has NO Service.StartLimit*
+# alias — so it was silently IGNORED:
+#
+#   systemd-analyze verify cmesh-member.service
+#   cmesh-member.service:172: Unknown key name 'StartLimitIntervalSec'
+#   in section 'Service', ignoring.
+#   systemctl show -p StartLimitIntervalUSec  →  10s   (the default, not 60s)
+#
+# Measured on real systemd 255 with ExecStart=/bin/false, RestartSec=5s:
+#   in [Service]  → NRestarts=18 after 95s, STILL looping
+#   in [Unit]     → NRestarts=5, then ActiveState=failed (stopped)
+#
+# The comment's arithmetic was right; the SECTION made it inert.
+# StartLimitIntervalSec / StartLimitBurst are [Unit] directives.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
 [Service]
 Type=simple
 User=cmesh
@@ -18,6 +37,20 @@ Group=cmesh
 # the unit fails with Result=resources and
 # "Failed to load environment files: No such file or directory".
 EnvironmentFile=/etc/cmesh/member.env
+
+# The private-deployment switch.
+#
+# A private or loopback discovery address is REFUSED by default — the
+# egress policy exists so a hostile member cannot steer the others at a
+# private address. But a deployment whose anchor is on a private network
+# (or the same host) legitimately needs it, and a service has no
+# interactive way to turn it on: the operator would have to put it in the
+# environment file, where it is easy to miss.
+#
+# It is an Environment= line (not part of the operator's file) so the
+# switch is visible in the unit and not something an operator has to
+# know about. Set it to 0 (or comment it out) for a public deployment.
+Environment=CMESH_ALLOW_PRIVATE_DISCOVERY=1
 
 # The member gets its OWN state directory. It must not share one with the
 # anchor (cmesh-discovery.service).
@@ -88,7 +121,7 @@ StateDirectoryMode=0700
 # Measured on the real machine: with the credential on the command line, ps
 # printed the whole credential string.
 LoadCredential=cred:/etc/cmesh/cred
-ExecStart=/opt/container-mesh/current/cmesh join --state ${CMESH_STATE} --cred-file ${CREDENTIALS_DIRECTORY}/cred --listen ${CMESH_LISTEN} $CMESH_TRUNK_ARGS
+ExecStart=/opt/container-mesh/current/cmesh join --state ${CMESH_STATE} --cred-file ${CREDENTIALS_DIRECTORY}/cred --listen ${CMESH_LISTEN} --relay-trunk ${CMESH_RELAY_TRUNK} --relay-trunk-id ${CMESH_RELAY_TRUNK_ID}
 
 # The relay trunk is OPTIONAL for the CLI and MANDATORY for the
 # deployment, and those are different things, so the unit checks it
@@ -105,8 +138,17 @@ ExecStart=/opt/container-mesh/current/cmesh join --state ${CMESH_STATE} --cred-f
 # reachable. A pure-outbound member is a valid configuration, so this
 # unit cannot simply require the trunk; it has to be loud about it.
 #
-# The check reads the SAME two variables the CLI would have read, so what
-# is validated is exactly what is used.
+# The check reads the SAME two variables the CLI reads, so what is
+# validated is exactly what is used.
+#
+# It used not to: ExecStart passed the trunk through a THIRD variable
+# ($CMESH_TRUNK_ARGS), so the guard validated two variables that the
+# command line never mentioned, and an operator who followed the example
+# file got a member that passed the guard and was still pure-outbound —
+# exactly the failure the guard exists to prevent. Measured on a real
+# host: cmdline had NO --relay-trunk, the anchor saw the member with
+# endpoints=[] (unreachable), and the guard was happy. ExecStart now
+# expands the two variables directly.
 #
 # "$$" is systemd's escape for a literal dollar sign: without it systemd
 # would expand ${CMESH_RELAY_TRUNK} ITSELF (to the empty string) before
@@ -115,44 +157,40 @@ ExecStart=/opt/container-mesh/current/cmesh join --state ${CMESH_STATE} --cred-f
 # the environment file, the guard below prints
 # "cmesh-member: CMESH_RELAY_TRUNK is not set" and the unit fails with
 # Result=exit-code, status=1/FAILURE.
-ExecStartPre=/bin/sh -c 'if [ -z "$${CMESH_RELAY_TRUNK}" ] || [ -z "$${CMESH_RELAY_TRUNK_ID}" ]; then echo "cmesh-member: CMESH_RELAY_TRUNK and CMESH_RELAY_TRUNK_ID must both be set: without a relay trunk this member is pure-outbound and can never RECEIVE a relayed session (see the member env example)" >&2; exit 1; fi'
+# An ExecCONDITION, not an ExecStartPre.
+#
+# ExecStartPre's failure is a start failure, and Restart=on-failure
+# covers it — so a member configured without a trunk retried every five
+# seconds FOREVER (measured: four restarts in sixteen seconds, three
+# guard messages). A precondition is a different thing: systemd does not
+# restart the unit when a condition fails, so the refusal is stable and
+# the operator sees it once, with the reason, instead of a machine that
+# screams every five seconds.
+ExecCondition=/bin/sh -c 'if [ -z "$${CMESH_RELAY_TRUNK}" ] || [ -z "$${CMESH_RELAY_TRUNK_ID}" ]; then echo "cmesh-member: CMESH_RELAY_TRUNK and CMESH_RELAY_TRUNK_ID must both be set: without a relay trunk this member is pure-outbound and can never RECEIVE a relayed session (see the member env example)" >&2; exit 1; fi'
 
-# The trunk flags travel in ONE variable, not as two separate ${VAR}
-# expansions, and this is a correctness requirement, not a style choice.
-#
-# Go's flag package consumes the NEXT argument as the value of a flag
-# that needs one. If the trunk flags were spelled out as two separate
-# expansions and the variables were empty, the CLI would receive
-# "--relay-trunk --relay-trunk-id" and take the literal string
-# "--relay-trunk-id" as the VALUE of --relay-trunk. Measured with the
-# real flag definitions: --relay-trunk then holds "--relay-trunk-id" and
-# --relay-trunk-id stays empty, and the CLI's own check ("--relay-trunk
-# needs --relay-trunk-id") never fires because the first one looks set.
-#
-# systemd's expansion is what makes this reachable. Measured on a real
-# Linux systemd host:
-#   - "${VAR} unset" expands to exactly ONE EMPTY argument, so the CLI
-#     sees --relay-trunk "" --relay-trunk-id "". The empty value is
-#     harmless: the CLI skips the relay-trunk block, and the guard above
-#     refuses to start before that.
-#   - "$VAR unset" (UNBRACED) expands to ZERO arguments, so the CLI sees
-#     "--relay-trunk --relay-trunk-id" and the mis-parse happens.
-#   - "$VAR set to 'one two'" splits into two arguments.
-# So an unbraced $VAR is both the dangerous form and the form that
-# splits, and a braced ${VAR} cannot carry the two flags as two
-# arguments at all (it is always exactly one argument).
-#
-# One variable, expanded unbraced, is the only shape that satisfies all
-# three requirements at once: it disappears entirely when unset (so no
-# flag is ever half-present), it splits into several arguments when set,
-# and it carries a whole flag list. Measured on a real Linux systemd
-# host: unset -> the program sees 2 arguments; set to
-# "--relay-trunk 10.0.0.1:18090 --relay-trunk-id abcdefghijklmnop" ->
-# the program sees 6 arguments with the values intact.
-Environment=CMESH_TRUNK_ARGS=
 
 Restart=on-failure
 RestartSec=5s
+
+# THE START LIMIT, EXPLICITLY — the same arithmetic as the anchor's unit.
+#
+# systemd's defaults are a burst of 5 starts in a 10-second interval.
+# With RestartSec=5s the starts land at 0, 5, 10 … so any 10-second
+# window holds at most 3, and the burst of 5 is UNREACHABLE — a broken
+# configuration then restarts forever instead of stopping where an
+# operator can see it.
+#
+# The window has to be longer than RestartSec * (Burst - 1) = 20
+# seconds for the burst to be reachable at all. 60 seconds gives room
+# for 12 starts.
+#
+# The ExecCondition above already refuses a misconfigured member
+# WITHOUT restarting it — but every OTHER failure path (an empty
+# passphrase, an unreadable credential, a read-only state directory)
+# still exits non-zero, and this is what stops those from looping.
+#
+# ★ The directives themselves are in [Unit] above — they are [Unit]
+# directives, and in [Service] systemd ignores them.
 
 # The member announces its own departure on SIGTERM, so the anchor and the
 # other members see it go. Give that broadcast a moment to leave.

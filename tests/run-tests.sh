@@ -83,6 +83,24 @@ cleanup() {
         kill "$RELAY_PID" 2>/dev/null
         wait "$RELAY_PID" 2>/dev/null
     fi
+    # A FAILED RUN KEEPS ITS EVIDENCE.
+    #
+    # The temp directory used to be removed unconditionally, which meant
+    # a red run took its own logs with it. The next round then had
+    # nothing but the assertion names to work from — and a red that
+    # cannot be diagnosed cannot be fixed, only re-run. That is exactly
+    # what happened: an intermittent red in the credential-enrolment
+    # section (join exit code 1) was re-run nine times and never
+    # reproduced, because the evidence that would have named the cause
+    # was deleted on the way out.
+    #
+    # So: on failure the directory is KEPT, and its path is printed, so
+    # the logs survive until somebody reads them. On success it is
+    # removed, because a green run's logs are worth nothing.
+    if [ "$FAIL" -ne 0 ]; then
+        printf '\n\033[31m失败：证据保留在 %s\033[0m\n' "$TMP"
+        return 0
+    fi
     rm -rf "$TMP"
 }
 trap cleanup EXIT INT TERM
@@ -108,10 +126,23 @@ fi
 # ---------------------------------------------------------------
 if [ "$QUICK" = "no" ]; then
     section "1. Go 单元测试"
-    if ( cd "$ROOT" && go test ./... ); then
+    # The unit test output is CAPTURED, and printed only when it fails.
+    #
+    # The script used to run `go test ./...` straight to the console and
+    # then, on failure, report only the words "单元测试失败". A red in
+    # there is a red in ANY package, and the package was the first thing
+    # the operator needs to know — so the output was thrown away at
+    # exactly the moment it became useful.
+    #
+    # The rule is the same one the credential section follows: a red
+    # prints its evidence.
+    if ( cd "$ROOT" && go test ./... ) > "$TMP/unit.log" 2>&1; then
         ok "go test ./..."
     else
         bad "go test ./..." "单元测试失败"
+        printf '\n\033[31m--- go test ./... 的输出---\033[0m\n'
+        grep -E "^(--- FAIL|FAIL|ok  |\s+.*_test\.go:)" "$TMP/unit.log" | head -60
+        printf '\n'
     fi
 
     section "2. 静态检查"
@@ -533,6 +564,25 @@ if [ -n "$ACCT_PUB" ]; then
         "$BIN" join --state "$CJOINER" --device-passphrase "$CPASS" --cred "$CRED" --once --timeout 15s \
             > "$JOIN_LOG" 2>&1
         JOIN_RC=$?
+        # A FAILED ENROLMENT PRINTS ITS OWN LOGS, RIGHT HERE.
+        #
+        # The credential section has failed intermittently (the join
+        # exited 1, and the anchor's log never said "enrolled device").
+        # Without this, the only trace was the assertion names — and the
+        # join's own stderr, which names the refusal, went into a
+        # directory that the cleanup removed. A red that cannot be read
+        # cannot be diagnosed; it can only be re-run, which is how it
+        # survived nine green re-runs and stayed unexplained.
+        #
+        # So the refusal is printed when it happens, while it is still
+        # the only evidence there is.
+        if [ "$JOIN_RC" != 0 ]; then
+            printf '\n\033[31m--- join 的日志（退出码 %s）---\033[0m\n' "$JOIN_RC"
+            cat "$JOIN_LOG"
+            printf '\n\033[31m--- 锚点的日志（末尾 40 行）---\033[0m\n'
+            tail -40 "$TMP/cred-anchor.log"
+            printf '\n'
+        fi
         assert_eq "join 子进程退出码" "0" "$JOIN_RC"
         if grep -q "Enrolled with a team credential" "$JOIN_LOG"; then
             ok "一条命令入网（无人工审批）"

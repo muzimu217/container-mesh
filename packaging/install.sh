@@ -21,6 +21,80 @@ STATE_DIR=${CMESH_STATE:-${HOME:-}/.cmesh}
 say() { printf '%s\n' "$*"; }
 die() { printf 'cmesh installer: %s\n' "$*" >&2; exit 1; }
 
+# resolve_path NORMALISES a path so that the guards below compare the
+# path a tool would ACTUALLY act on.
+#
+# It is pure string arithmetic — it never touches the filesystem — so it
+# cannot be defeated by a symlink and cannot have a side effect of its
+# own. What it does:
+#
+#   "//"        -> "/"
+#   "/."        -> "/"
+#   "/.."       -> "/"
+#   "/tmp/.."   -> "/"
+#   "/a/b/../c" -> "/a/c"
+#
+# The last case is what makes it more than a "/"-check: a path can hide
+# the root behind a deeper-looking prefix, and only a real normalization
+# finds it.
+#
+# ★ THE NORMALIZATION IS DONE ON THE WHOLE PATH, NOT ON A SPLIT. (Round
+# 98.) Splitting off the last component and resolving only the directory
+# leaves "/.." as "/..", because ".." is a component and not a directory
+# name — so a "/"-comparison would still miss it. The path is therefore
+# collapsed component by component, which is what makes "/tmp/.." and
+# "/.." both come out as "/".
+#
+# It uses `cd` into the directory plus `pwd`, which is what the shell can
+# do portably (readlink -f is not POSIX, and realpath is not everywhere).
+resolve_path() {
+    _rp=$1
+    case "$_rp" in
+        /*) ;;
+        *) _rp="$(pwd)/$_rp" ;;
+    esac
+    # Collapse the path component by component. ".." pops the previous
+    # component; "." and empty components are dropped; ".." at the root
+    # stays at the root (which is what POSIX says "/" + ".." is).
+    _rp_out=""
+    _rp_rest=${_rp#/}
+    while [ -n "$_rp_rest" ]; do
+        _rp_comp=${_rp_rest%%/*}
+        if [ "$_rp_comp" = "$_rp_rest" ]; then
+            _rp_rest=""
+        else
+            _rp_rest=${_rp_rest#*/}
+        fi
+        case "$_rp_comp" in
+            ''|'.') ;;
+            '..')
+                # Pop the last component of what we have so far.
+                #
+                # ★ dirname "" is "." and dirname "/" is "/", so the
+                # empty case has to be handled EXPLICITLY: without it,
+                # "/.." pops into "." and then resolves to the CURRENT
+                # DIRECTORY — which is not the root, and would sail
+                # straight past the guard.
+                if [ -z "$_rp_out" ] || [ "$_rp_out" = "/" ]; then
+                    _rp_out="/"
+                else
+                    _rp_out=$(dirname "$_rp_out")
+                fi
+                ;;
+            *) _rp_out="${_rp_out%/}/$_rp_comp" ;;
+        esac
+    done
+    [ -z "$_rp_out" ] && _rp_out=/
+    # The result may still name a directory that exists; resolve it so a
+    # symlinked path cannot smuggle the root past the guard.
+    if [ -d "$_rp_out" ]; then
+        _rp_real=$(cd "$_rp_out" 2>/dev/null && pwd) || _rp_real=$_rp_out
+        # "/.." resolves to "/" through a real cd; use that.
+        _rp_out=$_rp_real
+    fi
+    printf '%s\n' "$_rp_out"
+}
+
 usage() {
     cat >&2 <<'EOF'
 usage: install.sh
@@ -38,20 +112,123 @@ if [ "${1:-}" = "--uninstall" ]; then
     shift
     [ "${1:-}" = "--purge" ] && { PURGE=1; shift; }
     [ "$#" -eq 0 ] || usage
+    # The state directory must never be the filesystem root. With HOME
+    # unset, `${HOME:-}/.cmesh` expands to "/.cmesh" — and `--purge`
+    # then ran `rm -rf -- /.cmesh` with no confirmation.
+    #
+    # The refusal belongs HERE, before any removal is attempted, and it
+    # belongs in the UNINSTALL branch because that is the branch that
+    # removes things. The install branch checks it too (a refusal the
+    # operator only learns about at purge time is a refusal too late),
+    # but an install never touches the state directory, so it must not
+    # fail a perfectly good install over a state path it will not use.
+    case "$STATE_DIR" in
+        /|'')
+            die "the runtime state directory would be the filesystem root; set CMESH_STATE or HOME"
+            ;;
+    esac
+    # A path DIRECTLY under the filesystem root ("/.cmesh") is just as
+    # dangerous: `--purge` runs `rm -rf -- "$STATE_DIR"` on it. With
+    # HOME unset, `${HOME:-}/.cmesh` expands to exactly that.
+    #
+    # ★ THE STRING COMPARISON IS NOT ENOUGH. (Round 98.)
+    # "${STATE_DIR#/}" contains a "/" for "//" and for "/tmp/..", so the
+    # test below let BOTH through — and "//" is the one that matters:
+    # on busybox/Alpine (a platform this installer advertises support
+    # for) `rm -rf -- //` wipes the whole filesystem, because busybox
+    # treats "//" as "/" while GNU rm refuses it.
+    #
+    # So the path is RESOLVED first: an absolute path is resolved
+    # against the current directory and then normalized ("//" -> "/",
+    # "/tmp/.." -> "/"), and the result is compared against "/". A
+    # relative path is resolved against the current directory too.
+    #
+    # The resolution is pure string work (no filesystem access), so it
+    # cannot itself be defeated by a symlink.
+    resolved_state=$(resolve_path "$STATE_DIR")
+    case "$resolved_state" in
+        /)
+            die "the runtime state directory resolves to the filesystem root ($STATE_DIR); set CMESH_STATE or HOME"
+            ;;
+    esac
+    case "${resolved_state#/}" in
+        */*) ;;   # deeper than the root: fine
+        *) die "the runtime state directory would sit directly in the filesystem root ($STATE_DIR); set CMESH_STATE or HOME" ;;
+    esac
     marker="$INSTALL_DIR/.cmesh-install-root"
     [ -f "$marker" ] || die "$INSTALL_DIR is not a cmesh install root"
     case "$INSTALL_DIR" in
         ""|/) die "refusing to uninstall from an empty path or filesystem root" ;;
     esac
+    # ★ SAME RESOLUTION FOR THE INSTALL ROOT. "/.." and "/." and "//"
+    # all resolve to the filesystem root while LOOKING like something
+    # else, and the string comparison above let them through: the
+    # installer then wrote versions/, current, cmesh and
+    # .cmesh-install-root AT THE FILESYSTEM ROOT.
+    resolved_install=$(resolve_path "$INSTALL_DIR")
+    case "$resolved_install" in
+        /) die "refusing to uninstall from a path that resolves to the filesystem root ($INSTALL_DIR)" ;;
+    esac
+
+    # THE SYSTEMD UNITS MUST BE STOPPED, OR THE UNINSTALL IS INCOMPLETE.
+    #
+    # The installer never touches systemd, so `--uninstall` used to leave
+    # the units installed AND enabled, with the process still running
+    # (holding an already-unlinked binary) — and the next boot would
+    # start a unit whose ExecStart points at a path that no longer
+    # exists: status=203/EXEC, then the restart loop.
+    #
+    # The two findings are not independent: an uninstall that does not
+    # stop the unit IGNITES the restart loop on the next boot.
+    #
+    # So: any uninstall stops and disables the units; only a purge also
+    # removes the unit files. And the units that were stopped are
+    # NAMED in the output — otherwise the operator believes the machine
+    # is clean when it is not.
+    #
+    # `systemctl` is absent on a machine without systemd, so its absence
+    # is not an error: there is nothing to stop there.
+    UNITS="cmesh-discovery.service cmesh-member.service"
+    stopped=""
+    if command -v systemctl >/dev/null 2>&1; then
+        for u in $UNITS; do
+            # The unit counts as present if systemd knows it OR its file
+            # is on disk. The file check matters because a unit that
+            # systemd has forgotten (a stale enablement) is exactly the
+            # case this is here for.
+            if systemctl list-unit-files "$u" >/dev/null 2>&1 || \
+               [ -e "/etc/systemd/system/$u" ]; then
+                systemctl stop "$u" >/dev/null 2>&1 || true
+                systemctl disable "$u" >/dev/null 2>&1 || true
+                stopped="$stopped $u"
+            fi
+        done
+        if [ -n "$stopped" ]; then
+            systemctl daemon-reload >/dev/null 2>&1 || true
+        fi
+    fi
+
     if [ "$PURGE" -eq 1 ]; then
+        for u in $UNITS; do
+            rm -f -- "/etc/systemd/system/$u"
+        done
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl daemon-reload >/dev/null 2>&1 || true
+        fi
         rm -rf -- "$INSTALL_DIR"
         if [ -n "$STATE_DIR" ] && [ "$STATE_DIR" != "$INSTALL_DIR" ]; then
             rm -rf -- "$STATE_DIR"
         fi
         say "purged install root and runtime state"
+        if [ -n "$stopped" ]; then
+            say "stopped and disabled:$stopped"
+        fi
     else
         rm -rf -- "$INSTALL_DIR/cmesh" "$INSTALL_DIR/current" "$INSTALL_DIR/versions" "$marker"
         say "uninstalled binaries; runtime state was retained at $STATE_DIR"
+        if [ -n "$stopped" ]; then
+            say "stopped and disabled:$stopped (the unit files were kept; --purge removes them)"
+        fi
     fi
     exit 0
 fi
@@ -69,6 +246,47 @@ case "$VERSION" in
 esac
 case "$INSTALL_DIR" in
     ''|*[!A-Za-z0-9._/-]*) die "unsafe characters in CMESH_INSTALL" ;;
+esac
+# The filesystem root is NOT an install root.
+#
+# The uninstall branch already refused it (the empty-path check above),
+# but the INSTALL branch did not — so `CMESH_INSTALL=/ sh install.sh`
+# wrote /versions, /current, /cmesh and /.cmesh-install-root at the
+# filesystem root, and said only "installed: /current/cmesh".
+#
+# The asymmetry was the bug: a path the tool refuses to remove must
+# also be a path it refuses to install into. Otherwise a typo (or a
+# stray "CMESH_INSTALL=/") litters the root of the machine.
+#
+# ★ AND THE CHECK RESOLVES THE PATH, IT DOES NOT COMPARE STRINGS.
+# (Round 98.) "/..", "/." and "//" all resolve to the filesystem root
+# while LOOKING like something else, and a plain `case "$INSTALL_DIR" in
+# /)` let all three through: the installer then wrote versions/,
+# current, cmesh and .cmesh-install-root AT THE FILESYSTEM ROOT.
+case "$INSTALL_DIR" in
+    ''|/) die "refusing to install into the filesystem root" ;;
+esac
+resolved_install=$(resolve_path "$INSTALL_DIR")
+case "$resolved_install" in
+    /) die "refusing to install into a path that resolves to the filesystem root ($INSTALL_DIR)" ;;
+esac
+# The state directory: an install NEVER touches it, so a state path
+# that would be dangerous to purge must not fail a good install — but
+# the operator must hear about it NOW, not at purge time.
+case "$STATE_DIR" in
+    /|'')
+        say "warning: the runtime state directory would be the filesystem root (HOME is unset?); set CMESH_STATE or HOME"
+        ;;
+esac
+resolved_state=$(resolve_path "$STATE_DIR")
+case "$resolved_state" in
+    /)
+        say "warning: the runtime state directory resolves to the filesystem root ($STATE_DIR); set CMESH_STATE or HOME"
+        ;;
+esac
+case "${resolved_state#/}" in
+    */*) ;;   # deeper than the root: fine
+    *) say "warning: the runtime state directory would sit directly in the filesystem root ($STATE_DIR); set CMESH_STATE or HOME" ;;
 esac
 
 os=$(uname -s | tr '[:upper:]' '[:lower:]')
@@ -176,7 +394,21 @@ esac
 actual=$($checker "$tmpdir/$asset_base" | awk '{print $1}')
 [ "$(printf '%s' "$expected" | tr '[:upper:]' '[:lower:]')" = "$(printf '%s' "$actual" | tr '[:upper:]' '[:lower:]')" ] || die "checksum mismatch for $asset_base"
 
+# ★ THE versions/ DIRECTORY MUST BE TRAVERSABLE BY THE SERVICE USER.
+#
+# `mkdir -p` creates it with the process's umask, and the systemd units
+# run the node as an unprivileged "cmesh" user. Under a umask of 077 the
+# directory comes out 0700, so only the installing user can enter it and
+# the unit that is supposed to execute $INSTALL_DIR/current/cmesh gets
+# "Permission denied".
+#
+# This is the SAME class as the version-directory bug that was already
+# fixed one level down (the version dir was 0700 because mktemp -d
+# creates 0700): the fix was applied to the leaf and not to the tree
+# around it.
+chmod 0755 "$INSTALL_DIR/versions" 2>/dev/null || true
 mkdir -p "$INSTALL_DIR/versions" || die "cannot create install directory $INSTALL_DIR"
+chmod 0755 "$INSTALL_DIR/versions" 2>/dev/null || true
 stage=$(mktemp -d "$INSTALL_DIR/versions/.cmesh-install.XXXXXX")
 old=""
 cleanup_stage() { rm -rf "$stage"; [ -z "$old" ] || rm -rf "$old"; }

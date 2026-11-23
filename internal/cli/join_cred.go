@@ -55,6 +55,65 @@ func enrollWithCredential(ctx context.Context, cred *credential.Credential, dev 
 	return enrollWithCredentialUsing(ctx, cred, dev, nil)
 }
 
+// askCredentialStatus asks the discovery node why a credential cannot be
+// used, and returns the reason.
+//
+// It is the joiner's only way to learn about a REVOCATION: the revocation
+// list lives on the anchor and deliberately does not travel to the
+// members, so the joiner cannot check it. The question is asked with the
+// credential's public half and NO certificate — that is what tells the
+// anchor "this is a question, not an enrolment".
+//
+// A failure to ask is not a failure of the question: the anchor may be
+// unreachable, and the joiner then reports what it knows (the expiry).
+func askCredentialStatus(ctx context.Context, cred *credential.Credential, transport http.RoundTripper) string {
+	pub, err := cred.PublicPart()
+	if err != nil {
+		return ""
+	}
+	body, err := discovery.EncodeEnrollRequest(discovery.EnrollRequest{Credential: pub})
+	if err != nil {
+		return ""
+	}
+	client := &http.Client{Timeout: enrollTimeout}
+	switch {
+	case transport != nil:
+		client.Transport = transport
+	case cmeshtest.Enabled:
+		client.Transport = &http.Transport{ResponseHeaderTimeout: enrollTimeout}
+	default:
+		client.Transport = discovery.EgressTransportWith(enrollTimeout, discoveryAllowPrivate())
+	}
+	for _, addr := range cred.Public.DiscoveryAddrs {
+		base, err := discovery.NormalizeDiscoveryURLWith(addr, discoveryAllowPrivate())
+		if err != nil {
+			continue
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/mesh/enroll", bytes.NewReader(body))
+		if err != nil {
+			continue
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := client.Do(req)
+		if err != nil {
+			continue
+		}
+		raw, rerr := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
+		_ = resp.Body.Close()
+		if rerr != nil {
+			continue
+		}
+		var res discovery.EnrollResponse
+		if err := json.Unmarshal(raw, &res); err != nil {
+			continue
+		}
+		if !res.OK && res.Message != "" {
+			return res.Message
+		}
+	}
+	return ""
+}
+
 // enrollWithCredentialUsing is enrollWithCredential with an injectable
 // transport, so a test can point the request at an in-process server.
 func enrollWithCredentialUsing(ctx context.Context, cred *credential.Credential, dev *identity.Device, transport http.RoundTripper) error {
@@ -66,6 +125,20 @@ func enrollWithCredentialUsing(ctx context.Context, cred *credential.Credential,
 	// not outlive the authority that vouched for it.
 	ttl := cred.Public.ExpiresAt.Sub(time.Now().UTC())
 	if cred.Public.ExpiresAt.Before(time.Now().UTC()) {
+		// The credential is over, so the joiner cannot mint a
+		// certificate and cannot enrol. But it must not say "expired"
+		// and leave it there: the credential may ALSO have been revoked,
+		// and the revocation is the fact an operator needs — it says the
+		// owner turned this key off. Reported as "expired" alone, the
+		// revocation disappeared from the logs as the clock moved on.
+		//
+		// The joiner cannot know about revocations itself (the list is
+		// the anchor's, and it deliberately does not travel to the
+		// members), so it ASKS — a request with no certificate is a
+		// question about the credential, not an attempt to enrol.
+		if why := askCredentialStatus(ctx, cred, transport); why != "" {
+			return fmt.Errorf("%s", why)
+		}
 		return fmt.Errorf("credential expired at %s", cred.Public.ExpiresAt.UTC().Format(time.RFC3339))
 	}
 	if max := credential.DefaultCertTTL; ttl > max {

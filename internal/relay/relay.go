@@ -425,6 +425,13 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	// one makes its handler unwind through its Closed() channel — parked
 	// peers free their rooms, splices tear down, snapshot pushes stop.
 	s.closeHijacked()
+	// THE WINDOW, opened on purpose (tests only).
+	//
+	// closeHijacked closed what the relay KNEW about its sockets. A
+	// connection that hijacks its socket NOW is not in that set, and
+	// nothing else will close it — which is why handleWS refuses
+	// connections once the relay is stopping, and why trackConn closes a
+	// socket that registers too late.
 	s.waitConnsGone(ctx)
 	return err
 }
@@ -432,7 +439,36 @@ func (s *Server) Shutdown(ctx context.Context) error {
 // trackConn registers an upgraded pairing WebSocket in the shutdown
 // registry. The entry is dropped when the socket is gone, which also lets
 // Shutdown wait for live sockets to actually disappear.
+//
+// A socket that arrives AFTER the shutdown has begun is CLOSED instead
+// of registered.
+//
+// The reason is the ORDER inside Shutdown: it stops the listener, waits
+// for the plain HTTP handlers, and THEN closes what is in s.live. A
+// handler that has already hijacked its socket is no longer in
+// net/http's view — so net/http does not wait for it — and the only
+// thing that closes it is s.closeHijacked, which runs later.
+//
+// So a connection that hijacks its socket in between is in a hole: it is
+// not in s.live when closeHijacked looks, and nothing closes it
+// afterwards. The socket survives the shutdown, and waitConnsGone then
+// waits for a connection that will never go away — so the SHUTDOWN
+// ITSELF hangs until its context expires.
+//
+// Not a hypothetical: an external tester measured it on a 2-core
+// container under -race (the socket was never closed, and the shutdown
+// reported "context deadline exceeded").
+//
+// So the check is here, at the point where a socket becomes the
+// server's responsibility: a relay that is stopping closes it at once
+// instead of adopting a socket it will not be able to close.
 func (s *Server) trackConn(c *wsconn.Conn) {
+	if s.isShutdown() {
+		// The relay is stopping: this socket arrived too late to be
+		// closed by closeHijacked, so close it here.
+		_ = c.Close()
+		return
+	}
 	s.mu.Lock()
 	s.live[c] = struct{}{}
 	s.mu.Unlock()
@@ -555,6 +591,34 @@ func (s *Server) liveness() wsconn.Liveness {
 }
 
 func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
+	// A RELAY THAT IS STOPPING MUST NOT ADMIT ANY MORE CONNECTIONS.
+	//
+	// The order in Shutdown is: stop the listener, wait for the plain
+	// HTTP handlers, then close the hijacked sockets. A handler that
+	// has already HIJACKED its socket is no longer in net/http's view —
+	// so net/http does not wait for it and does not close it — and the
+	// only thing that closes it is s.closeHijacked, which runs LATER.
+	//
+	// So a connection that upgrades in between lands in a hole: it is
+	// not in s.live when closeHijacked looks, and nothing closes it
+	// afterwards. The socket survives the shutdown — and because
+	// waitConnsGone then waits for a connection that will never go
+	// away, the SHUTDOWN ITSELF HANGS until its context expires.
+	//
+	// That is not a hypothetical: an external tester measured it on a
+	// 2-core container under -race (3/3 in isolation) — the socket was
+	// never closed, and the shutdown reported "context deadline
+	// exceeded".
+	//
+	// So the check belongs HERE, at the top of the handler, before the
+	// upgrade: a relay that is stopping refuses the connection instead
+	// of adopting a socket it will not be able to close.
+	if s.isShutdown() {
+		s.log.Warn("refusing a connection: the relay is shutting down")
+		http.Error(w, "this relay is shutting down", http.StatusServiceUnavailable)
+		return
+	}
+
 	roomID := r.URL.Query().Get("room")
 	role := r.URL.Query().Get("role")
 	if roomID == "" {

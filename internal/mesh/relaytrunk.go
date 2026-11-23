@@ -242,6 +242,15 @@ type RelayTrunk struct {
 
 	mu    sync.RWMutex
 	state trunkState
+	// stopping says the trunk is shutting down. Once it is set, no NEW
+	// relay is admitted: a connection that arrives in the window between
+	// the stop and the listener's close would otherwise be adopted, and
+	// the trunk would have no way to close it — because a hijacked
+	// socket is no longer in net/http's view.
+	//
+	// This is the same hole the stage-1 relay had (internal/relay), and
+	// the same fix: refuse at the top of the handler.
+	stopping bool
 
 	// flows are the live relays this trunk carries. Guarded by mu.
 	flows map[uint64]*relayFlow
@@ -499,28 +508,104 @@ func InstalledRelayTrunk() *RelayTrunk {
 // relayProtoID identifies the relay protocol on the wire.
 const relayProtoID = "cmesh-relay/1"
 
-// maxRelayRecord bounds one relay record (the JSON envelope plus its
-// opaque payload). It matches the wire package's 1 MiB frame cap, so a
-// relayed record can never be bigger than a direct one.
+// maxRelayRecord bounds one relay record (the envelope plus its opaque
+// payload). It matches the wire package's 1 MiB frame cap, so a relayed
+// record can never be bigger than a direct one.
+//
+// It bounds BOTH formats: the binary frame (a 24-byte header, a meta
+// block and the payload) and the JSON envelope (base64, so a third
+// bigger). See maxRelayPlaintext.
 const maxRelayRecord = 1 << 20
 
 // maxRelayPlaintext is the largest plaintext that fits in ONE relay
 // record.
 //
-// A relay record is JSON, and JSON carries a []byte as base64: four
-// bytes of wire for every three bytes of payload. The end-to-end seal
-// adds a 12-byte nonce and a 16-byte tag. So the plaintext that fits is
-// roughly three quarters of the record limit, less the seal and the JSON
-// envelope.
+// THE SWITCH CHANGED THIS NUMBER, and it changed it upwards.
 //
-// It matters because the file sender writes 1 MiB chunks, and 1 MiB did
-// NOT fit: the record came out at 1398158 bytes against a 1048576-byte
-// limit, so every file bigger than about a megabyte failed through the
-// relay with "record too large" — while the same file went through the
-// direct link without complaint. The margin below is deliberately
-// generous: the exact size depends on the JSON envelope, and a record
-// that is one byte over the limit is a hard failure.
-const maxRelayPlaintext = maxRelayRecord*3/4 - 1024
+// A relay record used to be a JSON envelope, and JSON carries a []byte as
+// base64: four bytes of wire for every three bytes of payload. The
+// end-to-end seal adds a 12-byte nonce and a 16-byte tag, so the
+// plaintext that fit was roughly three quarters of the record limit.
+//
+// The binary frame carries the payload VERBATIM, so the SAME 1 MiB record
+// budget holds a third more: the cap is now the record limit less the
+// 24-byte header and the seal's overhead. Measured on the real host, the
+// binary record holds 1,047,552 payload bytes where the JSON one held
+// 785,408 (+33.38%).
+//
+// It matters because the file sender writes 1 MiB chunks (fileChunkSize),
+// and 1 MiB did NOT fit the old cap: the record came out at 1398158 bytes
+// against a 1048576-byte limit, so every file bigger than about a
+// megabyte failed through the relay with "record too large" — while the
+// same file went through the direct link without complaint.
+//
+// The margin below is deliberately generous: a record that is one byte
+// over the limit is a hard failure, and the exact size depends on the
+// seal's overhead.
+const maxRelayPlaintext = maxRelayRecord - relayFrameHeaderSize - e2eSealOverhead - 64
+
+// maxRelayPlaintextJSON is the largest plaintext that fits in ONE JSON
+// relay record.
+//
+// It is the OLD cap, and it is still the cap of the JSON path — which is
+// the fallback for a mixed-version deployment. A JSON record is bigger
+// than its payload by a third, so the binary cap would overflow it and
+// the record limit would refuse it.
+const maxRelayPlaintextJSON = maxRelayRecord*3/4 - 1024
+
+// e2eSealOverhead is what the end-to-end seal adds to a plaintext: the
+// 12-byte nonce in front of the ciphertext and the 16-byte GCM tag
+// behind it.
+const e2eSealOverhead = 12 + 16
+
+// maxRelayPlaintextFor is the largest plaintext that fits in ONE relay
+// record of the given format.
+//
+// It is the format's own cap: the binary frame carries its payload
+// verbatim, the JSON envelope carries it as base64, so the same record
+// budget holds a third more of one than the other.
+func maxRelayPlaintextFor(format RelaySpliceFormat) int {
+	if format == RelaySpliceFormatJSON {
+		return maxRelayPlaintextJSON
+	}
+	return maxRelayPlaintext
+}
+
+// maxRelayPayloadForLegs is the largest plaintext that survives the
+// WHOLE path of a relay.
+//
+// A relay is two legs: the writer's and the reader's. A record written
+// on the first leg is READ on the second one, and on a mixed-version
+// relay the anchor has to TRANSLATE it — which changes its size, because
+// the JSON envelope is a third bigger than the binary frame (base64).
+//
+// So the record has to fit on BOTH legs:
+//
+//   - the leg the writer writes on, in that leg's format;
+//   - the leg the reader reads on, in THAT leg's format — because the
+//     anchor re-encodes the record for it.
+//
+// The cap is the smaller of the two. On a same-version relay both legs
+// speak the same format and the cap is that format's cap. On a mixed
+// one, it is the JSON cap — the smaller of the two — because a JSON leg
+// is somewhere on the path.
+//
+// WHY THE SMALLER CAP AND NOT A SPLIT. The anchor cannot split an
+// oversized record: the end-to-end seal puts the GCM nonce at the front
+// of the ciphertext and the authentication tag at the back, covering
+// the whole plaintext, so half a sealed blob does not authenticate. The
+// WRITER has to write less, and the writer cannot know how much less —
+// the far leg's format is not its business. So the anchor, which knows
+// the whole path, computes this and tells the writer (see
+// relayRecord.MaxPayload).
+func maxRelayPayloadForLegs(writerFormat, readerFormat RelaySpliceFormat) uint64 {
+	a := maxRelayPlaintextFor(writerFormat)
+	b := maxRelayPlaintextFor(readerFormat)
+	if b < a {
+		a = b
+	}
+	return uint64(a)
+}
 
 // sealAndWriteRelayData seals the plaintext and writes it as relay
 // records, SPLITTING it when it does not fit in one.
@@ -530,22 +615,65 @@ const maxRelayPlaintext = maxRelayRecord*3/4 - 1024
 // and the business layer above reads a STREAM: it sees the same bytes in
 // the same order, only in more pieces.
 //
+// THE FORMAT IS THE BINARY ONE, and that is the switch's endpoint half.
+//
+// The requester endpoint is one of the THREE processes the switch has to
+// land on: the anchor's per-record cost was measured at 1140 µs, the
+// target's at 1345 µs and the REQUESTER's at 1778 µs — co-equal, and the
+// requester the most expensive of the three. A trunk that spoke the
+// binary format while the requester spoke JSON would have to decode and
+// re-encode every record anyway, so the anchor's win would be 1.85×
+// instead of the measured 96%.
+//
 // It returns how many bytes were written.
 func sealAndWriteRelayData(w io.Writer, e2e *E2ESession, p []byte) (int, error) {
+	return sealAndWriteRelayDataAs(w, e2e, p, RelaySpliceFormatBinary, 0)
+}
+
+// sealAndWriteRelayDataAs seals the plaintext and writes it as relay
+// records in the given format.
+//
+// The format parameter exists for the ONE case where the requester has to
+// speak the old format: a requester that reached an OLD anchor (the
+// anchor negotiated container-mesh-relay/1, so it speaks JSON). The
+// requester learns the format from the ALPN it negotiated, and the
+// anchor's answer says which one it is — so a requester on an old anchor
+// keeps working after the switch.
+//
+// The maxPayload parameter is the cap the ANCHOR stated in its answer
+// (or in its open record to a target). Zero means "no cap was stated",
+// and the writer then uses its own format's cap.
+//
+// WHY THE ANCHOR'S CAP AND NOT JUST THE WRITER'S OWN. On a
+// mixed-version relay the anchor TRANSLATES the record, and the JSON
+// envelope is a third bigger than the binary frame — so a record the
+// writer was allowed to write on its own leg does not fit on the far
+// one. The anchor is the only node that knows both legs, so it states
+// the cap that survives the whole path. See
+// maxRelayPayloadForLegs.
+func sealAndWriteRelayDataAs(w io.Writer, e2e *E2ESession, p []byte, format RelaySpliceFormat, maxPayload uint64) (int, error) {
 	total := len(p)
+	// The cap depends on the format: a JSON record is a third bigger
+	// than its payload (base64), so the JSON cap is the OLD one. And the
+	// anchor's cap, when it stated one, is SMALLER than either — it is
+	// the cap that survives the far leg as well.
+	limit := maxRelayPlaintextFor(format)
+	if maxPayload != 0 && int(maxPayload) < limit {
+		limit = int(maxPayload)
+	}
 	for len(p) > 0 {
 		n := len(p)
-		if n > maxRelayPlaintext {
-			n = maxRelayPlaintext
+		if n > limit {
+			n = limit
 		}
 		sealed, err := e2e.Seal(p[:n])
 		if err != nil {
 			return total - len(p), err
 		}
-		if err := writeRelayRecord(w, relayRecord{
+		if err := writeRelayRecordAs(w, relayRecord{
 			Type: uint8(wire.FrameMeshRelayData),
 			Data: sealed,
-		}); err != nil {
+		}, format); err != nil {
 			return total - len(p), err
 		}
 		p = p[n:]
@@ -595,13 +723,80 @@ type relayRecord struct {
 	Class string `json:"class,omitempty"`
 	// Grant says whether a request was granted.
 	Grant bool `json:"grant,omitempty"`
+	// MaxPayload is the largest PLAINTEXT the writer of this relay may
+	// put in ONE record.
+	//
+	// It is zero when the record says nothing about it, and the writer
+	// then uses its own leg's default. It is NOT zero on the records the
+	// anchor writes — the ANSWER to a requester and the OPEN to a target
+	// — because the anchor is the only node that knows the WHOLE path.
+	//
+	// WHY THE WRITER CANNOT KNOW IT ALONE. The binary frame carries its
+	// payload verbatim, so the same 1 MiB record budget holds a third
+	// more than the JSON envelope did: the cap rose from 786 KiB to
+	// about 1 MiB. But on a MIXED-VERSION relay the anchor TRANSLATES,
+	// and the JSON envelope is a third BIGGER (base64) — so a record at
+	// the binary cap becomes 1,397,966 bytes, over the 1,048,576-byte
+	// record cap.
+	//
+	// The anchor cannot fix that by splitting the record: the end-to-end
+	// seal puts the GCM nonce at the front of the ciphertext and the
+	// authentication tag at the back, covering the whole plaintext, so
+	// half a sealed blob does not authenticate. The WRITER has to write
+	// less, and the writer cannot know how much less — the far leg's
+	// format is not its business.
+	//
+	// So the anchor computes the cap that survives the whole path and
+	// states it here. See maxRelayPayloadForLegs.
+	MaxPayload uint64 `json:"maxp,omitempty"`
 }
 
-// writeRelayRecord writes one relay record.
+// writeRelayRecord writes one relay record in the DEFAULT format.
+//
+// The default is the BINARY frame, and that is the switch.
+//
+// The relay record used to be a JSON envelope, so the anchor had to
+// decode every record it forwarded (json.Unmarshal + base64 decode) and
+// re-encode it (json.Marshal + base64 encode) — 36.27% of the anchor's
+// CPU in the measured profile (base64 21.69% of it), and 27.76% of the
+// target endpoint's CPU too.
+//
+// The binary frame puts the type, the meta length and the payload length
+// in a FIXED 24-byte header, so the anchor can learn everything it needs
+// from 24 bytes and then copy the rest. The measured relay throughput
+// went from 33.3–36.5 MiB/s (the JSON product) to 65.9–67.8 MiB/s (the
+// binary frame, spliced) — +96%.
+//
+// The JSON path is still there, behind writeRelayRecordAs, because a
+// mixed-version deployment needs it.
 func writeRelayRecord(w io.Writer, rec relayRecord) error {
-	body, err := json.Marshal(rec)
-	if err != nil {
-		return err
+	return writeRelayRecordAs(w, rec, RelaySpliceFormatBinary)
+}
+
+// writeRelayRecordAs writes one relay record in the given format.
+//
+// The format is a property of the LEG it travels on, and the leg's format
+// comes from the ALPN that leg's connection negotiated.
+func writeRelayRecordAs(w io.Writer, rec relayRecord, format RelaySpliceFormat) error {
+	var body []byte
+	switch format {
+	case RelaySpliceFormatBinary:
+		frame, err := relayFrameFromRecord(rec)
+		if err != nil {
+			return err
+		}
+		body, err = EncodeBinaryRelayFrame(frame)
+		if err != nil {
+			return err
+		}
+	case RelaySpliceFormatJSON:
+		var err error
+		body, err = json.Marshal(rec)
+		if err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("mesh: relay: unknown record format (%d)", uint8(format))
 	}
 	if len(body) > maxRelayRecord {
 		return fmt.Errorf("mesh: relay: record too large (%d bytes)", len(body))
@@ -623,8 +818,10 @@ type relayRecordReader interface {
 
 // framedRecordReader reads the records off a byte stream.
 //
-// The framing is length-prefixed JSON (the same framing the rest of the
-// mesh uses), so a record boundary is unambiguous.
+// The framing is length-prefixed (the same framing the rest of the mesh
+// uses), so a record boundary is unambiguous. The BODY is the binary
+// relay frame by default; the JSON envelope is still readable through
+// the format field, and that is the mixed-version fallback.
 //
 // The reader is readMsgFrame, NOT plain readFrame — and the difference is
 // data integrity, not style. io.ReadFull returns io.EOF for "nothing was
@@ -637,6 +834,34 @@ type relayRecordReader interface {
 // (the same lesson the message path learned first).
 type framedRecordReader struct {
 	br *bufio.Reader
+	// format is the record format of this leg. The zero value means
+	// the DEFAULT (the binary frame) — a zero value that meant "JSON"
+	// would silently keep the old wire format alive in every caller
+	// that did not set it.
+	format RelaySpliceFormat
+	// binarySet says the format was chosen EXPLICITLY.
+	//
+	// It exists because the binary format is the zero value of
+	// RelaySpliceFormat (it is the first constant), so "not set" and
+	// "set to binary" would be the same value — and a leg that must
+	// speak JSON (a requester that reached an old anchor) could not be
+	// told so.
+	binarySet bool
+}
+
+// newFramedRecordReader builds a reader for a leg in the given format.
+func newFramedRecordReader(br *bufio.Reader, format RelaySpliceFormat) framedRecordReader {
+	return framedRecordReader{br: br, format: format, binarySet: true}
+}
+
+// legFormat reports the record format of this leg.
+//
+// It is the DEFAULT (binary) unless the format was chosen explicitly.
+func (f framedRecordReader) legFormat() RelaySpliceFormat {
+	if !f.binarySet {
+		return RelaySpliceFormatBinary
+	}
+	return f.format
 }
 
 // nextRecord reads one record off the stream.
@@ -645,23 +870,48 @@ type framedRecordReader struct {
 // anything else is a broken stream and must TEAR the flow down, never
 // masquerade as a finish.
 func (f framedRecordReader) nextRecord() (relayRecord, error) {
-	body, cleanEnd, err := readMsgFrame(f.br, maxRelayRecord)
+	return readRelayRecordAs(f.br, f.legFormat())
+}
+
+// readRelayRecord reads one relay record off a byte stream, in the
+// DEFAULT format.
+func readRelayRecord(br *bufio.Reader) (relayRecord, error) {
+	return readRelayRecordAs(br, RelaySpliceFormatBinary)
+}
+
+// readRelayRecordAs reads one relay record off a byte stream in the
+// given format.
+//
+// A record in the WRONG format is a loud failure, never a misreading:
+// the binary frame's tag (0xC7) is not a byte any JSON parser can start
+// a document with, and a JSON envelope starts with '{', which the binary
+// decoder refuses. So a member and an anchor that disagree about the
+// format break the relay at the first record, with a message that says
+// which format was expected.
+func readRelayRecordAs(br *bufio.Reader, format RelaySpliceFormat) (relayRecord, error) {
+	body, cleanEnd, err := readMsgFrame(br, maxRelayRecord)
 	if err != nil {
 		return relayRecord{}, err
 	}
 	if cleanEnd {
 		return relayRecord{}, io.EOF
 	}
-	var rec relayRecord
-	if err := json.Unmarshal(body, &rec); err != nil {
-		return relayRecord{}, fmt.Errorf("mesh: relay: bad record: %w", err)
+	switch format {
+	case RelaySpliceFormatBinary:
+		frame, err := DecodeBinaryRelayFrame(body)
+		if err != nil {
+			return relayRecord{}, fmt.Errorf("mesh: relay: bad record: %w", err)
+		}
+		return recordFromRelayFrame(frame), nil
+	case RelaySpliceFormatJSON:
+		var rec relayRecord
+		if err := json.Unmarshal(body, &rec); err != nil {
+			return relayRecord{}, fmt.Errorf("mesh: relay: bad record: %w", err)
+		}
+		return rec, nil
+	default:
+		return relayRecord{}, fmt.Errorf("mesh: relay: unknown record format (%d)", uint8(format))
 	}
-	return rec, nil
-}
-
-// readRelayRecord reads one relay record off a byte stream.
-func readRelayRecord(br *bufio.Reader) (relayRecord, error) {
-	return framedRecordReader{br: br}.nextRecord()
 }
 
 // ---------------------------------------------------------------------------
@@ -706,6 +956,24 @@ const (
 	// DefaultRelayBytesPerSec is the P-7 forwarding-rate limit, in bytes
 	// per second. 50 MiB/s.
 	DefaultRelayBytesPerSec = 50 << 20
+	// relayTeardownGrace is how long the trunk waits for the SECOND
+	// direction of a relay to finish once the first one has ended.
+	//
+	// It exists because a half-close is legitimate: a request/response
+	// protocol sends its request, half-closes, and then waits for the
+	// answer. So the first direction ending does NOT mean the relay is
+	// over — and the other direction must be given time to deliver that
+	// answer.
+	//
+	// But the other direction can also be stuck: a target that accepted
+	// the connection and then said nothing. Then the wait would be
+	// forever, and the relay would hold a stream slot (the trunk's
+	// quota) for a relay nobody is using.
+	//
+	// So the wait is BOUNDED. Ten seconds is generous for an answer
+	// (the transport's own idle timeout is ten seconds too) and short
+	// enough that a stuck relay does not hold a quota slot for long.
+	relayTeardownGrace = 10 * time.Second
 )
 
 // RelayQuota bounds what one node carries for others.
@@ -762,6 +1030,29 @@ type relayFlow struct {
 	// SAME reader, or the next record would be silently lost.
 	reqBr *bufio.Reader
 	tgtBr *bufio.Reader
+	// reqFormat and tgtFormat are the record formats of the two legs.
+	//
+	// THE FORMAT IS PER LEG, and it comes from the ALPN that leg's
+	// connection negotiated. The record format is an A↔C protocol — the
+	// anchor is a pipe — so the two legs MUST agree for the verbatim
+	// splice to be legal: if the requester writes binary frames and the
+	// target expects JSON, copying the bytes hands the target garbage.
+	//
+	// So the two formats are carried on the flow, and the forwarding path
+	// branches on whether they are EQUAL:
+	//
+	//	equal   → the FAST PATH: read the 24-byte header, copy the bytes.
+	//	unequal → the FALLBACK: decode the record and re-encode it in
+	//	          the far leg's format. That is the slow path, and it is
+	//	          what a mixed-version deployment runs on.
+	//
+	// The fallback is a TRANSLATION, not a refusal: a mixed-version
+	// deployment must keep working, because the window between the
+	// anchor's upgrade and the last target's upgrade is exactly as long
+	// as the operator's rollout. See
+	// TestAMixedVersionRelayIsCarriedByTranslation.
+	reqFormat RelaySpliceFormat
+	tgtFormat RelaySpliceFormat
 	// total is the lifetime byte count, for the trunk's statistics.
 	total int64
 	// done is closed when the flow ends, and doneOnce guards it.
@@ -950,6 +1241,35 @@ func (t *RelayTrunk) dialTargetWith(ctx context.Context, target identity.DeviceI
 // must not be reported in a way that makes the requester think it was
 // rejected on membership grounds.
 func (t *RelayTrunk) OpenFlow(ctx context.Context, open RelayOpen, req Session) (uint64, error) {
+	reqFormat, err := relayFormatOfSession(req)
+	if err != nil {
+		return 0, err
+	}
+	return t.openFlow(ctx, open, req, reqFormat, nil)
+}
+
+// OpenFlowWithFormats opens a relay flow with an EXPLICIT format for
+// each leg.
+//
+// It is the seam the mixed-version tests drive: the two legs' formats
+// come from the ALPNs their connections negotiated, and a test that wants
+// a mixed-version relay says so here.
+//
+// A nil tgtFormat means "ask the target's session", which is what the
+// production path does.
+func (t *RelayTrunk) OpenFlowWithFormats(ctx context.Context, open RelayOpen, req Session, reqFormat RelaySpliceFormat, tgtFormat RelaySpliceFormat) (uint64, error) {
+	return t.openFlow(ctx, open, req, reqFormat, &tgtFormat)
+}
+
+// openFlow opens a relay flow, with the two legs' record formats.
+//
+// The formats are per LEG, and they are the whole version negotiation:
+// the record format is an A↔C protocol, and each leg's format comes
+// from the ALPN that leg's connection negotiated.
+//
+// A nil tgtFormat means "ask the target session" — the production path,
+// where the target's connection reports its own ALPN.
+func (t *RelayTrunk) openFlow(ctx context.Context, open RelayOpen, req Session, reqFormat RelaySpliceFormat, tgtFormat *RelaySpliceFormat) (uint64, error) {
 	// ① the requester is still a member
 	if _, err := t.members.KeyFor(open.From); err != nil {
 		return 0, fmt.Errorf("%w: mesh: relay trunk: the requester %s is no longer a member of this view",
@@ -1000,36 +1320,94 @@ func (t *RelayTrunk) OpenFlow(ctx context.Context, open RelayOpen, req Session) 
 		return 0, fmt.Errorf("mesh: relay trunk: cannot reach %s: %w", open.To, err)
 	}
 
+	// The TARGET's leg format.
+	tgtFmt := RelaySpliceFormatBinary
+	if tgtFormat != nil {
+		tgtFmt = *tgtFormat
+	} else {
+		tgtFmt, err = relayFormatOfSession(tgt)
+		if err != nil {
+			_ = tgt.Close()
+			t.releaseStream()
+			return 0, err
+		}
+	}
+
 	// The OPEN record towards the TARGET. The target has no way of knowing
 	// who is asking for it: it sees a stream on the connection it opened
 	// towards the trunk, and the requester's identity travels in this
 	// record. Without it the target cannot pick the right key for the
 	// end-to-end handshake, so the handshake can never complete (defect C
 	// of the round-61 real-machine report).
-	if err := writeRelayRecord(tgt, relayRecord{
-		Type: uint8(wire.FrameMeshRelayOpen),
-		From: open.From,
-		To:   open.To,
-		Kind: open.Kind,
-		Hops: open.Hops,
-	}); err != nil {
+	//
+	// IT ALSO CARRIES THE PAYLOAD CAP for the whole path.
+	//
+	// The target is a writer too — it answers through the relay — and on
+	// a mixed-version relay its record has to fit on the REQUESTER's leg
+	// as well as on its own. The target cannot know the requester's leg's
+	// format; the anchor dialled both ends, so the anchor does.
+	//
+	// See maxRelayPayloadForLegs.
+	//
+	// It is written in the TARGET's format — the target is the one that
+	// has to read it.
+	capForTarget := maxRelayPayloadForLegs(tgtFmt, reqFormat)
+	//
+	// It is written in the TARGET's format — the target is the one that
+	// has to read it.
+	//
+	// It is written in the TARGET's format — the target is the one that
+	// has to read it.
+	if err := writeRelayRecordAs(tgt, relayRecord{
+		Type:       uint8(wire.FrameMeshRelayOpen),
+		From:       open.From,
+		To:         open.To,
+		Kind:       open.Kind,
+		Hops:       open.Hops,
+		MaxPayload: capForTarget,
+	}, tgtFmt); err != nil {
 		_ = tgt.Close()
 		t.releaseStream()
 		return 0, fmt.Errorf("mesh: relay trunk: tell %s who is calling: %w", open.To, err)
 	}
 
 	t.mu.Lock()
+	// ★ THE FLOW MUST NOT BE ADOPTED AFTER THE TEARDOWN. (Round 98.)
+	//
+	// The `stopping` flag is checked in reserveStream — but that is a
+	// DIFFERENT MOMENT from here. The slot is reserved first, then the
+	// target's session is opened (which can take seconds, up to the dial
+	// budget), and only NOW is the flow registered.
+	//
+	// Shutdown() walks the live flows and then zeroes the reserved
+	// counter. So a flow that reaches this line after that walk is
+	// neither torn down (the walk already passed) nor accounted for
+	// (its slot was handed back) — it lives forever, invisible to the
+	// stream-limit quota, and it holds two sessions open.
+	//
+	// The check belongs HERE, at the moment the flow becomes visible,
+	// because that is the moment it can be adopted. reserveStream's
+	// check covers a different window.
+	if t.stopping {
+		t.mu.Unlock()
+		_ = req.Close()
+		_ = tgt.Close()
+		t.releaseStream()
+		return 0, fmt.Errorf("%w: mesh: relay trunk: this node is shutting down", ErrRelayUnavailable)
+	}
 	t.nextFlow++
 	id := t.nextFlow
 	flow := &relayFlow{
-		id:    id,
-		from:  open.From,
-		to:    open.To,
-		req:   req,
-		tgt:   tgt,
-		reqBr: bufio.NewReader(req),
-		tgtBr: bufio.NewReader(tgt),
-		done:  make(chan struct{}),
+		id:        id,
+		from:      open.From,
+		to:        open.To,
+		req:       req,
+		tgt:       tgt,
+		reqBr:     bufio.NewReader(req),
+		tgtBr:     bufio.NewReader(tgt),
+		reqFormat: reqFormat,
+		tgtFormat: tgtFmt,
+		done:      make(chan struct{}),
 	}
 	t.flows[id] = flow
 	t.mu.Unlock()
@@ -1054,6 +1432,18 @@ func (t *RelayTrunk) OpenFlow(ctx context.Context, open RelayOpen, req Session) 
 func (t *RelayTrunk) reserveStream() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	// A TRUNK THAT IS STOPPING TAKES NO MORE WORK.
+	//
+	// The flag is checked HERE as well as at the top of the handler,
+	// because the two are not the same moment: the handler's check
+	// happens when the connection arrives, and this one happens when the
+	// slot is taken — and between them the trunk can be told to stop.
+	//
+	// A slot taken after the shutdown would keep itself forever,
+	// because the teardown has already walked the live flows.
+	if t.stopping {
+		return fmt.Errorf("%w: mesh: relay trunk: this node is shutting down", ErrRelayUnavailable)
+	}
 	if t.reserved >= t.quota.MaxStreams {
 		return fmt.Errorf("%w: mesh: relay trunk: this node is already carrying %d relay(s) (the limit)",
 			ErrQuota, t.quota.MaxStreams)
@@ -1110,6 +1500,33 @@ func (t *RelayTrunk) closeFlowForced(id uint64, reason string) {
 }
 
 func (t *RelayTrunk) tearDownFlow(id uint64, reason string, forced bool) {
+	// THE REASON IS THE OPERATOR'S ONLY CLUE, and it used to be dropped
+	// on the floor: every caller passes one ("relay peer failed",
+	// "a member of this relay was revoked", "the trunk is shutting
+	// down", …) and this function never looked at it.
+	//
+	// So a relay could die for ANY reason and the anchor's log would
+	// show nothing at all. The operator's only clue was the peer's
+	// side, and a peer that had vanished had no side.
+	//
+	// The reason is a FIXED STRING chosen by this package — it carries
+	// no payload, no peer text and no error text, so it cannot leak
+	// business content into the log. (That is the same rule the rest
+	// of this file follows: report the error CLASS, not its text.)
+	//
+	// A normal end is not a death: the relay finished, and saying so
+	// on every completed relay would drown the log on a busy anchor.
+	// So only the ABNORMAL teardowns are reported — the forced ones,
+	// and the graceful ones whose reason is not the ordinary "the
+	// relay finished".
+	if reason != "" && reason != "relay finished" {
+		kind := "graceful"
+		if forced {
+			kind = "forced"
+		}
+		fmt.Fprintf(relayLogWriter(),
+			"mesh: relay trunk: the relay %d was torn down (%s): %s\n", id, kind, reason)
+	}
 	t.mu.Lock()
 	flow, ok := t.flows[id]
 	if ok {
@@ -1143,10 +1560,64 @@ func (t *RelayTrunk) FlowCount() int {
 	return t.reserved
 }
 
+// FlowBytes reports how many payload bytes the flow has forwarded.
+//
+// It is the quota's accounting, exposed so a test can check that the
+// FAST PATH charges the same number the slow path does: the rate budget
+// is charged on the payload bytes, and the binary header carries the
+// same number as the decoded record's Data length did.
+func (t *RelayTrunk) FlowBytes(id uint64) int64 {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	flow, ok := t.flows[id]
+	if !ok {
+		return 0
+	}
+	return flow.total
+}
+
 // CloseAll tears down every live relay and frees the slots.
 //
 // It is the shutdown path: an anchor that is stopping must not leave
 // relayed sessions hanging on either end.
+// Shutdown stops the trunk: no new relay is admitted, and every live
+// one is torn down.
+//
+// It used to have no way to be called: CloseAll existed but nothing in
+// the production path called it, so an anchor that stopped left its live
+// relay flows running — and their stream slots reserved. A second relay
+// on the same anchor would then be refused for lack of a slot that no
+// longer had a flow behind it.
+//
+// So the shutdown is ONE call that does both halves: set the flag (no
+// new admissions) and tear down what is live (the slots come back).
+func (t *RelayTrunk) Shutdown() {
+	t.mu.Lock()
+	t.stopping = true
+	t.mu.Unlock()
+	t.CloseAll()
+	// The RESERVED slots are released too.
+	//
+	// A slot is reserved BEFORE the flow exists (the target's session
+	// has to be opened first), so CloseAll — which walks the live
+	// flows — cannot see a reservation that has no flow behind it yet.
+	// Those are exactly the slots a shutdown must hand back: the
+	// teardown is the end of the node's work, so every slot it held is
+	// free.
+	t.mu.Lock()
+	t.reserved = 0
+	t.mu.Unlock()
+}
+
+// isStopping reports whether the trunk is shutting down.
+func (t *RelayTrunk) isStopping() bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.stopping
+}
+
+// CloseAll tears down every live relay and gives their stream slots
+// back.
 func (t *RelayTrunk) CloseAll() {
 	t.mu.RLock()
 	ids := make([]uint64, 0, len(t.flows))
@@ -1201,103 +1672,359 @@ func (t *RelayTrunk) CloseAll() {
 // (the far side may still have something to say), and the flow is over
 // only when both directions are done.
 func (t *RelayTrunk) splice(flow *relayFlow) {
+	// The MIXED-VERSION line, once per relay.
+	//
+	// It is here, at the top of the splice, and not per record: a line
+	// per record would drown the log on a busy anchor — at the measured
+	// 65.9–67.8 MiB/s the record rate is in the tens of thousands per
+	// second — and the fact it reports (the two legs disagree) does not
+	// change during the relay.
+	//
+	// The operator's reading of the line is "the rollout is not finished":
+	// one of the two ends of this relay is still on the old format, so
+	// this relay is running on the slow path and carrying less than it
+	// could.
+	//
+	// THE LINE NAMES BOTH FORMATS rather than saying "the JSON path",
+	// because the mixed case has TWO shapes and only one of them is
+	// "the JSON path":
+	//
+	//	requester on JSON, target on binary → the anchor reads JSON and
+	//	                                   writes binary frames
+	//	requester on binary, target on JSON → the anchor reads binary
+	//	                                   frames and writes JSON
+	//
+	// A line that said "running on the JSON path" for a relay that WRITES
+	// binary frames would be wrong, and an operator who reads it would
+	// go looking in the wrong place. Naming the two formats also says
+	// WHICH end is the old one — which is the end to upgrade.
+	if flow.reqFormat != flow.tgtFormat {
+		fmt.Fprintf(relayLogWriter(),
+			"mesh: relay trunk: the relay from %s to %s is running on the slow path: "+
+				"the requester's leg speaks %s and the target's leg speaks %s; "+
+				"the anchor has to decode and re-encode every record until both ends are upgraded\n",
+			flow.from, flow.to, flow.reqFormat, flow.tgtFormat)
+	}
 	var wg sync.WaitGroup
 	wg.Add(2)
+	// ★ THE TEARDOWN MUST NOT DEPEND ON BOTH DIRECTIONS FINISHING.
+	// (Round 98.)
+	//
+	// The close used to run AFTER wg.Wait(), so ONE blocked direction
+	// kept the flow — and its stream slot — alive forever.
+	//
+	// The shape that does it: the requester half-closes (its direction
+	// sees EOF and ends), and the TARGET never answers. The direction
+	// that reads the target is then blocked on a read that will never
+	// return, so wg.Wait() never returns, so the flow is never closed.
+	//
+	// A `defer` alone does NOT fix that: the deferred close still waits
+	// for splice() to RETURN, and splice() is blocked in wg.Wait().
+	//
+	// So the wait itself is bounded. When ONE direction has finished,
+	// the other gets a grace period to finish on its own — long enough
+	// for the answer to a request that was sent before the half-close
+	// (the ordinary request/response shape) — and if it does not, the
+	// flow is torn down FORCED, which aborts both sessions and releases
+	// the slot.
+	//
+	// The reason is a fixed string, like every other reason in this
+	// file: it names a class, not a peer's text.
+	finished := make(chan struct{}, 2)
+	var once sync.Once
+	markFinished := func() { once.Do(func() { finished <- struct{}{} }) }
+
 	go func() {
 		defer wg.Done()
-		t.forwardRecords(flow, flow.reqBr, flow.tgt)
+		defer markFinished()
+		t.forwardRecords(flow, flow.reqBr, flow.tgt, flow.reqFormat, flow.tgtFormat)
 	}()
 	go func() {
 		defer wg.Done()
-		t.forwardRecords(flow, flow.tgtBr, flow.req)
+		defer markFinished()
+		t.forwardRecords(flow, flow.tgtBr, flow.req, flow.tgtFormat, flow.reqFormat)
 	}()
-	wg.Wait()
+
+	// Wait for the first direction to end.
+	<-finished
+
+	// Give the other direction a bounded grace period.
+	otherDone := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(otherDone)
+	}()
+	select {
+	case <-otherDone:
+		// Both directions finished: the ordinary end.
+	case <-time.After(relayTeardownGrace):
+		// One side is stuck. The flow must not survive it: the slot is
+		// the trunk's quota, and a quota slot held by a dead relay is a
+		// quota slot nobody can use.
+		t.closeFlowForced(flow.id, "the relay peer did not finish")
+		<-otherDone
+	}
 	t.closeFlow(flow.id, "relay finished")
 }
 
 // forwardRecords forwards the records from one side to the other.
 //
-// The records are forwarded VERBATIM: the trunk does not open the
-// payload, and it holds no key for it. What it counts is the SIZE of the
-// payload it carries.
+// THE TWO PATHS.
 //
-// The count is on the bytes the trunk ACTUALLY FORWARDS. The trunk's own
-// business traffic does not pass through here, so it never counts against
-// the relay budget — that is the "自身业务不受影响" half of P-7.
+// When the two legs speak the SAME format — the normal case, and the one
+// the whole switch is about — the records are forwarded VERBATIM: the
+// anchor reads the 24-byte fixed header, learns the payload's length
+// from it, and copies the bytes. It never decodes the payload, and it
+// holds no key for it.
+//
+// When the two legs DISAGREE — a mixed-version relay — the anchor has to
+// TRANSLATE: it decodes the record and re-encodes it in the far leg's
+// format. That is the old (slow) path, and it is the price of a
+// deployment that is only half upgraded.
+//
+// The measured difference, on the real host, same build, same lab, 128 MB
+// bench, 3 reps each, link=relay:
+//
+//	JSON decode + re-encode            33.3 – 36.5 MiB/s
+//	binary frame, decode + re-encode   59.4 – 61.6 MiB/s  (+77%)
+//	binary frame, byte-copy            65.9 – 67.8 MiB/s  (+96%)
+//
+// So the fast path is not a micro-optimisation: it is the difference
+// between a relay that carries 34 MiB/s and one that carries 66.
+//
+// WHAT IT COUNTS is the SIZE of the payload it carries. The count is on
+// the bytes the trunk ACTUALLY FORWARDS. The trunk's own business traffic
+// does not pass through here, so it never counts against the relay budget
+// — that is the "自身业务不受影响" half of P-7.
 //
 // The rate quota is checked BEFORE the write, so an over-rate flow is
 // refused rather than silently truncated: the flow's streams are closed
 // and the peers learn about it.
-func (t *RelayTrunk) forwardRecords(flow *relayFlow, br *bufio.Reader, to Session) {
-	for {
-		rec, err := readRelayRecord(br)
+func (t *RelayTrunk) forwardRecords(flow *relayFlow, br *bufio.Reader, to Session, from, toFormat RelaySpliceFormat) {
+	// THE FAST PATH is the one that matters, and it is legal only when
+	// the two legs both speak the BINARY FRAME: a verbatim copy is a copy
+	// of the record AS IT IS, and the far leg has to be able to read it.
+	//
+	// The splicer is built ONCE, here, and used for every record of this
+	// direction. Building it per record would put an allocation back on
+	// the hot path — and the whole point of the splice is that it
+	// allocates NOTHING per record (measured: 957 ns per 32 KiB record,
+	// zero allocations, against 114,369 ns and twelve allocations for
+	// the JSON path).
+	//
+	// WHY THE CONDITION IS "BOTH BINARY" AND NOT "THE LEGS AGREE".
+	//
+	// The splicer refuses two JSON legs on purpose: there is nothing to
+	// splice, the decode-and-re-encode path already forwards that format
+	// and has always done so. That refusal is a NORMAL ANSWER, not a
+	// fault — and the first version of this switch read it as a fault
+	// and tore the flow down.
+	//
+	// The symptom was a relay that died at its first record on the one
+	// deployment shape that has to keep working: a member that negotiated
+	// the OLD ALPN on both legs (an old member on a new anchor, or two
+	// old members on an old anchor). Since the anchor is upgraded FIRST,
+	// that shape exists for the whole window between the anchor's
+	// upgrade and the last member's upgrade — so tearing it down would
+	// take the relay feature down for exactly as long as the rollout
+	// took. See TestARelayWhoseTwoLegsBothSpeakJSONStillWorks.
+	//
+	// So the rule is: the splicer is the BINARY fast path, and EVERY
+	// other shape — two JSON legs, or two legs that disagree — goes down
+	// the decode-and-re-encode path, which is the old path and which has
+	// always worked.
+	var splicer *RelaySplicer
+	if from == RelaySpliceFormatBinary && toFormat == RelaySpliceFormatBinary {
+		var err error
+		splicer, err = NewRelaySplicer(from, toFormat)
 		if err != nil {
-			if errors.Is(err, io.EOF) {
-				// The sender is DONE SENDING — a half close, not a
-				// failure. The far side may still have an answer to
-				// give, so the far side is half-closed too and this
-				// direction ends here.
-				//
-				// This is the case every request/response protocol
-				// produces: "send the request, FIN, wait for the
-				// answer".
-				_ = to.Close()
-				return
-			}
-			// A hard failure: the peer is GONE, not merely finished.
-			// Nothing can be salvaged, so the flow is torn down — and
-			// tearing it down releases the other direction, which would
-			// otherwise wait for a peer that will never answer.
-			t.closeFlowForced(flow.id, "relay peer failed")
+			// Unreachable in practice: the two legs both speak the binary
+			// frame, which is the one shape the splicer accepts. But if it
+			// ever happened, the relay must not carry a record in a format
+			// the far side cannot read.
+			t.closeFlowForced(flow.id, "the relay could not be spliced")
 			return
 		}
-		if rec.Type == uint8(wire.FrameMeshRelayClose) {
-			// The sender is done. Forward the close and stop: the flow
-			// is over on this side. If the close itself cannot be
-			// written, this direction is dead in the same way a data
-			// write would be — tear the flow down explicitly rather
-			// than leaving the far direction to depend on the peer's
-			// failure mode (same reasoning as the data-write path).
-			if err := writeRelayRecord(to, rec); err != nil {
-				t.closeFlowForced(flow.id, "relay close forward failed")
+		splicer.Quota = &flowQuota{flow: flow, trunk: t}
+		splicer.Done = flow.done
+	}
+	for {
+		if splicer != nil {
+			if done := t.forwardOneVerbatim(flow, br, to, splicer); done {
 				return
 			}
+			continue
+		}
+		if done := t.forwardOneTranslated(flow, br, to, from, toFormat); done {
+			return
+		}
+	}
+}
+
+// forwardOneVerbatim forwards ONE record without decoding it.
+//
+// It is the fast path, and it is where the measured win lives.
+//
+// The record's length comes from the FIXED HEADER, not from a scan, and
+// the header says how long the meta block and the payload are. So the
+// anchor knows how many bytes to copy before it copies the first one.
+//
+// It returns true when this direction is OVER (the peer finished, or the
+// flow was torn down), and false when the caller should read the next
+// record.
+func (t *RelayTrunk) forwardOneVerbatim(flow *relayFlow, br *bufio.Reader, to Session, splicer *RelaySplicer) bool {
+	hdr, err := splicer.ForwardOne(br, to)
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			// The sender is DONE SENDING — a half close, not a
+			// failure. The far side may still have an answer to give,
+			// so the far side is half-closed too and this direction ends
+			// here.
+			//
+			// This is the case every request/response protocol
+			// produces: "send the request, FIN, wait for the answer".
 			_ = to.Close()
-			return
+			return true
 		}
-		// The rate budget is a THROTTLE, not a kill switch. chargeBytes
-		// reports how long the node needs to refill; the forwarder waits
-		// that long and tries again. The old behaviour tore the flow down
-		// the moment the bucket ran dry — a transfer faster than the cap
-		// DIED at the cap, which is the exact "file size limit" behaviour
-		// the bucket was introduced to remove. P-7 is a sustained-RATE
-		// requirement: a hundred megabytes at a 50 MiB/s cap takes two
-		// seconds and arrives whole.
-		for {
-			wait := t.chargeBytes(flow, int64(len(rec.Data)))
-			if wait == 0 {
-				break
-			}
-			select {
-			case <-time.After(wait):
-				// Refilled (maybe — another direction may have drunk
-				// from the same bucket, so loop and re-check).
-			case <-flow.done:
-				// The flow ended while this direction waited; nothing
-				// left to forward.
-				return
-			}
+		// A hard failure: the peer is GONE, not merely finished.
+		// Nothing can be salvaged, so the flow is torn down — and
+		// tearing it down releases the other direction, which would
+		// otherwise wait for a peer that will never answer.
+		t.closeFlowForced(flow.id, "relay peer failed")
+		return true
+	}
+	if hdr.Type == uint8(wire.FrameMeshRelayClose) {
+		// The sender is done. The close record has been forwarded
+		// already, so the far side knows. This direction ends with a
+		// HALF close: the far side may still have something to say.
+		_ = to.Close()
+		return true
+	}
+	return false
+}
+
+// forwardOneTranslated forwards ONE record, decoding it and re-encoding
+// it in the far leg's format.
+//
+// It is the MIXED-VERSION fallback: the anchor has to understand the
+// record to change its format, and understanding the record is exactly
+// what the fast path avoids. So this path is the old path, and it is
+// SLOW — that is the honest cost of a half-upgraded deployment.
+//
+// It returns true when this direction is OVER, and false when the caller
+// should read the next record.
+func (t *RelayTrunk) forwardOneTranslated(flow *relayFlow, br *bufio.Reader, to Session, from, toFormat RelaySpliceFormat) bool {
+	rec, err := readRelayRecordAs(br, from)
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			_ = to.Close()
+			return true
 		}
-		if err := writeRelayRecord(to, rec); err != nil {
-			// The write failed, so this direction cannot go on. Tear the
-			// flow down EXPLICITLY: the other direction must not be left
-			// waiting for a flow that is already over. (On the real
-			// stream a dead write usually means dead reads too, so the
-			// other direction unblocks on its own — but "usually" is not
-			// a teardown path, and the quota slot must not depend on the
-			// peer's failure mode.)
-			t.closeFlowForced(flow.id, "relay forwarding write failed")
-			return
+		t.closeFlowForced(flow.id, "relay peer failed")
+		return true
+	}
+	if rec.Type == uint8(wire.FrameMeshRelayClose) {
+		// The sender is done. Forward the close and stop: the flow
+		// is over on this side. If the close itself cannot be written,
+		// this direction is dead in the same way a data write would be —
+		// tear the flow down explicitly rather than leaving the far
+		// direction to depend on the peer's failure mode.
+		if err := writeRelayRecordAs(to, rec, toFormat); err != nil {
+			t.closeFlowForced(flow.id, "relay close forward failed")
+			return true
+		}
+		_ = to.Close()
+		return true
+	}
+	// The rate budget is a THROTTLE, not a kill switch. chargeBytes
+	// reports how long the node needs to refill; the forwarder waits
+	// that long and tries again. The old behaviour tore the flow down
+	// the moment the bucket ran dry — a transfer faster than the cap
+	// DIED at the cap, which is the exact "file size limit" behaviour
+	// the bucket was introduced to remove. P-7 is a sustained-RATE
+	// requirement: a hundred megabytes at a 50 MiB/s cap takes two
+	// seconds and arrives whole.
+	for {
+		wait := t.chargeBytes(flow, int64(len(rec.Data)))
+		if wait == 0 {
+			break
+		}
+		select {
+		case <-time.After(wait):
+			// Refilled (maybe — another direction may have drunk
+			// from the same bucket, so loop and re-check).
+		case <-flow.done:
+			// The flow ended while this direction waited; nothing
+			// left to forward.
+			return true
+		}
+	}
+	if err := writeRelayRecordAs(to, rec, toFormat); err != nil {
+		// The write failed, so this direction cannot go on. Tear the
+		// flow down EXPLICITLY: the other direction must not be left
+		// waiting for a flow that is already over. (On the real stream
+		// a dead write usually means dead reads too, so the other
+		// direction unblocks on its own — but "usually" is not a
+		// teardown path, and the quota slot must not depend on the
+		// peer's failure mode.)
+		//
+		// THE REASON IS LOGGED, because on the TRANSLATED path the
+		// failure has a cause an operator can act on: the record the
+		// writer sent does not fit in the far leg's format. The JSON
+		// envelope is a third bigger than the binary frame, so a writer
+		// that ignored the cap the anchor stated would produce exactly
+		// this — and without the line the operator sees a relay that
+		// died for no stated reason.
+		fmt.Fprintf(relayLogWriter(),
+			"mesh: relay trunk: the relay from %s to %s could not forward a record "+
+				"the %s leg cannot hold: %v; the writer is not honouring the payload cap\n",
+			flow.from, flow.to, toFormat, err)
+		t.closeFlowForced(flow.id, "relay forwarding write failed")
+		return true
+	}
+	return false
+}
+
+// flowQuota is the rate budget the splicer charges against.
+//
+// It is the trunk's own budget, reached through the same accounting the
+// translated path uses, so the two paths charge IDENTICALLY: a relay
+// that falls back to the slow path does not get a different quota.
+type flowQuota struct {
+	flow  *relayFlow
+	trunk *RelayTrunk
+}
+
+// Reserve charges payloadLen payload bytes against the budget.
+//
+// The splice asks once and waits if the bucket is dry; the wait is the
+// trunk's own throttling, so it is re-asked rather than trusted (the
+// flow's other direction may have drunk from the same bucket).
+func (q *flowQuota) Reserve(payloadLen int64) (time.Duration, error) {
+	for {
+		wait := q.trunk.chargeBytes(q.flow, payloadLen)
+		if wait == 0 {
+			return 0, nil
+		}
+		// The wait must be INTERRUPTIBLE.
+		//
+		// The old shape slept first and checked afterwards, so a flow
+		// that ended while the splice was waiting for the rate budget
+		// kept its forwarding goroutine for the whole wait — up to a
+		// full record's worth of refill (about 15 s at a 64 KiB/s
+		// cap). The check after the sleep could therefore only report
+		// the end LATE; it could never cut the wait short.
+		//
+		// So the wait is a select on the flow's end and a timer: the
+		// goroutine goes away as soon as the flow does, instead of
+		// lingering for a budget it will never spend.
+		timer := time.NewTimer(wait)
+		select {
+		case <-q.flow.done:
+			timer.Stop()
+			return 0, fmt.Errorf("%w: mesh: the flow ended while the relay waited for the rate budget",
+				ErrRelaySpliceFlowEnded)
+		case <-timer.C:
 		}
 	}
 }
@@ -1468,7 +2195,26 @@ func (t *RelayTrunk) RevokeFlows() int {
 }
 
 // stillMember reports whether id is still in the member view.
+//
+// It asks the NARROW question — "is it still a member?" — and not the
+// wide one KeyFor asks ("is it a member AND is its certificate valid
+// AND is there a view?").
+//
+// The distinction matters for the same reason it matters on the direct
+// path: a member whose certificate merely LAPSED is not a revoked
+// member. The product renews certificates precisely so that expiry is a
+// normal, recoverable event — and a revocation watch that tears down a
+// flow because a timer ran out kills a legitimate transfer and tells
+// the peer it was revoked.
+//
+// The two paths must agree: the direct path asks the narrow question
+// (see Listener.stillMember), so this one does too. A member whose
+// certificate lapsed keeps its direct session AND its relay flow —
+// a member whose membership was revoked loses both.
 func (t *RelayTrunk) stillMember(id identity.DeviceID) bool {
+	if m, ok := t.members.(membershipChecker); ok {
+		return m.StillMember(id)
+	}
 	_, err := t.members.KeyFor(id)
 	return err == nil
 }
@@ -1571,6 +2317,24 @@ type relaySession struct {
 
 	// rec reads the records the trunk sends back.
 	rec relayRecordReader
+	// format is the record format of this leg.
+	//
+	// It comes from the ALPN the connection to the trunk negotiated, and
+	// it is the requester's half of the switch: a requester on a NEW
+	// anchor writes binary records, and a requester on an OLD anchor
+	// writes JSON ones. The requester cannot know which before it
+	// connects — and it does not have to guess, because the ALPN says.
+	format RelaySpliceFormat
+	// maxPayload is the cap the ANCHOR stated in its answer.
+	//
+	// It is the largest plaintext that survives the WHOLE path of the
+	// relay — the anchor knows the target's leg's format too, and on a
+	// mixed-version relay the record has to fit on the target's leg as
+	// well as on this one. Zero means the anchor stated no cap, and the
+	// writer uses its own leg's default.
+	//
+	// See relayRecord.MaxPayload and maxRelayPayloadForLegs.
+	maxPayload uint64
 	// wmu guards the write side: records go out one at a time, and two
 	// writers would interleave them.
 	wmu sync.Mutex
@@ -1594,7 +2358,7 @@ func (r *relaySession) Write(p []byte) (int, error) {
 	if r.closed {
 		return 0, errors.New("mesh: relay: the session is closed")
 	}
-	n, err := sealAndWriteRelayData(r.conn, r.e2e, p)
+	n, err := sealAndWriteRelayDataAs(r.conn, r.e2e, p, r.format, r.maxPayload)
 	if err != nil {
 		return n, fmt.Errorf("mesh: relay: write: %w", err)
 	}
@@ -1648,15 +2412,41 @@ func (r *relaySession) Close() error {
 	// The close record is sent UNSEALED: it carries no business
 	// content, and the trunk has to be able to act on it (tear the
 	// relay down) even though it cannot read the payload.
-	if err := writeRelayRecord(r.conn, relayRecord{
+	if err := writeRelayRecordAs(r.conn, relayRecord{
 		Type:   uint8(wire.FrameMeshRelayClose),
 		Close:  true,
 		Reason: "the sender closed the session",
-	}); err != nil {
+	}, r.format); err != nil {
 		_ = r.conn.Close()
 		return err
 	}
 	return r.conn.Close()
+}
+
+// ALPN reports the record format this leg speaks.
+//
+// It is here so that a leg's format can be asked of it the same way a
+// connection's can. Without it, relayFormatOfSession asks, gets no
+// answer, and FALLS BACK TO THE BINARY FRAME — so a leg that had
+// negotiated the OLD protocol would be read as binary while it writes
+// JSON, and the reader would find text where a length prefix belongs.
+//
+// (The symptom is memorable: "frame of 1937009004 bytes exceeds the
+// 1048576 byte cap", where 1937009004 is 0x7374696C — the four ASCII
+// bytes "stil" read as a big-endian length. A record's JSON payload
+// read as a length prefix.
+//
+// The byte order is BIG endian (the frame length is written and read
+// that way in internal/mesh/direct.go), so the bytes on the wire were
+// 73 74 69 6C = "stil". The little-endian reading of the same number
+// spells "lits" — a plausible-looking but wrong string to grep for.)
+func (r *relaySession) ALPN() string {
+	switch r.format {
+	case RelaySpliceFormatJSON:
+		return RelayALPN
+	default:
+		return RelayALPN2
+	}
 }
 
 // SetReadDeadline bounds the pending and future reads.
@@ -1734,11 +2524,24 @@ func OpenRelay(ctx context.Context, cfg RelayRequesterConfig) (Session, error) {
 	// relay is an error the caller can act on; a hung one is not.
 	handshakeDeadline := time.Now().Add(relayHandshakeTimeout)
 	_ = conn.SetReadDeadline(handshakeDeadline)
+	// The record format of this leg comes from the ALPN the connection
+	// to the trunk negotiated.
+	//
+	// It is the requester's half of the version negotiation, and it is
+	// what makes the switch deployable: a requester that reached an OLD
+	// anchor negotiated the old ALPN, so it speaks JSON — and the old
+	// anchor, which only knows JSON, keeps working.
+	format, err := relayFormatOfSession(conn)
+	if err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("mesh: relay: the relay member speaks an unknown protocol: %w", err)
+	}
 	r := &relaySession{
 		conn:   conn,
 		e2e:    e2e,
 		target: cfg.Target,
-		rec:    framedRecordReader{br: bufio.NewReader(conn)},
+		rec:    newFramedRecordReader(bufio.NewReader(conn), format),
+		format: format,
 	}
 
 	// ① ask the trunk to carry the session.
@@ -1748,13 +2551,13 @@ func OpenRelay(ctx context.Context, cfg RelayRequesterConfig) (Session, error) {
 		Hops: 1,
 		Kind: cfg.Kind,
 	}
-	if err := writeRelayRecord(conn, relayRecord{
+	if err := writeRelayRecordAs(conn, relayRecord{
 		Type: uint8(wire.FrameMeshRelayOpen),
 		From: open.From,
 		To:   open.To,
 		Hops: open.Hops,
 		Kind: open.Kind,
-	}); err != nil {
+	}, format); err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("mesh: relay: send the open record: %w", err)
 	}
@@ -1773,6 +2576,19 @@ func OpenRelay(ctx context.Context, cfg RelayRequesterConfig) (Session, error) {
 		_ = conn.Close()
 		return nil, relayRefusal(rec)
 	}
+	// The ANCHOR'S CAP.
+	//
+	// The anchor is the only node that knows the whole path — it dialled
+	// the target, so it knows the target's leg's format — and on a
+	// mixed-version relay the record the requester writes has to fit on
+	// the target's leg as well as on this one. So the anchor states the
+	// cap in its answer, and the requester honours it.
+	//
+	// Zero means the anchor stated no cap: an OLD anchor does not know
+	// about it, and an old anchor is JSON-only — so the requester's leg
+	// is JSON too and the requester's own default IS the JSON cap.
+	// Nothing is lost.
+	r.maxPayload = rec.MaxPayload
 
 	// ③ the end-to-end handshake, THROUGH the trunk.
 	//
@@ -1809,10 +2625,10 @@ func (r *relaySession) sendHello() error {
 	if err != nil {
 		return err
 	}
-	if err := writeRelayRecord(r.conn, relayRecord{
+	if err := writeRelayRecordAs(r.conn, relayRecord{
 		Type:  uint8(wire.FrameMeshRelayHello),
 		Hello: raw,
-	}); err != nil {
+	}, r.format); err != nil {
 		return fmt.Errorf("mesh: relay: send our hello: %w", err)
 	}
 	return nil
@@ -1920,6 +2736,15 @@ type TrunkJoiner struct {
 	// trunk's data plane can be tested without a QUIC stack: the pipe
 	// based tests supply their own.
 	open func(ctx context.Context) (Session, error)
+	// format is the record format of this joiner's leg.
+	//
+	// It comes from the ALPN the join connection negotiated, and every
+	// stream the trunk opens on that connection speaks it — the ALPN is
+	// a property of the CONNECTION, not of the stream.
+	//
+	// The zero value is the BINARY frame, which is the default and the
+	// fast path.
+	format RelaySpliceFormat
 	// mu guards the write side.
 	mu sync.Mutex
 	// closed marks the joiner as gone.
@@ -1947,7 +2772,7 @@ func (j *TrunkJoiner) Send(rec relayRecord) error {
 	if j.closed {
 		return errors.New("mesh: relay trunk: the joiner is gone")
 	}
-	return writeRelayRecord(j.sess, rec)
+	return writeRelayRecordAs(j.sess, rec, j.format)
 }
 
 // Close drops the joiner.
@@ -2082,7 +2907,13 @@ func (t *RelayTrunk) ServeJoiner(ctx context.Context, sess Session, table *Joine
 // streams towards the member.
 func (t *RelayTrunk) ServeJoinerWithOpener(ctx context.Context, sess Session, table *JoinerTable, open func(context.Context) (Session, error)) error {
 	br := bufio.NewReader(sess)
-	rec, err := readRelayRecord(br)
+	// The joiner's leg format comes from the ALPN its connection
+	// negotiated.
+	format, err := relayFormatOfSession(sess)
+	if err != nil {
+		return fmt.Errorf("mesh: relay trunk: the join connection speaks an unknown protocol: %w", err)
+	}
+	rec, err := readRelayRecordAs(br, format)
 	if err != nil {
 		return fmt.Errorf("mesh: relay trunk: read the join record: %w", err)
 	}
@@ -2095,7 +2926,7 @@ func (t *RelayTrunk) ServeJoinerWithOpener(ctx context.Context, sess Session, ta
 	if _, err := t.members.KeyFor(rec.From); err != nil {
 		return fmt.Errorf("%w: mesh: relay trunk: %s is not a member of this view", ErrAuth, rec.From)
 	}
-	joiner := &TrunkJoiner{Device: rec.From, sess: sess, br: br, open: open}
+	joiner := &TrunkJoiner{Device: rec.From, sess: sess, br: br, open: open, format: format}
 	table.Add(joiner)
 	defer func() {
 		table.Remove(joiner)
@@ -2111,7 +2942,7 @@ func (t *RelayTrunk) ServeJoinerWithOpener(ctx context.Context, sess Session, ta
 	// silent: a broken frame is a member (or a path) corrupting records,
 	// and an operator needs the reason in the log.
 	for {
-		if _, err := readRelayRecord(br); err != nil {
+		if _, err := readRelayRecordAs(br, format); err != nil {
 			if !errors.Is(err, io.EOF) {
 				fmt.Fprintf(relayLogWriter(), "mesh: relay trunk: the join connection from %s broke: %v\n", rec.From, err)
 			}
@@ -2155,13 +2986,43 @@ func (t *RelayTrunk) ServeRequester(ctx context.Context, sess Session, dialer Re
 // was written closed the requester's QUIC connection while the relay was
 // still carrying its bytes, so the requester never even got to read the
 // grant (defect A of the round-61 real-machine report).
+//
+// The record format is ASKED of the leg, not assumed. This function used
+// to hardcode the binary frame — and a leg that had negotiated the old
+// protocol was then read as binary while it wrote JSON: the reader found
+// text where a length prefix belongs. That is the same shape as the
+// round-81 defect (a relayed session could not report its own format,
+// so the question came back empty and the caller fell back to the
+// binary frame — the most dangerous of the two defaults).
+//
+// So the format comes from the ALPN the leg negotiated, exactly as it
+// does on the production path. A leg that cannot say (the test pipes)
+// gets the binary frame, which is the default the same-version
+// deployment wants.
 func (t *RelayTrunk) ServeRequesterWithFirst(ctx context.Context, sess Session, dialer RelayJoiner, br *bufio.Reader, first *relayRecord) error {
+	format, err := relayFormatOfSession(sess)
+	if err != nil {
+		return fmt.Errorf("mesh: relay trunk: the requester's leg format: %w", err)
+	}
+	return t.ServeRequesterWithFirstFormat(ctx, sess, dialer, br, first, format)
+}
+
+// ServeRequesterWithFirstFormat serves one requester's connection with
+// an EXPLICIT record format for this leg.
+//
+// The format is the requester's leg's format, and it comes from the ALPN
+// the requester's connection negotiated. It is the whole version
+// negotiation: a requester that reached an OLD anchor negotiated the old
+// ALPN, so it speaks JSON, and the anchor must speak JSON back to it —
+// including the ANSWER record, which is the one record the requester
+// cannot do without.
+func (t *RelayTrunk) ServeRequesterWithFirstFormat(ctx context.Context, sess Session, dialer RelayJoiner, br *bufio.Reader, first *relayRecord, format RelaySpliceFormat) error {
 	var rec relayRecord
 	var err error
 	if first != nil {
 		rec = *first
 	} else {
-		rec, err = readRelayRecord(br)
+		rec, err = readRelayRecordAs(br, format)
 		if err != nil {
 			return fmt.Errorf("mesh: relay trunk: read the open record: %w", err)
 		}
@@ -2175,12 +3036,27 @@ func (t *RelayTrunk) ServeRequesterWithFirst(ctx context.Context, sess Session, 
 	// is the security property, and it is not repeated here.
 	ans, verdict := t.Decide(open)
 	if !ans.Grant {
-		_ = writeRelayRecord(sess, relayRecord{
+		// THE ANCHOR LOGS THE REFUSAL TOO.
+		//
+		// The requester learns WHY (the answer carries the reason and
+		// the class), but until now the ANCHOR said nothing: a relay
+		// refused at 3am left no trace on the node that refused it.
+		//
+		// The operator's only clue was the requester's error message
+		// on a different machine — which is exactly the information the
+		// trunk exists to centralise, thrown away.
+		//
+		// The reason is the package's OWN fixed string (the same one
+		// the requester receives), so no peer text reaches the log.
+		fmt.Fprintf(relayLogWriter(),
+			"mesh: relay trunk: the relay from %s to %s was refused (%s): %s\n",
+			open.From, open.To, ans.Class, ans.Reason)
+		_ = writeRelayRecordAs(sess, relayRecord{
 			Type:   uint8(wire.FrameMeshRelayAnswer),
 			Grant:  false,
 			Reason: ans.Reason,
 			Class:  ans.Class,
-		})
+		}, format)
 		return verdict
 	}
 
@@ -2197,22 +3073,29 @@ func (t *RelayTrunk) ServeRequesterWithFirst(ctx context.Context, sess Session, 
 	// LOCAL condition), so the requester tries another relay and the
 	// running transfers keep the node's remaining budget.
 	if err := t.reserveStream(); err != nil {
-		_ = writeRelayRecord(sess, relayRecord{
+		// The anchor logs the quota refusal too — same reasoning as the
+		// authorization refusal above: a node that says "I am full"
+		// must be visible in the node's own log, not only in the
+		// requester's.
+		fmt.Fprintf(relayLogWriter(),
+			"mesh: relay trunk: the relay from %s to %s was refused (%s): this node is carrying as many relays as it may\n",
+			open.From, open.To, RelayClassQuota)
+		_ = writeRelayRecordAs(sess, relayRecord{
 			Type:   uint8(wire.FrameMeshRelayAnswer),
 			Grant:  false,
 			Reason: "this node is carrying as many relays as it may",
 			Class:  RelayClassQuota,
-		})
+		}, format)
 		return err
 	}
 	if t.overRateQuota() {
 		t.releaseStream()
-		_ = writeRelayRecord(sess, relayRecord{
+		_ = writeRelayRecordAs(sess, relayRecord{
 			Type:   uint8(wire.FrameMeshRelayAnswer),
 			Grant:  false,
 			Reason: "this node's forwarding budget is spent; try another relay",
 			Class:  RelayClassQuota,
-		})
+		}, format)
 		// The requester's session ends with the refusal: without this
 		// the requester reads the answer and then waits for the idle
 		// timeout (10 s) before it learns the relay is done.
@@ -2239,7 +3122,7 @@ func (t *RelayTrunk) ServeRequesterWithFirst(ctx context.Context, sess Session, 
 		// the target has no endpoints. The requester is already known to
 		// be a member (the authorization ran before this point), so
 		// telling it the cause leaks nothing to a stranger.
-		_ = writeRelayRecord(sess, relayRecord{
+		_ = writeRelayRecordAs(sess, relayRecord{
 			Type:   uint8(wire.FrameMeshRelayAnswer),
 			Grant:  false,
 			Reason: fmt.Sprintf("this node cannot reach %s right now: %v", open.To, err),
@@ -2248,9 +3131,31 @@ func (t *RelayTrunk) ServeRequesterWithFirst(ctx context.Context, sess Session, 
 			// the path layer treats as a verdict — so the fallback chain
 			// stopped here and the second relay was never tried.
 			Class: RelayClassUnavailable,
-		})
+		}, format)
 		// The session ends with the refusal: the requester reads the
 		// answer and then waits for the idle timeout otherwise.
+		_ = sess.Close()
+		return err
+	}
+
+	// The TARGET's leg format comes from the ALPN that leg's connection
+	// negotiated — and it is INDEPENDENT of the requester's.
+	//
+	// This is the mixed-version case the switch has to survive: a new
+	// requester on a new anchor (the requester's leg speaks the binary
+	// frame) reaching an OLD target (the target's leg speaks JSON). The
+	// two formats disagree, so the anchor has to TRANSLATE — and it says
+	// so, once, in the log.
+	tgtFormat, err := relayFormatOfSession(tgt)
+	if err != nil {
+		_ = tgt.Close()
+		t.releaseStream()
+		_ = writeRelayRecordAs(sess, relayRecord{
+			Type:   uint8(wire.FrameMeshRelayAnswer),
+			Grant:  false,
+			Reason: fmt.Sprintf("this node cannot reach %s right now: %v", open.To, err),
+			Class:  RelayClassUnavailable,
+		}, format)
 		_ = sess.Close()
 		return err
 	}
@@ -2261,16 +3166,29 @@ func (t *RelayTrunk) ServeRequesterWithFirst(ctx context.Context, sess Session, 
 	// it. Without this record the target has no idea whose handshake it
 	// is looking at, and the handshake can never complete (defect C of
 	// the round-61 real-machine report).
-	if err := writeRelayRecord(tgt, relayRecord{
-		Type: uint8(wire.FrameMeshRelayOpen),
-		From: open.From,
-		To:   open.To,
-		Kind: open.Kind,
-		Hops: open.Hops,
-	}); err != nil {
+	//
+	// IT ALSO CARRIES THE PAYLOAD CAP for the whole path: the target
+	// answers through the relay, and on a mixed-version relay its record
+	// has to fit on the REQUESTER's leg as well as on its own. The
+	// target cannot know the requester's leg's format; the anchor dialled
+	// both ends, so the anchor does.
+	//
+	// See maxRelayPayloadForLegs.
+	//
+	// It is written in the TARGET's format — the target is the one that
+	// has to read it.
+	capForTarget := maxRelayPayloadForLegs(tgtFormat, format)
+	if err := writeRelayRecordAs(tgt, relayRecord{
+		Type:       uint8(wire.FrameMeshRelayOpen),
+		From:       open.From,
+		To:         open.To,
+		Kind:       open.Kind,
+		Hops:       open.Hops,
+		MaxPayload: capForTarget,
+	}, tgtFormat); err != nil {
 		_ = tgt.Close()
 		t.releaseStream()
-		_ = writeRelayRecord(sess, relayRecord{
+		_ = writeRelayRecordAs(sess, relayRecord{
 			Type:   uint8(wire.FrameMeshRelayAnswer),
 			Grant:  false,
 			Reason: fmt.Sprintf("this node cannot reach %s right now: %v", open.To, err),
@@ -2281,7 +3199,7 @@ func (t *RelayTrunk) ServeRequesterWithFirst(ctx context.Context, sess Session, 
 			// multi-relay fallback chain exactly the way the dial failure
 			// once did.
 			Class: RelayClassUnavailable,
-		})
+		}, format)
 		// The session ends with the refusal: the requester reads the
 		// answer and then waits for the idle timeout otherwise.
 		_ = sess.Close()
@@ -2294,14 +3212,16 @@ func (t *RelayTrunk) ServeRequesterWithFirst(ctx context.Context, sess Session, 
 	t.nextFlow++
 	id := t.nextFlow
 	flow := &relayFlow{
-		id:    id,
-		from:  open.From,
-		to:    open.To,
-		req:   sess,
-		tgt:   tgt,
-		reqBr: br,
-		tgtBr: bufio.NewReader(tgt),
-		done:  make(chan struct{}),
+		id:        id,
+		from:      open.From,
+		to:        open.To,
+		req:       sess,
+		tgt:       tgt,
+		reqBr:     br,
+		tgtBr:     bufio.NewReader(tgt),
+		reqFormat: format,
+		tgtFormat: tgtFormat,
+		done:      make(chan struct{}),
 	}
 	t.flows[id] = flow
 	t.mu.Unlock()
@@ -2311,11 +3231,25 @@ func (t *RelayTrunk) ServeRequesterWithFirst(ctx context.Context, sess Session, 
 	// this function returned — before the handshake had even crossed.
 
 	// The grant.
-	if err := writeRelayRecord(sess, relayRecord{
-		Type:    uint8(wire.FrameMeshRelayAnswer),
-		Grant:   true,
-		Session: id,
-	}); err != nil {
+	//
+	// IT CARRIES THE PAYLOAD CAP for the whole path.
+	//
+	// The requester writes its records on ITS leg, and on a mixed-version
+	// relay the anchor has to re-encode them for the TARGET's leg — and
+	// the JSON envelope is a third bigger than the binary frame. So a
+	// record the requester was allowed to write on its own leg may not
+	// fit on the target's.
+	//
+	// The requester cannot know the target's leg's format; the anchor
+	// dialled both ends, so the anchor does. See
+	// maxRelayPayloadForLegs.
+	capForRequester := maxRelayPayloadForLegs(format, tgtFormat)
+	if err := writeRelayRecordAs(sess, relayRecord{
+		Type:       uint8(wire.FrameMeshRelayAnswer),
+		Grant:      true,
+		Session:    id,
+		MaxPayload: capForRequester,
+	}, format); err != nil {
 		t.closeFlowForced(id, "the grant could not be written")
 		return err
 	}
@@ -2359,6 +3293,24 @@ type relayTargetSession struct {
 
 	// rec reads the records the requester sends through the trunk.
 	rec relayRecordReader
+	// format is the record format of this leg.
+	//
+	// It comes from the ALPN the connection to the trunk negotiated, and
+	// it is the TARGET's half of the switch: the target's per-record
+	// cost was measured at 1345 µs — co-equal with the anchor's — so a
+	// target that still spoke JSON would have kept half the relay's
+	// total CPU on the JSON path.
+	format RelaySpliceFormat
+	// maxPayload is the cap the ANCHOR stated in the OPEN record.
+	//
+	// It is the largest plaintext that survives the WHOLE path of the
+	// relay: the anchor knows the requester's leg's format too, and on a
+	// mixed-version relay the record the target writes has to fit on the
+	// requester's leg as well as on this one. Zero means the anchor
+	// stated no cap, and the target uses its own leg's default.
+	//
+	// See relayRecord.MaxPayload and maxRelayPayloadForLegs.
+	maxPayload uint64
 	// wmu guards the write side.
 	wmu sync.Mutex
 	// buf holds the plaintext of the record currently being read out.
@@ -2376,7 +3328,7 @@ func (t *relayTargetSession) Write(p []byte) (int, error) {
 	if t.closed {
 		return 0, errors.New("mesh: relay target: the session is closed")
 	}
-	n, err := sealAndWriteRelayData(t.conn, t.e2e, p)
+	n, err := sealAndWriteRelayDataAs(t.conn, t.e2e, p, t.format, t.maxPayload)
 	if err != nil {
 		return n, fmt.Errorf("mesh: relay target: write: %w", err)
 	}
@@ -2421,11 +3373,11 @@ func (t *relayTargetSession) Close() error {
 		return nil
 	}
 	t.closed = true
-	if err := writeRelayRecord(t.conn, relayRecord{
+	if err := writeRelayRecordAs(t.conn, relayRecord{
 		Type:   uint8(wire.FrameMeshRelayClose),
 		Close:  true,
 		Reason: "the target closed the session",
-	}); err != nil {
+	}, t.format); err != nil {
 		_ = t.conn.Close()
 		return err
 	}
@@ -2440,6 +3392,31 @@ func (t *relayTargetSession) SetWriteDeadline(ts time.Time) error {
 	return t.conn.SetWriteDeadline(ts)
 }
 
+// ALPN reports the record format this leg speaks.
+//
+// The target's leg format comes from the ALPN the connection to the
+// trunk negotiated (see ServeRelayTarget), so the target can say it —
+// and saying it closes the last hole in the "ask the leg" question.
+//
+// Without this method the question comes back EMPTY, and the caller
+// falls back to the binary frame — the most dangerous of the two
+// defaults. That is the same shape as the round-81 defect (a relayed
+// session could not report its own format, so a leg that had
+// negotiated the old protocol was read as binary while it wrote JSON,
+// and the reader found text where a length prefix belongs).
+//
+// So every type that can be handed back as a Session says its format.
+// The capability is asked for by type assertion, and a session that
+// cannot say (the test pipes) falls back to the binary frame.
+func (t *relayTargetSession) ALPN() string {
+	switch t.format {
+	case RelaySpliceFormatJSON:
+		return RelayALPN
+	default:
+		return RelayALPN2
+	}
+}
+
 // Abort ends the target's side of the relayed session on both sides.
 //
 // The half close (Close) is the polite end of the send direction. This is
@@ -2450,6 +3427,17 @@ func (t *relayTargetSession) Abort() error {
 	t.closed = true
 	t.wmu.Unlock()
 	return abortSession(t.conn)
+}
+
+// relayFormatReader is the OPTIONAL way to ask a record reader which
+// format it reads.
+//
+// It mirrors the other optional capabilities in this package: the
+// capability is asked for by type assertion, and a reader that does not
+// have it is not broken.
+type relayFormatReader interface {
+	// legFormat reports the record format this reader reads.
+	legFormat() RelaySpliceFormat
 }
 
 // ServeRelayTarget performs the TARGET's half of the end-to-end
@@ -2466,12 +3454,30 @@ func (t *relayTargetSession) Abort() error {
 //
 // The target holds the end-to-end key. The trunk does not — that is the
 // whole point of the layer.
+//
+// THE RECORD FORMAT is the target's leg's format, and it comes from the
+// ALPN the connection to the trunk negotiated. The reader and the writer
+// must agree on it — the trunk wrote the OPEN record in that format, so
+// a reader in another format would fail on the first record.
+//
+// A disagreement is a LOUD failure, not a guess: the target refuses the
+// session rather than misreading the records.
 func ServeRelayTarget(sess Session, src relayRecordReader, cfg RelayTargetConfig) (Session, error) {
 	if cfg.Device == nil {
 		return nil, errors.New("mesh: relay target: needs a device identity")
 	}
 	if len(cfg.RequesterKey) != ed25519.PublicKeySize {
 		return nil, fmt.Errorf("mesh: relay target: the requester's key is malformed (%d bytes)", len(cfg.RequesterKey))
+	}
+	format, err := relayFormatOfSession(sess)
+	if err != nil {
+		return nil, fmt.Errorf("mesh: relay target: the trunk speaks an unknown protocol: %w", err)
+	}
+	if r, ok := src.(relayFormatReader); ok {
+		if got := r.legFormat(); got != format {
+			return nil, fmt.Errorf("mesh: relay target: the record reader speaks %s but the connection "+
+				"negotiated %s; the records on this leg cannot be read", got, format)
+		}
 	}
 	e2e, err := NewE2ESession(E2EConfig{
 		Self:    cfg.Device,
@@ -2511,14 +3517,14 @@ func ServeRelayTarget(sess Session, src relayRecordReader, cfg RelayTargetConfig
 	if err != nil {
 		return nil, err
 	}
-	if err := writeRelayRecord(sess, relayRecord{
+	if err := writeRelayRecordAs(sess, relayRecord{
 		Type:  uint8(wire.FrameMeshRelayHello),
 		Hello: raw,
-	}); err != nil {
+	}, format); err != nil {
 		return nil, fmt.Errorf("mesh: relay target: send our hello: %w", err)
 	}
 	// ③ the business layer gets a plain-bytes session.
-	return &relayTargetSession{conn: sess, e2e: e2e, rec: src}, nil
+	return &relayTargetSession{conn: sess, e2e: e2e, rec: src, format: format, maxPayload: cfg.MaxPayload}, nil
 }
 
 // RelayTargetConfig configures the target's end of a relayed session.
@@ -2530,6 +3536,20 @@ type RelayTargetConfig struct {
 	// RequesterKey is the requester's public key, from the member view.
 	// It verifies the requester's end-to-end hello signature.
 	RequesterKey ed25519.PublicKey
+	// MaxPayload is the cap the ANCHOR stated in the OPEN record: the
+	// largest plaintext that survives the WHOLE path of the relay.
+	//
+	// It is zero when the anchor stated no cap — an OLD anchor does not
+	// know about it — and the target then uses its own leg's default.
+	//
+	// The target is a writer: it answers through the relay, and on a
+	// mixed-version relay the record it writes is re-encoded for the
+	// REQUESTER's leg, which may be a JSON one — and a JSON envelope is a
+	// third bigger than the binary frame. So the target has to write
+	// less than its own leg would allow, and only the anchor knows that.
+	//
+	// See relayRecord.MaxPayload and maxRelayPayloadForLegs.
+	MaxPayload uint64
 }
 
 // ---------------------------------------------------------------------------
@@ -2569,6 +3589,134 @@ type RelayTargetConfig struct {
 // The separation is by PROTOCOL, not by PORT: the same socket may offer
 // both ALPNs, and each connection ends up on one of them (D76).
 const RelayALPN = "container-mesh-relay/1"
+
+// relayAdvertisedALPNs is the list every relay-protocol endpoint
+// advertises.
+//
+// THE ORDER IS LOAD-BEARING, and it is the same list for the server and
+// the client.
+//
+// Go's ALPN negotiation is SERVER-FIRST: it walks the SERVER's list in
+// order and takes the first entry the client also offers (measured over
+// crypto/tls in docs/design/RELAY-FRAME.md §4.3, and re-measured over
+// QUIC in TestTheALPNNegotiationUnderQUICIsServerFirst). So:
+//
+//   - The ANCHOR (the server) must advertise the NEW ALPN FIRST, or it
+//     negotiates the OLD protocol with a member that could have spoken
+//     the new one — and the relay keeps running on JSON for ever.
+//   - The MEMBER (the client) must advertise BOTH, because a member
+//     that offers only the new ALPN cannot reach an OLD anchor at all:
+//     the handshake fails with "no application protocol" (measured;
+//     TestAClientThatOffersOnlyTheNewALPNCannotReachAnOldAnchor).
+//
+// The two rules together give a rolling upgrade that never breaks:
+//
+//	new member → new anchor   /2  binary  (the fast path)
+//	new member → old anchor   /1  JSON    (the fallback)
+//	old member → new anchor   /1  JSON    (the fallback)
+//	old member → old anchor   /1  JSON
+//
+// And they give the DEPLOYMENT ORDER: the anchor is upgraded FIRST. An
+// old anchor cannot read a binary record at all, so a new member on an
+// old anchor dies at the first record — the one case the ALPN cannot
+// save, because the old anchor offers only the old ALPN and the new
+// member has to honour it.
+//
+// The list is the SAME for the server and the client on purpose: it is
+// one fact about the protocol, stated once.
+func relayAdvertisedALPNs() []string {
+	return []string{RelayALPN2, RelayALPN}
+}
+
+// isRelayALPN reports whether an ALPN names the relay protocol.
+//
+// There are TWO of them now — the old one and the new one — and the
+// listener's dispatch has to recognise both: a connection that negotiated
+// either of them speaks the relay protocol.
+//
+// It is NOT enough to recognise only the new one: an old member that
+// connected to a new anchor negotiated the OLD ALPN, and the anchor has
+// to serve it on the relay path (the JSON fallback), not on the
+// direct-link path.
+func isRelayALPN(alpn string) bool {
+	return alpn == RelayALPN || alpn == RelayALPN2
+}
+
+// relayFormatForALPN says which record format a connection that
+// negotiated the given ALPN speaks.
+//
+// It is the bridge between the ALPN and the record format, and it is the
+// ONLY place the two are related: the ALPN is the version negotiation,
+// and the negotiated protocol names the record format.
+//
+// An ALPN this code does not know is a REFUSAL, not a guess: the
+// negotiated protocol names a record format this node cannot speak, and
+// guessing would put the node on a forwarding path the peer is not on.
+func relayFormatForALPN(alpn string) (RelaySpliceFormat, error) {
+	return RelaySpliceFormatForALPN(alpn)
+}
+
+// ALPN reports the application protocol the connection negotiated.
+//
+// It is an OPTIONAL capability, on purpose: the Session interface is a
+// byte stream, and "which protocol version did this connection agree
+// on" is a property of the CONNECTION, not of the stream. A transport
+// that cannot answer it simply does not implement this method, and the
+// caller falls back to the default format.
+//
+// The method is declared HERE rather than in session.go because the
+// record format is what needs it: session.go knows about streams, and
+// this is the first place the relay protocol's version negotiation
+// reaches the transport.
+func (s quicSession) ALPN() string {
+	if s.conn == nil {
+		return ""
+	}
+	return s.conn.ConnectionState().TLS.NegotiatedProtocol
+}
+
+// alpnSession is the OPTIONAL way to ask a session which protocol
+// version its connection negotiated.
+//
+// It mirrors the shape of the other optional capabilities in this
+// package (sessionAborter, lossReporter): the capability is asked for by
+// type assertion, and a transport that does not have it is not broken —
+// it simply falls back to the default.
+type alpnSession interface {
+	// ALPN reports the negotiated application protocol, or "" when the
+	// session cannot say.
+	ALPN() string
+}
+
+// sessionALPN reports the ALPN a session's connection negotiated, or ""
+// when the session cannot say.
+//
+// A pipe (the test double) cannot say, and "" means "no information" —
+// not "the old protocol". The caller treats it as the default format.
+func sessionALPN(sess Session) string {
+	if a, ok := sess.(alpnSession); ok {
+		return a.ALPN()
+	}
+	return ""
+}
+
+// relayFormatOfSession reports the record format a session's leg speaks.
+//
+// The format comes from the ALPN the leg's connection negotiated, and
+// the default is the BINARY frame — so a transport that cannot report
+// its ALPN (the test pipes) gets the fast path, which is what a
+// same-version deployment wants.
+//
+// An ALPN that is neither relay protocol is a REFUSAL: the connection
+// negotiated something this node does not know how to speak, and guessing
+// would put the relay on a forwarding path the peer is not on.
+func relayFormatOfSession(sess Session) (RelaySpliceFormat, error) {
+	alpn := sessionALPN(sess)
+	if alpn == "" {
+		return RelaySpliceFormatBinary, nil
+	}
+	return relayFormatForALPN(alpn)
+}
 
 // RelayListenerConfig configures the relay listener.
 type RelayListenerConfig struct {
@@ -2664,9 +3812,34 @@ func (h *RelayHandler) ServeConn(conn *quic.Conn) {
 		_ = conn.CloseWithError(0, "bye")
 		return
 	}
+	// A TRUNK THAT IS STOPPING MUST NOT ADMIT ANY MORE CONNECTIONS.
+	//
+	// The order in a shutdown is: set the stopping flag, close the
+	// listener, then tear down the live flows. A connection that arrives
+	// in between would otherwise be adopted — and a flow adopted after
+	// the teardown would keep its stream slot forever, because nothing
+	// would close it.
+	//
+	// The same hole the stage-1 relay had, and the same fix: refuse at
+	// the top of the handler, before anything is adopted.
+	if trunk.isStopping() {
+		_ = st.Close()
+		_ = conn.CloseWithError(0, "this relay trunk is shutting down")
+		return
+	}
+	// The REQUESTER's leg format comes from the ALPN this connection
+	// negotiated. It is the whole version negotiation: the peer offered
+	// [new, old] and the anchor took the first one it also offered, so
+	// the negotiated protocol names the record format this leg speaks.
+	reqFormat, err := relayFormatOfSession(sess)
+	if err != nil {
+		_ = st.Close()
+		_ = conn.CloseWithError(0, "bye")
+		return
+	}
 	// Peek at the first record to tell a joiner from a requester.
 	br := bufio.NewReader(sess)
-	rec, err := readRelayRecord(br)
+	rec, err := readRelayRecordAs(br, reqFormat)
 	if err != nil {
 		_ = st.Close()
 		_ = conn.CloseWithError(0, "bye")
@@ -2682,9 +3855,9 @@ func (h *RelayHandler) ServeConn(conn *quic.Conn) {
 			_ = conn.CloseWithError(0, "bye")
 			return
 		}
-		h.serveJoiner(trunk, conn, sess, br, peerID)
+		h.serveJoiner(trunk, conn, sess, br, peerID, reqFormat)
 	case uint8(wire.FrameMeshRelayOpen):
-		h.serveRequester(trunk, conn, sess, br, &rec, peerID)
+		h.serveRequester(trunk, conn, sess, br, &rec, peerID, reqFormat)
 	default:
 		_ = st.Close()
 		_ = conn.CloseWithError(0, "bye")
@@ -2696,7 +3869,7 @@ func (h *RelayHandler) ServeConn(conn *quic.Conn) {
 // The joiner's connection is LONG-LIVED: it carries every relay the
 // trunk sends to that member, one FRESH STREAM per relay. The opener
 // below is how a new relay's stream is created.
-func (h *RelayHandler) serveJoiner(trunk *RelayTrunk, conn *quic.Conn, sess Session, br *bufio.Reader, peerID identity.DeviceID) {
+func (h *RelayHandler) serveJoiner(trunk *RelayTrunk, conn *quic.Conn, sess Session, br *bufio.Reader, peerID identity.DeviceID, format RelaySpliceFormat) {
 	open := func(ctx context.Context) (Session, error) {
 		st, err := conn.OpenStreamSync(ctx)
 		if err != nil {
@@ -2704,7 +3877,11 @@ func (h *RelayHandler) serveJoiner(trunk *RelayTrunk, conn *quic.Conn, sess Sess
 		}
 		return quicSession{st: st, conn: conn}, nil
 	}
-	joiner := &TrunkJoiner{Device: peerID, sess: sess, br: br, open: open}
+	// The joiner carries the record format of its leg. It is the format
+	// the JOIN connection negotiated, and every stream the trunk opens
+	// on that connection speaks it — the ALPN is a property of the
+	// CONNECTION, not of the stream.
+	joiner := &TrunkJoiner{Device: peerID, sess: sess, br: br, open: open, format: format}
 	h.joiners.Add(joiner)
 	defer func() {
 		h.joiners.Remove(joiner)
@@ -2715,7 +3892,7 @@ func (h *RelayHandler) serveJoiner(trunk *RelayTrunk, conn *quic.Conn, sess Sess
 	// stream is not the same event as a clean disconnect and must not be
 	// equally silent (see the join loop in ServeJoinerWithOpener).
 	for {
-		if _, err := readRelayRecord(br); err != nil {
+		if _, err := readRelayRecordAs(br, format); err != nil {
 			if !errors.Is(err, io.EOF) {
 				fmt.Fprintf(relayLogWriter(), "mesh: relay trunk: the join connection from %s broke: %v\n", peerID, err)
 			}
@@ -2743,14 +3920,14 @@ func (h *RelayHandler) serveJoiner(trunk *RelayTrunk, conn *quic.Conn, sess Sess
 // The connection is NOT closed here: the relay is still running. The
 // flow's own teardown closes the requester's session, and this
 // connection goes with it.
-func (h *RelayHandler) serveRequester(trunk *RelayTrunk, conn *quic.Conn, sess Session, br *bufio.Reader, first *relayRecord, peerID identity.DeviceID) {
+func (h *RelayHandler) serveRequester(trunk *RelayTrunk, conn *quic.Conn, sess Session, br *bufio.Reader, first *relayRecord, peerID identity.DeviceID, format RelaySpliceFormat) {
 	// The pin is UNCONDITIONAL on this path: if the caller had to peek at
 	// the record to tell a joiner from a requester, that record is what
 	// gets pinned; if it did not, read the record HERE and pin it. A nil
 	// first used to skip the check silently — the record would then be
 	// served past the pin without anyone vouching for it.
 	if first == nil {
-		rec, err := readRelayRecord(br)
+		rec, err := readRelayRecordAs(br, format)
 		if err != nil {
 			_ = sess.Close()
 			return
@@ -2758,12 +3935,12 @@ func (h *RelayHandler) serveRequester(trunk *RelayTrunk, conn *quic.Conn, sess S
 		first = &rec
 	}
 	if first.From != peerID {
-		_ = writeRelayRecord(sess, relayRecord{
+		_ = writeRelayRecordAs(sess, relayRecord{
 			Type:   uint8(wire.FrameMeshRelayAnswer),
 			Grant:  false,
 			Reason: "the open record does not name this connection's device",
 			Class:  RelayClassAuth,
-		})
+		}, format)
 		// The SESSION closes, but the CONNECTION does not.
 		//
 		// Closing the connection right after writing the answer throws
@@ -2779,7 +3956,7 @@ func (h *RelayHandler) serveRequester(trunk *RelayTrunk, conn *quic.Conn, sess S
 		_ = sess.Close()
 		return
 	}
-	_ = trunk.ServeRequesterWithFirst(context.Background(), sess, h.joiners, br, first)
+	_ = trunk.ServeRequesterWithFirstFormat(context.Background(), sess, h.joiners, br, first, format)
 }
 
 // RelayListener accepts relay-protocol connections.
@@ -2820,7 +3997,10 @@ func NewRelayListener(ctx context.Context, cfg RelayListenerConfig) (*RelayListe
 	}
 	// The ALPN is what separates the relay protocol from the direct
 	// link. A peer that offers the wrong one fails the handshake.
-	tlsCfg.NextProtos = []string{RelayALPN}
+	//
+	// The relay protocol's own list is [NEW, OLD] — see
+	// relayAdvertisedALPNs for why the ORDER is load-bearing.
+	tlsCfg.NextProtos = relayAdvertisedALPNs()
 
 	l := &RelayListener{cfg: cfg, stop: make(chan struct{})}
 	for _, a := range cfg.Addrs {
@@ -3061,11 +4241,19 @@ func joinRelayTrunkOnce(ctx context.Context, cfg RelayJoinConfig) error {
 	defer link.Close()
 	sess := link.Session()
 
+	// The joiner's leg format comes from the ALPN the connection
+	// negotiated. It is the format of every stream the trunk opens on
+	// this connection — the ALPN is a property of the CONNECTION.
+	format, err := relayFormatOfSession(sess)
+	if err != nil {
+		return fmt.Errorf("mesh: relay join: the trunk speaks an unknown protocol: %w", err)
+	}
+
 	// The join record.
-	if err := writeRelayRecord(sess, relayRecord{
+	if err := writeRelayRecordAs(sess, relayRecord{
 		Type: uint8(wire.FrameMeshRelayJoin),
 		From: cfg.Device.ID(),
-	}); err != nil {
+	}, format); err != nil {
 		return fmt.Errorf("mesh: relay join: send the join record: %w", err)
 	}
 
@@ -3093,7 +4281,7 @@ func joinRelayTrunkOnce(ctx context.Context, cfg RelayJoinConfig) error {
 	// not the same event as a clean disconnect; say which one happened.
 	br := bufio.NewReader(sess)
 	for {
-		if _, err := readRelayRecord(br); err != nil {
+		if _, err := readRelayRecordAs(br, format); err != nil {
 			if !errors.Is(err, io.EOF) {
 				fmt.Fprintf(relayLogWriter(), "mesh: relay trunk: the join stream broke: %v\n", err)
 			}
@@ -3108,9 +4296,19 @@ func joinRelayTrunkOnce(ctx context.Context, cfg RelayJoinConfig) error {
 // The requester's identity comes from the open record the trunk sends;
 // the requester's key is resolved from the member view, and the
 // requester's hello is verified against it.
+//
+// The record format is the JOIN CONNECTION's format — the ALPN is a
+// property of the connection, and every stream the trunk opens on it
+// speaks the same one.
 func serveRelayedSession(sess Session, cfg RelayJoinConfig) {
 	br := bufio.NewReader(sess)
-	open, err := readRelayRecord(br)
+	format, err := relayFormatOfSession(sess)
+	if err != nil {
+		reportRelaySessionFailure("", "", err)
+		_ = sess.Close()
+		return
+	}
+	open, err := readRelayRecordAs(br, format)
 	if err != nil {
 		// The failures BEFORE the handler are reported too: they are
 		// precisely the "truncated or interrupted transfer invisible on
@@ -3136,10 +4334,15 @@ func serveRelayedSession(sess Session, cfg RelayJoinConfig) {
 		_ = sess.Close()
 		return
 	}
-	tsess, err := ServeRelayTarget(sess, framedRecordReader{br: br}, RelayTargetConfig{
+	tsess, err := ServeRelayTarget(sess, newFramedRecordReader(br, format), RelayTargetConfig{
 		Device:       cfg.Device,
 		Requester:    open.From,
 		RequesterKey: key,
+		// The ANCHOR'S CAP, from the OPEN record. The target writes
+		// through the relay too, and its record has to fit on the
+		// REQUESTER's leg as well as on this one — and only the anchor
+		// knows both legs' formats.
+		MaxPayload: open.MaxPayload,
 	})
 	if err != nil {
 		// The end-to-end handshake failed — the other end of the

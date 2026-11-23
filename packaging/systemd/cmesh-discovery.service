@@ -3,6 +3,28 @@ Description=container-mesh discovery relay
 Wants=network-online.target
 After=network-online.target
 
+# ★ THE START LIMIT BELONGS TO [Unit], NOT TO [Service].
+#
+# It used to sit in [Service], and systemd has NO Service.StartLimit*
+# alias — so it was silently IGNORED:
+#
+#   systemd-analyze verify cmesh-discovery.service
+#   cmesh-discovery.service:79: Unknown key name 'StartLimitIntervalSec'
+#   in section 'Service', ignoring.
+#   systemctl show -p StartLimitIntervalUSec  →  10s   (the default, not 60s)
+#
+# Measured on real systemd 255 with ExecStart=/bin/false, RestartSec=5s:
+#   in [Service]  → NRestarts=18 after 95s, STILL looping
+#   in [Unit]     → NRestarts=5, then ActiveState=failed (stopped)
+#
+# So the "a configuration error restarts forever" fix was INERT, and the
+# arithmetic in the comment below was describing a limit that systemd
+# never applied. The comment was right; the SECTION was wrong.
+#
+# StartLimitIntervalSec / StartLimitBurst are [Unit] directives.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
 [Service]
 Type=simple
 User=cmesh
@@ -54,6 +76,32 @@ ExecStart=/opt/container-mesh/current/cmesh serve-discovery --state ${CMESH_STAT
 Restart=on-failure
 RestartSec=5s
 
+# THE START LIMIT, EXPLICITLY.
+#
+# Without these two directives systemd uses its defaults: a burst of 5
+# starts in a 10-second interval. With RestartSec=5s the starts land at
+# 0, 5, 10, 15 … — so ANY 10-second sliding window holds at most 3
+# starts, and the burst of 5 is UNREACHABLE. The consequence is that a
+# configuration error (an empty passphrase, an unreadable credential, a
+# read-only state directory) restarts FOREVER, spamming the journal
+# instead of stopping where an operator can see it.
+#
+# The arithmetic that makes the limit reachable: the burst must fit in
+# the window, so the window has to be longer than
+# RestartSec * (Burst - 1) = 5 * 4 = 20 seconds.
+#
+# 60 seconds gives room for 12 starts, so 5 is reachable and a broken
+# configuration stops after 5 attempts — while the "kill -9 and it comes
+# back in 5s" self-healing (the property that matters in production) is
+# untouched.
+#
+# Do NOT fix this by changing RestartSec alone: a shorter interval makes
+# the self-healing faster but also makes the window reach the burst
+# sooner, which is a different trade-off from the one being made here.
+#
+# ★ The directives themselves are in [Unit] above — they are [Unit]
+# directives, and in [Service] systemd ignores them.
+
 # The relay drains on SIGTERM: the HTTP listener closes and pairing rooms
 # unwind before the process exits. Allow that drain to finish instead of
 # being killed mid-way, and make the stop signal explicit.
@@ -65,6 +113,19 @@ RestartSec=5s
 # Do not read a missing LEAVE here as a bug — there is none to send.
 KillSignal=SIGTERM
 TimeoutStopSec=15s
+
+# ★ THE RELAY SWITCH. (Round 98.)
+#
+# `systemctl reload` sends SIGHUP only when the unit declares
+# ExecReload=. Without this line the switch exists in the binary but the
+# DOCUMENTED COMMAND DOES NOTHING — which is the same shape as a
+# capability nobody calls: the operator sends the signal, sees no
+# change, and concludes the switch is broken.
+#
+# SIGHUP toggles the relay trunk between carrying relays and not
+# carrying them, live. The node does not restart: the control plane,
+# the panel and the pairing relay keep working.
+ExecReload=/bin/kill -HUP $MAINPID
 
 UMask=0077
 NoNewPrivileges=true

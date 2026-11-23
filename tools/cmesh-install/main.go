@@ -55,6 +55,26 @@ func run() error {
 	version := envOr("CMESH_VERSION", "latest")
 	dir := envOr("CMESH_INSTALL", ".")
 
+	// ★ THE INSTALL ROOT IS REFUSED BEFORE ANYTHING IS FETCHED.
+	//
+	// The shell installer refuses the filesystem root on the install
+	// branch too, and for the same reason: a path the tool refuses to
+	// remove must also be a path it refuses to install into. Two
+	// installers that ship side by side must not have opposite safety.
+	//
+	// The check is done BEFORE the download, so a bad target never even
+	// reaches the network.
+	//
+	// ONLY the filesystem root itself is refused here — NOT a directory
+	// that sits directly in the root. "/cmesh" is a real install root in
+	// the field, and the install branch only ADDS files under it; it
+	// never removes the directory itself. The stricter "direct child"
+	// rule belongs to the REMOVAL path, where it is the difference
+	// between a typo and a wiped machine.
+	if err := refuseRootOnly(dir, "install root"); err != nil {
+		return err
+	}
+
 	if !strings.HasPrefix(base, "https://") {
 		return fmt.Errorf("CMESH_BASE_URL must be https://")
 	}
@@ -246,6 +266,28 @@ func uninstall(root, state string, purge bool) error {
 	if root == "" || filepath.Clean(root) == string(filepath.Separator) {
 		return errors.New("refusing to uninstall from an empty path or filesystem root")
 	}
+	// ★ THE STATE PATH IS GUARDED TOO, AND THAT GUARD IS THE ONE THAT
+	// MATTERS MOST.
+	//
+	// The install root was checked above, but the PURGE branch then did
+	// `os.RemoveAll(state)` with no check at all — and Go's os.RemoveAll
+	// has NO root failsafe (unlike GNU rm, which refuses `rm -rf /` and
+	// `rm -rf //`). So `CMESH_STATE=/ cmesh-install --uninstall --purge`
+	// called os.RemoveAll("/") and DELETED THE FILESYSTEM ROOT.
+	//
+	// That is not theoretical: it happened, on a host that runs production
+	// web services, during the audit that found this very defect. The
+	// audit identified the hole and then demonstrated it on real
+	// hardware. See docs/ROUND-LOG.md, Round 98.
+	//
+	// The lesson is the reason this guard exists in the first place: a
+	// defect you have identified is a defect you do NOT demonstrate on
+	// production hardware.
+	if purge {
+		if err := refuseDangerousPath(state, "runtime state directory"); err != nil {
+			return err
+		}
+	}
 	marker := filepath.Join(root, ".cmesh-install-root")
 	if _, err := os.Stat(marker); err != nil {
 		return fmt.Errorf("%s is not a cmesh install root", root)
@@ -265,6 +307,67 @@ func uninstall(root, state string, purge bool) error {
 		if err := os.RemoveAll(filepath.Join(root, name)); err != nil {
 			return fmt.Errorf("cannot remove %s: %w", name, err)
 		}
+	}
+	return nil
+}
+
+// refuseDangerousPath refuses the paths whose removal would take the
+// machine with it.
+//
+// It is deliberately STRICTER than the string comparisons the shell
+// installer uses, because those are bypassable: "/..", "/." and "//" all
+// resolve to the filesystem root while looking like something else.
+//
+// The rules:
+//   - the path must not be empty;
+//   - it must not RESOLVE to the filesystem root (so "/", "//", "/.", "/.."
+//     and "/a/.." are all refused);
+//   - it must not BE the filesystem root's direct child (so "/.cmesh" and
+//     "/etc" are refused — removing a directory that sits directly in the
+//     root is what "rm -rf /.cmesh" was).
+//
+// The resolution is done with filepath.Abs + filepath.Clean, which
+// collapses ".." and "//" without touching the filesystem (so it cannot
+// itself be defeated by a symlink race on a missing path).
+func refuseDangerousPath(path, what string) error {
+	if path == "" {
+		return fmt.Errorf("refusing to use an empty %s", what)
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return fmt.Errorf("refusing to use the %s %q: %v", what, path, err)
+	}
+	abs = filepath.Clean(abs)
+	if abs == string(filepath.Separator) {
+		return fmt.Errorf("refusing to use the filesystem root as the %s (%q resolves to /)", what, path)
+	}
+	// A path that sits DIRECTLY in the filesystem root is one `rm -rf`
+	// away from being a root-level catastrophe, and it is exactly what
+	// "${HOME:-}/.cmesh" becomes when HOME is unset.
+	if filepath.Dir(abs) == string(filepath.Separator) {
+		return fmt.Errorf("refusing to use %q as the %s: it would sit directly in the filesystem root", path, what)
+	}
+	return nil
+}
+
+// refuseRootOnly refuses ONLY the filesystem root (and the paths that
+// resolve to it).
+//
+// It is the rule for a path the tool ADDS files under. A directory that
+// sits directly in the root ("/cmesh") is a legitimate install root in
+// the field — the install branch never removes the directory itself —
+// so the stricter "direct child" rule of refuseDangerousPath belongs to
+// the REMOVAL path only.
+func refuseRootOnly(path, what string) error {
+	if path == "" {
+		return fmt.Errorf("refusing to use an empty %s", what)
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return fmt.Errorf("refusing to use the %s %q: %v", what, path, err)
+	}
+	if filepath.Clean(abs) == string(filepath.Separator) {
+		return fmt.Errorf("refusing to use the filesystem root as the %s (%q resolves to /)", what, path)
 	}
 	return nil
 }

@@ -36,14 +36,19 @@ import (
 // forward the bytes VERBATIM: read 24 bytes, splice the rest. The
 // forwarding path then never touches the payload at all.
 //
-// THIS FILE IS DEAD CODE ON PURPOSE.
+// THIS FILE IS THE FORMAT, AND IT IS LIVE.
 //
 // It defines the format and its codec, and it is exercised by its own
-// tests. No production call site uses it yet: writeRelayRecord /
-// readRelayRecord still speak JSON. The switch is a SEPARATE step, and
-// this file exists to make that step a mechanical change instead of a
-// design change — and to give the second step a baseline to compare
-// against. See docs/design/RELAY-FRAME.md.
+// tests. The SWITCH is done: writeRelayRecord and readRelayRecord speak
+// the binary frame, and the JSON envelope is the fallback a leg that
+// negotiated the old ALPN speaks.
+//
+// It exists as a SEPARATE file on purpose. The format is a protocol
+// between the two ENDPOINTS of a relay — the anchor is a pipe — and it
+// has to be able to exist on its own, apart from the forwarding code
+// that uses it, so that the two can be reasoned about separately and so
+// that the compatibility properties can be proved rather than assumed.
+// See docs/design/RELAY-FRAME.md.
 //
 // THE WIRE SHAPE DOES NOT CHANGE.
 //
@@ -221,6 +226,12 @@ type relayFrame struct {
 	Class string
 	// Grant says whether a request was granted.
 	Grant bool
+	// MaxPayload is the largest plaintext the writer of this relay may
+	// put in ONE record. Zero means "not stated".
+	//
+	// It is a VARIABLE field, so it lives in the meta block — see
+	// encodeRelayFrameMeta for why it does not need a flag bit.
+	MaxPayload uint64
 }
 
 // relayFrameHeader is the fixed header of a binary relay record, read on
@@ -253,18 +264,19 @@ func relayFrameFromRecord(rec relayRecord) (relayFrame, error) {
 		return relayFrame{}, fmt.Errorf("mesh: relay: the hop budget is negative (%d)", rec.Hops)
 	}
 	return relayFrame{
-		Type:    rec.Type,
-		Session: rec.Session,
-		From:    rec.From,
-		To:      rec.To,
-		Kind:    rec.Kind,
-		Hops:    uint32(rec.Hops),
-		Hello:   rec.Hello,
-		Data:    rec.Data,
-		Close:   rec.Close,
-		Reason:  rec.Reason,
-		Class:   rec.Class,
-		Grant:   rec.Grant,
+		Type:       rec.Type,
+		Session:    rec.Session,
+		From:       rec.From,
+		To:         rec.To,
+		Kind:       rec.Kind,
+		Hops:       uint32(rec.Hops),
+		Hello:      rec.Hello,
+		Data:       rec.Data,
+		Close:      rec.Close,
+		Reason:     rec.Reason,
+		Class:      rec.Class,
+		Grant:      rec.Grant,
+		MaxPayload: rec.MaxPayload,
 	}, nil
 }
 
@@ -276,18 +288,19 @@ func relayFrameFromRecord(rec relayRecord) (relayFrame, error) {
 // would have produced.
 func recordFromRelayFrame(f relayFrame) relayRecord {
 	return relayRecord{
-		Type:    f.Type,
-		Session: f.Session,
-		From:    f.From,
-		To:      f.To,
-		Kind:    f.Kind,
-		Hops:    int(f.Hops),
-		Hello:   f.Hello,
-		Data:    f.Data,
-		Close:   f.Close,
-		Reason:  f.Reason,
-		Class:   f.Class,
-		Grant:   f.Grant,
+		Type:       f.Type,
+		Session:    f.Session,
+		From:       f.From,
+		To:         f.To,
+		Kind:       f.Kind,
+		Hops:       int(f.Hops),
+		Hello:      f.Hello,
+		Data:       f.Data,
+		Close:      f.Close,
+		Reason:     f.Reason,
+		Class:      f.Class,
+		Grant:      f.Grant,
+		MaxPayload: f.MaxPayload,
 	}
 }
 
@@ -363,6 +376,31 @@ func encodeRelayFrameMeta(f relayFrame) ([]byte, byte, error) {
 	}
 	if f.Grant {
 		flags |= relayFrameFlagGrant
+	}
+	// THE CAP GOES LAST, AND IT NEEDS NO FLAG BIT.
+	//
+	// The flags byte has all eight of its bits taken by the other
+	// optional fields, and a ninth bit would mean a ninth byte in the
+	// FIXED header — which would cost the frame the one property it
+	// exists for: the anchor learns the type and the payload's length
+	// from a fixed 24 bytes.
+	//
+	// It does not need one, because the meta block's own LENGTH says
+	// where the block ends. The fields that come before it are all
+	// length-prefixed and all gated by flags, so a decoder that has
+	// read them knows exactly how many bytes they took; whatever is
+	// LEFT in the block is the cap, and there is nothing else it could
+	// be.
+	//
+	// The presence rule is the same as every other optional value's: a
+	// zero cap is ABSENT, not present-and-zero. So a record with no cap
+	// has a meta block of exactly the flagged fields, and a peer that
+	// has never heard of the cap reads it correctly and ignores the
+	// trailing bytes — which is what makes the field SAFE TO ADD.
+	if f.MaxPayload != 0 {
+		var b [8]byte
+		binary.BigEndian.PutUint64(b[:], f.MaxPayload)
+		meta = append(meta, b[:]...)
 	}
 	return meta, flags, nil
 }
@@ -442,6 +480,28 @@ func DecodeBinaryRelayFrame(b []byte) (relayFrame, error) {
 	}
 	if hello != nil {
 		f.Hello = hello
+	}
+	// THE CAP, if there is one.
+	//
+	// It is the LAST thing in the meta block, it is eight bytes, and it
+	// is there only when it is not zero — so "what is left in the
+	// block" says whether it is present. The block's own length says
+	// where it ends, so a decoder that has read the flagged fields
+	// knows exactly how many bytes are left and what they can be.
+	//
+	// A peer that does not know about the cap reads the record
+	// correctly and IGNORES these bytes — the same way it ignores a
+	// field it has never heard of in the JSON envelope. That is what
+	// makes the cap safe to add to a wire format that is already
+	// deployed.
+	switch len(rest) {
+	case 0:
+		// No cap. The common case.
+	case 8:
+		f.MaxPayload = binary.BigEndian.Uint64(rest)
+	default:
+		return relayFrame{}, fmt.Errorf("%w: the meta block has %d trailing bytes, want 0 or 8",
+			ErrRelayFrameFormat, len(rest))
 	}
 	f.Data = payload
 	return f, nil

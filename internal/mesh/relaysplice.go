@@ -59,13 +59,17 @@ import (
 // with the type byte is recognise the CLOSE record, because that record
 // ends the direction and the far side has to learn about it.
 //
-// THIS FILE IS DEAD CODE ON PURPOSE.
+// THIS FILE IS THE FAST PATH, AND IT IS LIVE.
 //
-// No production call site uses it yet: writeRelayRecord / readRelayRecord
-// / forwardRecords still speak JSON. The splice exists so that the switch
-// is a mechanical change, and so that the compatibility properties can be
-// proved BEFORE the switch rather than during it. See
-// docs/design/RELAY-FRAME.md.
+// The trunk's forwarding path uses it whenever the relay's two legs both
+// speak the binary frame — which is the DEFAULT deployment, and the one
+// the whole switch is about. It exists as a SEPARATE unit on purpose:
+// the compatibility properties (the splice refuses to be built for two
+// legs that disagree; it refuses a frame it cannot understand at
+// RUNTIME) are properties of a unit that can be proved on their own,
+// rather than of a forwarding loop that has a dozen other concerns.
+//
+// See docs/design/RELAY-FRAME.md.
 // ---------------------------------------------------------------------------
 
 // RelaySpliceFormat names the record format of ONE leg of a relay.
@@ -254,8 +258,7 @@ func RelaySpliceFormatOf(body []byte) (RelaySpliceFormat, error) {
 //
 // It is the sibling of RelayALPN ("container-mesh-relay/1", relaytrunk.go)
 // and it is defined HERE rather than there because this file is the one
-// that knows what a record format IS. The production switch has to move
-// it next to RelayALPN when it advertises it.
+// that knows what a record format IS.
 //
 // THE ORDER MATTERS. Go's ALPN negotiation is SERVER-FIRST: it walks the
 // SERVER's list in order and takes the first entry the client also
@@ -263,7 +266,7 @@ func RelaySpliceFormatOf(body []byte) (RelaySpliceFormat, error) {
 // and over crypto/tls in docs/design/RELAY-FRAME.md §4.3). So the anchor
 // must advertise [RelayALPN2, RelayALPN] — the NEW one FIRST — or it
 // negotiates the old protocol with a member that could have spoken the
-// new one.
+// new one. See relayAdvertisedALPNs.
 //
 // The member must offer BOTH. A member that offers only RelayALPN2
 // cannot connect to an old anchor at all: the handshake fails with "no
@@ -285,10 +288,10 @@ const RelayALPN2 = "container-mesh-relay/2"
 // negotiated protocol names a record format this anchor cannot speak, and
 // guessing would put the anchor on a forwarding path the peer is not on.
 //
-// The production switch has to add the new ALPN to the anchor's
-// advertised list (NEW FIRST — Go walks the server's list in order) and to
-// the member's offered list (BOTH, or the member cannot reach an old
-// anchor at all). See docs/design/RELAY-FRAME.md §4.3 and §4.5.
+// The anchor advertises the new ALPN FIRST (Go walks the server's list
+// in order) and the member offers BOTH (or the member cannot reach an
+// old anchor at all). See relayAdvertisedALPNs, and
+// docs/design/RELAY-FRAME.md §4.3 and §4.5.
 func RelaySpliceFormatForALPN(alpn string) (RelaySpliceFormat, error) {
 	switch alpn {
 	case RelayALPN2:

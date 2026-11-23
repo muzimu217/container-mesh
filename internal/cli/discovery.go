@@ -499,6 +499,35 @@ func (r *liveViewResolver) KeyFor(id identity.DeviceID) (ed25519.PublicKey, erro
 	return mesh.SnapshotAdapter{Snap: snap, AccountPub: ed25519.PublicKey(r.accountPub)}.KeyFor(id)
 }
 
+// StillMember reports whether the device is still in the current view.
+//
+// It is the NARROW question ("is it still a member?"), and it exists
+// because KeyFor answers a wider one — it also fails for an EXPIRED
+// certificate.
+//
+// Without this method the revocation watch on the direct path falls
+// back to KeyFor, and a member whose certificate merely lapsed has its
+// live session destroyed and is told it was revoked. That was a real
+// defect, and it is worth recording HOW it survived my own fix: the
+// capability existed on the mesh side (SnapshotAdapter), but this
+// wrapper did not forward it — so **every real member (the production
+// shape) answered the wide question**, and only the TEST FIXTURE
+// answered the narrow one.
+//
+// The forwarding has to be explicit: Go's type assertion sees the
+// wrapper's method set, not the wrapped adapter's.
+func (r *liveViewResolver) StillMember(id identity.DeviceID) bool {
+	cl := r.ptr.Load()
+	if cl == nil {
+		return false
+	}
+	snap := cl.Snapshot()
+	if snap == nil {
+		return false
+	}
+	return mesh.SnapshotAdapter{Snap: snap, AccountPub: ed25519.PublicKey(r.accountPub)}.StillMember(id)
+}
+
 // relayMembersResolver pins direct-link certificates against the relay's
 // LIVE member list — the serve-discovery listener must follow hot reloads,
 // or an approved device could not connect until process restart.
@@ -506,6 +535,19 @@ type relayMembersResolver struct{ srv *relay.Server }
 
 func (r relayMembersResolver) KeyFor(id identity.DeviceID) (ed25519.PublicKey, error) {
 	return mesh.MemberListAdapter{List: r.srv.MeshMembers()}.KeyFor(id)
+}
+
+// StillMember reports whether the device is still in the LIVE member
+// list, regardless of whether its certificate has expired.
+//
+// The relay trunk's revocation watch asks the NARROW question, so this
+// wrapper has to forward the capability — **Go's type assertion sees
+// the wrapper's method set, not the wrapped adapter's**. Without it the
+// watch falls back to KeyFor, whose error also covers "certificate
+// expired", and a member whose certificate merely lapsed would have
+// its relay flow torn down and be told it was revoked.
+func (r relayMembersResolver) StillMember(id identity.DeviceID) bool {
+	return mesh.MemberListAdapter{List: r.srv.MeshMembers()}.StillMember(id)
 }
 
 // memberEndpoints reports the addresses a member announced for direct
@@ -1236,6 +1278,102 @@ func runJoin(args []string) error {
 // exit dies with the process anyway.
 const serveDiscoveryGrace = 10 * time.Second
 
+// shutdownDiscoveryServer is the anchor's stop path.
+//
+// It is a NAMED function, not a block inside the signal goroutine, because
+// the thing it has to guarantee is a WIRING fact: the relay trunk must
+// actually be stopped when the anchor stops.
+//
+// The trunk used to have no shutdown path at all (CloseAll existed and
+// nothing in production called it), and the first fix — adding Shutdown() —
+// had the same failure mode in a new place: the capability existed, the
+// unit test of the capability was green, and the ANCHOR STILL DID NOT CALL
+// IT. A capability that nothing calls has exactly the symptom of a
+// capability that does not exist.
+//
+// So the wiring gets its own test, on this function, which is the real
+// entry point the anchor's stop watcher calls.
+func shutdownDiscoveryServer(srv *relay.Server, trunk *mesh.RelayTrunk) {
+	// The RELAY TRUNK goes down FIRST, and it goes down as ONE call:
+	// no new relay is admitted, and every live one is torn down (which
+	// gives their stream slots back).
+	//
+	// It used to have no shutdown path at all: CloseAll existed but
+	// nothing in production called it, so an anchor that stopped left
+	// its live relay flows running — and their stream slots reserved.
+	// The next relay on the same anchor would then be refused for
+	// lack of a slot that no longer had a flow behind it.
+	if trunk != nil {
+		trunk.Shutdown()
+	}
+	if srv == nil {
+		return
+	}
+	sctx, cancel := context.WithTimeout(context.Background(), serveDiscoveryGrace)
+	defer cancel()
+	if err := srv.Shutdown(sctx); err != nil {
+		fmt.Fprintf(os.Stderr, "serve-discovery: shutdown: %v\n", err)
+	}
+}
+
+// watchDiscoveryStop is the anchor's stop watcher: it waits for the
+// context to end (the signal) and then drains the node.
+//
+// It is a named function for the same reason as shutdownDiscoveryServer:
+// the WIRING is the thing under test, and a wiring that lives inside an
+// anonymous goroutine cannot be tested without a real signal.
+func watchDiscoveryStop(ctx context.Context, stop func(), srv *relay.Server, trunk *mesh.RelayTrunk) {
+	<-ctx.Done()
+	// Restore default signal handling first: a second SIGTERM while the
+	// drain wedges must kill the process instead of being swallowed by
+	// the very registration this drain waits on.
+	stop()
+	shutdownDiscoveryServer(srv, trunk)
+}
+
+// watchRelayTrunkSwitch is the operator's relay switch.
+//
+// SIGHUP toggles the trunk between "carrying relays" and "not carrying
+// relays" WITHOUT stopping the node: the members' control plane, the
+// panel and the pairing relay keep working, and the trunk simply stops
+// accepting new relays (and, when it is turned off, tears down the ones
+// it is carrying — a trunk that is switched off must not keep other
+// people's traffic).
+//
+// ★ THIS EXISTS BECAUSE SetEnabled HAD NO CALLER. (Round 98.) The
+// capability was written, the unit test of it was green, and no
+// production path ever called it — the same shape this project has hit
+// three times now (CloseAll, SetEnabled, and the trunk's own Shutdown
+// wiring). A capability that nothing calls has exactly the symptom of a
+// capability that does not exist.
+//
+// The signal handler is installed on its own channel, and it is REMOVED
+// when the context ends, so a SIGHUP that arrives after the stop does
+// not resurrect the default handler's behaviour.
+func watchRelayTrunkSwitch(ctx context.Context, trunk *mesh.RelayTrunk) {
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGHUP)
+	defer signal.Stop(sigCh)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-sigCh:
+			on := !trunk.Enabled()
+			trunk.SetEnabled(on)
+			if on {
+				fmt.Fprintf(os.Stderr, "  relay trunk: ON — this node carries relays again\n")
+				continue
+			}
+			// Switching OFF must also tear down what is being carried:
+			// a trunk that is "off" but still forwarding other members'
+			// traffic is worse than one that is off.
+			trunk.CloseAll()
+			fmt.Fprintf(os.Stderr, "  relay trunk: OFF — this node carries no more relays\n")
+		}
+	}
+}
+
 // runServeDiscovery implements `cmesh serve-discovery`: the pairing relay and
 // the mesh discovery node in one process. The first machine to do this
 // bootstraps an empty member list containing itself (O-6).
@@ -1515,18 +1653,28 @@ func runServeDiscovery(args []string) error {
 	// meantime is not lost: ctx is already done, Shutdown arms the flag
 	// ListenAndServe consults when the signal beat the bind, and the process
 	// still exits 0 instead of serving a server nobody can stop.
-	go func() {
-		<-ctx.Done()
-		// Restore default signal handling first: a second SIGTERM while the
-		// drain wedges must kill the process instead of being swallowed by
-		// the very registration this drain waits on.
-		stop()
-		sctx, cancel := context.WithTimeout(context.Background(), serveDiscoveryGrace)
-		defer cancel()
-		if err := srv.Shutdown(sctx); err != nil {
-			fmt.Fprintf(os.Stderr, "serve-discovery: shutdown: %v\n", err)
-		}
-	}()
+	go watchDiscoveryStop(ctx, stop, srv, relayTrunkInst)
+
+	// ★ THE OPERATOR'S SWITCH ON THE RELAY TRUNK. (Round 98.)
+	//
+	// D73 promised that a node could stop relaying without being
+	// restarted. The capability existed — RelayTrunk.SetEnabled — and
+	// NOTHING called it: no flag, no signal, no admin endpoint. So the
+	// promise was in the design and not in the product.
+	//
+	// SIGHUP is the switch. It is the conventional "reload the
+	// configuration" signal, and a node that is relaying for the whole
+	// network is exactly the node an operator may need to stop relaying
+	// for a while — without taking the node down and dropping the
+	// members' control plane.
+	//
+	// The toggle is reported on stderr, because an operator who sends a
+	// signal and sees nothing must be able to tell "it did not arrive"
+	// from "it arrived and did nothing".
+	if relayTrunkInst != nil {
+		go watchRelayTrunkSwitch(ctx, relayTrunkInst)
+		fmt.Fprintf(os.Stderr, "  relay trunk switch: SIGHUP toggles it (on ⇄ off) while the node keeps running\n")
+	}
 
 	// Approval flow: certificates dropped into <state>/certs/ are adopted
 	// automatically, and external edits of members.json are reloaded. One
@@ -2050,7 +2198,18 @@ func certRenewLoop(ctx context.Context, cred *credential.Credential, dev *identi
 // the caller's job: it has the log line, and it can decide whether a
 // failure is worth retrying.
 func joinRelayTrunk(ctx context.Context, dev *identity.Device, resolver *liveViewResolver, trunkID identity.DeviceID, endpoint, inboxDir string) {
-	backoff := 2 * time.Second
+	// relayTrunkRetryInitial is how long the member waits before
+	// dialling the trunk again, both after a failure and after a
+	// connection that ended on its own.
+	//
+	// It is a named constant because the two uses must agree: the
+	// backoff after a FAILURE grows from here, and the wait after a
+	// connection that ended by itself starts from here too (the
+	// accumulated backoff is for failures, and a trunk that restarted
+	// is not a failure — it is the one node this member can always
+	// reach).
+	const relayTrunkRetryInitial = 2 * time.Second
+	backoff := relayTrunkRetryInitial
 	for {
 		err := mesh.JoinRelayTrunk(ctx, mesh.RelayJoinConfig{
 			Device:    dev,
@@ -2100,13 +2259,34 @@ func joinRelayTrunk(ctx context.Context, dev *identity.Device, resolver *liveVie
 			}
 			continue
 		}
+		// The connection worked, so the failure counter starts over.
+		backoff = relayTrunkRetryInitial
+
 		// The connection ended on its own (the trunk restarted). Wait a
 		// beat before dialling again, so a restarting anchor is not
 		// hammered.
+		//
+		// The wait is the INITIAL interval, not the accumulated backoff.
+		//
+		// The backoff only ever GREW (it was declared outside the loop
+		// and reset nowhere), so after a few failed attempts it sat at
+		// its 30-second cap — and a member whose trunk had been up for
+		// a while reconnected after the anchor restarted with THAT wait.
+		// Measured by an external tester: the anchor restarted, and the
+		// pure-outbound member was unreachable for 15-18 seconds while
+		// it waited out a backoff it had accumulated from failures long
+		// ago.
+		//
+		// A successful connection RESETS the backoff (it is the failure
+		// counter, after all), and a connection that ends on its own gets
+		// the initial interval: the anchor is the one node this member
+		// can always reach, so reconnecting promptly matters more than
+		// not hammering it.
+		backoff = relayTrunkRetryInitial
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(backoff):
+		case <-time.After(relayTrunkRetryInitial):
 		}
 	}
 }

@@ -68,8 +68,31 @@ func (s *memSession) Read(p []byte) (int, error) {
 			return n, nil
 		}
 		deadline := s.rdead
+		// The peer's CLOSE must be read UNDER THE SAME LOCK as the
+		// buffer.
+		//
+		// It used to be read after the unlock, and that was a race with
+		// a lost message: a reader that found the buffer empty could
+		// then see "the peer has closed" and report io.EOF — even
+		// though the bytes were written in between and were sitting in
+		// the buffer. The reader had checked the buffer BEFORE the write
+		// and the close AFTER it, so the write fell between the two
+		// checks.
+		//
+		// The symptom was a test that failed for the wrong reason:
+		// "the receiver accepted a truncated frame; it must report a
+		// failure" — the truncated frame was never seen at all,
+		// because the double threw it away. And it was LOAD-SENSITIVE
+		// (it only appeared when the whole package ran at once),
+		// which is what made it look like a product defect.
+		//
+		// A half close means "no MORE bytes", not "no bytes were
+		// ever written". So the buffer is the authority, and the close
+		// flag is only consulted once the buffer is empty — under the
+		// lock that guards the buffer.
+		peerClosed := s.peer.closed.Load()
 		s.mu.Unlock()
-		if s.peer.closed.Load() {
+		if peerClosed {
 			return 0, io.EOF
 		}
 		if !deadline.IsZero() && time.Now().After(deadline) {

@@ -54,6 +54,29 @@ func enrollDevice(members *identity.MemberList, accountPub ed25519.PublicKey, re
 	if err != nil {
 		return discovery.EnrollResponse{OK: false, Message: "credential is malformed: " + err.Error()}
 	}
+	// A request with NO CERTIFICATE AT ALL is a QUESTION about the
+	// credential, not an attempt to enrol: "is this credential still
+	// usable, and if not, why not?"
+	//
+	// It exists because of a real gap an external tester found: the
+	// JOINER checks the credential's expiry LOCALLY, before it sends
+	// anything. So a credential that was BOTH revoked AND expired was
+	// reported as "expired" — and the revocation, which is the far more
+	// important fact (it says the owner turned this key off), disappeared
+	// from the operator's view as the clock moved on. An operator
+	// grepping the logs for "revoked" would find nothing.
+	//
+	// The joiner cannot know about revocations itself (the revocation
+	// list is the anchor's, and it deliberately does not travel to the
+	// members), so it asks. The answer comes from the side that knows.
+	//
+	// The distinction is the ABSENCE OF THE CERTIFICATE, not the
+	// absence of the signer: a certificate signed by the ACCOUNT (rather
+	// than by a delegator) is still a certificate, and it must still be
+	// refused below as "not signed by a delegator".
+	if len(req.Cert.DevicePub) == 0 {
+		return credentialStatus(members, accountPub, pub, now)
+	}
 	// The revocation list, FIRST of the credential checks: the id is part
 	// of the account-signed body, so it cannot be swapped by the holder.
 	// A listed id is refused no matter how valid the signature is — the
@@ -118,6 +141,30 @@ func enrollDevice(members *identity.MemberList, accountPub ed25519.PublicKey, re
 		return discovery.EnrollResponse{OK: false, Message: "device rejected: " + err.Error()}
 	}
 	return discovery.EnrollResponse{OK: true, DeviceID: cert.DeviceID, Message: "enrolled"}
+}
+
+// credentialStatus answers "is this credential still usable, and if not,
+// why not?" — the question a joiner asks when it cannot enrol for a
+// reason it cannot see.
+//
+// The revocation list is the anchor's, and it deliberately does NOT
+// travel to the members (it would tell every member which credentials
+// had leaked). So the member cannot answer this for itself, and the
+// anchor can.
+//
+// The ORDER is the point: a REVOKED credential is reported as revoked
+// even when it has also expired. The owner's decision to turn a key off
+// is the fact an operator needs, and it must not fade away with the
+// clock.
+func credentialStatus(members *identity.MemberList, accountPub ed25519.PublicKey, pub *credential.Public, now time.Time) discovery.EnrollResponse {
+	if members.CredentialRevoked(pub.ID) {
+		return discovery.EnrollResponse{OK: false, Message: fmt.Sprintf(
+			"credential %s has been revoked; ask the owner for a new one", pub.ID)}
+	}
+	if err := pub.Verify(accountPub, now); err != nil {
+		return discovery.EnrollResponse{OK: false, Message: "credential rejected: " + err.Error()}
+	}
+	return discovery.EnrollResponse{OK: true, DeviceID: "", Message: "the credential is still valid"}
 }
 
 // installEnrollHandler wires the credential enrollment endpoint into the

@@ -181,14 +181,54 @@ const Skew = 5 * time.Second
 // MemberResolver supplies verified device keys for TLS certificate pinning.
 // Two adapters exist: the discovery node side resolves from the identity
 // MemberList; a joined client resolves from its verified snapshot.
+// MemberResolver is the question "is this device still a member, and what
+// is its key".
 type MemberResolver interface {
 	// KeyFor returns the device public key for id, or an error when the
 	// device is not a (current) member.
 	KeyFor(id identity.DeviceID) (ed25519.PublicKey, error)
 }
 
+// membershipChecker is the OPTIONAL, PRECISE version of the same
+// question: "is this device still in the roster?"
+//
+// It exists because KeyFor answers SEVERAL questions with one error —
+// "not a member", "the certificate expired", "no view is available" —
+// and a revocation watch needs only the FIRST of them.
+//
+// The distinction matters in both directions:
+//
+//   - A peer whose certificate merely EXPIRED is not a revoked peer.
+//     Tearing its connection down because its certificate lapsed would
+//     kill a legitimate session for a reason the requirement does not
+//     ask for (and the product has a renewal loop precisely so that
+//     expiry is a normal, recoverable event).
+//   - A peer that is simply not in the roster IS revoked (or removed),
+//     and that is what must destroy the session.
+//
+// So a resolver that can answer the narrow question is asked the narrow
+// question; one that cannot falls back to KeyFor, which is the same
+// question the handshake asks.
+type membershipChecker interface {
+	// StillMember reports whether the device is still in the roster,
+	// regardless of whether its certificate has expired.
+	StillMember(id identity.DeviceID) bool
+}
+
 // MemberListAdapter resolves keys from an identity.MemberList.
 type MemberListAdapter struct{ List *identity.MemberList }
+
+// StillMember reports whether the device is still in the roster.
+//
+// It answers the narrow question, so an expired certificate does NOT
+// read as a revocation.
+func (a MemberListAdapter) StillMember(id identity.DeviceID) bool {
+	if a.List == nil {
+		return false
+	}
+	_, ok := a.List.Get(id)
+	return ok
+}
 
 func (a MemberListAdapter) KeyFor(id identity.DeviceID) (ed25519.PublicKey, error) {
 	if a.List == nil {
@@ -223,6 +263,33 @@ type SnapshotAdapter struct {
 	// AccountPub re-verifies each view's certificate before trusting its
 	// key: the snapshot may be older than the last verification.
 	AccountPub ed25519.PublicKey
+}
+
+// StillMember reports whether the device is still in the view,
+// regardless of whether its certificate has expired.
+//
+// It is the NARROW question, and it exists because KeyFor answers a
+// WIDER one: KeyFor fails for "not a member", for "the certificate
+// expired" AND for "the certificate failed verification" — three
+// different situations, one error.
+//
+// The revocation watch needs only the first. Without this method the
+// watch falls back to KeyFor, and a member whose certificate merely
+// LAPSED (a normal, recoverable event — the product renews
+// certificates for exactly that reason) has its live session destroyed
+// and is told it was revoked.
+//
+// This was found by an audit, and it is worth recording HOW: the test
+// for the expiry case used MemberListAdapter, which HAS this method —
+// so the test passed and the PRODUCTION resolver (the snapshot-backed
+// one every real member uses) never got the narrow answer. **A test
+// that only exercises the fixture cannot find a gap in the fixture.**
+func (a SnapshotAdapter) StillMember(id identity.DeviceID) bool {
+	if a.Snap == nil {
+		return false
+	}
+	_, ok := a.Snap.Members[id]
+	return ok
 }
 
 func (a SnapshotAdapter) KeyFor(id identity.DeviceID) (ed25519.PublicKey, error) {
@@ -307,18 +374,37 @@ const (
 	// quicHandshakeTimeout is how long a handshake may take before the
 	// attempt is abandoned.
 	//
-	// It is the ONE number both the QUIC config and the dialers use, on
-	// purpose. quic-go's own default is five seconds, which is too short
-	// on a loaded machine; this project raised it to twenty. But a dialer
+	// quic-go's own default is five seconds, which is too short on a
+	// loaded machine; this project raised it to twenty. But a dialer
 	// whose CONTEXT is shorter than the handshake it waits for cancels
 	// the handshake before it can finish — the peer is ready and the
 	// dialer has already given up. That showed up as
 	// "quic dial relay …: context deadline exceeded" on a busy machine,
 	// with nothing wrong at either end.
 	//
-	// So: one constant, and every dial budget is derived from it.
+	// So: every dial budget is derived from this constant — and the
+	// TRANSPORT's own ceiling is a separate, SHORTER number
+	// (quicTransportHandshakeTimeout), because quic-go abandons the
+	// handshake at HandshakeIdleTimeout whatever the caller's context
+	// allows. See quicConfig and the budget test.
 	quicHandshakeTimeout = 20 * time.Second
 )
+
+// quicTransportHandshakeTimeout is the TRANSPORT's own ceiling on a
+// handshake.
+//
+// It is deliberately SHORTER than the dial budget
+// (quicHandshakeTimeout + a margin): quic-go abandons a handshake that
+// has not completed within HandshakeIdleTimeout, whatever the caller's
+// context allows. So the transport's number has to be the smaller one,
+// or the caller's budget is unreachable — and the failure it produces
+// ("timeout: no recent network activity") reads like an unreachable
+// peer rather than a slow one.
+//
+// The gap between the two is the room a slow machine needs: the
+// transport gives up at 20 s, and the dialer's own budget (20 s + 10 s)
+// is the last word.
+const quicTransportHandshakeTimeout = 15 * time.Second
 
 func quicConfig() *quic.Config {
 	return tracingConfig(&quic.Config{
@@ -331,10 +417,18 @@ func quicConfig() *quic.Config {
 		// "timeout: no recent network activity" — a false failure that
 		// looks like an unreachable peer.
 		//
-		// It is doubled relative to MaxIdleTimeout, which keeps the
-		// relationship the same shape quic-go documents: the attempt is
-		// aborted if the handshake does not complete in twice this time.
-		HandshakeIdleTimeout: quicHandshakeTimeout,
+		// It is LONGER than MaxIdleTimeout, but the relationship that
+		// matters is not the multiple — it is the ORDER against the
+		// dialer's budget. The transport gives up at
+		// quicTransportHandshakeTimeout (15 s); the dialer's own budget
+		// (quicHandshakeTimeout + 10 s = 30 s) is the last word.
+		//
+		// So on a loaded machine the TRANSPORT's message arrives first,
+		// and it says which of the two gave up. (It used to be the other
+		// way round: the transport's ceiling and the budget were the
+		// SAME number, so the budget's margin could never be spent and
+		// the two could never be told apart.)
+		HandshakeIdleTimeout: quicTransportHandshakeTimeout,
 		// The flow control windows — see the comment above.
 		InitialStreamReceiveWindow:     relayStreamReceiveWindow,
 		MaxStreamReceiveWindow:         relayMaxReceiveWindow,
@@ -483,9 +577,14 @@ func NewListener(ctx context.Context, cfg ListenerConfig) (*Listener, error) {
 	// That was WRONG — it is the reason the trunk needed a second UDP
 	// port, and the reason an operator had to open one more port in
 	// their security group for the relay to work at all.
+	//
+	// The relay protocol's ALPNs are [NEW, OLD] — see
+	// relayAdvertisedALPNs for why the ORDER is load-bearing (Go's ALPN
+	// negotiation is server-first, so the anchor's list order decides
+	// which protocol a member that offers both ends up speaking).
 	tlsCfg.NextProtos = []string{directALPN}
 	if cfg.RelayTrunk != nil {
-		tlsCfg.NextProtos = append(tlsCfg.NextProtos, RelayALPN)
+		tlsCfg.NextProtos = append(tlsCfg.NextProtos, relayAdvertisedALPNs()...)
 	}
 	l := &Listener{cfg: cfg, stop: make(chan struct{})}
 	if cfg.RelayTrunk != nil {
@@ -577,6 +676,67 @@ func (l *Listener) acceptLoop(ln *quic.Listener) {
 	}
 }
 
+// watchRevocation aborts a direct connection whose peer has lost its
+// membership.
+//
+// It polls the member view on a ticker — the same shape as the relay
+// trunk's RevokeFlows watch, and for the same reason: the push of a new
+// member view can take up to a second (the snapshot is coalesced), so
+// "the revocation takes effect" cannot depend on the push alone.
+//
+// The interval is one second: the requirement is that a revoked device's
+// session stops within a second.
+//
+// The check is deliberately the SAME question the handshake asks —
+// "is this device still a member?" — so the two paths cannot disagree
+// about who is a member. A revoked device is not in the view, so
+// KeyFor fails for it.
+//
+// The connection is aborted, not closed: a half close is polite, and a
+// revoked device must not be able to keep its sessions alive by
+// ignoring it.
+func (l *Listener) watchRevocation(ctx context.Context, peerID identity.DeviceID, conn *quic.Conn) {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-l.stop:
+			return
+		case <-ticker.C:
+			if !l.stillMember(peerID) {
+				// The peer is no longer in the roster: revoked, or
+				// removed. Tear the connection down so its sessions
+				// stop.
+				_ = conn.CloseWithError(0, "this device is no longer a member")
+				return
+			}
+		}
+	}
+}
+
+// stillMember asks the PRECISE question: "is this device still in the
+// roster?"
+//
+// It prefers the narrow capability (StillMember) when the resolver has
+// it, because KeyFor's error also covers "the certificate expired" and
+// "no view is available" — and neither of those is a revocation. A peer
+// whose certificate merely lapsed must keep its session (the product
+// renews certificates for exactly that reason); a peer that has left
+// the roster must not.
+//
+// A resolver that cannot answer the narrow question falls back to
+// KeyFor, which is the same question the handshake asks — so the two
+// paths still agree about who is a member.
+func (l *Listener) stillMember(id identity.DeviceID) bool {
+	if m, ok := l.cfg.Members.(membershipChecker); ok {
+		return m.StillMember(id)
+	}
+	_, err := l.cfg.Members.KeyFor(id)
+	return err == nil
+}
+
 // handle drives one accepted connection: one authenticated hello per stream,
 // then the session body. Stream-level failures do not kill the connection.
 //
@@ -587,7 +747,7 @@ func (l *Listener) acceptLoop(ln *quic.Listener) {
 // both (D76) — and it is still as isolated as separate sockets were: a
 // peer that offers the wrong ALPN never gets past the handshake.
 func (l *Listener) handle(conn *quic.Conn) {
-	if proto := conn.ConnectionState().TLS.NegotiatedProtocol; proto == RelayALPN {
+	if proto := conn.ConnectionState().TLS.NegotiatedProtocol; isRelayALPN(proto) {
 		if l.relay == nil {
 			// This listener does not run a trunk. The handshake should
 			// not have succeeded (the relay ALPN was not advertised),
@@ -602,6 +762,32 @@ func (l *Listener) handle(conn *quic.Conn) {
 	// The peer's identity comes from its pinned device certificate (mTLS);
 	// receive handlers stamp it onto every message and file they accept.
 	peerID := identity.DeviceID(conn.ConnectionState().TLS.PeerCertificates[0].Subject.CommonName)
+
+	// THE REVOCATION WATCH ON THE DIRECT PATH.
+	//
+	// The requirement says a revoked device's ACTIVE SESSIONS are
+	// destroyed ("其活跃会话在一个推送往返内被销毁"): it does not say
+	// "relay sessions". The relay trunk has had a revocation watch for
+	// rounds (RevokeFlows / StartRevocationWatch), but the DIRECT path
+	// had NONE — so revoking a device that was mid-transfer over a
+	// direct link left that transfer running until it finished on its
+	// own. Only NEW handshakes were refused.
+	//
+	// The check is the member view: a revoked device is not a member
+	// any more, so KeyFor fails for it. That is the same question the
+	// relay's watch asks, and it is the live view (the roster is
+	// hot-reloaded from the anchor's file), so a revocation reaches
+	// this node without a push.
+	//
+	// The CONNECTION is the unit: aborting it destroys every stream it
+	// carries, which is exactly what "its active sessions are
+	// destroyed" asks for.
+	if l.cfg.Members != nil {
+		watchCtx, cancelWatch := context.WithCancel(context.Background())
+		defer cancelWatch()
+		go l.watchRevocation(watchCtx, peerID, conn)
+	}
+
 	for {
 		st, err := conn.AcceptStream(context.Background())
 		if err != nil {
@@ -1581,7 +1767,17 @@ func DialRelaySession(
 	if err != nil {
 		return nil, err
 	}
-	tlsCfg.NextProtos = []string{RelayALPN}
+	// The member's ALPN list is [NEW, OLD].
+	//
+	// BOTH are needed: a member that offers only the new ALPN cannot
+	// reach an OLD anchor at all — the handshake fails with "no
+	// application protocol" (measured; see
+	// TestAClientThatOffersOnlyTheNewALPNCannotReachAnOldAnchor).
+	//
+	// The NEW one comes FIRST so that a NEW anchor (which is server-first
+	// and takes the first entry of its own list the client also offers)
+	// lands on the new protocol with a member that can speak it.
+	tlsCfg.NextProtos = relayAdvertisedALPNs()
 
 	var lastErr error
 	for _, ep := range endpoints {
