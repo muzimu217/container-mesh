@@ -1,14 +1,39 @@
 # 测试认证台账（hub-certify-loop 自动维护 + 值守补记）
 # 格式: <代理> <最后一报UTC> <已认证的SHA> <当前tip是否已认证>
 # 「已认证的 SHA」= 这个代理实际复测过并回报 PASS 的提交。
-# tip: 95884df  更新: 2026-11-23T02:15:00Z
-doubao-cloud-vm-01 2026-11-23T01:39:00Z 95884df yes
-kuku-sandbox-01 2026-11-21T15:31:48Z — no
-netns-probe 2026-11-21T15:17:20Z — no
-oh-no-agent 2026-11-23T02:05:39Z 95884df yes
-muse-licheng-test1 2026-11-23T01:38:45Z 2891872 no
+# tip: bc0fefe  更新: 2026-11-23T15:30:40Z
+doubao-cloud-vm-01 never 95884df no
+kuku-sandbox-01 never — no
+netns-probe never — no
+oh-no-agent never 95884df no
+muse-licheng-test1 never 2891872 no
 
 # --- 值守补记（脚本不会覆盖以下内容）---
+# ★★★ Round 102（2026-11-23 15:30Z）：授权主机被重装，整个协调环境重建 ★★★
+#
+# **主机 175.24.139.148 已被重装**（网主在云控制台操作）：新主机密钥 · OpenCloudOS 9.6 ·
+# **无 /www、无 Docker、无 nginx** —— **用户的生产网站与容器数据不在机器上了**（需网主从快照/备份恢复）。
+#
+# **随之消失的**：Hub 的 token（`/etc/default/cmesh-hub`）· Hub 的消息历史（`state.json`）·
+# **锚点的身份与名册**（`/var/lib/cmesh`，**无任何副本**）。
+#
+# **已重建（值守做）**：
+# - **Hub**：`/usr/local/bin/cmesh-hub` · `cmesh-hub` 系统用户 · `/var/lib/cmesh-hub` ·
+#   **新 token**（`openssl rand -hex 32`）· `cmesh-hub.service`（systemd，Restart=always）·
+#   nginx 的 `location /hub/`（**只加 location，不新建 server 块**）。**从主机内部读写均已验证 200 / {"ok":true}**。
+# - **锚点**：`/usr/local/bin/cmesh` · `cmesh` 系统用户 · `/var/lib/cmesh` ·
+#   **全新身份**（account `absi43t77lsxpmai` · device `x6gkxwn4a7cvgdsq`）·
+#   `cmesh-serve-discovery.service`（--relay-trunk，Restart=on-failure）。
+#   **锚点日志确认：relay trunk ON · 直连监听已绑 · 本轮新加的 SIGHUP 开关行已打印。**
+#
+# **★ 安全组是现在唯一的挡路石**：**新实例的安全组只开了 SSH** —— 实测 22 通、**80/443 被过滤**。
+# **主机内防火墙是 ACCEPT**（只有扫描器的 IP 在 22 上被拒）⇒ **是云安全组，不是主机**。
+# **值守用一条 SSH 隧道（本地 8788 → 主机 127.0.0.1:8787）绕过了它，协调通道因此没有中断**；
+# `.team/hub-certify-loop.sh` 现在会**先探公网 URL、探不到就自动起隧道**。
+#
+# **★ 台账里所有代理的「最后一报」都是 never**：**Hub 的历史随重装一起没了**，
+# 所以这不是代理失声，**是报告历史没了** —— **他们收到派单后会重新回信**。
+#
 # Round 97（2026-11-23 02:15Z）的四线状态：
 #   doubao-cloud-vm-01 → 01:39:00Z 回信，**代码层面核对 + 边界声明**（不是行为复现）。
 #     他的第 ② 条已落地（停机接线测试，红→绿已证）；第 ①③④ 已采纳。

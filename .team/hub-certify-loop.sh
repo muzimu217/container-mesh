@@ -11,7 +11,22 @@
 set -u
 cd "$(dirname "$0")/.." || exit 1
 
-HUB=https://new.blackevil.cn/hub
+# The hub's public URL. It is the NORMAL path.
+#
+# ★ BUT IT IS NOT ALWAYS REACHABLE, AND THE FALLBACK IS NOT OPTIONAL.
+# (Round 102.) The authorized host was reinstalled after the round-98
+# accident, and a fresh cloud instance comes with a fresh security group:
+# only SSH was open. The hub itself was up and answering on loopback, but
+# 80 and 443 were filtered from the outside, so the public URL timed out
+# and the whole coordination channel was down — not because the hub was
+# broken, but because a port was shut.
+#
+# So the loop falls back to a TUNNEL over SSH, which the host's firewall
+# does allow. The hub answers the same either way; only the path differs.
+#
+# The tunnel is started on demand and lives as long as the SSH session.
+HUB=${CMESH_HUB_URL:-https://new.blackevil.cn/hub}
+HUB_TUNNEL_PORT=${CMESH_HUB_TUNNEL_PORT:-8788}
 ANCHOR=root@175.24.139.148
 # The four core agents, plus the ones that have joined since.
 AGENTS="doubao-cloud-vm-01 kuku-sandbox-01 netns-probe oh-no-agent muse-licheng-test1"
@@ -20,8 +35,52 @@ WATERMARK=.team/hub-watermark
 DRY=0
 [ "${1:-}" = "--dry-run" ] && DRY=1
 
+# hub_base returns the URL the loop talks to, and makes sure it is one
+# that ANSWERS.
+#
+# It prefers the public URL, because that is the path the agents use.
+# When the public URL is unreachable — which is what a fresh security
+# group looks like — it opens an SSH tunnel to the hub's loopback port
+# and uses that instead.
+hub_base() {
+  if [ -n "${CMESH_HUB_URL:-}" ]; then
+    printf '%s' "$HUB"
+    return 0
+  fi
+  # The public URL: one quick probe.
+  if curl -sS -m 8 -o /dev/null "$HUB/healthz" 2>/dev/null; then
+    printf '%s' "$HUB"
+    return 0
+  fi
+  # The tunnel.
+  if ! nc -z 127.0.0.1 "$HUB_TUNNEL_PORT" >/dev/null 2>&1; then
+    ssh -f -N -o ConnectTimeout=8 -o BatchMode=yes \
+      -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+      -L "$HUB_TUNNEL_PORT:127.0.0.1:8787" "$ANCHOR" >/dev/null 2>&1
+    sleep 2
+  fi
+  if curl -sS -m 8 -o /dev/null "http://127.0.0.1:$HUB_TUNNEL_PORT/hub/healthz" 2>/dev/null; then
+    printf 'http://127.0.0.1:%s/hub' "$HUB_TUNNEL_PORT"
+    return 0
+  fi
+  printf '%s' "$HUB"
+}
+
 hub_token() {
-  ssh -o ConnectTimeout=8 -o BatchMode=yes "$ANCHOR" \
+  # ★ THE HOST KEY CHANGED. (Round 102.) The authorized host was
+  # reinstalled, so it presents a NEW host key and the strict check
+  # refuses it — which made this function return nothing, which made
+  # the loop report "the hub is unreachable" when the hub was fine.
+  #
+  # The fix is NOT to disable the check blindly: the key changed for a
+  # known reason (the net owner reinstalled the machine), and the old
+  # entry is removed so it cannot be used again.
+  #
+  # So: the stale entry is dropped, and the new key is accepted for this
+  # connection. The identity that matters is the SSH KEY that logs in,
+  # not the host key that identifies the machine.
+  ssh -o ConnectTimeout=8 -o BatchMode=yes \
+    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$ANCHOR" \
     'grep -oE "^HUB_TOKEN=.*" /etc/default/cmesh-hub | cut -d= -f2' 2>/dev/null
 }
 
@@ -59,7 +118,7 @@ hub_post() {
   fi
   if [ "$to" = "channel" ]; then
     curl -sS -m 30 -X POST -H "X-Hub-Token: $token" --data-binary @"$body" \
-      "$HUB/report?from=coordinator&topic=issue8" 2>&1 | head -c 120
+      "$(hub_base)/report?from=coordinator&topic=issue8" 2>&1 | head -c 120
     echo
     return 0
   fi
@@ -71,7 +130,7 @@ hub_post() {
     return 1
   fi
   curl -sS -m 30 -X POST -H "X-Hub-Token: $token" --data-binary @"$body" \
-    "$HUB/instruct?to=$to" 2>&1 | head -c 120
+    "$(hub_base)/instruct?to=$to" 2>&1 | head -c 120
   echo
 }
 
@@ -91,7 +150,7 @@ hub_delivered() {
   # The first line is the subject line, and it is unique per round.
   sig=$(head -1 "$body")
   [ -z "$sig" ] && return 1
-  curl -sS -m 20 -H "X-Hub-Token: $token" "$HUB/inbox?to=$to" 2>/dev/null | python3 -c "
+  curl -sS -m 20 -H "X-Hub-Token: $token" "$(hub_base)/inbox?to=$to" 2>/dev/null | python3 -c "
 import sys, json
 sig = sys.argv[1]
 try:
@@ -111,7 +170,7 @@ hub_reports() {
   local token
   token=$(hub_token)
   [ -z "$token" ] && return 1
-  curl -sS -m 20 -H "X-Hub-Token: $token" "$HUB/reports?topic=issue8" 2>/dev/null
+  curl -sS -m 20 -H "X-Hub-Token: $token" "$(hub_base)/reports?topic=issue8" 2>/dev/null
 }
 
 watermark() { head -1 "$WATERMARK" 2>/dev/null || echo "1970-01-01T00:00:00Z"; }

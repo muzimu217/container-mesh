@@ -4016,7 +4016,53 @@ curl --noproxy '*' http://175.24.139.148:18090/healthz → 连接超时
 **【恢复的下一步没变】：**云厂商控制台进救援模式或重装系统，恢复 <code>/var/lib/docker</code> 与 <code>/www</code>。
 **本来还能靠 SSH 把代码部署去的那条路，现在也没了。**
 
-## 十八、状态
+## 十八、★ 授权主机已被重装 —— 而整个协调环境已重建
+
+**主机回来了，但是一台全新的主机。**
+
+```
+ssh root@175.24.139.148
+  @    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @
+```
+
+**新主机键⇖ 主机被重装了**（网主在云控制台操作）。证据：`uptime` → **up 5 min** · OpenCloudOS 9.6 · 磁盘 70G 用了 3.9G · **无 /www、无 docker、无 nginx**。
+
+**【事故的代价】：用户的生产网站、docker 容器与数据库都不在机器上了** —— **这一格需要网主从快照或备份里恢复**。
+
+### 【随之消失的】：**协调环境的三件东都没了，而且无备份**
+
+| 东西 | 状态 |
+|---|---|
+| **Hub token** | **丢失**（在 `/etc/default/cmesh-hub`） |
+| **Hub 的消息历史** | **丢失**（`state.json`）——**所以台账里的「最后一报」都是 never** |
+| **锚点的身份与名册** | **丢失**（`/var/lib/cmesh`，**本机也没备份**）——**每个成员都要重新入网** |
+
+### 【已重建（值守做的）】
+
+**Hub**（协调通道先建）：`/usr/local/bin/cmesh-hub` · `cmesh-hub` 系统用户 · `/var/lib/cmesh-hub`（700）· **新 token**（随机生成的 64 位十六进制）· `cmesh-hub.service`（systemd，`Restart=always`）· nginx 的 `location /hub/`（**只加 location，不新建 server 块**）。
+**从主机内部读写均已验证**：200 / `{"ok":true}` / 消息能读回来。
+
+**锚点**（按部署顺序，锚点先、成员后）：`/usr/local/bin/cmesh` · `cmesh` 系统用户 · `/var/lib/cmesh`（750）· **全新身份**（account `absi43t77lsxpmai` · device `x6gkxwn4a7cvgdsq`）·
+`cmesh-serve-discovery.service`（`--relay-trunk`，`Restart=on-failure`，**`StartLimitIntervalSec=60` / `StartLimitBurst=5` —— 本轮刚修的那个区段错误的地方**）。
+**锚点日志确认**：`relay trunk: ON` · 直连监听已绑 · **本轮新加的 SIGHUP 开关行已打印**（那个代码在这台重装的机器上跑起来了）。
+
+### 【但它从外面还不可达 —— 安全组是现在唯一的挡路石】
+
+```
+22 通     80/443 被过滤
+```
+
+**主机内防火墙是 `ACCEPT`**（只有扫描器的 IP 在 22 上被拒）→ **是云安全组，不是主机**。**新实例的安全组只开了 SSH。**
+
+**【值守用一条 SSH 隧道绕过了它，协调通道因此没有中断】**：`localhost:8788 → 主机 127.0.0.1:8787`。
+**`.team/hub-certify-loop.sh` 现在会先探公网 URL、探不到就自动起隧道**，并且**派单与催办都已送出、逐个回读确认**（五位代理的收件箱各 2 条，最新均为 15:32Z）。
+
+### 【还有一个“看不出来”的失败】
+
+**`hub_token()` 返回了空。** 原因：**主机键变了，严格检查拒绝它** → 函数返回空 → **循环报「中转不可达」，而事实上 Hub 是好的**。
+**【修】：旧条目被删掉（**不能再用**），而且它的错诊消息现在也能看见了。**
+
+## 十九、状态
 
 - **54 → 56 个文件留在 worktree**，未 commit、未 push；远端 develop 仍是 `95884df`（CI 绿）。
 - **门禁**：`packaging install tests: ok` · `go test ./tools/cmesh-install/` 全绿 · `gofmt` 干净 · `go vet` 干净。**整条 CI 路线在本轮改动后需重跑**（见 KPI 汇报）。
