@@ -957,7 +957,9 @@ const (
 	// per second. 50 MiB/s.
 	DefaultRelayBytesPerSec = 50 << 20
 	// relayTeardownGrace is how long the trunk waits for the SECOND
-	// direction of a relay to finish once the first one has ended.
+	// direction of a relay to finish once the first one has ended —
+	// measured from the LAST BYTE the flow moved, not from the moment
+	// the first direction ended.
 	//
 	// It exists because a half-close is legitimate: a request/response
 	// protocol sends its request, half-closes, and then waits for the
@@ -970,10 +972,20 @@ const (
 	// forever, and the relay would hold a stream slot (the trunk's
 	// quota) for a relay nobody is using.
 	//
-	// So the wait is BOUNDED. Ten seconds is generous for an answer
-	// (the transport's own idle timeout is ten seconds too) and short
-	// enough that a stuck relay does not hold a quota slot for long.
+	// ★ IT IS AN IDLE DEADLINE, NOT A WALL-CLOCK ONE. (Round 98.) A
+	// wall-clock deadline cannot tell a SLOW transfer from a STUCK one,
+	// and on a loaded machine it tore down healthy transfers. The
+	// teardown writes a FrameMeshRelayClose to the target, so a mistaken
+	// teardown ends the target's side of the JOIN connection — which is
+	// the poisoning the relay's own big-file test exists to catch.
+	//
+	// Ten seconds is generous for an answer (the transport's own idle
+	// timeout is ten seconds too) and short enough that a stuck relay
+	// does not hold a quota slot for long.
 	relayTeardownGrace = 10 * time.Second
+	// relayTeardownPoll is how often the idle time is re-checked. It is
+	// short enough that a resumed transfer is noticed quickly.
+	relayTeardownPoll = 250 * time.Millisecond
 )
 
 // RelayQuota bounds what one node carries for others.
@@ -1055,16 +1067,42 @@ type relayFlow struct {
 	tgtFormat RelaySpliceFormat
 	// total is the lifetime byte count, for the trunk's statistics.
 	total int64
-	// done is closed when the flow ends, and doneOnce guards it.
+	// lastActivity is when this flow last moved a byte, in Unix
+	// nanoseconds. It is the signal that separates a flow that is SLOW
+	// from a flow that is STUCK.
 	//
-	// The trunk's serving path WAITS on it: the requester's connection
-	// must stay open for as long as the flow carries bytes. Returning
-	// from the serving function while the flow was still alive closed
-	// the requester's QUIC connection under it, and the requester never
-	// even got to read the grant (defect A of the round-61 real-machine
-	// report).
-	done     chan struct{}
-	doneOnce sync.Once
+	// ★ WHY IT EXISTS. (Round 98.) The splice's teardown was given a
+	// grace period so that a peer which never answers could not hold a
+	// stream slot forever. The first version used a WALL-CLOCK deadline:
+	// "if the other direction has not finished in N seconds, tear the
+	// flow down". And a wall-clock deadline cannot tell a slow transfer
+	// from a dead one — so on a loaded machine it tore down transfers
+	// that were perfectly healthy, and the teardown wrote a
+	// FrameMeshRelayClose to the target, which ended the target's side
+	// of the JOIN connection. That is the exact poisoning the relay's
+	// own big-file test exists to catch.
+	//
+	// So the deadline is measured from the last BYTE, not from the
+	// start. A transfer that is moving is never torn down; a flow whose
+	// last byte was long ago is.
+	lastActivity atomic.Int64
+	done         chan struct{}
+	doneOnce     sync.Once
+}
+
+// touch records that this flow moved a byte just now.
+func (f *relayFlow) touch() {
+	f.lastActivity.Store(time.Now().UnixNano())
+}
+
+// idleFor returns how long this flow has been without moving a byte.
+func (f *relayFlow) idleFor() time.Duration {
+	last := f.lastActivity.Load()
+	if last == 0 {
+		// A flow that never moved a byte: its start is the reference.
+		return 0
+	}
+	return time.Since(time.Unix(0, last))
 }
 
 // finish marks the flow as ended. It is safe to call more than once.
@@ -1409,6 +1447,9 @@ func (t *RelayTrunk) openFlow(ctx context.Context, open RelayOpen, req Session, 
 		tgtFormat: tgtFmt,
 		done:      make(chan struct{}),
 	}
+	// The flow starts ALIVE: it has just been opened, so its idle clock
+	// starts now. (Round 98.)
+	flow.touch()
 	t.flows[id] = flow
 	t.mu.Unlock()
 
@@ -1748,23 +1789,58 @@ func (t *RelayTrunk) splice(flow *relayFlow) {
 	// Wait for the first direction to end.
 	<-finished
 
-	// Give the other direction a bounded grace period.
+	// The other direction gets its own watcher, so that "both finished"
+	// and "this one is stuck" are distinguishable.
 	otherDone := make(chan struct{})
 	go func() {
 		wg.Wait()
 		close(otherDone)
 	}()
-	select {
-	case <-otherDone:
-		// Both directions finished: the ordinary end.
-	case <-time.After(relayTeardownGrace):
-		// One side is stuck. The flow must not survive it: the slot is
-		// the trunk's quota, and a quota slot held by a dead relay is a
-		// quota slot nobody can use.
-		t.closeFlowForced(flow.id, "the relay peer did not finish")
-		<-otherDone
+
+	// ★ THE TEARDOWN WAITS FOR IDLE, NOT FOR THE WALL CLOCK. (Round 98.)
+	//
+	// The first version of this gave the other direction a fixed grace
+	// period and tore the flow down when it expired. A wall-clock
+	// deadline cannot tell a SLOW flow from a STUCK one, so on a loaded
+	// machine it tore down healthy transfers — and the teardown wrote a
+	// FrameMeshRelayClose to the target, which ended the target's side
+	// of the JOIN connection. That is the poisoning the relay's own
+	// big-file test exists to catch, and it showed up as a 15-second
+	// failure that looked like a network problem.
+	//
+	// So the deadline is measured from the LAST BYTE. A flow that is
+	// carrying bytes is never torn down, however slow it is; a flow
+	// whose last byte was long ago is.
+	//
+	// The loop waits in small steps so that the IDLE time is measured
+	// continuously: a flow that resumes moving resets its clock.
+	idleDeadline := time.NewTimer(relayTeardownGrace)
+	defer idleDeadline.Stop()
+	poll := time.NewTicker(relayTeardownPoll)
+	defer poll.Stop()
+	for {
+		select {
+		case <-otherDone:
+			// Both directions finished: the ordinary end.
+			t.closeFlow(flow.id, "relay finished")
+			return
+		case <-idleDeadline.C:
+			// The grace expired WITHOUT the flow moving a byte.
+			t.closeFlowForced(flow.id, "the relay peer did not finish")
+			<-otherDone
+			t.closeFlow(flow.id, "relay finished")
+			return
+		case <-poll.C:
+			// Did the flow move since the last check? If it did, the
+			// grace starts again: it is SLOW, not STUCK.
+			if flow.idleFor() < relayTeardownGrace {
+				if !idleDeadline.Stop() {
+					<-idleDeadline.C
+				}
+				idleDeadline.Reset(relayTeardownGrace)
+			}
+		}
 	}
-	t.closeFlow(flow.id, "relay finished")
 }
 
 // forwardRecords forwards the records from one side to the other.
@@ -1900,6 +1976,12 @@ func (t *RelayTrunk) forwardOneVerbatim(flow *relayFlow, br *bufio.Reader, to Se
 		_ = to.Close()
 		return true
 	}
+	// ★ A RECORD MOVED: the flow is alive. (Round 98.)
+	//
+	// This is what tells the teardown apart from a stuck flow. A flow
+	// that is carrying bytes is SLOW, not STUCK, and it must never be
+	// torn down for being slow.
+	flow.touch()
 	return false
 }
 
@@ -1936,6 +2018,8 @@ func (t *RelayTrunk) forwardOneTranslated(flow *relayFlow, br *bufio.Reader, to 
 		_ = to.Close()
 		return true
 	}
+	// ★ A RECORD MOVED: the flow is alive. (Round 98.)
+	flow.touch()
 	// The rate budget is a THROTTLE, not a kill switch. chargeBytes
 	// reports how long the node needs to refill; the forwarder waits
 	// that long and tries again. The old behaviour tore the flow down
@@ -3223,6 +3307,7 @@ func (t *RelayTrunk) ServeRequesterWithFirstFormat(ctx context.Context, sess Ses
 		tgtFormat: tgtFormat,
 		done:      make(chan struct{}),
 	}
+	flow.touch()
 	t.flows[id] = flow
 	t.mu.Unlock()
 	// NOTE: the flow is NOT closed by a defer here. The splice owns it

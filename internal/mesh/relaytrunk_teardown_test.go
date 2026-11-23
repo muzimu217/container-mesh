@@ -94,11 +94,22 @@ func (s *silentSession) Read(p []byte) (int, error) {
 }
 
 func (s *silentSession) Write(p []byte) (int, error) {
+	// ★ A HALF-CLOSED SESSION CAN STILL BE WRITTEN TO. (Round 98.)
+	//
+	// The Session contract says Close "ends the SEND side (a FIN). The
+	// receive side stays open." So a session whose send side has ended
+	// still accepts writes — that is exactly the request/response shape:
+	// "send the request, FIN, wait for the answer", and the ANSWER comes
+	// back on the same session.
+	//
+	// The first version of this double failed the write once the send
+	// side closed, which made the trunk tear the flow down ("relay
+	// forwarding write failed") instead of letting the second direction
+	// carry on. The double was stricter than the protocol, and the test
+	// was measuring that.
 	select {
 	case <-s.closed:
 		return 0, errors.New("session closed")
-	case <-s.sendClosed:
-		return 0, errors.New("session send side closed")
 	default:
 	}
 	return len(p), nil
