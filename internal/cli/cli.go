@@ -225,6 +225,8 @@ Usage:
   cmesh send-to --file PATH <deviceID>
         Stream a file to a member over a direct link, sha256-verified.
         The receiver saves it into its inbox (📬).
+        A file the receiver already has is NOT replaced: the receiver
+        refuses, and says so. Pass --force to replace it deliberately.
 
   cmesh bench [--size 100MB] [--rate 0] <deviceID>
         Measure bidirectional direct-link throughput without writing a file.

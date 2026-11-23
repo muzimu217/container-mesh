@@ -225,7 +225,7 @@ func TestRelayListenerServesARequesterEndToEnd(t *testing.T) {
 			var targetSess Session
 			select {
 			case targetSess = <-sessions:
-			case <-time.After(15 * time.Second):
+			case <-time.After(relayHandshakeWait):
 				t.Fatal("the target never received the relayed session")
 			}
 			if targetSess == nil {
@@ -272,7 +272,7 @@ func TestRelayListenerKeepsTheRequesterAliveThroughTheRelay(t *testing.T) {
 	var targetSess Session
 	select {
 	case targetSess = <-sessions:
-	case <-time.After(15 * time.Second):
+	case <-time.After(relayHandshakeWait):
 		t.Fatal("the target never received the relayed session")
 	}
 
@@ -334,7 +334,7 @@ func TestRelayListenerTellsTheTargetWhoIsCalling(t *testing.T) {
 
 	select {
 	case <-sessions:
-	case <-time.After(15 * time.Second):
+	case <-time.After(relayHandshakeWait):
 		t.Fatal("the target never received the relayed session")
 	}
 }
@@ -376,7 +376,7 @@ func TestRelayListenerServesTwoRelaysToTheSameTarget(t *testing.T) {
 		}
 		select {
 		case <-sessions:
-		case <-time.After(15 * time.Second):
+		case <-time.After(relayHandshakeWait):
 			cancel()
 			t.Fatalf("relay %d never reached the target", i+1)
 		}

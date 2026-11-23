@@ -129,6 +129,20 @@ type FileHeader struct {
 	Name   string `json:"name"`
 	Size   int64  `json:"size"`
 	SHA256 string `json:"sha256"`
+	// Force says the SENDER knows the receiver already has a file with
+	// this name and wants it replaced.
+	//
+	// ★ IT IS THE SENDER'S INTENT, AND IT MUST BE EXPLICIT. (Round 99.)
+	// The receiver used to rename over whatever was there, so the first
+	// file was silently replaced by the second — with no warning to
+	// either side, and the sender told "done <hash>". A file can only
+	// be replaced when somebody asked for it to be replaced, and the
+	// only one who can ask is the sender.
+	//
+	// It is a field rather than a flag because the receiver is a
+	// different process on a different machine: the decision has to
+	// travel with the file.
+	Force bool `json:"force,omitempty"`
 }
 
 // MaxFileBytes caps one inbound file (default 8 GiB). Large is the point —
@@ -1093,8 +1107,26 @@ func receiveFile(from identity.DeviceID, br *bufio.Reader, st Session, cfg Liste
 		return errors.New("mesh: file integrity check failed")
 	}
 	saved := filepath.Join(cfg.InboxDir, base)
-	if err := os.Rename(tmpPath, saved); err != nil {
+	// ★ DO NOT SILENTLY OVERWRITE WHAT IS ALREADY THERE. (Round 99.)
+	//
+	// `os.Rename` replaces the destination if it exists. So a second
+	// `send-to` of a file with the same name REPLACED the first one,
+	// with no warning to either side: the sender was told "done <hash>"
+	// and the receiver's inbox now holds the second file, not the first.
+	// An operator who sends "report.pdf" twice, or two members who
+	// happen to pick the same name, loses a file without being told.
+	//
+	// The stage-1 path has had this right for a while (publishNoClobber:
+	// link-then-remove gives atomic "create if absent" semantics, and the
+	// destination existing is a REFUSAL). The mesh line is a separate
+	// implementation, and it did not carry that rule over.
+	//
+	// So: refuse to replace, and say so — to the SENDER, over the
+	// stream, because the sender is waiting for a verdict. A local error
+	// would leave it blocked until its timeout.
+	if err := publishMeshNoClobber(tmpPath, saved, h.Force); err != nil {
 		_ = os.Remove(tmpPath)
+		fmt.Fprintf(st, "err: %s\n", err)
 		return err
 	}
 	if _, err := fmt.Fprintln(st, "done "+h.SHA256); err != nil {
@@ -1104,6 +1136,68 @@ func receiveFile(from identity.DeviceID, br *bufio.Reader, st Session, cfg Liste
 		cfg.OnFile(from, saved, h)
 	}
 	return nil
+}
+
+// publishMeshNoClobber moves the finished file into place WITHOUT
+// replacing a file that is already there.
+//
+// The atomic way to do it is a hard link: link-then-remove means the
+// destination is created only if it did not exist, and there is no
+// window in which the file is half-published.
+//
+// A filesystem that cannot create hard links (FAT, some network mounts,
+// Android) falls back to an explicit existence check, which is not
+// atomic — but it is still better than a silent replacement, and the
+// fallback's window is a rename over a name that was absent a moment
+// ago.
+func publishMeshNoClobber(part, final string, force bool) error {
+	if force {
+		// The operator asked for replacement; rename is atomic and clobbers.
+		if err := os.Rename(part, final); err != nil {
+			return fmt.Errorf("mesh: rename: %w", err)
+		}
+		return nil
+	}
+
+	if err := os.Link(part, final); err == nil {
+		// The data is reachable under both names; drop the temporary one.
+		if rmErr := os.Remove(part); rmErr != nil && !os.IsNotExist(rmErr) {
+			return fmt.Errorf("mesh: remove the temporary file after publishing: %w", rmErr)
+		}
+		return nil
+	} else if !os.IsExist(err) && !meshLinkUnsupported(err) {
+		return fmt.Errorf("mesh: publish %s: %w", final, err)
+	}
+
+	// Either the destination exists (refuse) or linking is unsupported
+	// here.
+	if _, statErr := os.Stat(final); statErr == nil {
+		return fmt.Errorf("the receiver already has a file named %s "+
+			"(rename it or remove it to receive this one)", filepath.Base(final))
+	}
+	if err := os.Rename(part, final); err != nil {
+		return fmt.Errorf("mesh: rename: %w", err)
+	}
+	return nil
+}
+
+// meshLinkUnsupported reports whether an error from os.Link means the
+// filesystem cannot create hard links (as opposed to the destination
+// already existing).
+func meshLinkUnsupported(err error) bool {
+	s := strings.ToLower(err.Error())
+	for _, marker := range []string{
+		"operation not permitted",
+		"operation not supported",
+		"not supported",
+		"invalid cross-device link",
+		"no such device or address",
+	} {
+		if strings.Contains(s, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // echoPings answers ping records verbatim until the dialer hangs up.
@@ -1158,6 +1252,17 @@ type DialConfig struct {
 	// session is established over. Nil = the session is always direct,
 	// which is byte-for-byte today's behaviour.
 	Picker PathPicker
+	// ForceOverwrite says the sender knows the receiver already has a
+	// file with this name and wants it replaced.
+	//
+	// ★ IT IS THE SENDER'S INTENT, AND IT IS EXPLICIT BY DEFAULT-OFF.
+	// (Round 99.) The receiver used to rename over whatever was there,
+	// so a second transfer of the same name REPLACED the first one
+	// silently — the sender was told "done <hash>" and the first file
+	// was gone. A file can only be replaced when somebody asked for it,
+	// and the stage-1 path has had that rule (publishNoClobber) for a
+	// while.
+	ForceOverwrite bool
 }
 
 // DialDirect brings up a mutually-authenticated direct link, trying the
@@ -1461,6 +1566,7 @@ func SendFile(ctx context.Context, cfg DialConfig, path string) (FileHeader, err
 		Name:   filepath.Base(path),
 		Size:   st.Size(),
 		SHA256: fmt.Sprintf("%x", hash.Sum(nil)),
+		Force:  cfg.ForceOverwrite,
 	}
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		return FileHeader{}, err

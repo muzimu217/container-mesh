@@ -948,7 +948,7 @@ func TestTheSwitchWorksOverARealQUICConnection(t *testing.T) {
 	var targetSess Session
 	select {
 	case targetSess = <-sessions:
-	case <-time.After(20 * time.Second):
+	case <-time.After(relayHandshakeWait):
 		t.Fatal("the target never received the relayed session")
 	}
 

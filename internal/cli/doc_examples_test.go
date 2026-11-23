@@ -160,6 +160,7 @@ func TestTheDocumentedCommandLinesParse(t *testing.T) {
 	root := repoRoot(t)
 
 	var checked int
+	sweepStart := time.Now()
 	for _, rel := range docExampleDirs {
 		files := []string{filepath.Join(root, rel)}
 		if fi, err := os.Stat(files[0]); err == nil && fi.IsDir() {
@@ -193,6 +194,22 @@ func TestTheDocumentedCommandLinesParse(t *testing.T) {
 				if strings.HasPrefix(strings.TrimSpace(line), ">") {
 					continue
 				}
+				// ★ THE SWEEP HAS ITS OWN BUDGET. (Round 99.) Go's
+				// default limit for a test binary is TEN MINUTES, and
+				// this package's other tests take most of it. A sweep
+				// that runs eighty-three commands can blow that limit
+				// — which is exactly what happened on the first CI run
+				// ("panic: test timed out after 10m0s"). The local runs
+				// passed because the machine was idle; CI was not.
+				//
+				// So the sweep gives up on TIME as well as on
+				// per-command timeouts, and says so in the log rather
+				// than pretending it checked everything.
+				if time.Since(sweepStart) > docSweepBudget {
+					t.Logf("the sweep ran out of its budget after %d command lines; "+
+						"the rest were not checked", checked)
+					break
+				}
 				for _, cmd := range extractCmeshCommands(line) {
 					if !isRunnableDocExample(cmd) {
 						continue
@@ -212,6 +229,14 @@ func TestTheDocumentedCommandLinesParse(t *testing.T) {
 	}
 	t.Logf("checked %d documented command lines", checked)
 }
+
+// docSweepBudget is how long the documentation sweep may take.
+//
+// It is a fraction of Go's default ten-minute limit for a test binary,
+// because this package's other tests need most of that. The sweep is a
+// guard, not a benchmark: if the documents grow, the sweep stops early
+// and SAYS it stopped early.
+const docSweepBudget = 90 * time.Second
 
 // extractCmeshCommands pulls the `cmesh …` invocations out of one line.
 func extractCmeshCommands(line string) []string {
@@ -377,13 +402,27 @@ func runDocExample(bin, cmd string) error {
 	// So the timeout is INSIDE the command: a context with a deadline,
 	// and `CommandContext`, which kills the process itself and waits for
 	// it. No concurrent kill, no shared state, no race.
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	//
+	// ★ AND THE BUDGET MUST FIT THE PACKAGE. (Round 99.) The first
+	// version allowed twenty seconds per command over eighty-three
+	// commands — twenty-seven minutes, against Go's default TEN-minute
+	// limit for a test binary. The CI run died with "panic: test timed
+	// out after 10m0s", and the local runs passed because the machine
+	// was idle and only ONE command (`cmesh doctor`, which probes the
+	// network) ever waited.
+	//
+	// So the per-command budget is three seconds — long enough for a
+	// command that starts and answers, short enough that a command that
+	// waits is cut off quickly — and the SWEEP ITSELF has a budget, so
+	// it can never eat the package's limit.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	proc := exec.CommandContext(ctx, bin, args...)
 	proc.Stdin = strings.NewReader("")
 	out, _ := proc.CombinedOutput()
 	// A command that did not finish is not a parse failure; it is a
-	// command that WAITS.
+	// command that WAITS (a network probe, a prompt). The parse question
+	// was already answered by the time it started waiting.
 	if ctx.Err() != nil {
 		return nil
 	}

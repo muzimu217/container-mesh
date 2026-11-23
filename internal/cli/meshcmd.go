@@ -347,6 +347,8 @@ func runSendTo(args []string) error {
 	state := fs.String("state", "", "state directory (default ~/.cmesh)")
 	pass := fs.String("device-passphrase", "", "passphrase for the device file (for scripting)")
 	file := fs.String("file", "", "file to send (required)")
+	force := fs.Bool("force", false,
+		"replace a file the receiver already has with the same name (the receiver refuses by default)")
 	timeout := fs.Duration("timeout", 10*time.Minute, "overall budget; large files need real time")
 	if err := fs.Parse(args); err != nil {
 		return ExitError{Code: 2, Err: err}
@@ -381,6 +383,13 @@ func runSendTo(args []string) error {
 		Target:    target,
 		Endpoints: eps,
 		Picker:    sess.picker(),
+		// ★ THE RECEIVER REFUSES TO REPLACE A FILE UNLESS THE SENDER
+		// ASKS IT TO. (Round 99.) The receiver used to rename over
+		// whatever was there, so a second transfer of the same name
+		// REPLACED the first one silently — and the sender was told
+		// "done <hash>". The stage-1 path has had that rule for a while
+		// (`--force` there); the mesh line did not carry it over.
+		ForceOverwrite: *force,
 	}, *file)
 	if err != nil {
 		return ExitError{Code: 1, Err: err}

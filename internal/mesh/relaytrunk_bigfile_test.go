@@ -46,6 +46,11 @@ type bigFileFixture struct {
 	listener *Listener
 	hubAddr  string
 	inbox    string
+
+	// transferMu guards transfers, which counts the transfers so each
+	// one can have its own file name. (Round 99.)
+	transferMu sync.Mutex
+	transfers  int
 }
 
 // newBigFileFixture builds the three nodes and the member view.
@@ -166,9 +171,21 @@ func (f *bigFileFixture) relayOnlyPicker() PathPicker {
 // trunk, with the REAL SendFile code path.
 //
 // It returns the error the sender saw, and how long it took.
+//
+// ★ EACH TRANSFER GETS ITS OWN FILE NAME. (Round 99.) The helper used
+// to write "payload.bin" every time, so a test that sent twice was
+// really asking the receiver to overwrite — and the receiver now
+// REFUSES to overwrite (that is the fix: a second file with the same
+// name used to replace the first one silently).
+//
+// The tests here are about the RELAY's health — whether the join
+// connection survives a transfer, whether a failed transfer poisons it —
+// not about overwriting. Giving each transfer its own name is what a
+// real operator does, and it keeps each test's intent intact.
 func (f *bigFileFixture) sendFileOverRelay(t *testing.T, size int) (time.Duration, error) {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "payload.bin")
+	name := fmt.Sprintf("payload-%d.bin", f.nextTransfer())
+	path := filepath.Join(t.TempDir(), name)
 	payload := make([]byte, size)
 	for i := range payload {
 		payload[i] = byte(i * 7)
@@ -191,7 +208,7 @@ func (f *bigFileFixture) sendFileOverRelay(t *testing.T, size int) (time.Duratio
 		return took, err
 	}
 	// The target must have saved the file, byte for byte.
-	saved := filepath.Join(f.inbox, "payload.bin")
+	saved := filepath.Join(f.inbox, name)
 	got, rerr := os.ReadFile(saved)
 	if rerr != nil {
 		return took, fmt.Errorf("the target saved no file: %w", rerr)
@@ -203,6 +220,15 @@ func (f *bigFileFixture) sendFileOverRelay(t *testing.T, size int) (time.Duratio
 		return took, fmt.Errorf("the file the target saved does not match the one that was sent")
 	}
 	return took, nil
+}
+
+// nextTransfer hands out a number that makes each transfer's file name
+// unique.
+func (f *bigFileFixture) nextTransfer() int {
+	f.transferMu.Lock()
+	defer f.transferMu.Unlock()
+	f.transfers++
+	return f.transfers
 }
 
 // TestTheRelayCarriesAFileOfEverySize walks the sizes the real machine
