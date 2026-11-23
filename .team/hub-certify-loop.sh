@@ -33,6 +33,21 @@ HUB_TUNNEL_PORT=${CMESH_HUB_TUNNEL_PORT:-8788}
 # a hardcoded literal in one place and a variable in another is how
 # the pattern starts killing tunnels that belong to someone else.
 HUB_REMOTE_PORT=${CMESH_HUB_REMOTE_PORT:-8787}
+
+# ★ THE COOLDOWNS. (Round 102.) The loop runs every few minutes, and
+# it used to re-send the same brief and the same nudge every time:
+# measured on kuku's inbox, 11 messages of which 4 were one identical
+# assignment and 5 were one identical nudge. A tester cannot tell a new
+# nudge from a re-send of the old one.
+#
+# Both decisions are made from what was ACTUALLY DELIVERED (read back
+# from the hub), not from a local guess about what we sent.
+#
+# ★ THEY ARE DEFINED HERE, AT THE TOP, because the assignment section
+#   uses ASSIGN_COOLDOWN and the nudge section defines it — and a
+#   `set -u` shell then dies with "unbound variable" on the FIRST run.
+NUDGE_COOLDOWN=${CMESH_NUDGE_COOLDOWN:-3600}
+ASSIGN_COOLDOWN=${CMESH_ASSIGN_COOLDOWN:-3600}
 ANCHOR=root@175.24.139.148
 # The four core agents, plus the ones that have joined since.
 AGENTS="doubao-cloud-vm-01 kuku-sandbox-01 netns-probe oh-no-agent muse-licheng-test1"
@@ -232,6 +247,54 @@ hub_post() {
   curl -sS -m 30 -X POST -H "X-Hub-Token: $token" --data-binary @"$body" \
     "$base/instruct?to=$to" 2>&1 | head -c 120
   echo
+}
+
+# hub_inbox_times prints "<time>" for every message in an agent's inbox,
+# one per line, oldest first. It is used to decide whether a nudge is
+# due — the decision must be based on what was ACTUALLY DELIVERED (read
+# back from the hub), not on a local guess about what we sent.
+hub_inbox_times() {
+  local to="$1" token
+  token=$(hub_token)
+  [ -z "$token" ] && return 1
+  local base
+  base="$(hub_base)" || return 1
+  # ★ THE CHANNEL IS A TOPIC, NOT AN INBOX. The brief to everybody goes
+  # to /hub/report?topic=issue8, so it lands in the TOPIC store — not
+  # in an inbox named "channel". Reading /hub/inbox?to=channel returns
+  # nothing, so a cooldown decided on that reading could never fire
+  # and the same brief went out on every single cycle.
+  local path
+  if [ "$to" = "channel" ]; then
+    path="$base/reports?topic=issue8"
+  else
+    path="$base/inbox?to=$to"
+  fi
+  curl -sS -m 20 -H "X-Hub-Token: $token" "$path" 2>/dev/null | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    raise SystemExit(0)
+for m in d.get('messages') or []:
+    t = m.get('time') or ''
+    b = m.get('body') or ''
+    print(t + '\t' + b.split(chr(10))[0])
+"
+}
+
+# ts_of turns an RFC3339 timestamp into a unix epoch second. It returns
+# 0 for anything it cannot parse, so a malformed timestamp reads as
+# "very old" rather than as "just now" — a nudge is cheap, a silent
+# agent is not.
+ts_of() {
+  python3 -c "
+from datetime import datetime, timezone
+try:
+    print(int(datetime.strptime('$1'.replace('Z','+0000'), '%Y-%m-%dT%H:%M:%S%z').timestamp()))
+except Exception:
+    print(0)
+"
 }
 
 hub_delivered() {
@@ -537,6 +600,28 @@ done < /tmp/hub-last-reports.$$
 # grep for a word that never appears in it. A row is pending when its
 # state column is not "yes" — that is the column the loop itself writes.
 PENDING=$(awk '$1 !~ /^#/ && NF >= 3 && $4 != "yes" {n++} END {print n+0}' "$LEDGER" 2>/dev/null)
+
+# ★ NEVER SEND A BRIEF WITH AN UNKNOWN TIP. (Round 102.) The brief
+# names the SHA it wants certified. If the tip is "unknown", the brief
+# asks the agents to certify "unknown" — which is not a SHA, and the
+# agents cannot act on it. Worse, it looks like a real assignment.
+#
+# How it happened: the loop was run from a COPY of itself in a
+# directory that is not a git repository (an isolated test of the
+# ledger-wipe fix), so `git rev-parse origin/develop` failed and the
+# tip came out empty. The copy still had the real token and the real
+# hub URL, so it posted eight real briefs into the agents' inboxes.
+#
+# An unknown tip is not a reason to keep going quietly. It is a reason
+# to stop and say so.
+if [ "$TIP" = "unknown" ] || [ -z "$TIP" ]; then
+  echo "!! the develop tip could not be resolved — NOTHING was sent."
+  echo "!! (a brief naming an unknown SHA is not an assignment; and a"
+  echo "!!  loop run outside the repository would send it to the real agents)"
+  rm -f /tmp/hub-last-reports.$$
+  exit 1
+fi
+
 if [ "$PENDING" -gt 0 ]; then
   # WHO STILL OWNS A CELL.
   #
@@ -574,6 +659,39 @@ if [ "$PENDING" -gt 0 ]; then
     echo "收到请先回 {\"ok\":true}。"
   } > "$BRIEF"
   echo "--- certification assignment (pending=$PENDING) ---"
+
+  # ★ THE ASSIGNMENT GETS A COOLDOWN TOO. (Round 102.) Measured on
+  # kuku's inbox: 11 messages, of which 4 were the SAME assignment and
+  # 5 were the SAME nudge. The loop runs every few minutes, so an
+  # agent whose cell was still pending received a fresh copy of the
+  # same brief every time.
+  #
+  # The assignment is per-tip, so the question is not "did we send one"
+  # but "did we send one for THIS tip, and how long ago". A brief
+  # naming tip X is still the brief naming tip X tomorrow — it says the
+  # same thing, so resending it says the same thing again.
+  #
+  # The decision is made from what was actually delivered (read back
+  # from the hub), not from a local guess.
+  assign_due=1
+  assign_at=""
+  while IFS=$'\t' read -r mtime mfirst; do
+    case "$mfirst" in
+      *"测试认证派单 · develop@$TIP"*) assign_due=0; assign_at="$mtime" ;;
+    esac
+  done <<EOF
+$(hub_inbox_times channel 2>/dev/null)
+EOF
+  if [ "$assign_due" = 0 ] && [ -n "$assign_at" ]; then
+    age=$(( NOW - $(ts_of "$assign_at") ))
+    if [ "$age" -lt "$ASSIGN_COOLDOWN" ]; then
+      echo "  assignment: SKIPPED (the same brief for tip $TIP went out $(( age / 60 )) min ago, under the $(( ASSIGN_COOLDOWN / 60 )) min cooldown)"
+      assign_due=0
+    fi
+  fi
+  if [ "$assign_due" = 0 ]; then
+    :
+  else
   hub_post channel "$BRIEF"
   for a in $PENDING_AGENTS; do
     hub_post "$a" "$BRIEF"
@@ -584,6 +702,7 @@ if [ "$PENDING" -gt 0 ]; then
     fi
   done
   rm -f "$BRIEF"
+  fi
 else
   echo "tip $TIP is fully certified; sending a heartbeat only"
   HB=/tmp/hub-heartbeat.$$
@@ -593,7 +712,37 @@ else
 fi
 
 # 6. Nudges (after the assignment so the assignment is the primary mail).
+#
+# ★ A NUDGE IS NOT A HEARTBEAT. (Round 102.) The loop runs every few
+# minutes and every run re-sent the same nudge to every silent agent,
+# so an inbox that had been quiet for 6 hours filled with IDENTICAL
+# copies: 11 messages, of which 5 were the same nudge and 4 were the
+# same assignment. Measured on kuku's inbox.
+#
+# A tester cannot tell a new nudge from a re-send of the old one, and
+# an inbox full of identical copies is exactly the shape that makes a
+# silent agent look like a busy one.
+#
+# So a nudge is sent only if the last one to that agent was more than
+# NUDGE_COOLDOWN ago — and the receipt is read back from the inbox
+# (which the loop already does for delivery), so the decision is based
+# on what was actually delivered, not on a local guess.
 for a in $NUDGE_LIST; do
+  last_nudge=""
+  while IFS=$'\t' read -r mtime mfirst; do
+    case "$mfirst" in
+      *"具体催办 · $a"*) last_nudge="$mtime" ;;
+    esac
+  done <<EOF
+$(hub_inbox_times "$a" 2>/dev/null)
+EOF
+  if [ -n "$last_nudge" ]; then
+    age=$(( NOW - $(ts_of "$last_nudge") ))
+    if [ "$age" -lt "$NUDGE_COOLDOWN" ]; then
+      echo "  nudge → $a: SKIPPED (the last one was $(( age / 60 )) min ago, under the $(( NUDGE_COOLDOWN / 60 )) min cooldown)"
+      continue
+    fi
+  fi
   N=/tmp/hub-nudge.$$
   {
     echo "# 具体催办 · $a · $(date -u +%FT%TZ)"
