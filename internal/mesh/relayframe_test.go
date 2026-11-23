@@ -83,7 +83,8 @@ func relayRecordEqual(a, b relayRecord) bool {
 		a.Close == b.Close &&
 		a.Reason == b.Reason &&
 		a.Class == b.Class &&
-		a.Grant == b.Grant
+		a.Grant == b.Grant &&
+		a.MaxPayload == b.MaxPayload
 }
 
 // TestRelayFrameZeroValueIsAbsent checks the omitempty rule: a zero value
@@ -534,6 +535,13 @@ func randomRelayRecord(rng *rand.Rand) relayRecord {
 	}
 	if rng.IntN(3) == 0 {
 		rec.Grant = true
+	}
+	// The payload cap. It is the one optional field that lives in the
+	// meta block WITHOUT a flag bit — its presence is decided by the
+	// block's own length — so it is the one the property test has to
+	// cover hardest.
+	if rng.IntN(3) == 0 {
+		rec.MaxPayload = rng.Uint64()
 	}
 	return rec
 }

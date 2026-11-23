@@ -96,7 +96,7 @@ func TestContestedRoomRecovers(t *testing.T) {
 	if err := a.Send([]byte("after recovery")); err != nil {
 		t.Fatalf("send: %v", err)
 	}
-	_ = b.SetReadDeadline(time.Now().Add(3 * time.Second))
+	_ = b.SetReadDeadline(time.Now().Add(deliveryDeadline))
 	got, err := b.Recv()
 	if err != nil {
 		t.Fatalf("B recv after recovery: %v", err)

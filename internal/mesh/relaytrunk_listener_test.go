@@ -409,6 +409,22 @@ func TestOneSocketServesBothProtocols(t *testing.T) {
 		Target:    f.hub.ID(),
 		Endpoints: []string{f.hubAddr},
 		Kind:      KindPing,
+		// The handshake budget is EXPLICIT.
+		//
+		// Without it this dial falls back to the transport's own
+		// ceiling — quic-go's HandshakeIdleTimeout — and the test then
+		// fails with "context deadline exceeded" or "timeout: no recent
+		// network activity" after exactly 20.01 s under the full-suite
+		// -race load, with no product defect behind it (the same failure
+		// mode the repo already documents in direct_test.go: "under the
+		// full-suite -race load the QUIC handshake can take longer than
+		// 5 s on a loaded CI runner").
+		//
+		// So the budget is stated here, the way the production path
+		// states it, and it is longer than the transport's ceiling so
+		// the TRANSPORT is the thing that times out — with a message
+		// that says so — rather than a test that guesses.
+		HandshakeTimeout: 30 * time.Second,
 	})
 	if err != nil {
 		t.Fatalf("the direct link could not be opened on the shared socket: %v", err)
@@ -499,10 +515,31 @@ func TestTheTargetsJoinConnectionSurvivesTheFlow(t *testing.T) {
 	//
 	// The write is bounded: a session that is wedged rather than dead
 	// must fail the test too, and a test that hangs reports nothing.
+	//
+	// The write must be a FRAMED RECORD, not raw bytes.
+	//
+	// The join stream is a framed record stream: the trunk reads it with
+	// readRelayRecordAs, which takes a 4-byte length prefix first. Raw
+	// bytes on it are therefore read as a length, and the stream is
+	// reported as broken — correctly, because it IS broken.
+	//
+	// Writing the literal string "still here" put the four bytes
+	// 73 74 69 6C on the wire, and a reader that took them as a
+	// big-endian length reported "frame of 1937009004 bytes exceeds the
+	// 1048576 byte cap" — the memorable symptom of the round-81 format
+	// desync, produced here by a TEST that spoke the protocol wrongly.
+	//
+	// That symptom then appeared in a DIFFERENT test (the joiner's own
+	// loop reported the broken stream), so a bug in one test showed up
+	// as a failure in another. The product was right throughout; the
+	// test was not.
 	_ = joiner.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	writeDone := make(chan error, 1)
 	go func() {
-		_, err := joiner.Write([]byte("still here"))
+		err := writeRelayRecordAs(joiner, relayRecord{
+			Type: uint8(wire.FrameMeshRelayData),
+			Data: []byte("still here"),
+		}, RelaySpliceFormatBinary)
 		writeDone <- err
 	}()
 	select {

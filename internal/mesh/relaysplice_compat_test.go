@@ -439,7 +439,12 @@ func negotiateALPNUnderQUIC(t *testing.T, serverProtos, clientProtos []string) (
 	}
 	acceptedCh := make(chan accepted, 1)
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		// The budget must OUTLAST the handshake it waits for: QUIC's
+		// own HandshakeIdleTimeout is 15 s (quicTransportHandshakeTimeout),
+		// so a 20-second context is longer than the transport's ceiling
+		// — and under the full-suite -race load the handshake is the
+		// slower of the two.
+		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 		defer cancel()
 		conn, err := ln.Accept(ctx)
 		acceptedCh <- accepted{conn: conn, err: err}
@@ -502,7 +507,9 @@ func negotiateALPNUnderQUIC(t *testing.T, serverProtos, clientProtos []string) (
 		t.Fatalf("client listen udp: %v", err)
 	}
 	defer cliUDP.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	// The budget must OUTLAST the handshake it waits for — see the
+	// comment on the accept side above.
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 	conn, err := quic.Dial(ctx, cliUDP, raddr, cliCfg, quicConfig())
 	if err != nil {

@@ -64,6 +64,25 @@ func TestEnrollRefusesPrivateResolvedAddress(t *testing.T) {
 	t.Setenv("NO_PROXY", origin)
 	t.Setenv("no_proxy", origin)
 
+	// The private-deployment switch must be OFF, whatever the
+	// environment says.
+	//
+	// This test pins the EGRESS POLICY, and the switch turns that policy
+	// off on purpose (it is how a LAN deployment addresses a private
+	// anchor). So the switch being on in the environment means "the
+	// policy is off" — which is the opposite of what this test asserts.
+	//
+	// It is not a hypothetical: an external tester runs his whole suite
+	// with CMESH_ALLOW_PRIVATE_DISCOVERY=1 (his loopback anchor needs
+	// it), and this test failed for him with "the enrollment request
+	// reached a loopback address" — a failure that says nothing about
+	// the product and everything about the test inheriting the
+	// environment.
+	//
+	// A test that asserts a policy must also PIN that policy on, or it
+	// measures the environment instead of the code.
+	t.Setenv("CMESH_ALLOW_PRIVATE_DISCOVERY", "")
+
 	acc, err := identity.GenerateAccount()
 	if err != nil {
 		t.Fatal(err)

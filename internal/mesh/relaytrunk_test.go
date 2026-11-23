@@ -629,7 +629,27 @@ type pipeSession struct {
 	// readDeadline bounds a blocking Read. The zero value means "no
 	// deadline".
 	readDeadline time.Time
-	mu           sync.Mutex
+	// pending holds the tail of a chunk the last Read did not have room
+	// for.
+	//
+	// IT IS A BYTE STREAM, so a Read that cannot take the whole chunk
+	// must KEEP the rest. The old double dropped it: `copy(b, chunk)`
+	// returns what fitted and threw the remainder away, so a reader
+	// whose buffer was smaller than the chunk lost bytes — silently, in
+	// the middle of a record.
+	//
+	// The JSON relay path never noticed: its records were read with
+	// io.ReadFull over a body of the EXACT size, and bufio's
+	// direct-read path (used when the caller's slice is at least as big
+	// as bufio's buffer) happened to line the sizes up. The binary
+	// splice copies the body through a 32 KiB scratch buffer, which is
+	// exactly bufio's buffer size — so the split lands on the boundary
+	// and the tail was lost.
+	//
+	// A byte stream that loses bytes is not a byte stream, and a test
+	// double that loses bytes tests nothing about the code under it.
+	pending []byte
+	mu      sync.Mutex
 	// seen records every byte that crossed this session, so a test can
 	// assert what the OTHER end could read. It is how the end-to-end
 	// encryption test checks that the trunk never held the plaintext: the
@@ -701,9 +721,19 @@ func (p *pipeSession) Read(b []byte) (int, error) {
 	p.mu.Lock()
 	readErr := p.readErr
 	deadline := p.readDeadline
+	pending := p.pending
 	p.mu.Unlock()
 	if readErr != nil {
 		return 0, readErr
+	}
+	// The PENDING tail comes first: it is the remainder of a chunk a
+	// previous Read could not take, and a byte stream must not lose it.
+	if len(pending) > 0 {
+		n := copy(b, pending)
+		p.mu.Lock()
+		p.pending = pending[n:]
+		p.mu.Unlock()
+		return n, nil
 	}
 	// Drain first: bytes that are already queued must not be lost to
 	// the end-of-stream signal.
@@ -712,7 +742,7 @@ func (p *pipeSession) Read(b []byte) (int, error) {
 		if !ok {
 			return 0, io.EOF
 		}
-		return copy(b, chunk), nil
+		return p.take(b, chunk), nil
 	default:
 	}
 	// The deadline turns "the peer will never send anything" into a
@@ -744,7 +774,7 @@ func (p *pipeSession) Read(b []byte) (int, error) {
 		if !ok {
 			return 0, io.EOF
 		}
-		return copy(b, chunk), nil
+		return p.take(b, chunk), nil
 	case <-p.closed:
 		return 0, io.EOF
 	case <-timeout:
@@ -774,15 +804,42 @@ func (p *pipeSession) Read(b []byte) (int, error) {
 // aborted (a RESET_STREAM on the real wire).
 var errPeerAborted = errors.New("pipe session: the peer aborted the stream")
 
+// take copies a chunk into the caller's buffer and KEEPS the remainder.
+//
+// The remainder is the whole point: a Read that cannot take the whole
+// chunk must not lose the rest of it. The old double dropped it, and a
+// byte stream that drops bytes is not a byte stream — it is a lossy
+// channel wearing a stream's clothes.
+func (p *pipeSession) take(b []byte, chunk []byte) int {
+	n := copy(b, chunk)
+	if n < len(chunk) {
+		p.mu.Lock()
+		p.pending = append(p.pending[:0], chunk[n:]...)
+		p.mu.Unlock()
+	}
+	return n
+}
+
 // drainThenEOF hands back the bytes that are already queued and then
 // reports the end of the stream.
 func (p *pipeSession) drainThenEOF(b []byte) (int, error) {
+	// The PENDING tail comes first: it is the remainder of a chunk the
+	// previous Read could not take, and it must be handed out before the
+	// end-of-stream signal — otherwise the tail of the last record would
+	// be lost.
+	p.mu.Lock()
+	pending := p.pending
+	p.mu.Unlock()
+	if len(pending) > 0 {
+		n := p.take(b, pending)
+		return n, nil
+	}
 	select {
 	case chunk, ok := <-p.in:
 		if !ok {
 			return 0, io.EOF
 		}
-		return copy(b, chunk), nil
+		return p.take(b, chunk), nil
 	default:
 	}
 	return 0, io.EOF

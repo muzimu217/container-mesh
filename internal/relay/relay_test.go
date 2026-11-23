@@ -84,8 +84,33 @@ func sendUntilReceived(t *testing.T, src, dst *wsconn.Conn, msg string, timeout 
 	return ""
 }
 
+// The TWO DEADLINES this package uses, and why they differ.
+//
+// evictionDeadline is for a PROMPTNESS claim: "the displaced peer is
+// released" and "the room times out and closes". Those are product
+// properties, and a slow machine must not be allowed to excuse a
+// regression in them. They stay tight.
+//
+// deliveryDeadline is for a DELIVERY claim: "the peer receives the
+// message". The bytes wait for the pairing, and the pairing waits for
+// the splice, so this budget covers several round trips that are
+// usually instant and occasionally are not — the machine, not the
+// product, decides how long.
+//
+// The distinction matters because the two were once the same number
+// (3 seconds), and conflating them made a load-sensitive test look
+// like a flaky one. An external tester reported exactly that: 1 red in
+// 3 full-package -race runs on a 2-core container, 8/8 green in
+// isolation.
+//
+// Measured on an unloaded machine a delivery takes 0–20 ms, so the old
+// 3-second budget was already 150x the real cost.
+const (
+	evictionDeadline = 3 * time.Second
+	deliveryDeadline = 30 * time.Second
+)
+
 func dial(t *testing.T, base, room, role string) *wsconn.Conn {
-	t.Helper()
 	c, err := wsconn.Dial(context.Background(), wsconn.DialOptions{
 		URL:         fmt.Sprintf("%s?room=%s&role=%s", base, room, role),
 		DialTimeout: 3 * time.Second,
@@ -109,7 +134,7 @@ func TestRelayPairsAndForwards(t *testing.T) {
 	if err := a.Send([]byte("ping from A")); err != nil {
 		t.Fatal(err)
 	}
-	_ = b.SetReadDeadline(time.Now().Add(3 * time.Second))
+	_ = b.SetReadDeadline(time.Now().Add(deliveryDeadline))
 	got, err := b.Recv()
 	if err != nil {
 		t.Fatalf("B recv: %v", err)
@@ -122,7 +147,7 @@ func TestRelayPairsAndForwards(t *testing.T) {
 	if err := b.Send([]byte("pong from B")); err != nil {
 		t.Fatal(err)
 	}
-	_ = a.SetReadDeadline(time.Now().Add(3 * time.Second))
+	_ = a.SetReadDeadline(time.Now().Add(deliveryDeadline))
 	got, err = a.Recv()
 	if err != nil {
 		t.Fatalf("A recv: %v", err)
@@ -135,6 +160,23 @@ func TestRelayPairsAndForwards(t *testing.T) {
 // TestRelayDuplicateRoleEvictsStaleWaiter verifies the reconnect story: a
 // client that redials with the same code+role takes over the slot from the
 // stale waiter (last writer wins), and then pairs normally.
+//
+// THE TWO DEADLINES BELOW ARE NOT THE SAME ASSERTION.
+//
+// The EVICTION deadline ("the displaced peer is released promptly") is a
+// product property and stays tight.
+//
+// The DELIVERY deadline ("B receives the message") is not a promptness
+// claim at all: the bytes wait for the PAIRING, and the pairing waits
+// for the splice. An external tester saw this test fail under -race on
+// a 2-core container (1 red in 3 full-package runs) while it was 8/8
+// green in isolation — a machine-load artefact, not a behaviour change.
+// Measured on an unloaded machine the delivery takes 0–20 ms, so the
+// old 3-second budget was 150x the real cost and only failed when the
+// machine was busy.
+//
+// The two are kept apart by name so the next reader does not widen the
+// eviction one by accident.
 func TestRelayDuplicateRoleEvictsStaleWaiter(t *testing.T) {
 	base, stop := startTestRelay(t)
 	defer stop()
@@ -144,7 +186,7 @@ func TestRelayDuplicateRoleEvictsStaleWaiter(t *testing.T) {
 	defer a2.Close()
 
 	// The displaced connection must be released promptly.
-	_ = a1.SetReadDeadline(time.Now().Add(3 * time.Second))
+	_ = a1.SetReadDeadline(time.Now().Add(evictionDeadline))
 	if _, err := a1.Recv(); err == nil {
 		t.Fatal("stale waiter should be closed after eviction")
 	}
@@ -155,7 +197,28 @@ func TestRelayDuplicateRoleEvictsStaleWaiter(t *testing.T) {
 	if err := a2.Send([]byte("from-newcomer")); err != nil {
 		t.Fatal(err)
 	}
-	_ = b.SetReadDeadline(time.Now().Add(3 * time.Second))
+	// The DELIVERY gets a generous budget, and the EVICTION above keeps
+	// a tight one. They are not the same assertion.
+	//
+	// The delivery waits for the PAIRING: `a2.Send` happens as soon as
+	// the dial returns, but the splice that carries the bytes to b only
+	// starts once the relay has paired them. The bytes are not lost (the
+	// relay deliberately does not read a parked socket — they sit in the
+	// socket buffer), but the delivery waits for the splice.
+	//
+	// So this budget has to cover the dial round trip, the eviction, the
+	// pairing, the splice starting, and the byte crossing. Measured on
+	// an unloaded machine the delivery takes 0–20 ms; the old 3-second
+	// budget is 150x that, which is why it only failed on a LOADED
+	// machine: an external tester saw it fail under -race on a 2-core
+	// container (1 red in 3 full-package runs) while it was 8/8 green
+	// in isolation and 3/3 green for the whole package elsewhere.
+	//
+	// The eviction deadline above stays at 3 seconds ON PURPOSE: "the
+	// displaced peer is released promptly" is a real product property,
+	// and a slow machine must not be allowed to excuse a regression
+	// there. Widening this one does not weaken that one.
+	_ = b.SetReadDeadline(time.Now().Add(30 * time.Second))
 	got, err := b.Recv()
 	if err != nil {
 		t.Fatalf("B recv: %v", err)
@@ -216,12 +279,12 @@ func TestRelayMultipleRoomsAreIsolated(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_ = b1.SetReadDeadline(time.Now().Add(3 * time.Second))
+	_ = b1.SetReadDeadline(time.Now().Add(deliveryDeadline))
 	got1, err := b1.Recv()
 	if err != nil {
 		t.Fatalf("b1: %v", err)
 	}
-	_ = b2.SetReadDeadline(time.Now().Add(3 * time.Second))
+	_ = b2.SetReadDeadline(time.Now().Add(deliveryDeadline))
 	got2, err := b2.Recv()
 	if err != nil {
 		t.Fatalf("b2: %v", err)
@@ -354,7 +417,7 @@ func TestRoomTimesOut(t *testing.T) {
 	defer a.Close()
 
 	// The relay should close A's connection after PairTimeout.
-	_ = a.SetReadDeadline(time.Now().Add(3 * time.Second))
+	_ = a.SetReadDeadline(time.Now().Add(evictionDeadline))
 	if _, err := a.Recv(); err == nil {
 		t.Fatal("expected the room to time out and close the connection")
 	}
@@ -386,7 +449,7 @@ func TestParkedDeadPeerFreesRoom(t *testing.T) {
 	if err := a2.Send([]byte("fresh")); err != nil {
 		t.Fatal(err)
 	}
-	_ = b.SetReadDeadline(time.Now().Add(3 * time.Second))
+	_ = b.SetReadDeadline(time.Now().Add(deliveryDeadline))
 	got, err := b.Recv()
 	if err != nil {
 		t.Fatalf("B recv: %v", err)
@@ -414,7 +477,7 @@ func TestParkedEarlyDataSurvivesPairing(t *testing.T) {
 	b := dial(t, base, "early", "B")
 	defer b.Close()
 
-	_ = b.SetReadDeadline(time.Now().Add(3 * time.Second))
+	_ = b.SetReadDeadline(time.Now().Add(deliveryDeadline))
 	got, err := b.Recv()
 	if err != nil {
 		t.Fatalf("B recv: %v", err)

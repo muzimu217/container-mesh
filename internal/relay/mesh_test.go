@@ -440,7 +440,7 @@ func TestStreamCloseExpiresMemberFast(t *testing.T) {
 
 	// The observer is pushed the offline flip well within seconds — the
 	// bound here is a smoke ceiling (T-2.4), the P-5 line is 10 s.
-	_ = obs.SetReadDeadline(time.Now().Add(3 * time.Second))
+	_ = obs.SetReadDeadline(time.Now().Add(deliveryDeadline))
 	snap := recvSnapshot(t, obs)
 	if snap.Members[f.devices[1].ID()].Online {
 		t.Fatalf("victim still online after stream close (%.1fs)", time.Since(start).Seconds())

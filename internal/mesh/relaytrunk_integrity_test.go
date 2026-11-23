@@ -382,7 +382,7 @@ func TestTheRequesterIsWhoItsCertificateSays(t *testing.T) {
 		Hops: 1,
 	}
 	h := &RelayHandler{trunk: trunk, joiners: NewJoinerTable()}
-	h.serveRequester(trunk, nil, trunkSide, bufio.NewReader(trunkSide), &open, f.alice.ID())
+	h.serveRequester(trunk, nil, trunkSide, bufio.NewReader(trunkSide), &open, f.alice.ID(), RelaySpliceFormatBinary)
 
 	_ = aSide.SetReadDeadline(time.Now().Add(5 * time.Second))
 	ans, err := readRelayRecord(bufio.NewReader(aSide))
