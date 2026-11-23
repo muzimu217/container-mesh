@@ -9,6 +9,8 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -82,7 +84,26 @@ func postMsg(w http.ResponseWriter, r *http.Request) {
 	from := strings.TrimSpace(r.URL.Query().Get("from"))
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBody))
 	if err != nil {
-		http.Error(w, "body too large or unreadable", http.StatusBadRequest)
+		// ★ SAY WHICH FAILURE IT WAS. (Round 102, found by the audit
+		// line.) The old message was "body too large or unreadable" —
+		// ONE text for TWO failures, so an agent could not tell "your
+		// report is over the limit, shrink it" from "the connection
+		// broke, retry". Both write paths said it.
+		//
+		// The status code says it too: 413 means the entity was
+		// understood and refused for being too big, which is exactly
+		// what happened. 400 says the request was malformed, which it
+		// was not.
+		//
+		// The limit is IN the message, because an agent has to be able
+		// to compute the number it must stay under.
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			http.Error(w, fmt.Sprintf("body too large: the limit is %d bytes", maxBody),
+				http.StatusRequestEntityTooLarge)
+			return
+		}
+		http.Error(w, "body unreadable", http.StatusBadRequest)
 		return
 	}
 	msg := message{
@@ -136,7 +157,26 @@ func postInstruct(w http.ResponseWriter, r *http.Request) {
 	}
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBody))
 	if err != nil {
-		http.Error(w, "body too large or unreadable", http.StatusBadRequest)
+		// ★ SAY WHICH FAILURE IT WAS. (Round 102, found by the audit
+		// line.) The old message was "body too large or unreadable" —
+		// ONE text for TWO failures, so an agent could not tell "your
+		// report is over the limit, shrink it" from "the connection
+		// broke, retry". Both write paths said it.
+		//
+		// The status code says it too: 413 means the entity was
+		// understood and refused for being too big, which is exactly
+		// what happened. 400 says the request was malformed, which it
+		// was not.
+		//
+		// The limit is IN the message, because an agent has to be able
+		// to compute the number it must stay under.
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			http.Error(w, fmt.Sprintf("body too large: the limit is %d bytes", maxBody),
+				http.StatusRequestEntityTooLarge)
+			return
+		}
+		http.Error(w, "body unreadable", http.StatusBadRequest)
 		return
 	}
 	msg := message{
