@@ -31,21 +31,80 @@ hub_post() {
   # The hub's two write endpoints: /hub/report (the channel, from=…&topic=…)
   # and /hub/instruct (one agent's inbox, to=…). The body travels as the
   # POST body, not as a form field.
+  #
+  # ★ A `{"ok":true}` IS NOT PROOF OF DELIVERY. (Round 98, found the hard
+  # way.) The hub CREATES AN INBOX FOR ANY `to=` VALUE and answers
+  # `{"ok":true}` whether or not that agent exists — so a misspelled
+  # recipient (`to=kuku` instead of `to=kuku-sandbox-01`) is accepted,
+  # stored, and NEVER READ. The sender sees a success that no one receives.
+  #
+  # We lost four messages that way: the reply to doubao, the nudges to
+  # kuku and netns, and the reply to muse all went to phantom inboxes
+  # named `doubao` / `kuku` / `muse` while the real agents stayed silent
+  # — and the silence looked exactly like an agent that had stopped
+  # answering.
+  #
+  # So the recipient is CHECKED AGAINST THE KNOWN ROSTER before sending,
+  # and the delivery is VERIFIED BY READING THE INBOX BACK.
   local to="$1" body="$2" token
   token=$(hub_token)
   [ -z "$token" ] && { echo "hub token unavailable" >&2; return 1; }
   if [ "$DRY" = 1 ]; then
-    echo "  [dry] would send to=$to: $(head -c 60 "$body" | tr '\n' ' ')..."
+    # The preview must not die on a multi-byte character: `tr` works on
+    # BYTES, and in a UTF-8 locale it aborts on the first Chinese
+    # character it meets ("tr: Illegal byte sequence"). The preview is
+    # cosmetic, so it must never take the run down.
+    echo "  [dry] would send to=$to: $(head -c 60 "$body" | LC_ALL=C tr '\n' ' ' 2>/dev/null || head -c 60 "$body")..."
     return 0
   fi
   if [ "$to" = "channel" ]; then
     curl -sS -m 30 -X POST -H "X-Hub-Token: $token" --data-binary @"$body" \
       "$HUB/report?from=coordinator&topic=issue8" 2>&1 | head -c 120
-  else
-    curl -sS -m 30 -X POST -H "X-Hub-Token: $token" --data-binary @"$body" \
-      "$HUB/instruct?to=$to" 2>&1 | head -c 120
+    echo
+    return 0
   fi
+  # THE RECIPIENT MUST BE A REAL AGENT. A name that is not in the roster
+  # is a typo, and a typo is how messages vanish.
+  if ! printf '%s\n' $AGENTS | grep -qx "$to"; then
+    echo "REFUSED: '$to' is not in the roster ($AGENTS)" >&2
+    echo "         (the hub would have accepted it into a phantom inbox)" >&2
+    return 1
+  fi
+  curl -sS -m 30 -X POST -H "X-Hub-Token: $token" --data-binary @"$body" \
+    "$HUB/instruct?to=$to" 2>&1 | head -c 120
   echo
+}
+
+hub_delivered() {
+  # hub_delivered <agent> <body-file>
+  #
+  # VERIFY THE DELIVERY BY READING THE INBOX BACK.
+  #
+  # The hub's `{"ok":true}` only says "I stored this somewhere". The
+  # only thing that says "the agent can read it" is the message being
+  # in THAT agent's inbox. So the check is: does the recipient's inbox
+  # now contain a message whose body matches what we sent?
+  local to="$1" body="$2" token
+  token=$(hub_token)
+  [ -z "$token" ] && return 1
+  local sig
+  # The first line is the subject line, and it is unique per round.
+  sig=$(head -1 "$body")
+  [ -z "$sig" ] && return 1
+  curl -sS -m 20 -H "X-Hub-Token: $token" "$HUB/inbox?to=$to" 2>/dev/null | python3 -c "
+import sys, json
+sig = sys.argv[1]
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print('inbox unreadable'); raise SystemExit(1)
+for m in d.get('messages') or []:
+    if (m.get('body') or '').startswith(sig):
+        print('delivered at ' + str(m.get('time')))
+        raise SystemExit(0)
+print('NOT in this inbox')
+raise SystemExit(1)
+" "$sig"
 }
 
 hub_reports() {
@@ -57,9 +116,61 @@ hub_reports() {
 
 watermark() { head -1 "$WATERMARK" 2>/dev/null || echo "1970-01-01T00:00:00Z"; }
 
+# The HANDLED cursor: the newest report the coordinator has actually
+# DISPOSED of (read, judged, replied to, mirrored).
+#
+# It is a SEPARATE line from the fetched cursor because "the report
+# arrived" and "the report was handled" are different facts. An
+# external tester put it exactly right: a report of theirs was
+# delivered (HTTP 200, hub side stored it, the content was quoted
+# back to them) and yet it was never acted on — because the tool
+# recorded one cursor for both facts.
+#
+# The file's format is:
+#   line 1: FETCHED  — the newest report this loop has seen
+#   line 2: HANDLED  — the newest report the coordinator has disposed of
+#   line 3: the fetched cursor again (kept for older readers)
+handled_watermark() { sed -n '2p' "$WATERMARK" 2>/dev/null || watermark; }
+
 advance_watermark() {
   local ts="$1"
+  # A DRY RUN WRITES NOTHING. It says what it WOULD send, and it says
+  # what it WOULD advance the watermark to — but it does not do it.
+  #
+  # The bug this fixes: the dry run advanced the watermark anyway. The
+  # watermark is the "reports I have already handled" cursor, so moving
+  # it in a dry run SILENTLY DISCARDED every report between the old and
+  # the new cursor — the next real run then read nothing new and those
+  # reports were never handled. It cost one round: a tester's report
+  # (doubao, 18:20:59Z) was read and then marked as handled without
+  # being handled.
+  #
+  # The rule is the general one: a dry run must not mutate state that
+  # decides what work remains. Printing a plan is not doing the work.
+  if [ "$DRY" = 1 ]; then
+    echo "  [dry] would advance the watermark to $ts"
+    return 0
+  fi
   printf '%s\n%s\n%s\n' "$ts" "$ts" "$ts" > "$WATERMARK"
+}
+
+# advance_handled records that the coordinator has disposed of every
+# report up to and including ts.
+#
+# It is a SEPARATE write from advance_watermark on purpose: the loop
+# FETCHES reports, but the COORDINATOR handles them. The loop may
+# advance the fetched cursor on its own; only the coordinator may
+# advance the handled one. Merging them is what turned "delivered"
+# into "done".
+advance_handled() {
+  local ts="$1"
+  if [ "$DRY" = 1 ]; then
+    echo "  [dry] would advance the HANDLED cursor to $ts"
+    return 0
+  fi
+  local fetched
+  fetched=$(watermark)
+  printf '%s\n%s\n%s\n' "$fetched" "$ts" "$fetched" > "$WATERMARK"
 }
 
 tip() { git rev-parse --short origin/develop 2>/dev/null || echo unknown; }
@@ -85,6 +196,21 @@ print(len(new))
 echo "new reports since the watermark: $NEW_COUNT"
 
 # 2. Per-agent last-report time (the ledger's raw material).
+#
+# THE HUB HAS TWO MESSAGE SHAPES, and only one of them was understood.
+#
+# A normal report arrives as {"topic","time","from","text"}. But an
+# agent that posts a JSON document as its BODY arrives as
+# {"topic","time","body":"{\"from\": \"...\", \"body\": \"...\"}"} —
+# there is no top-level "from" at all.
+#
+# The old parser read m.get('from') and got "" for that one, so the
+# report was INVISIBLE: it did not count as a report (the agent looked
+# silent) and it did not reach the ledger. The agent had answered, and
+# the loop said nothing had arrived.
+#
+# So the parser now unwraps a nested body when it is JSON. A report is
+# a report no matter which shape it arrived in.
 printf '%s' "$REPORTS" | python3 -c "
 import sys, json
 d = json.load(sys.stdin)
@@ -92,9 +218,16 @@ last = {}
 for m in d.get('messages') or []:
     f = m.get('from') or ''
     t = m.get('time') or ''
+    body = m.get('body') or ''
+    if not f and body.startswith('{'):
+        # A nested report: the agent posted a JSON document as the body.
+        try:
+            inner = json.loads(body)
+            f = inner.get('from') or ''
+        except Exception:
+            f = ''
     if f and (f not in last or t > last[f]):
         last[f] = t
-import os
 for a in '$AGENTS'.split():
     print('%s %s' % (a, last.get(a, 'never')))
 " > /tmp/hub-last-reports.$$ 2>/dev/null
@@ -109,6 +242,11 @@ for a in '$AGENTS'.split():
 # it did not write.)
 if [ ! -f "$LEDGER" ] || ! diff -q <(sort /tmp/hub-last-reports.$$) \
     <(grep -E "^(doubao|kuku|netns|ohno|oh-no|muse)" "$LEDGER" 2>/dev/null | awk '{print $1, $2}' | sort) >/dev/null 2>&1; then
+  # A DRY RUN DOES NOT WRITE THE LEDGER EITHER. The ledger is the
+  # record of who certified what; a rehearsal must not change it.
+  if [ "$DRY" = 1 ]; then
+    echo "  [dry] would update the ledger ($LEDGER)"
+  else
   {
     echo "# 测试认证台账（hub-certify-loop 自动维护 + 值守补记）"
     echo "# 格式: <代理> <最后一报UTC> <已认证的SHA> <当前tip是否已认证>"
@@ -145,6 +283,7 @@ if [ ! -f "$LEDGER" ] || ! diff -q <(sort /tmp/hub-last-reports.$$) \
   } > "$LEDGER.tmp"
   mv "$LEDGER.tmp" "$LEDGER"
   echo "ledger updated: $LEDGER"
+  fi
 fi
 
 # 4. Silence check: a last report older than 6h is a nudge.
@@ -169,13 +308,44 @@ done < /tmp/hub-last-reports.$$
 
 # 5. The certification assignment: send when any agent's ledger entry is
 #    pending for the current tip.
-PENDING=$(grep -c "pending" "$LEDGER" 2>/dev/null || echo 0)
+#
+# The count must be an INTEGER on one line. `grep -c` prints "0" AND exits
+# 1 when it finds nothing, so `grep -c ... || echo 0` yields TWO lines
+# ("0\n0") — and `[ "0
+# 0" -gt 0 ]` then fails with "integer expected". The assignment was
+# therefore never sent, and the loop announced a heartbeat instead: the
+# tip was declared "fully certified" while three of the five agents had
+# NOT certified it (their SHA column was "—", i.e. "no SHA recorded").
+#
+# So the count is taken from the ledger's OWN state column, not from a
+# grep for a word that never appears in it. A row is pending when its
+# state column is not "yes" — that is the column the loop itself writes.
+PENDING=$(awk '$1 !~ /^#/ && NF >= 3 && $4 != "yes" {n++} END {print n+0}' "$LEDGER" 2>/dev/null)
 if [ "$PENDING" -gt 0 ]; then
+  # WHO STILL OWNS A CELL.
+  #
+  # The assignment used to go to EVERY agent, every time, as long as
+  # ANY cell was pending. So an agent who had already submitted their
+  # result got asked again — and one of them said so: "doubao 那一格
+  # 已经在 22:20Z 交过了……不必重发". Re-asking a tester who has
+  # already answered is not a harmless repeat: it makes their inbox
+  # noisy and it makes their silence (once they stop replying to
+  # repeats) indistinguishable from being stuck.
+  #
+  # So the brief lists only the agents whose OWN row still says the
+  # tip is not certified, and it goes only to them.
+  PENDING_AGENTS=$(awk -v tip="$TIP" '$1 !~ /^#/ && NF >= 4 && $3 != tip {print $1}' "$LEDGER" 2>/dev/null)
+  if [ -z "$PENDING_AGENTS" ]; then
+    # No row names a pending agent: fall back to every agent, so a
+    # ledger that has lost its rows does not silence the whole loop.
+    PENDING_AGENTS="$AGENTS"
+  fi
+
   BRIEF=/tmp/hub-certify-brief.$$
   {
     echo "# 测试认证派单 · develop@$TIP · $(date -u +%FT%TZ)"
     echo
-    echo "当前 tip \`$TIP\` 尚未完成四线认证（台账 pending 项 $PENDING）。请各线在**本轮回信**里带上你复测的 SHA 与结论，格式："
+    echo "当前 tip \`$TIP\` 尚未完成四线认证（台账 pending 项 $PENDING）。请**尚未交这一格**的线在**本轮回信**里带上你复测的 SHA 与结论，格式："
     echo "    SHA=$TIP 结论=PASS|FAIL 证据=<命令原文+退出码+输出首末20行>"
     echo
     echo "分工："
@@ -184,12 +354,18 @@ if [ "$PENDING" -gt 0 ]; then
     echo "  - netns：资源与可用性（RSS 口径 / cred 命令面走查）"
     echo "  - oh-no：同 SHA 外部复测（独立环境）"
     echo
+    echo "**已经交过这一格的线不必再回**（重复交是噪音，不是配合）。"
     echo "收到请先回 {\"ok\":true}。"
   } > "$BRIEF"
   echo "--- certification assignment (pending=$PENDING) ---"
   hub_post channel "$BRIEF"
-  for a in $AGENTS; do
+  for a in $PENDING_AGENTS; do
     hub_post "$a" "$BRIEF"
+    # ★ The `{"ok":true}` is not proof. Read the inbox back.
+    if [ "$DRY" != 1 ]; then
+      printf '  delivered? %s: ' "$a"
+      hub_delivered "$a" "$BRIEF" || echo "  ★ NOT DELIVERED — the message is not in that inbox"
+    fi
   done
   rm -f "$BRIEF"
 else
@@ -209,6 +385,11 @@ for a in $NUDGE_LIST; do
   } > "$N"
   echo "--- nudge → $a ---"
   hub_post "$a" "$N"
+  # ★ Same check: a nudge nobody received is the same as a nudge never sent.
+  if [ "$DRY" != 1 ]; then
+    printf '  delivered? %s: ' "$a"
+    hub_delivered "$a" "$N" || echo "  ★ NOT DELIVERED — the message is not in that inbox"
+  fi
   rm -f "$N"
 done
 

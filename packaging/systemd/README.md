@@ -114,3 +114,110 @@ which is a silent failure the CLI cannot detect for you.
 
 Measured on the real machine: with the credential on the command line, `ps`
 printed the whole credential string.
+
+## The relay switch: SIGHUP
+
+An anchor that runs with `--relay-trunk` carries relayed sessions for the
+whole network. **An operator may need to stop that without taking the
+node down** — the members' control plane, the panel and the pairing relay
+must keep working.
+
+**`SIGHUP` is the switch.** It toggles the trunk between carrying relays
+and not carrying them, live:
+
+```sh
+sudo systemctl reload cmesh-discovery.service   # sends SIGHUP (ExecReload=)
+# or, equivalently:
+sudo kill -HUP "$(systemctl show -p MainPID --value cmesh-discovery.service)"
+```
+
+The node does not restart. The trunk simply stops accepting new relays.
+**Turning it OFF also tears down the relays it is currently carrying** —
+a trunk that is "off" but still forwarding other members' traffic is
+worse than one that is off.
+
+**The unit declares `ExecReload=/bin/kill -HUP $MAINPID`** — without it
+`systemctl reload` would do nothing, which is the same shape as a
+capability nobody calls: the operator sends the signal, sees no change,
+and concludes the switch is broken.
+
+The result is printed on stderr (`relay trunk: ON` / `relay trunk: OFF`),
+because an operator who sends a signal and sees nothing must be able to
+tell "it did not arrive" from "it arrived and did nothing".
+
+## The rollback floor
+
+The shipped units use flags that older builds do not have: the anchor
+uses `--panel-token-file`, the member uses `--cred-file`. Rolling
+`current` back past those builds does not fail loudly — the symlink
+rotates happily and then BOTH units die in a restart loop with
+`flag provided but not defined` (status=2/INVALIDARGUMENT).
+
+So the rollback floor is the commit that introduced the file-based
+secrets (`f428483`, "the credential stops being a command-line
+secret"). Below that, roll FORWARD instead. The installer does not
+check this yet — it is a known gap, and the honest statement is that the
+floor is a rule an operator has to know, not a rule the tool enforces.
+
+The other direction is safe: rolling FORWARD keeps the state directory
+byte-for-byte (measured — the device identity, the account key and the
+certificates all survive an upgrade unchanged), so an upgrade is not a
+migration.
+
+## The start-limit window
+
+Both units set `RestartSec=5s` and, explicitly, `StartLimitIntervalSec=60`
+with `StartLimitBurst=5`.
+
+**★ The two `StartLimit*` directives live in the `[Unit]` section, not in
+`[Service]`.** They are `[Unit]` directives, and systemd has **no
+`Service.StartLimitIntervalSec` alias at all** — so in `[Service]` they
+are silently ignored:
+
+```
+$ systemd-analyze verify cmesh-discovery.service
+cmesh-discovery.service:79: Unknown key name 'StartLimitIntervalSec'
+in section 'Service', ignoring.
+
+$ systemctl show cmesh-discovery.service -p StartLimitIntervalUSec
+StartLimitIntervalUSec=10s     # the DEFAULT — not the 60s we wrote
+```
+
+This was the state of the units until the round-98 audit: the arithmetic
+in the comment was right, the **section** was wrong, and the fix was
+therefore **inert**. Measured on real systemd 255 (OpenCloudOS 9.4) with
+`ExecStart=/bin/false`, `Restart=on-failure`, `RestartSec=5s`:
+
+| placement | outcome over 95 s |
+|---|---|
+| `[Service]` (the old, broken one) | **NRestarts = 18, still looping** |
+| `[Unit]` (the current one) | **NRestarts = 5, then `ActiveState=failed`** |
+
+**Do not change `RestartSec` on its own.** The two settings are one
+decision, and the arithmetic binds them:
+
+- systemd's defaults are a burst of **5 starts in a 10-second window**;
+- with `RestartSec=5s` the starts land at 0 s, 5 s, 10 s, 15 s … so **any
+  10-second window holds at most 3 starts** — the burst of 5 is
+  **unreachable**;
+- a burst is reachable only if the window is longer than
+  `RestartSec × (Burst − 1)`, which here is `5 × 4 = 20 s`.
+
+So without the explicit `StartLimitIntervalSec=60`, a **configuration
+error** — an empty passphrase, an unreadable credential, a read-only
+state directory — **restarts forever**, filling the journal instead of
+stopping where an operator can see it. (The member's `ExecCondition`
+already refuses a missing trunk configuration *without* restarting; every
+other failure path still exits non-zero, and this is what stops those.)
+
+The window being 60 s costs nothing in production: the property that
+matters there is "kill −9 and it comes back in 5 s", and that is
+`RestartSec`, which is unchanged.
+
+**The placement has been verified BY BEHAVIOUR on a real systemd 255**, and
+so has the `ExecCondition` vs `ExecStartPre` distinction the member unit
+depends on: an `ExecCondition` that exits 1 gives `NRestarts = 0` (the
+unit does not loop), while an `ExecStartPre` that exits 1 gives
+`NRestarts = 5` and then fails. **So the member's use of `ExecCondition`
+for a pure precondition is right, and no `ExecStartPre` remains in either
+unit.**
