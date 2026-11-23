@@ -4250,6 +4250,67 @@ Hub 二进制、systemd 单元、nginx location、证书与续期定时器 —�
 **上一次我在真机上演示破坏性缺陷，炸掉了整台主机；这一次是在真收件箱里发了 8 条垃圾。**
 **同一条纪律，两次不同的代价。**
 
+## 十八之五、★ CI 红了，而红在一个**只改了 README** 的提交上 —— 于是它是个潜伏的缺陷
+
+**`f5fe989` 只改了一行 README，CI 却红了**：
+
+```
+--- FAIL: TestParkedPeerDeathIsNoticed (0.33s)
+panic: repeated read on failed websocket connection
+  gorilla/websocket.(*Conn).NextReader
+  internal/wsconn.(*Conn).Recv        wsconn.go:272
+  internal/relay.sendUntilReceived    relay_test.go:78
+```
+
+**一份 README 造成不了这个** —— **所以它是读路径里一个早就存在的缺陷，那笔提交只是把它照了出来。**
+
+### ★ 机制是 gorilla 的，而它自己的注释就写着
+
+> "Applications that do handle the error returned from this method **spin in tight loop on
+> connection failure**. To help application developers detect this error, panic on repeated
+> reads to the failed connection."
+
+**它在连续 1000 次失败读之后 panic。** 而**第一次失败之后，gorilla 立刻返回缓存的错误**
+⇒ **一个继续往下读的调用方会以全速空转：几毫秒里 1000 轮，然后进程 panic。**
+
+**★ 这不是 gorilla 的缺陷 —— 是 gorilla 在告诉我们「有人在读一条死连接」，而我们的 Conn 由着他读。**
+
+**已修**：**一条已经失败的连接会一直返回同一个错误，永远不再把读交给 gorilla。**
+**红→绿已证**（1500 次读，在死连接上 —— 修之前 panic 的消息与 CI 一字不差）。
+
+### ★ 顺带删掉一个「没有调用者、而它的用法会崩掉 relay」的导出方法
+
+`RecvWithDeadline` 的注释说它是给「拥有 socket 读侧」的调用方用的，
+**并点名「relay 的 parked-peer 探针」** —— **而它从来没有调用者，relay 从来没用过它，注释是错的。**
+
+**它是 28c21f8 留下的残骸**，而 28c21f8 正是这样写的：
+
+> "relay: probing a parked connection by reading it **crashes the process** …
+> both 'read with a deadline' variants **eventually killed the relay**"
+
+**那一笔的修法是「parked 连接一律不读，死亡靠传输层的 liveness ticker 通知」** ——
+**方法留下了，注释却还在点名那个唯一不能读 parked socket 的调用方。**
+
+**它另一个承诺是不可能的**：「超时 … 让连接留给下一次调用」——
+**gorilla 会锁存每一次读错误，包括超时**（它自己的文档写着 "Errors returned from this method are permanent"）。
+
+**⇒ 一个没有使用者、而它的文档用途是一条已知的崩溃 relay 的路的导出方法。已删**，
+**删掉的理由留在原处**：如果真的需要带截止时间的读，**它必须是新连接的第一个也是唯一一个读**
+（**一条 gorilla 连接一生只犯一次读错误**）。
+
+### ★ 一个我差点记错的结论（值得单独记）
+
+修的过程中，`TestARelayThatIsStoppingRefusesNewConnections` 挂了：我的树挂、base 通过。
+**我据此判断「是我的改动造成的」** —— **然后我做了对照，结论反了**：
+
+**base 自己也会挂** —— **第一遍通过，第二、三遍挂**。
+**它是临时端口池被耗尽（那个测试从不停止它的 relay，监听器一直占着端口）**，**与代码无关**。
+
+**★ 教训：「它在我的树上挂、在他们那儿过」不是一个诊断，是一个巧合** ——
+**直到你把 base 重跑一遍。**
+
+**（顺带把那个测试的 relay 停了 —— 泄漏的监听器只在重复跑测试时现形，而重复跑正是抓 flake 的方法。）**
+
 ## 十九、状态
 
 - **54 → 56 个文件留在 worktree**，未 commit、未 push；远端 develop 仍是 `95884df`（CI 绿）。
