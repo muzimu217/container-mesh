@@ -655,7 +655,10 @@ echo "rc=$?"
 
 ```bash
 # 锚点：吊销整个凭证（级联踢出它带进来的全部设备）
-cmesh cred revoke --state "$ANCHOR_STATE" --account-passphrase "$PASS" --cred-id "$CRED_ID"
+cmesh cred revoke --state "$ANCHOR_STATE" --cred-id "$CRED_ID"
+# NOTE: no --account-passphrase. The revocation acts on the ANCHOR's roster
+# file, not on the account key — the code says so on purpose
+# (internal/cli/cred.go), and the flag does not exist.
 echo "rc=$?"
 ```
 
@@ -674,7 +677,8 @@ echo "rc=$?"
 ### T11. `cred list`（值守在锚点跑）
 
 ```bash
-cmesh cred list --state "$ANCHOR_STATE" --account-passphrase "$PASS"
+cmesh cred list --state "$ANCHOR_STATE"
+# NOTE: no --account-passphrase either — the list reads the roster file.
 echo "rc=$?"
 ```
 

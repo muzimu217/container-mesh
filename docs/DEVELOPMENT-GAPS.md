@@ -6,6 +6,27 @@
 >
 > 审阅依据：源码、源码注释、`README.md`、`docs/REQUIREMENTS.md`、`docs/DESIGN.md`、`docs/architecture/`、`docs/PROJECT-PLAN.md`、`docs/DEV-KPI.md`、`docs/ROUND-LOG.md`、`deploy/` 和 `packaging/`。当前工作树存在未提交变更，因此本清单不指定一个未经确认的验收 SHA。
 
+>
+> ### ★ 本清单的时效（2026-11-23 轮）
+>
+> **一份过期的缺口清单比没有缺口清单更害：它会把下一个人引到已经修好的东西上去，同时跳过真正没修的。**
+>
+> **本轮核对后，以下条目已经不再是缺口**（每条都有代码位置或测量）：
+>
+> | 条目 | 状态 | 依据 |
+> |---|---|---|
+> | §3.1 实现 device-ID relay trunk | **已完成（真机打通）** | 两台纯出站机器经锚点中转，`link=relay via=<锚点>`；ping 3/3 lost 0，msg 送达，run @info 返回，send-to sha256 逐字节匹配（ROUND-LOG） |
+> | §4.1 显式 LEAVE | **已完成** | `internal/discovery/client.go` 的 `Leave`；真实公网实测收敛 **1128 ms**（预算 3 s）；LEAVE 丢失时降级到断开检测（单测 957 µs） |
+> | §4.2 撤销后切断既有会话 | **已完成** | `internal/mesh/direct.go` 的 `watchRevocation`（每秒检查，用窄问题「还在名册里吗」）；真机 2 GiB 红底证据（doubao） |
+> | §7.2 修正部署指南和 README 的能力状态 | **部分修正** | 本轮又修了 11 处不可解析的命令行（见 下方「本轮新增」） |
+>
+> **仍然开放的：** §5 组网直连断点续传、§8 真实环境与发布验收、§11 团队权限模型。
+>
+> ### 本轮新增（Round 99）：**文档里的命令行必须能跑**
+>
+> `internal/cli/doc_examples_test.go` 会把指定文档里的每一条 `cmesh …` 命令行提出来**真的跑一遍**，并要求它不能是解析错误。本轮因此改掉了 11 处（完成判据：`internal/cli/help_runnable_test.go` 与 `internal/cli/doc_examples_test.go`，红→绿已证）。
+> **当你改了一行文档，测试会回报。**
+
 ## 1. 总体判定
 
 项目已经具备较清楚的产品定义和较完整的设计体系，身份、发现、成员认证、直连通信、消息、文件、只读诊断、端口转发和锚点面板已有不同程度的实现或验证。

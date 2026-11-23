@@ -15,8 +15,8 @@
 >
 > **两个易踩的 CLI 约定**（首轮测试实测踩中）：
 > 1. 位置参数（invite 串、deviceID）**必须放在所有 flag 之后**——Go 的 flag
->    解析碰到第一个位置参数就停止，`cmesh join "$INV" --state X` 会把
->    `--state X` 吞进位置参数报错；
+>    解析碰到第一个位置参数就停止，所以 `cmesh join --state X "$INV"`
+>    才对，而 `cmesh join "$INV" --state X` 会把 `--state X` 吞进位置参数而报错；
 > 2. `show-pub` 的人类可读行走 stderr、密钥走 stdout——脚本取值用
 >    `cmesh show-pub 2>/dev/null`。
 
@@ -28,7 +28,7 @@
 
 - 组网加入/审批全流程：`init` → `account` → `invite` → `join` → `authorize`
 - 成员互见：任意成员实时看到全网成员与在线状态
-- 直连 RTT 测量：`cmesh mesh ping`（同机实测 p95 0.2ms，门槛 5ms）
+- 直连 RTT 测量：`cmesh mesh ping <deviceID>`（同机实测 p95 0.2ms，门槛 5ms）
 - 直连交互通道：`cmesh dial <deviceID>`（双向认证，mTLS 设备证书钉死成员视图）
 - 撤销即失效：成员除名后直连立即失败（证书钉死的是实时视图）
 
@@ -101,11 +101,11 @@ cmesh serve-discovery --addr :8080 --account-pub <base64 或 hex>
 ```bash
 # 公网成员机器 B（可被直连）——--listen 绑具体地址，别用 0.0.0.0：
 cmesh init
-cmesh join <invite> --listen <B的内网或公网IP>:7000
+cmesh join --listen <B的内网或公网IP>:7000 <invite>
 # 输出 PUBKEY 行；同时设备处于「等待批准」状态
 #
 # NAT 后的成员要被公网直连（做了端口映射/DNAT 的），公告映射后的公网地址：
-cmesh join <invite> --listen 192.168.1.10:7000 --endpoint <公网IP>:7000
+cmesh join --listen 192.168.1.10:7000 --endpoint <公网IP>:7000 <invite>
 #   --endpoint 优先于绑定地址公告；只绑 0.0.0.0 且不给 --endpoint 时
 #   程序会大声警告「不可被直连」（通配地址发出去对端只会拨到自己）
 
@@ -199,7 +199,12 @@ After=network-online.target
 
 [Service]
 Environment=CMESH_PASSPHRASE=%e/CMESH_PASSPHRASE
-ExecStart=/usr/local/bin/cmesh join --listen 0.0.0.0:7000
+ExecStart=/usr/local/bin/cmesh join --listen 0.0.0.0:7000 ${CMESH_INVITE}
+# The invite goes LAST (flag parsing stops at the first positional
+# argument), and it must be PRESENT: a join with no invite and no
+# --cred has nothing to join with, so the unit would fail on every
+# start. Put the invite in the credential file
+# (EnvironmentFile=/etc/cmesh/join.env) and reference it here.
 Restart=always
 RestartSec=5
 User=cmesh

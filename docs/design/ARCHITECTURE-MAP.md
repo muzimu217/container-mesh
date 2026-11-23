@@ -520,7 +520,7 @@ cmd/cm
 **成员流的信任门**：非成员在 upgrade 之前就被拒（`relay/mesh.go:366-374`）；
 流凭证是 `MeshAuthContext + deviceID + timestamp` 的成员签名（`discovery/snapshot.go:25`）。
 
-### 6.3 一次 `cmesh send-to <deviceID> --file PATH`（经中转）
+### 6.3 一次 `cmesh send-to --file PATH <deviceID>`（经中转）
 
 ```
 [CLI]

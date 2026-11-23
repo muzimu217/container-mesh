@@ -47,7 +47,7 @@
     → 公钥 = 设备身份 (deviceID = base32(sha256(pubkey))[:16])
 
 加入一个网:
-  cmesh join <invite>
+  cmesh join <invite>   # 邀请串放最后（位置参数在前面会被旧解析器当成旗标）
     → invite 里含：网络 ID + 发现节点地址 + 网络公钥
     → 本设备用私钥签名一个加入请求
     → 已有成员批准（或用邀请码里的预共享授权）

@@ -6,7 +6,7 @@ binary path is `/opt/container-mesh/current/cmesh`.
 
 The unit uses an external, root-readable environment file. Keep passwords,
 private keys, and tokens in a root-only secret manager or file; do not put real
-values in this repository or in the unit. `cmesh install` only manages binaries
+values in this repository or in the unit. `cmesh-install` (the Go tool) and `install.sh` only manage binaries
 and never reads this state directory.
 
 The environment file is **required**, not optional. The unit reads
@@ -99,7 +99,7 @@ sudo systemctl enable --now cmesh-member.service
 ```
 
 The `cmesh` user and group are a prerequisite of BOTH units and nothing in
-this repository creates them (`cmesh install` manages binaries only). Create
+this repository creates them (the installer manages binaries only). Create
 them once per machine:
 
 ```sh

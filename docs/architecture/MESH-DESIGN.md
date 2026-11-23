@@ -482,11 +482,11 @@ GET  /healthz          存活（已有）
 cmesh init [--path ~/.cmesh]                生成设备身份（交互输口令）
 cmesh account create                        生成账号密钥（最可信的机器上做一次）
 cmesh account device-add [--device PATH]    给本设备签发证书
-cmesh join <invite>                         用邀请加入网络
+cmesh join <invite>                         用邀请加入网络（邀请串放最后）
 cmesh invite                                生成邀请（成员机器上）
 cmesh status                                列出成员、在线状态、RTT、路由
 cmesh dial <deviceID|name> [--cmd ARGS]     与某设备建立交互
-cmesh send-to <deviceID> --file PATH        点对点传文件（按设备名）
+cmesh send-to --file PATH <deviceID>        点对点传文件（按设备名；设备 ID 放最后）
 cmesh serve-discovery                       本机兼任发现节点
 cmesh mesh ping <deviceID>                  自定义 RTT 测量（非 ICMP）
 ```
