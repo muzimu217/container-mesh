@@ -47,14 +47,44 @@ hub_base() {
     printf '%s' "$HUB"
     return 0
   fi
-  # The public URL: one quick probe.
-  if curl -sS -m 8 -o /dev/null "$HUB/healthz" 2>/dev/null; then
+  # ★ THE PUBLIC URL, OVER IPv6. (Round 102, third part.) The security
+  # group filters 80/443 on the IPv4 address — measured: IPv4:443
+  # times out at 4.00s (dropped), while IPv6:443 answers with an RST
+  # in 0.05s, i.e. the packet REACHED the host, so IPv6 is not
+  # filtered. (The host's ip6tables INPUT policy is ACCEPT.)
+  #
+  # The canonical URL works as-is over IPv6: a Let's Encrypt
+  # certificate was issued (HTTP-01 over IPv6) and nginx now listens on
+  # [::]:443. So the agents' own two curl lines need no change at all.
+  #
+  # -6 is used deliberately: over IPv4 the same URL times out, and a
+  # probe that has to wait out the timeout on every call is a probe
+  # that lies about which path it found.
+  if curl -sS -m 8 -6 -o /dev/null "$HUB/healthz" 2>/dev/null; then
     printf '%s' "$HUB"
     return 0
   fi
-  # The tunnel.
-  if ! nc -z 127.0.0.1 "$HUB_TUNNEL_PORT" >/dev/null 2>&1; then
-    ssh -f -N -o ConnectTimeout=8 -o BatchMode=yes \
+  # Plain HTTP over IPv6 — the fallback if the certificate ever
+  # expires and the renewal has not run yet.
+  if curl -sS -m 8 -6 -o /dev/null \
+      "http://new.blackevil.cn/hub/healthz" 2>/dev/null; then
+    printf 'http://new.blackevil.cn/hub'
+    return 0
+  fi
+  # The tunnel. A direct public path beats a tunnel, so this is the
+  # LAST resort — but it is the one path that needs no DNS and no
+  # public port at all.
+  #
+  # The tunnel dies with the SSH session, and a dead tunnel that
+  # still holds the port LOOKS alive to `nc -z` — so the port check
+  # alone is not enough. It is verified by an actual request, and
+  # ExitOnForwardFailure keeps a failed forward from lingering.
+  if ! curl -sS -m 8 -o /dev/null \
+      "http://127.0.0.1:$HUB_TUNNEL_PORT/hub/healthz" 2>/dev/null; then
+    pkill -f "ssh -f -N.*$HUB_TUNNEL_PORT:127.0.0.1:8787" 2>/dev/null
+    ssh -f -N -o ConnectTimeout=10 -o BatchMode=yes \
+      -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
+      -o ExitOnForwardFailure=yes \
       -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
       -L "$HUB_TUNNEL_PORT:127.0.0.1:8787" "$ANCHOR" >/dev/null 2>&1
     sleep 2
@@ -79,6 +109,21 @@ hub_token() {
   # So: the stale entry is dropped, and the new key is accepted for this
   # connection. The identity that matters is the SSH KEY that logs in,
   # not the host key that identifies the machine.
+  #
+  # ★ A LOCAL COPY IS THE PRIMARY SOURCE. (Round 102, third part.) The
+  # token is the one credential that EVERY agent already holds in its
+  # own environment — so as long as the hub runs the SAME token, every
+  # agent works with no reconfiguration at all. The token therefore
+  # lives in .team/hub-token (mode 600, git-ignored), and the hub on
+  # the host was given that same value.
+  #
+  # The local copy is preferred because it needs no SSH: the whole
+  # point of the IPv6 path is that it survives the SSH path being
+  # broken. SSH is the fallback.
+  if [ -r .team/hub-token ]; then
+    tr -d '\n\r' < .team/hub-token
+    return 0
+  fi
   ssh -o ConnectTimeout=8 -o BatchMode=yes \
     -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$ANCHOR" \
     'grep -oE "^HUB_TOKEN=.*" /etc/default/cmesh-hub | cut -d= -f2' 2>/dev/null

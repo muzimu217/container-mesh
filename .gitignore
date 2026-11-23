@@ -33,6 +33,9 @@ probe.json
 .codeartsdoer/
 .team/verify/
 .team/hub-watermark
+# Hub 的共享凭证（每个 agent 手里都有一份）。★ 绝不入库：这是公开仓库，
+# 入了库凭证即刻公开。
+.team/hub-token
 
 # autoresearch 会话状态（插件已在隔离 worktree 运行；develop 侧只留 config.json 供插件读取，
 # 必须忽略，否则会被别人的 git add -A 扫进提交）
