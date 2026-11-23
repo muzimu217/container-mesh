@@ -385,6 +385,19 @@ func runDocExample(bin, cmd string) error {
 	if strings.Contains(cmd, "|") || strings.Contains(cmd, ">") || strings.Contains(cmd, "&") {
 		return nil
 	}
+	// ★ `cmesh doctor` PROBES THE NETWORK. (Round 100.) It waits for the
+	// dial to time out when the route is slow or broken — 6.3 seconds on
+	// the machine this was written on, and minutes on the CI runner.
+	//
+	// The flag that stops it from dialing is given to it.
+	//
+	// The commands that reach for a PEER are NOT skipped: they validate
+	// the device id FIRST and refuse it before they dial (measured at
+	// 0.02–0.04 s each), so they are fast — and they are exactly the
+	// lines whose argument ORDER this test is checking.
+	if len(args) > 1 && (args[1] == "doctor" || args[1] == "probe") {
+		args = append(args[:2], append([]string{"--skip-network"}, args[2:]...)...)
+	}
 
 	// ★ THE COMMAND MUST NOT BE ALLOWED TO WAIT, AND THE TIMEOUT MUST
 	// BE OWNED BY THE COMMAND, NOT BY A KILL FROM ANOTHER GOROUTINE.

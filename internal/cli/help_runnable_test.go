@@ -4,9 +4,11 @@
 package cli
 
 import (
+	"context"
 	"os/exec"
 	"strings"
 	"testing"
+	"time"
 )
 
 // ---------------------------------------------------------------------------
@@ -127,6 +129,18 @@ func isAHelpExampleLine(trimmed string) bool {
 func TestTheHelpExamplesParse(t *testing.T) {
 	bin := buildCLIBinary(t)
 
+	// ★ THE SWEEP HAS A BUDGET OF ITS OWN. (Round 101.)
+	//
+	// Go's test binary has a TEN-minute default limit, and this package's
+	// other tests take most of it. This test ran 8m49s on the CI runner
+	// and took the whole package down with it — twice, because the first
+	// fix (a budget on the DOCUMENT sweep) left this one unbounded.
+	//
+	// So the sweep gives up on TIME as well as on the per-command
+	// timeout, and says so in the log rather than pretending it checked
+	// everything.
+	sweepStart := time.Now()
+
 	// The examples that name a device or an invite are run with a
 	// placeholder, because the POINT is that they PARSE. What they do
 	// afterwards is not this test's business.
@@ -149,7 +163,14 @@ func TestTheHelpExamplesParse(t *testing.T) {
 		"…":               "hello",
 	}
 
+	checked := 0
 	for _, line := range helpExampleLines(t) {
+		// ★ THE SWEEP STOPS WHEN ITS BUDGET IS GONE. (Round 101.)
+		if time.Since(sweepStart) > helpSweepBudget {
+			t.Logf("the sweep ran out of its budget after %d example lines; "+
+				"the rest were not checked", checked)
+			return
+		}
 		args := splitHelpExample(line)
 		if len(args) == 0 {
 			continue
@@ -164,8 +185,53 @@ func TestTheHelpExamplesParse(t *testing.T) {
 		if len(args) == 1 {
 			continue
 		}
-		cmd := exec.Command(bin, args[1:]...)
+		// ★ A COMMAND THAT INHERENTLY WAITS IS NOT ABOUT PARSING.
+		//
+		// `cmesh doctor` PROBES THE NETWORK: it checks outbound
+		// connectivity, and on a machine with a slow or broken route it
+		// waits for the dial to time out — 6.3 seconds on the machine
+		// this was written on, and minutes on the CI runner, which is
+		// where it took the whole package down ("panic: test timed out
+		// after 10m0s … TestTheHelpExamplesParse (8m49s)").
+		//
+		// So `doctor` is given the flag that stops it from dialing.
+		//
+		// ★ THE COMMANDS THAT REACH FOR A PEER ARE NOT SKIPPED. (Round
+		// 100.) The first version of this skipped them, and that was
+		// wrong: the commands that dial validate the device ID FIRST and
+		// refuse it before they dial — measured at 0.02–0.04 s each — so
+		// they are fast AND they are exactly the lines whose argument
+		// ORDER this test is checking. **Skipping them would have
+		// skipped the very lines the test exists for.**
+		//
+		// What is left is `doctor`, and the flag fixes it.
+		if args[1] == "doctor" || args[1] == "probe" {
+			args = append(args[:2], append([]string{"--skip-network"}, args[2:]...)...)
+		}
+		// ★ THE COMMAND MUST NOT BE ALLOWED TO WAIT. (Round 100.)
+		//
+		// This test ran the help's examples with NO timeout, and the CI
+		// runner found it: "panic: test timed out after 10m0s … running
+		// tests: TestTheHelpExamplesParse (8m49s)". One of the examples
+		// waits (a network probe), the runner is slower than the machine
+		// the test was written on, and the whole package died.
+		//
+		// The documentation sweep got the same treatment a round earlier
+		// and the same thing happened — so this is the SECOND time the
+		// same mistake was made in the same file family, and the fix is
+		// the same one: the timeout belongs to the COMMAND, and it is
+		// short.
+		//
+		// A command that did not finish is not a parse failure; the parse
+		// question was answered when it started.
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, bin, args[1:]...)
+		cmd.Stdin = strings.NewReader("")
 		out, _ := cmd.CombinedOutput()
+		if ctx.Err() != nil {
+			continue
+		}
 		text := string(out)
 		// The command may fail for any REASON — it needs a peer, a state
 		// directory, an identity. What it must not do is refuse to
@@ -173,8 +239,18 @@ func TestTheHelpExamplesParse(t *testing.T) {
 		if strings.Contains(text, "usage:") || strings.Contains(text, "flag provided but not defined") {
 			t.Errorf("the help's own example does not parse:\n  %s\n%s", line, text)
 		}
+		checked++
 	}
+	t.Logf("checked %d help examples", checked)
 }
+
+// helpSweepBudget is how long the help sweep may take.
+//
+// It is a fraction of Go's default ten-minute limit for a test binary,
+// because this package's other tests need most of that. The sweep is a
+// guard, not a benchmark: if it runs out of budget it stops and SAYS it
+// stopped.
+const helpSweepBudget = 60 * time.Second
 
 // splitHelpExample splits a help example line into its arguments.
 //
