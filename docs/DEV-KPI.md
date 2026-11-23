@@ -15,7 +15,7 @@
 - **还活着**：ping 与 TCP 22/80/443/4500/8888/18090 全 OPEN；:80 的 SPA 完整（526753 字节 JS）；:8888 后端答真实 Spring JSON；:18090 锚点 uptime 在涨；:4500 Hub 200。
 - **已断**：**SSH**（密钥交换后即断）· sftp / scp / rsync / ssh -N 隧道全部同样失败 · docker socket 代理 502。
 - **★ 恢复需要云厂商控制台**（救援模式 / 重装，恢复 `/var/lib/docker` 与 `/www`）——**这一格我到不了**。**跑着的进程是靠 inode 活着的**：systemd 需要 `/usr/lib/systemd/systemd`、bash 需要 `/bin/bash`、dockerd 需要 `/var/run/docker.sock` —— **重启就会失去整个栈**。
-- **★ 顺带丢了 Hub 的 token**（只存在那台机的 `/etc/default/cmesh-hub`）→ **本轮起 Hub 的读写需要网主重新提供 token**，否则协调通道也断。
+- **★ 关于 Hub token —— 我上一轮写「需要网主重新提供 token」是**不准确**的，已更正**：**它一直有效**（Hub 进程还活着：`:4500/healthz` → 200；**代理们手里就有**：netns-probe 用 `X-Hub-Token` 刚拿到过 86 条频道消息）。**坏掉的只是「从 SSH 上读 `/etc/default/cmesh-hub`」这条路**（SSH 断了）。**所以需要的是「重新拿到同一个 token」，不是「提供一个新 token」**；**在拿到之前，我用 GitHub issue #8 作正典通道**（hub 的 README 自己写着「issue 仍是正典记录；hub 只是传输层」）。
 
 **★ 我自己的本机也受了一处损失**：为了证明「测试能抓」而摘掉守卫跑红，**而那条测试当时正指向 `/`** → `os.RemoveAll("/")` 在本机跑了 **72 秒**。**macOS 系统卷是 sealed 的（`/usr`、`/etc`、`/var` 一个字节没少）**，**可写的是 `/Applications` 与家目录 —— 那里有损失**（应用少了若干：VS Code / 微信 / iTerm / PyCharm / Notion / Postman 等；**家目录、`Documents`、`.ssh`、`.zcode`、仓库与 git 完整性都在**）。
 
