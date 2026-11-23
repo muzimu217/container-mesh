@@ -195,32 +195,38 @@ Usage:
         Check a downloaded binary against the published digest. Reads local
         files only: it never downloads, and never runs what it verifies.
 
-  cmesh join <invite> [--endpoint host:port ...] [--listen host:port ...] [--once]
+  cmesh join [--endpoint host:port ...] [--listen host:port ...] [--once] <invite-string>
         Join the network announced by an invite: announce on a heartbeat and
         wait until an existing member approves this device's certificate.
         Without --once it keeps running and prints the network view.
         --listen additionally binds direct-link (QUIC) endpoints and serves
         them — what binds is what gets announced, so other members can
         cmesh dial / cmesh mesh ping this device.
+        (The invite goes LAST: flag parsing stops at the first positional
+        argument, so "join <invite-string> --listen ..." does not parse.)
 
   cmesh mesh ping <deviceID>
         Measure direct-link RTT to a member (custom measurement, not ICMP).
         Resolves the target's endpoints from the live member view.
 
   cmesh dial <deviceID>
-        Open a mutually-authenticated direct channel to a member (device
+        Open a mutually-authenticated channel to a member (device
         certificates are pinned to the member view). Interactive: typed
-        lines echo back. PR-M4 adds real services on this link.
+        lines echo back.
+        The path is chosen for you — direct when the member has endpoints
+        of its own, relayed through a trunk when it does not (a
+        pure-outbound member). The line says which one was used
+        ("direct" or "relay via=<id>").
 
-  cmesh msg <deviceID> --text "…"
+  cmesh msg --text "…" <deviceID>
         Deliver a message to a member. The receiver's join --listen
         process prints it live (📩).
 
-  cmesh send-to <deviceID> --file PATH
+  cmesh send-to --file PATH <deviceID>
         Stream a file to a member over a direct link, sha256-verified.
         The receiver saves it into its inbox (📬).
 
-  cmesh bench <deviceID> [--size 100MB] [--rate 0]
+  cmesh bench [--size 100MB] [--rate 0] <deviceID>
         Measure bidirectional direct-link throughput without writing a file.
         Size applies to each direction; --rate is bytes per second per
         direction (0 = unlimited). QUIC retransmissions are reported as n/a.

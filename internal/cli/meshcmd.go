@@ -525,18 +525,46 @@ func runDial(args []string) error {
 	if err != nil {
 		return ExitError{Code: 1, Err: err}
 	}
-	link, err := mesh.DialDirect(hctx, mesh.DialConfig{
+	// ★ THE PICKER, LIKE EVERY OTHER DIAL. (Round 99.)
+	//
+	// `dial` used to call DialDirect directly, so it was the ONE command
+	// that could never reach a PURE-OUTBOUND member — a member with no
+	// endpoints of its own, which is exactly the member the relay trunk
+	// exists for. Every other dial in the CLI (bench, msg, send-to, run,
+	// mesh ping) goes through the picker, and `bench` had this fixed
+	// already for exactly this reason (netns-probe reported it on a real
+	// SNAT lab: ping/msg/send-to went over the relay while bench alone
+	// answered "has no reachable endpoints").
+	//
+	// So the command that opens an INTERACTIVE channel was the one that
+	// could not reach half the network.
+	link, used, err := mesh.DialViaPickerPath(hctx, mesh.DialConfig{
 		Device:    sess.dev,
 		Resolver:  sess.resolver,
 		Target:    target,
-		Endpoints: eps,
 		Kind:      mesh.KindDial,
+		Picker:    sess.picker(),
+		Endpoints: eps,
 	})
 	if err != nil {
 		return ExitError{Code: 1, Err: err}
 	}
 	defer link.Close()
-	fmt.Fprintf(os.Stderr, "connected to %s (direct, mutually authenticated); type lines — they echo back; Ctrl-C to quit\n", target)
+	// ★ SAY WHICH PATH, IN THE SHAPE THE OTHER COMMANDS USE. (Round 99.)
+	// The old line said "direct" unconditionally — which is not only
+	// wrong now that the relay path is reachable, it was wrong before
+	// (the dial could have failed and fallen back). An operator cannot
+	// tell a relayed session from a direct one otherwise, and "I dialled
+	// it and it was slow" has a very different answer depending on
+	// which path it took.
+	//
+	// The shape is the one `mesh ping` already prints — "link=relay
+	// via=<id>" — so the operator sees the same vocabulary everywhere.
+	linkClass := string(used.Kind)
+	if used.Kind == mesh.PathRelay && used.Via != "" {
+		linkClass = "relay via=" + used.Via.String()
+	}
+	fmt.Fprintf(os.Stderr, "connected to %s (%s, mutually authenticated); type lines — they echo back; Ctrl-C to quit\n", target, linkClass)
 
 	// Duplex pipe: stdin → stream, stream → stdout. Either side ending ends
 	// the session.
