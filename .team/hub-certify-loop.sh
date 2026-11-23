@@ -27,6 +27,12 @@ cd "$(dirname "$0")/.." || exit 1
 # The tunnel is started on demand and lives as long as the SSH session.
 HUB=${CMESH_HUB_URL:-https://new.blackevil.cn/hub}
 HUB_TUNNEL_PORT=${CMESH_HUB_TUNNEL_PORT:-8788}
+# The hub listens on 127.0.0.1:8787 on the host (HUB_ADDR in
+# cmesh-hub.service). It is a variable, not a literal, because the
+# pkill pattern that finds a stale tunnel has to match it exactly —
+# a hardcoded literal in one place and a variable in another is how
+# the pattern starts killing tunnels that belong to someone else.
+HUB_REMOTE_PORT=${CMESH_HUB_REMOTE_PORT:-8787}
 ANCHOR=root@175.24.139.148
 # The four core agents, plus the ones that have joined since.
 AGENTS="doubao-cloud-vm-01 kuku-sandbox-01 netns-probe oh-no-agent muse-licheng-test1"
@@ -36,12 +42,39 @@ DRY=0
 [ "${1:-}" = "--dry-run" ] && DRY=1
 
 # hub_base returns the URL the loop talks to, and makes sure it is one
-# that ANSWERS.
+# that ANSWERS CORRECTLY.
 #
-# It prefers the public URL, because that is the path the agents use.
-# When the public URL is unreachable — which is what a fresh security
-# group looks like — it opens an SSH tunnel to the hub's loopback port
-# and uses that instead.
+# ★ A PROBE THAT CANNOT FAIL IS NOT A PROBE. (Round 102, found by the
+# audit line and reproduced by hand.) The old probe was
+# `curl -sS -m 8 -o /dev/null "$HUB/healthz"` — and curl EXITS 0 ON
+# EVERY HTTP ERROR STATUS. Only a transport failure is non-zero.
+# Measured: 401 → exit 0, 404 → exit 0, 502 → exit 0. So the probe
+# said "reachable" for a hub that was answering "unauthorized" and for
+# an nginx whose upstream was dead.
+#
+# And it probed the WRONG URL. The hub registers /healthz at the ROOT
+# (deploy/hub/main.go:45, unauthenticated); nginx proxies only
+# location /hub/, and /hub/ is behind auth(). So $HUB/healthz is
+# https://new.blackevil.cn/hub/healthz, which is a 401 without a token
+# and a 404 with one. There is NO working health endpoint behind the
+# proxy at all.
+#
+# So the probe now asks the only question that matters: does the hub
+# ANSWER AN AUTHENTICATED REQUEST with something the hub would say?
+# `hub_probe <url>` succeeds only on HTTP 200. A 401 means the token is
+# wrong; a 404 means the path is wrong; a 502 means the upstream is
+# dead. None of them are "the path works".
+hub_probe() {
+  # hub_probe <base-url>
+  local base="$1" tok
+  tok="$(hub_token)"
+  [ -z "$tok" ] && return 1
+  # -f makes curl fail on 4xx/5xx. The endpoint is the reports one,
+  # because it is the only one that exists behind the proxy.
+  curl -sS -m 8 -6 -f -o /dev/null \
+    -H "X-Hub-Token: $tok" "$base/reports?topic=issue8" 2>/dev/null
+}
+
 hub_base() {
   if [ -n "${CMESH_HUB_URL:-}" ]; then
     printf '%s' "$HUB"
@@ -60,14 +93,17 @@ hub_base() {
   # -6 is used deliberately: over IPv4 the same URL times out, and a
   # probe that has to wait out the timeout on every call is a probe
   # that lies about which path it found.
-  if curl -sS -m 8 -6 -o /dev/null "$HUB/healthz" 2>/dev/null; then
+  if hub_probe "$HUB"; then
     printf '%s' "$HUB"
     return 0
   fi
   # Plain HTTP over IPv6 — the fallback if the certificate ever
   # expires and the renewal has not run yet.
-  if curl -sS -m 8 -6 -o /dev/null \
-      "http://new.blackevil.cn/hub/healthz" 2>/dev/null; then
+  #
+  # ⚠️ THIS PATH SENDS THE SHARED TOKEN IN CLEARTEXT. It is a
+  # fallback, not the normal path. The agent-facing documentation
+  # says HTTPS; only the loop falls back to this.
+  if hub_probe "http://new.blackevil.cn/hub"; then
     printf 'http://new.blackevil.cn/hub'
     return 0
   fi
@@ -79,21 +115,32 @@ hub_base() {
   # still holds the port LOOKS alive to `nc -z` — so the port check
   # alone is not enough. It is verified by an actual request, and
   # ExitOnForwardFailure keeps a failed forward from lingering.
-  if ! curl -sS -m 8 -o /dev/null \
-      "http://127.0.0.1:$HUB_TUNNEL_PORT/hub/healthz" 2>/dev/null; then
-    pkill -f "ssh -f -N.*$HUB_TUNNEL_PORT:127.0.0.1:8787" 2>/dev/null
+  if ! hub_probe "http://127.0.0.1:$HUB_TUNNEL_PORT/hub"; then
+    # ★ THE pkill PATTERN MUST NOT MATCH OTHER PORTS. The old one was
+    # "ssh -f -N.*$PORT:127.0.0.1:8787" — 8788 is a SUBSTRING of
+    # 18788, and the dots in 127.0.0.1 are regex "any char". Measured:
+    # a tunnel on -L 18788:127.0.0.1:8787 matched and was killed.
+    # The pattern is now anchored on the local port with a word
+    # boundary, and the remote port is a variable rather than a
+    # literal.
+    pkill -f -- "-L ${HUB_TUNNEL_PORT}:127\.0\.0\.1:${HUB_REMOTE_PORT}( |$)" 2>/dev/null
     ssh -f -N -o ConnectTimeout=10 -o BatchMode=yes \
       -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
       -o ExitOnForwardFailure=yes \
       -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-      -L "$HUB_TUNNEL_PORT:127.0.0.1:8787" "$ANCHOR" >/dev/null 2>&1
+      -L "$HUB_TUNNEL_PORT:127.0.0.1:$HUB_REMOTE_PORT" "$ANCHOR" >/dev/null 2>&1
     sleep 2
   fi
-  if curl -sS -m 8 -o /dev/null "http://127.0.0.1:$HUB_TUNNEL_PORT/hub/healthz" 2>/dev/null; then
+  if hub_probe "http://127.0.0.1:$HUB_TUNNEL_PORT/hub"; then
     printf 'http://127.0.0.1:%s/hub' "$HUB_TUNNEL_PORT"
     return 0
   fi
-  printf '%s' "$HUB"
+  # ★ NO PATH WORKS. The old code printed the public URL anyway and
+  # returned 0 — so the loop carried on with a URL it knew was dead,
+  # and (because the fetch then yielded nothing) it wiped the ledger.
+  # Now it says so and fails.
+  echo "hub_base: no working path to the hub (public IPv6, plain HTTP, tunnel all failed)" >&2
+  return 1
 }
 
 hub_token() {
@@ -161,9 +208,17 @@ hub_post() {
     echo "  [dry] would send to=$to: $(head -c 60 "$body" | LC_ALL=C tr '\n' ' ' 2>/dev/null || head -c 60 "$body")..."
     return 0
   fi
+  # ★ THE BASE MUST BE RESOLVED BEFORE THE POST, AND ITS FAILURE
+  # MUST STOP THE POST. "$(hub_base)" inside a URL is a command
+  # substitution in a string: its exit status is thrown away, so a
+  # failed hub_base yields the URL "/report?..." — which curl fetches
+  # as a relative path and fails, or worse, against whatever a proxy
+  # answers. The failure has to be checked, not interpolated.
+  local base
+  base="$(hub_base)" || return 1
   if [ "$to" = "channel" ]; then
     curl -sS -m 30 -X POST -H "X-Hub-Token: $token" --data-binary @"$body" \
-      "$(hub_base)/report?from=coordinator&topic=issue8" 2>&1 | head -c 120
+      "$base/report?from=coordinator&topic=issue8" 2>&1 | head -c 120
     echo
     return 0
   fi
@@ -175,7 +230,7 @@ hub_post() {
     return 1
   fi
   curl -sS -m 30 -X POST -H "X-Hub-Token: $token" --data-binary @"$body" \
-    "$(hub_base)/instruct?to=$to" 2>&1 | head -c 120
+    "$base/instruct?to=$to" 2>&1 | head -c 120
   echo
 }
 
@@ -195,7 +250,9 @@ hub_delivered() {
   # The first line is the subject line, and it is unique per round.
   sig=$(head -1 "$body")
   [ -z "$sig" ] && return 1
-  curl -sS -m 20 -H "X-Hub-Token: $token" "$(hub_base)/inbox?to=$to" 2>/dev/null | python3 -c "
+  local base
+  base="$(hub_base)" || return 1
+  curl -sS -m 20 -H "X-Hub-Token: $token" "$base/inbox?to=$to" 2>/dev/null | python3 -c "
 import sys, json
 sig = sys.argv[1]
 try:
@@ -215,7 +272,9 @@ hub_reports() {
   local token
   token=$(hub_token)
   [ -z "$token" ] && return 1
-  curl -sS -m 20 -H "X-Hub-Token: $token" "$(hub_base)/reports?topic=issue8" 2>/dev/null
+  local base
+  base="$(hub_base)" || return 1
+  curl -sS -m 20 -H "X-Hub-Token: $token" "$base/reports?topic=issue8" 2>/dev/null
 }
 
 watermark() { head -1 "$WATERMARK" 2>/dev/null || echo "1970-01-01T00:00:00Z"; }
@@ -336,7 +395,60 @@ for a in '$AGENTS'.split():
     print('%s %s' % (a, last.get(a, 'never')))
 " > /tmp/hub-last-reports.$$ 2>/dev/null
 
+# ★ AN AGENT WITH NO REPORT IN THE FETCH KEEPS ITS KNOWN TIME.
+# (Round 102, found while fixing the P0 above.) The hub's history is
+# not permanent: a restart with a fresh state.json, a topic that was
+# trimmed, or a channel that was rebuilt all make the fetch come back
+# with no message for an agent that DID report — and the ledger then
+# overwrites a known timestamp with "never".
+#
+# That is the same error as the wipe, one level up: "I did not see it
+# this time" is not "it never happened". It cost real information once
+# already — the recovered silence durations (kuku 48.8 h, netns 49.0 h)
+# were replaced by "never" because the hub had been restarted.
+#
+# So a "never" from the fetch never overwrites a known value in the
+# ledger. Only a real timestamp does.
+while read -r a t; do
+  if [ "$t" = "never" ]; then
+    known=$(awk -v ag="$a" '$1==ag {print $2}' "$LEDGER" 2>/dev/null | head -1)
+    if [ -n "$known" ] && [ "$known" != "never" ]; then
+      printf '%s %s\n' "$a" "$known"
+      continue
+    fi
+  fi
+  printf '%s %s\n' "$a" "$t"
+done < /tmp/hub-last-reports.$$ > /tmp/hub-last-reports.keep.$$
+mv /tmp/hub-last-reports.keep.$$ /tmp/hub-last-reports.$$
+
 # 3. Update the ledger (only when something changed).
+#
+# ★ NEVER REWRITE THE LEDGER FROM AN EMPTY FETCH. (Round 102, found by
+# the audit line and reproduced by hand.) The agent rows are written
+# ONLY from /tmp/hub-last-reports.$$ — so when the fetch produced
+# nothing, the `while read` loop below wrote nothing, and `mv` replaced
+# the whole ledger with just the coordinator's `#` notes. The five
+# agent rows were DELETED.
+#
+# And it was worse than data loss: with the rows gone, PENDING counts
+# to 0, so the loop printed "tip ... is fully certified" — a FALSE
+# GREEN on an empty ledger, which is exactly the outcome this script
+# exists to prevent.
+#
+# One network blip or one token desync was enough to trigger it.
+# curl exits 0 on a 401 and on a 404, so "the hub answered" and "the
+# hub answered correctly" are the same thing to that check.
+#
+# So: an empty fetch means "I do not know", and "I do not know" must
+# never be written down as "nothing is certified".
+if [ ! -s /tmp/hub-last-reports.$$ ]; then
+  echo "  !! the hub fetch produced NOTHING — the ledger is left UNTOUCHED"
+  echo "  !! (the agent rows are written only from that fetch; rewriting from it"
+  echo "  !!  would delete them and report the tip as fully certified)"
+  rm -f /tmp/hub-last-reports.$$
+  exit 1
+fi
+
 #
 # The ledger keeps MORE than this script can know: the SHA an agent
 # actually certified, and the notes the coordinator wrote. So the update
