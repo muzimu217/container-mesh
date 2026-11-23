@@ -71,6 +71,24 @@ func TestARelayThatIsStoppingRefusesNewConnections(t *testing.T) {
 
 	errc := make(chan error, 1)
 	go func() { errc <- srv.ListenAndServe() }()
+	// ★ STOP THE RELAY WHEN THE TEST ENDS. (Round 102.)
+	//
+	// The relay was never stopped here, so its listener stayed open for
+	// the rest of the process. With -count=100 that is a hundred
+	// listeners, and reserveTestAddr hands out ports from the OS's
+	// ephemeral pool by binding :0 and closing it — so once the pool
+	// wraps, a test gets a port that one of the previous iterations
+	// still holds, the new relay cannot bind, and the dial fails with
+	// "connection refused".
+	//
+	// That reads like a product defect and is not one: it is a leaked
+	// listener in a test, and it only shows up when the test is run
+	// repeatedly — which is exactly how a flake is hunted.
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	})
 	waitAccept(t, addr)
 
 	// Arm the shutdown flag exactly as Shutdown does.
@@ -133,6 +151,24 @@ func TestARelayThatIsRunningAcceptsConnections(t *testing.T) {
 
 	errc := make(chan error, 1)
 	go func() { errc <- srv.ListenAndServe() }()
+	// ★ STOP THE RELAY WHEN THE TEST ENDS. (Round 102.)
+	//
+	// The relay was never stopped here, so its listener stayed open for
+	// the rest of the process. With -count=100 that is a hundred
+	// listeners, and reserveTestAddr hands out ports from the OS's
+	// ephemeral pool by binding :0 and closing it — so once the pool
+	// wraps, a test gets a port that one of the previous iterations
+	// still holds, the new relay cannot bind, and the dial fails with
+	// "connection refused".
+	//
+	// That reads like a product defect and is not one: it is a leaked
+	// listener in a test, and it only shows up when the test is run
+	// repeatedly — which is exactly how a flake is hunted.
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	})
 	waitAccept(t, addr)
 
 	// A real pairing connection, on a relay that is running.

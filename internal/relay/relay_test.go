@@ -69,19 +69,56 @@ func startTestRelay(t *testing.T) (string, func()) {
 // an artifact of the probe rather than on the behaviour under test.
 func sendUntilReceived(t *testing.T, src, dst *wsconn.Conn, msg string, timeout time.Duration) string {
 	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if err := src.Send([]byte(msg)); err != nil {
-			t.Fatalf("send: %v", err)
+
+	// ★ A gorilla CONNECTION GETS EXACTLY ONE READ ERROR, EVER.
+	//
+	// The old version of this helper read with a 150ms deadline and
+	// looped. That is only possible if the read never fails — but a
+	// timeout IS a read error, and gorilla latches it ("Errors returned
+	// from this method are permanent"). So after the first timeout the
+	// next Recv returned the cached error INSTANTLY, and the loop spun
+	// at full speed: 1000 iterations in milliseconds, then gorilla's
+	// guard panicked with "repeated read on failed websocket
+	// connection".
+	//
+	// CI caught exactly that in TestParkedPeerDeathIsNoticed — on a
+	// commit that changed only a README, so it was a latent defect in
+	// the read path, not something that commit introduced. The panic
+	// was a symptom; the spin was the disease.
+	//
+	// So the sending and the reading are separated: the sends keep
+	// happening (a parked peer's liveness probe can swallow the first
+	// message), and the read happens ONCE, with the whole budget.
+	//
+	// The read is on the receiving side, the sends are on the sending
+	// side: different connections, so there is no concurrency question.
+	stop := make(chan struct{})
+	sendErr := make(chan error, 1)
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if err := src.Send([]byte(msg)); err != nil {
+				select {
+				case sendErr <- err:
+				default:
+				}
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
 		}
-		_ = dst.SetReadDeadline(time.Now().Add(150 * time.Millisecond))
-		got, err := dst.Recv()
-		if err == nil {
-			return string(got)
-		}
+	}()
+	defer close(stop)
+
+	_ = dst.SetReadDeadline(time.Now().Add(timeout))
+	got, err := dst.Recv()
+	if err != nil {
+		t.Fatalf("read %q within %s: %v", msg, timeout, err)
 	}
-	t.Fatalf("peer never received %q within %s", msg, timeout)
-	return ""
+	return string(got)
 }
 
 // The TWO DEADLINES this package uses, and why they differ.
