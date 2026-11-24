@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -194,6 +195,24 @@ func installPayload(root, version string, payload []byte) error {
 	}
 	defer os.RemoveAll(stage)
 
+	// ★ THE STAGING DIRECTORY MUST BE TRAVERSABLE. (Round 103, found by
+	// the install-closure audit.)
+	//
+	// os.MkdirTemp creates the directory with mode 0700, and the rename
+	// below MOVES that mode onto the final versions/<version>/. So the
+	// installed version directory was 0700 while the binary inside it
+	// was 0755 — and a unit running as an unprivileged user could not
+	// traverse INTO the directory to execute it:
+	//
+	//   Permission denied — ExecStart=/opt/container-mesh/current/cmesh
+	//
+	// The shell installer has always done this correctly (chmod 0755 on
+	// the stage, and the install regression asserts it), so the two
+	// installers disagreed about what they produce.
+	if err := os.Chmod(stage, 0o755); err != nil {
+		return fmt.Errorf("cannot make the staging directory traversable: %w", err)
+	}
+
 	binary := filepath.Join(stage, "cmesh")
 	if err := os.WriteFile(binary, payload, 0o755); err != nil {
 		return fmt.Errorf("cannot stage binary: %w", err)
@@ -266,6 +285,25 @@ func uninstall(root, state string, purge bool) error {
 	if root == "" || filepath.Clean(root) == string(filepath.Separator) {
 		return errors.New("refusing to uninstall from an empty path or filesystem root")
 	}
+	// ★ THE UNITS MUST BE STOPPED AND DISABLED, OR THE UNINSTALL IS
+	// INCOMPLETE — AND THE NEXT BOOT IGNITES A RESTART LOOP.
+	//
+	// The Go uninstaller used to remove the binaries and nothing else.
+	// It never touched systemd. So the unit files stayed on disk, still
+	// ENABLED, with ExecStart pointing at a path that no longer exists:
+	// at the next boot systemd started the unit, got 203/EXEC, and — with
+	// Restart=always — restarted it forever.
+	//
+	// The shell installer (packaging/install.sh) does stop and disable
+	// the units, and names the ones it stopped in its output. This is
+	// the same rule on the other path: any uninstall stops and disables
+	// the units; only a purge also removes the unit FILES.
+	//
+	// The unit names are the deployed ones — cmesh-serve-discovery is
+	// the unit that actually runs the anchor, and cmesh-discovery is
+	// not it. A unit that is not present is simply skipped.
+	stopped := stopAndDisableUnits(unitNames)
+
 	// ★ THE STATE PATH IS GUARDED TOO, AND THAT GUARD IS THE ONE THAT
 	// MATTERS MOST.
 	//
@@ -296,6 +334,10 @@ func uninstall(root, state string, purge bool) error {
 		if err := os.RemoveAll(root); err != nil {
 			return fmt.Errorf("cannot purge install root: %w", err)
 		}
+		// The unit FILES go only on a purge — an uninstall keeps them.
+		for _, u := range unitNames {
+			_ = os.Remove(filepath.Join("/etc/systemd/system", u))
+		}
 		if state != "" && filepath.Clean(state) != filepath.Clean(root) {
 			if err := os.RemoveAll(state); err != nil {
 				return fmt.Errorf("cannot purge state directory: %w", err)
@@ -308,7 +350,56 @@ func uninstall(root, state string, purge bool) error {
 			return fmt.Errorf("cannot remove %s: %w", name, err)
 		}
 	}
+	// ★ AND THE OPERATOR IS TOLD WHAT WAS STOPPED. Otherwise they
+	// believe the machine is clean when it is not.
+	if stopped != "" {
+		fmt.Printf("stopped and disabled: %s\n", stopped)
+	}
 	return nil
+}
+
+// unitNames are the systemd units this product installs.
+//
+// ★ THE DEPLOYED NAMES, NOT THE PACKAGING NAMES. The anchor runs as
+// "cmesh-serve-discovery.service"; "cmesh-discovery.service" is the
+// packaging name and is NOT what a deployed machine has. Stopping the
+// wrong list leaves the real unit running and enabled — and the next
+// boot starts it with a removed binary.
+var unitNames = []string{
+	"cmesh-serve-discovery.service",
+	"cmesh-discovery.service",
+	"cmesh-member.service",
+	"cmesh-hub.service",
+}
+
+// stopAndDisableUnits stops and disables every unit that is present,
+// and returns the names it acted on.
+//
+// It is best-effort: a machine without systemd has nothing to stop,
+// and that is not an error. What matters is that a unit that IS there
+// does not survive an uninstall.
+func stopAndDisableUnits(units []string) string {
+	if _, err := exec.LookPath("systemctl"); err != nil {
+		return ""
+	}
+	var stopped []string
+	for _, u := range units {
+		// Present means systemd knows it OR its file is on disk: a
+		// stale enablement systemd has forgotten is exactly the case
+		// this is here for.
+		known := exec.Command("systemctl", "list-unit-files", u).Run() == nil
+		_, statErr := os.Stat(filepath.Join("/etc/systemd/system", u))
+		if !known && statErr != nil {
+			continue
+		}
+		_ = exec.Command("systemctl", "stop", u).Run()
+		_ = exec.Command("systemctl", "disable", u).Run()
+		stopped = append(stopped, u)
+	}
+	if len(stopped) > 0 {
+		_ = exec.Command("systemctl", "daemon-reload").Run()
+	}
+	return strings.Join(stopped, " ")
 }
 
 // refuseDangerousPath refuses the paths whose removal would take the
