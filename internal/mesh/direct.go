@@ -35,6 +35,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -129,6 +130,26 @@ type FileHeader struct {
 	Name   string `json:"name"`
 	Size   int64  `json:"size"`
 	SHA256 string `json:"sha256"`
+	// ResumeFrom is the byte offset the sender will start streaming
+	// from. Zero means "from the beginning".
+	//
+	// ★ THE MESH PATH USED TO ALWAYS RESEND FROM ZERO. (Round 106.)
+	//
+	// The stage-1 path has had resume for a long time (internal/peer:
+	// offer, accept with ResumeFrom, seek, stream from the offset). The
+	// mesh line is a separate implementation and never carried the rule
+	// over: it sent the header, the receiver answered "ok", and the
+	// whole body was streamed from byte 0.
+	//
+	// So an interrupted mesh transfer restarted from the beginning, and
+	// the operator was left re-sending a multi-gigabyte file because
+	// the link dropped once.
+	//
+	// The receiver answers "ok <offset>" — the number of bytes it
+	// already has in its .part file — and the sender seeks there. The
+	// whole-file hash is still verified before the file is renamed into
+	// place, so a stale or corrupt prefix cannot survive.
+	ResumeFrom int64 `json:"resume_from,omitempty"`
 	// Force says the SENDER knows the receiver already has a file with
 	// this name and wants it replaced.
 	//
@@ -1056,6 +1077,48 @@ func checkMsgAck(ack []byte) error {
 	return fmt.Errorf("mesh: receiver error: %s", ack)
 }
 
+// parseResumeAck reads the byte offset out of the receiver's ack.
+//
+// The ack is "ok" for a fresh transfer and "ok <n>" when the receiver
+// holds a partial file. An ack it cannot parse means "no offset", not
+// an error: the transfer proceeds from the beginning, which is what
+// happened before the offset existed.
+func parseResumeAck(ack string) (int64, error) {
+	fields := strings.Fields(ack)
+	if len(fields) < 2 {
+		return 0, errors.New("mesh: no resume offset in the ack")
+	}
+	return strconv.ParseInt(fields[1], 10, 64)
+}
+
+// hashPartialFile adds the first `n` bytes of a file to the running
+// hash.
+//
+// It is needed because the hash covers the WHOLE file: when a transfer
+// resumes, the bytes already on disk are part of that file and must be
+// hashed too — not just the bytes that arrive now.
+func hashPartialFile(path string, n int64, h io.Writer) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if _, err := io.CopyN(h, f, n); err != nil {
+		return err
+	}
+	return nil
+}
+
+// firstErr returns the first non-nil error, or nil.
+func firstErr(errs ...error) error {
+	for _, e := range errs {
+		if e != nil {
+			return e
+		}
+	}
+	return nil
+}
+
 // receiveFile reads one FileHeader line, streams the body to InboxDir,
 // verifies sha256, and answers "ok\n" (or an error line the sender shows).
 func receiveFile(from identity.DeviceID, br *bufio.Reader, st Session, cfg ListenerConfig) error {
@@ -1084,29 +1147,109 @@ func receiveFile(from identity.DeviceID, br *bufio.Reader, st Session, cfg Liste
 		fmt.Fprintln(st, "err: bad file name")
 		return errors.New("mesh: bad file name")
 	}
-	_ = st.SetWriteDeadline(time.Now().Add(10 * time.Second))
-	if _, err := fmt.Fprintln(st, "ok"); err != nil {
-		return err
+	// ★ ".part" IS THE RECEIVER'S OWN IN-PROGRESS SUFFIX. (Round 106.)
+	//
+	// Accepting a file whose name ends in .part would let a sender
+	// write into the receiver's own bookkeeping — the file that holds
+	// the partial transfer. The stage-1 path has refused that suffix
+	// for a long time; the mesh line has to carry the same rule.
+	if strings.HasSuffix(strings.ToLower(base), ".part") {
+		fmt.Fprintln(st, "err: refusing reserved suffix .part")
+		return errors.New("mesh: refusing reserved suffix .part")
 	}
-	_ = st.SetWriteDeadline(time.Time{})
-
 	if err := os.MkdirAll(cfg.InboxDir, 0o700); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(cfg.InboxDir, ".incoming-*")
+	saved := filepath.Join(cfg.InboxDir, base)
+	partPath := saved + ".part"
+
+	// ★ HOW MUCH DOES THE RECEIVER ALREADY HAVE? (Round 106.)
+	//
+	// The partial file is what makes the second attempt cheap: the
+	// sender seeks to this offset and streams only what is missing.
+	//
+	// A partial file is only trusted if it is not LONGER than the file
+	// being sent. A longer prefix cannot be a prefix of it.
+	have := int64(0)
+	if info, err := os.Stat(partPath); err == nil {
+		if info.Mode().IsRegular() && info.Size() <= h.Size {
+			have = info.Size()
+		} else {
+			// Useless: drop it, so the next attempt starts clean.
+			_ = os.Remove(partPath)
+		}
+	}
+	// ★ The sender's own idea of where to resume is not trusted: it is
+	// the RECEIVER's count that counts, because the receiver is the one
+	// holding the bytes.
+	if h.ResumeFrom != have {
+		h.ResumeFrom = have
+	}
+
+	_ = st.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	// ★ The ack carries the offset the RECEIVER already has — but only
+	// when there IS one.
+	//
+	// A fresh transfer answers exactly "ok", which is what the wire
+	// contract has always been (and what the existing session test
+	// pins). A RESUMED one answers "ok <n>".
+	//
+	// ★ WHY NOT ALWAYS "ok 0": the ack is a LINE FORMAT, and a format
+	// that changes shape for every transfer is a format every reader
+	// has to understand twice. The offset only appears when it means
+	// something.
+	if have > 0 {
+		if _, err := fmt.Fprintf(st, "ok %d\n", have); err != nil {
+			return err
+		}
+	} else {
+		if _, err := fmt.Fprintln(st, "ok"); err != nil {
+			return err
+		}
+	}
+	_ = st.SetWriteDeadline(time.Time{})
+
+	// Open the PARTIAL file — appending to what is already there, so a
+	// resumed transfer continues rather than restarting.
+	tmp, err := os.OpenFile(partPath, os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
 	}
 	tmpPath := tmp.Name()
+	// The hash covers the WHOLE file, so the bytes already on disk are
+	// part of it.
 	hash := sha256.New()
-	_, copyErr := io.CopyN(io.MultiWriter(tmp, hash), br, h.Size)
+	if have > 0 {
+		if _, err := tmp.Seek(have, io.SeekStart); err != nil {
+			tmp.Close()
+			return err
+		}
+		// The part already on disk has to be hashed too — not just the
+		// bytes that arrive now.
+		if err := hashPartialFile(partPath, have, hash); err != nil {
+			tmp.Close()
+			return err
+		}
+	}
+	_, copyErr := io.CopyN(io.MultiWriter(tmp, hash), br, h.Size-have)
 	closeErr := tmp.Close()
 	if copyErr != nil || closeErr != nil || fmt.Sprintf("%x", hash.Sum(nil)) != h.SHA256 {
-		_ = os.Remove(tmpPath)
-		fmt.Fprintln(st, "err: sha256 mismatch or short read")
-		return errors.New("mesh: file integrity check failed")
+		// ★ THE PARTIAL FILE IS KEPT. (Round 106.)
+		//
+		// It is deleted only when it is USELESS — a hash mismatch means
+		// the bytes on disk are not the bytes that were promised, so the
+		// next attempt must start from zero. A SHORT READ, on the other
+		// hand, is the normal case of an interrupted transfer, and the
+		// prefix is exactly what the next attempt resumes from.
+		if copyErr == nil && closeErr == nil {
+			// The hash did not match: the prefix is not the right one.
+			_ = os.Remove(partPath)
+			fmt.Fprintln(st, "err: sha256 mismatch")
+			return errors.New("mesh: file integrity check failed")
+		}
+		fmt.Fprintln(st, "err: transfer interrupted")
+		return fmt.Errorf("mesh: file transfer interrupted: %w", firstErr(copyErr, closeErr))
 	}
-	saved := filepath.Join(cfg.InboxDir, base)
 	// ★ DO NOT SILENTLY OVERWRITE WHAT IS ALREADY THERE. (Round 99.)
 	//
 	// `os.Rename` replaces the destination if it exists. So a second
@@ -1588,15 +1731,29 @@ func SendFile(ctx context.Context, cfg DialConfig, path string) (FileHeader, err
 	}
 	// Receiver answers ok before taking bytes (its inbox may be unset or
 	// the file over its cap — cheaper to learn now than after 8 GB).
+	//
+	// ★ The ack carries the offset the RECEIVER already has (Round 106):
+	// "ok" for a fresh transfer, "ok <n>" when the receiver holds a
+	// partial file. The RECEIVER's count is the one that counts — it is
+	// the one holding the bytes.
 	_ = link.Session().SetReadDeadline(time.Now().Add(15 * time.Second))
 	if ack, err := readLine(link.br, MaxHelloBytes); err != nil {
 		return h, fmt.Errorf("mesh: read file ack: %w", err)
 	} else if !bytes.HasPrefix(ack, []byte("ok")) {
 		return h, fmt.Errorf("mesh: receiver refused: %s", ack)
+	} else if off, perr := parseResumeAck(string(ack)); perr == nil && off > 0 {
+		// ★ RESUME: seek to where the receiver stopped.
+		if off > h.Size {
+			return h, fmt.Errorf("mesh: receiver claims %d bytes of a %d-byte file", off, h.Size)
+		}
+		if _, err := f.Seek(off, io.SeekStart); err != nil {
+			return h, err
+		}
+		h.ResumeFrom = off
 	}
 	_ = link.Session().SetReadDeadline(time.Time{})
 
-	if err := sendFileBody(ctx, link.Session(), f, h.Size); err != nil {
+	if err := sendFileBody(ctx, link.Session(), f, h.Size-h.ResumeFrom); err != nil {
 		return h, fmt.Errorf("mesh: send body: %w", err)
 	}
 	_ = link.Session().SetReadDeadline(time.Now().Add(30 * time.Second))
