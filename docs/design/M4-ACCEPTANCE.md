@@ -915,16 +915,20 @@ kuku / netns 曾连续多轮静默 50 h+，协调者无法区分「你没做」�
 | M-4 | 「RSS 未达标」 | 先分清 **pre-GC / post-GC 相位** | D74 |
 | M-5 | 「大文件经中转挂死」 | 先看**是握手层还是传输层**（「read verdict: deadline exceeded」指向传输，实际原因在握手） | ROUND-LOG 教训② |
 
-### 7.5 本轮整理时新发现的缺口（尚未修，验收时必须绕开）
+### 7.5 本轮整理时新发现的缺口（**已修 —— 验收时不必再绕开**）
 
 > 这一节是**写这份清单时现场实测出来的**，不在任何历史轮次记录里。
-> 两条都是**真缺陷或真缺口**，但**不是**本清单要修的东西（本文只写文档），
-> 所以**验收时必须绕开**，并把「绕开方式」写清楚。
+> 两条都曾是真缺陷，**但它们在 Round 104 之前已经被修掉了**
+> —— **下面保留原文，是因为「修好了」这句话本身需要有据可查。**
+>
+> ★ **为什么保留这一节而不是删掉**：一份验收清单里「曾经要绕开的地方」，
+> **如果连同绕开方式一起删掉，下一个测试员会重新踩一遍**，
+> 而踩的人不会知道这条路曾经被标过「已修」。
 
-| # | 现象 | 判据 | 影响 | 绕开方式 |
+| # | 现象 | 判据 | 影响 | 现在的状态 |
 |---|---|---|---|---|
-| **N-1** | **`CMESH_ALLOW_PRIVATE_DISCOVERY=1` 对邀请式 join 不生效** | 开关只在 `normalizeBaseURLWith` 这条**可切换**的路径上生效（`internal/discovery/client.go:1039`）。`DecodeInvite` 调的是**不可切换**的 `normalizeBaseURL`（`internal/discovery/member.go:400`）→ 邀请串里的私网/回环发现地址**一律被拒**，与开关无关。[实测]：开关已 export 的情况下 `join "<invite>"` 仍报 `bad invite: discovery: malformed endpoint: "127.0.0.1:64866"` | **私网部署走邀请式 join 走不通**。而凭证路径走的是切换版（`internal/cli/join_cred.go:101`）→ **凭证式正常** | 私网 / netns / 回环拓扑**一律用 `join --cred`**；公网拓扑两条都行 |
-| **N-2** | **`cmesh invite` 生成邀请串时不校验发现地址** | `runInvite`（`internal/cli/discovery.go:211-217`）只检查 `--disc` 非空，**不**做 `normalizeBaseURL` 校验 → 它能生成一个**自己 join 不了**的邀请串（私网地址）。[实测]：`invite --disc 127.0.0.1:PORT` 正常打印，但随后 `join` 该 invite 报 `malformed endpoint` | 邀请串**在生成侧通过、在使用侧被拒**，报错信息指向「邀请串坏了」而不是「这个地址不被允许」——排障方向被带偏 | 用 `cmesh invite` 前先自检地址是否公网可达；私网部署改用 `cred create` |
+| **N-1** | **`CMESH_ALLOW_PRIVATE_DISCOVERY=1` 对邀请式 join 不生效** | 开关只在 `normalizeBaseURLWith` 这条**可切换**的路径上生效（`internal/discovery/client.go:1039`）。`DecodeInvite` 调的是**不可切换**的 `normalizeBaseURL`（`internal/discovery/member.go:400`）→ 邀请串里的私网/回环发现地址**一律被拒**，与开关无关。[实测]：开关已 export 的情况下 `join "<invite>"` 仍报 `bad invite: discovery: malformed endpoint: "127.0.0.1:64866"` | **私网部署走邀请式 join 走不通**。而凭证路径走的是切换版（`internal/cli/join_cred.go:101`）→ **凭证式正常** | **✅ 已修**：`DecodeInvite` 现在走 `normalizeBaseURLWith(a, privateAllowed)`（`internal/discovery/member.go:428`）—— **邀请式 join 与凭证式 join 现在走同一条可切换的路径**。<br>**守卫**：`internal/discovery/invite_private_test.go`（4 条）+ `internal/discovery/private_discovery_test.go`（5 条）<br>**⇒ 私网 / netns / 回环拓扑现在两条路径都能用，不再需要「一律用 `join --cred`」** |
+| **N-2** | **`cmesh invite` 生成邀请串时不校验发现地址** | `runInvite`（`internal/cli/discovery.go:211-217`）只检查 `--disc` 非空，**不**做 `normalizeBaseURL` 校验 → 它能生成一个**自己 join 不了**的邀请串（私网地址）。[实测]：`invite --disc 127.0.0.1:PORT` 正常打印，但随后 `join` 该 invite 报 `malformed endpoint` | 邀请串**在生成侧通过、在使用侧被拒**，报错信息指向「邀请串坏了」而不是「这个地址不被允许」——排障方向被带偏 | **✅ 已修**：`runInvite` 在打印邀请串**之前**就校验地址（`internal/cli/discovery.go` 的 "The addresses are VALIDATED before the invite is printed" 段）—— **它生不出一个自己 join 不了的邀请串**。<br>**⇒ 「先自检地址是否可达」这条绕开方式不再需要** |
 
 **为什么这两条值得单列**：它们是「**结构上够不到**」家族的新成员——
 和 §3.1（名册只在锚点）、§3.4（锚点不能主动发起）同类：

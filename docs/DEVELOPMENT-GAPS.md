@@ -7,7 +7,7 @@
 > 审阅依据：源码、源码注释、`README.md`、`docs/REQUIREMENTS.md`、`docs/DESIGN.md`、`docs/architecture/`、`docs/PROJECT-PLAN.md`、`docs/DEV-KPI.md`、`docs/ROUND-LOG.md`、`deploy/` 和 `packaging/`。当前工作树存在未提交变更，因此本清单不指定一个未经确认的验收 SHA。
 
 >
-> ### ★ 本清单的时效（2026-11-23 轮）
+> ### ★ 本清单的时效（2026-11-24 轮）
 >
 > **一份过期的缺口清单比没有缺口清单更害：它会把下一个人引到已经修好的东西上去，同时跳过真正没修的。**
 >
@@ -18,9 +18,17 @@
 > | §3.1 实现 device-ID relay trunk | **已完成（真机打通）** | 两台纯出站机器经锚点中转，`link=relay via=<锚点>`；ping 3/3 lost 0，msg 送达，run @info 返回，send-to sha256 逐字节匹配（ROUND-LOG） |
 > | §4.1 显式 LEAVE | **已完成** | `internal/discovery/client.go` 的 `Leave`；真实公网实测收敛 **1128 ms**（预算 3 s）；LEAVE 丢失时降级到断开检测（单测 957 µs） |
 > | §4.2 撤销后切断既有会话 | **已完成** | `internal/mesh/direct.go` 的 `watchRevocation`（每秒检查，用窄问题「还在名册里吗」）；真机 2 GiB 红底证据（doubao） |
-> | §7.2 修正部署指南和 README 的能力状态 | **部分修正** | 本轮又修了 11 处不可解析的命令行（见 下方「本轮新增」） |
+> | §7.1 标记或归档旧 SD-WAN 方案 | **已完成** | `docs/architecture/ARCHITECTURE-SDWAN.md` 开头已加醒目归档标记（「历史提案 / 已被 R3 产品定义替代 / 不作为当前实现范围」），并指向当前正典（`REQUIREMENTS.md` R3 + `decisions.md`） |
+> | §7.5 N-1（私网开关对邀请式 join 不生效） | **已完成** | `internal/discovery/member.go:428` 的 `DecodeInvite` 现在走 `normalizeBaseURLWith(a, privateAllowed)`；守卫 `internal/discovery/invite_private_test.go` + `private_discovery_test.go`（9 条） |
+> | §7.5 N-2（`invite` 生成时不校验发现地址） | **已完成** | `internal/cli/discovery.go` 的 `runInvite` 在打印邀请串**之前**校验地址 |
+> | §7.2 修正部署指南和 README 的能力状态 | **部分修正** | Round 99 修了 11 处不可解析的命令行；**Round 104 又修了 P-4/P-7 的表面矛盾（`REQUIREMENTS.md`）、`PROJECT-PLAN.md` 的 LEAVE 状态、`M4-ACCEPTANCE.md` §7.5 的过期「尚未修」表头与版本戳** |
+> | §7.6 解析后 SSRF 防护 | **已完成** | 拨号层 `dialer.Control` 里强制（`internal/wsconn/wsconn.go:159-172`）—— **DNS 解析之后、socket 连接之前**；`internal/discovery/egress.go` 的 `EgressPolicyWith`；6 条守卫测试 |
 >
 > **仍然开放的：** §5 组网直连断点续传、§8 真实环境与发布验收、§11 团队权限模型。
+>
+> **★ 上一版把「仍然开放」只列了三节，而 §7.3 / §7.4 两节既不在「不再是缺口」表里、也不在「仍然开放」句里 —— 读者无从判断它们的状态。**
+> **本版把每一节都归了类**：上面表里列出的**已不再是缺口**；下面三节**仍然开放**；
+> **§7.3 / §7.4 归在 §7.2 之下（文档状态清理的同一族）**，随 §7.2 一起处理。
 >
 > ### 本轮新增（Round 99）：**文档里的命令行必须能跑**
 >
@@ -254,7 +262,12 @@
 - `docs/REQUIREMENTS.md` 的阶段 2/PR-M2、status、客户端 credential 接线和验收章节存在历史状态，必须标记历史快照或更新到当前候选 SHA。
 - `packaging/README.md`、`packaging/start.sh` 和部分部署入口仍把旧 `/dashboard` 当主入口；代码中 `/dashboard`、`/status` 仍注册为阶段 1 legacy 端点，因此应标为 legacy/demo，而不是声称不存在。当前主产品入口是 `/panel`/`/panel-lite`。
 - `docs/README.md` 仍保留旧 `/dashboard` 状态入口引用，需与当前 panel/status API 事实统一。
-- `allowedDiscoveryHost` 对字面 IP 做公有可路由校验，但普通 hostname 目前只拒绝 `localhost` 并做语法放行；尚未看到 DNS 解析后再次拒绝私有/环回/保留地址的实际 egress enforcement。因此当前修复不能宣传为完整 DNS rebinding/解析后 SSRF 防护，需在实际拨号层补有超时、无凭据泄露的解析后校验。
+- ~~`allowedDiscoveryHost` 对字面 IP 做公有可路由校验，但普通 hostname 目前只拒绝 `localhost` 并做语法放行；尚未看到 DNS 解析后再次拒绝私有/环回/保留地址的实际 egress enforcement。~~ **✅ 已完成（Round 104 核实）**：**解析后的实际拨号层有强制**，**而且是在 `dialer.Control` 里 —— 即「DNS 解析之后、socket 连接之前」**：
+  - `internal/wsconn/wsconn.go:159-172`：`dialer.Control` 拿到的是**已解析的地址**（`address` 参数），交给 `policy(NewResolvedAddr(address, host))` ⇒ **被拒绝的地址根本到不了网络**；
+  - `internal/discovery/egress.go:22 / :37`：`EgressPolicy` / `EgressPolicyWith(addr, privateAllowed)`；
+  - **6 条守卫测试**：`internal/wsconn/egress_test.go`、`internal/discovery/egress_test.go`、`egress_register_test.go`、`egress_wiring_test.go`、`resolved_addr_single_test.go`、`client_internal_test.go`；
+  - **register / enroll / members 三条路径共用同一套决策**（`internal/discovery/client.go`）。
+  **⇒ 因此「解析后 SSRF 防护」现在是可以宣传的 —— 这条缺口自己把自己列为「不能宣传」的东西，现在可以了。**
 **完成判据**：每个入口标注文档日期/候选 SHA；旧设计和历史轮次保留历史标记；用户可见命令与当前源码、测试和发布资产一致。
 
 需求中“界面阶段 3后置”和 M4“锚点轻量面板已交付”并不矛盾，但必须写成明确规则：
