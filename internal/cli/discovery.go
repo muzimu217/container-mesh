@@ -82,6 +82,30 @@ var joinResolverHook func(*liveViewResolver)
 // process-level acceptance test.
 var joinLifetimeHook func() (context.Context, context.CancelFunc)
 
+// inboundMessageHook is intentionally nil in production. CLI tests use it
+// to observe a message that ARRIVED at this node.
+//
+// ★ WHY IT EXISTS. (Round 104.)
+//
+// The M4 acceptance cell B5 says a message must be "delivered" to the
+// target — and the sender's own line ("delivered N message(s) to X")
+// is the sender's CLAIM about itself. A command that printed that line
+// while delivering nothing would satisfy every existing check.
+//
+// So the test needs the RECEIVER's side of the fact. The receiver
+// hands a message to its OnMessage callback; that callback prints to
+// stderr, and a test cannot capture another goroutine's stderr without
+// racing every other test in the package.
+//
+// This hook is the seam: it is called with the same arguments the
+// print would have used, so a test can observe the arrival without
+// touching the process's streams.
+//
+// It follows the package's existing convention (joinResolverHook,
+// joinLifetimeHook, discoveryClientTransportHook): nil in production,
+// set by tests.
+var inboundMessageHook func(from identity.DeviceID, text string)
+
 var discoveryClientTransportHook discoveryClientTransport
 
 func withDiscoveryClientTransport(cfg discovery.ClientConfig) discovery.ClientConfig {
@@ -1747,6 +1771,11 @@ func runServeDiscovery(args []string) error {
 			// everything sent to it — the symptom seen in the first real
 			// cross-internet test.
 			OnMessage: func(from identity.DeviceID, text string) {
+				// ★ The hook runs FIRST, so a test observes the arrival
+				// even if the print below is changed or removed.
+				if inboundMessageHook != nil {
+					inboundMessageHook(from, text)
+				}
 				fmt.Fprintf(os.Stderr, "📩 from %s: %s\n", from, text)
 			},
 			InboxDir: filepath.Join(dir, "inbox"),
