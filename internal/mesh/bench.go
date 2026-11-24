@@ -365,6 +365,22 @@ func runBenchStream(ctx context.Context, st Session, br *bufio.Reader, cfg Bench
 			if n == 0 || n > benchFrameMax || received > cfg.Size-n {
 				return BenchStats{}, errors.New("mesh: invalid bench data length")
 			}
+			// ★ CHECK THE CONTENT, NOT ONLY THE COUNT. (Round 104.)
+			//
+			// The bench used to fill its payload with zeros and count the
+			// bytes it received. A transfer that arrived CORRUPTED — the
+			// wrong bytes, the right number of them — was counted as a
+			// success, and the acceptance cell (B10) says the bytes must
+			// arrive intact.
+			//
+			// The payload is now a deterministic function of its OFFSET
+			// (benchPatternByte), so the receiver can check each byte
+			// against the offset it expects. No digest has to be
+			// exchanged and no extra round trip is added: the sender and
+			// the receiver agree on the pattern by construction.
+			if !benchPayloadMatches(body[1:], received) {
+				return BenchStats{}, errors.New("mesh: bench payload corrupted")
+			}
 			received += n
 		case benchTagEnd:
 			if peerEnded {
@@ -580,13 +596,22 @@ func sendBenchData(ctx context.Context, st Session, cfg BenchConfig) error {
 	var sent int64
 	started := time.Now()
 	for sent < cfg.Size {
-		if err := ctx.Err(); err != nil {
-			return err
+		if ctx.Err() != nil {
+			return ctx.Err()
 		}
 		n := int64(len(payload))
 		if left := cfg.Size - sent; left < n {
 			n = left
 		}
+		// ★ THE PAYLOAD IS A FUNCTION OF ITS OFFSET, NOT ZEROS.
+		//
+		// A payload of zeros cannot be checked: a transfer that
+		// arrives with the wrong bytes and the right count looks
+		// identical to a correct one. The acceptance cell says the
+		// bytes must arrive intact, so the receiver has to be able to
+		// tell — and a deterministic pattern lets both sides agree by
+		// construction, with no digest exchanged.
+		benchFillPattern(payload[:n], sent)
 		if cfg.RateBytesPerSecond > 0 {
 			want := started.Add(time.Duration(float64(sent) / float64(cfg.RateBytesPerSecond) * float64(time.Second)))
 			if err := waitBenchUntil(ctx, want); err != nil {
@@ -598,6 +623,7 @@ func sendBenchData(ctx context.Context, st Session, cfg BenchConfig) error {
 		}
 		sent += n
 	}
+
 	return writer.writeControl(st, benchTagEnd)
 }
 
