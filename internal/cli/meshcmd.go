@@ -38,6 +38,48 @@ type meshSession struct {
 	resolver *liveViewResolver
 }
 
+// isAnchorState reports whether the state directory belongs to an
+// ANCHOR — the node that IS the network.
+//
+// The rule is the one the credential code already uses (see cred.go):
+// the anchor is the node that holds an ACCOUNT. A member has a device
+// identity and a discovery config; the anchor has a device identity
+// and an account.
+func isAnchorState(dir string) bool {
+	_, err := os.Stat(filepath.Join(dir, "account.json"))
+	return err == nil
+}
+
+// statusDiscoveryConfigError returns the message for a node that has
+// no discovery.json.
+//
+// ★ THE ANCHOR MUST NOT BE TOLD TO JOIN. (Round 104.)
+//
+// The anchor IS the network: it holds the account and the roster and
+// serves them. But it has no discovery.json — that file is what a
+// MEMBER writes when it joins — so the missing file used to produce
+// one message:
+//
+//	"this device has not joined a network yet (run cmesh join)"
+//
+// On the anchor that is false, and it tells the operator to run the
+// one command that would make things worse. Measured on the
+// authorized host: `cmesh status` exits 1 with exactly that message
+// while the anchor holds a roster with a member in it.
+//
+// So the two cases get different messages: a node with an account is
+// an anchor and is told what it actually is; a node without one is a
+// member that has not joined yet, and keeps the original advice.
+func statusDiscoveryConfigError(dir string) string {
+	cfgPath := filepath.Join(dir, "discovery.json")
+	if isAnchorState(dir) {
+		return fmt.Sprintf("%s not found; this node is the ANCHOR of the network "+
+			"(it holds the account and the roster), so there is nothing to join — "+
+			"use \"cmesh account show\" or \"cmesh cred list\" to inspect it", cfgPath)
+	}
+	return fmt.Sprintf("%s not found; this device has not joined a network yet (run cmesh join)", cfgPath)
+}
+
 // openMeshSession loads state and starts a discovery client, returning once
 // the first verified snapshot has arrived (or the context ends). The
 // passphrase goes through readPassphrase so CMESH_PASSPHRASE works exactly
@@ -67,7 +109,7 @@ func openMeshSessionWithSnapshotTimeout(ctx context.Context, state, passFlag str
 	cfgPath := filepath.Join(dir, "discovery.json")
 	blob, err := os.ReadFile(cfgPath)
 	if err != nil {
-		return nil, fmt.Errorf("%s not found; this device has not joined a network yet (run cmesh join)", cfgPath)
+		return nil, errors.New(statusDiscoveryConfigError(dir))
 	}
 	var cfg discoveryConfig
 	if err := json.Unmarshal(blob, &cfg); err != nil {
