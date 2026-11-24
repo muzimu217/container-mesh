@@ -4512,6 +4512,64 @@ journalctl -u cmesh-hub | grep "state save failed"
 请求方与目标在本机 —— **看天花板的归属会不会从「syscall 路径」变成「RTT×cwnd」**。
 **回环的 141 MiB/s 分不清「relay 到顶了」与「回环到顶了」，只有一条 WAN 腿能分。**
 
+## 十八之九、★ 云端真链路：**一条真机远程客户端把 M4 主链路全走了一遍**
+
+**这一轮最重要的一格**：外部验证代理从**另一台机器**对授权主机做了一次**完整的 M4 主链路实测**
+（不是「跑过一次」，是每一步都有退出码与输出）：
+
+| 步骤 | 实测结果 |
+|---|---|
+| `cred create --disc 175.24.139.148:18090` | 凭证签发成功（退出码 0） |
+| `cmesh join --cred …` | 锚点日志：`enrolled device … under a team credential (roster v3)` → 名册重载为 2 个成员 |
+| `cmesh status` | `online: 2/2`（退出码 0） |
+| **`mesh ping`** | **10/10 丢 0（0.0%）、p50 73.585 ms、p95 288.646 ms、`link=direct`** |
+| `msg --text` | **`delivered 1 message(s)`**；锚点日志有 `📩 from …: verifier-hello` |
+| `send-to` 1 MiB | **`sent … (1048576 bytes)` + 接收端 sha256 校验通过**；锚点日志有 `📬 … → inbox/…` |
+| `run @info` | 五行齐全（hostname / os linux/amd64 / version 63bc3ba / go go1.27.2 / uptime） |
+| `bench --size 4MB` | **`sent=4000000 received=4000000`、`duration=5.614s`、`packets_lost=0`** |
+| `cred revoke --cred-id …` | 该设备离网；名册进 `revoked_creds` |
+
+**★ 测完把名册按 md5 逐字节还原**（`b5ed58de…` 前后一致），**本地与主机上的临时产物全部清掉**。
+
+### ★ 但它同时查出两条真缺陷
+
+**① P0：真机上的锚点 unit 没有 `--panel`，也没有 `ExecReload=`**
+⇒ **`/panel` 回 404**（而**面板是 M4 的验收项之一**）、
+**`systemctl reload` 回 `CanReload=no`、退出码 3**（**文档里那条命令什么也没做**）。
+**二进制其实支持 `--panel` 与 `--panel-token-file`，手动 `kill -HUP` 也能切换干道** ——
+**⇒ 这是部署漂移，不是产品缺陷。**
+
+**已修并在真机验证**：
+- 面板令牌生成到 `/etc/cmesh/panel-token`（**root:cmesh 0640**），
+  用 **`LoadCredential`** 给服务一份私有副本 ——
+  **令牌的值既不在命令行也不在环境里**（实测 `/proc/<pid>/environ` 里含 panel 的条目数 = **0**）。
+- unit 补上 **`ExecReload=`** ⇒ **`systemctl reload` 退出码 0**，
+  日志里能看到**干道 ON → OFF → ON** 的切换。
+- 实测：**`/panel` → 308 → `/panel/` → 200**；**`/api/mesh` 无令牌 401 / 带令牌 200（返回真实名册）**。
+
+**② P1：`cmesh status` 在锚点上会说「这台设备还没入网，去跑 `cmesh join`」**
+—— **而锚点就是那张网**（它持有 `account.json` 与 `members.json` 并对外服务），
+**它只是没有 `discovery.json`（那是成员 join 时写的）**。
+**⇒ 这句话是假的，而且它让运维去跑那条会让情况更糟的命令。**
+
+**已修**：**「有没有 `account.json`」就是锚点与成员的判据** ——
+**这条规矩凭证代码里本来就有**（`cred.go`），**只是 `status` 没用它**。
+**两条消息分开**（锚点说清它是什么并指向 `account show` / `cred list`；成员保留原来的「去 join」）。
+**三条测试钉住。**
+
+### ★ 一条环境事实，值得长期记住
+
+**同一个产品的两个服务，可达的地址族是「不相交」的**：
+
+| 服务 | IPv4 | IPv6 |
+|---|---|---|
+| **Hub**（协调） | ✗ 443 被安全组过滤 | ✓ 通 |
+| **锚点**（18090） | ✓ 通 | ✗ 被过滤（**tcpdump 在 eth0 上抓到 0 个 IPv6 包 —— SYN 根本没到主机**） |
+
+**⇒ IPv4 的客户端够不到 Hub，IPv6 的客户端够不到锚点。**
+**★ 这不是主机的问题**（`ip6tables INPUT = ACCEPT`、firewalld 未启用、无 nftables 规则），
+**是云安全组那一层。**
+
 ## 十九、状态
 
 - **54 → 56 个文件留在 worktree**，未 commit、未 push；远端 develop 仍是 `95884df`（CI 绿）。
