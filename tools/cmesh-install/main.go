@@ -15,6 +15,7 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -75,10 +76,25 @@ func run() error {
 	if err := refuseRootOnly(dir, "install root"); err != nil {
 		return err
 	}
+	return installFrom(base, version, dir)
+}
 
-	if !strings.HasPrefix(base, "https://") {
-		return fmt.Errorf("CMESH_BASE_URL must be https://")
+// installFrom downloads the named release and installs it into dir.
+//
+// It is separate from run() so the download-and-install path can be
+// exercised against a fixture server — the fallback below is only
+// meaningful if something can reach it.
+//
+// base may be plain http ONLY when it points at a loopback fixture:
+// the download carries a binary that is verified against a checksum
+// fetched over the same connection, and a plaintext connection to a
+// REMOTE host could be tampered with on the way. Loopback is not on
+// the way.
+func installFrom(base, version, dir string) error {
+	if err := checkBaseURL(base); err != nil {
+		return err
 	}
+
 	if parsed, err := url.Parse(base); err != nil || parsed.Host == "" {
 		return fmt.Errorf("CMESH_BASE_URL is not a URL")
 	}
@@ -100,7 +116,39 @@ func run() error {
 	client := &http.Client{Timeout: 120 * time.Second}
 	sums, err := fetch(client, sumsURL)
 	if err != nil {
-		return fmt.Errorf("cannot fetch the release checksums: %w", err)
+		// ★ THE "latest" PATH NEEDS A FALLBACK. (Round 103, found by the
+		// install-closure audit.)
+		//
+		// GitHub's /releases/latest points at the newest NON-prerelease.
+		// While the only release is a prerelease — which is where this
+		// project is — that path is a 404, and the default install fails
+		// outright: a new user following the README gets nothing at all.
+		//
+		// The shell installer (packaging/install.sh) already falls back
+		// to the release API, which lists prereleases too. The Go
+		// installer did not — so the two installers disagreed about
+		// whether the documented default works.
+		//
+		// Measured: /releases/latest/download/SHA256SUMS → 404, while
+		// the API names v1.0.0-rc2 and that release's assets are there.
+		if version != "latest" {
+			return fmt.Errorf("cannot fetch the release checksums: %w", err)
+		}
+		resolved, apiErr := resolveLatestRelease(client)
+		if apiErr != nil {
+			return fmt.Errorf("cannot fetch the release checksums (%v), and the release API is unreachable: %w", err, apiErr)
+		}
+		fmt.Printf("  no published release at the latest URL; using release %s\n", resolved)
+		version = resolved
+		asset = fmt.Sprintf("cmesh-%s-%s-%s", version, runtime.GOOS, runtime.GOARCH)
+		if runtime.GOOS == "windows" {
+			asset += ".exe"
+		}
+		sumsURL, binaryURL = releaseURLs(base, version, asset)
+		sums, err = fetch(client, sumsURL)
+		if err != nil {
+			return fmt.Errorf("cannot fetch the release checksums for %s: %w", version, err)
+		}
 	}
 	expected := checksumFor(sums, asset)
 	if expected == "" {
@@ -126,11 +174,108 @@ func run() error {
 	return nil
 }
 
+// checkBaseURL refuses a base URL that is not https, except a plain
+// http one that points at loopback.
+//
+// The download carries an executable, and the checksum that verifies it
+// comes over the same connection — so a plaintext connection to a
+// remote host could be tampered with on the way. Loopback is not on
+// the way, and it is what a fixture server uses.
+func checkBaseURL(base string) error {
+	if strings.HasPrefix(base, "https://") {
+		return nil
+	}
+	if strings.HasPrefix(base, "http://") {
+		parsed, err := url.Parse(base)
+		if err == nil {
+			host := parsed.Hostname()
+			if host == "127.0.0.1" || host == "localhost" || host == "::1" {
+				return nil
+			}
+		}
+	}
+	return fmt.Errorf("CMESH_BASE_URL must be https://")
+}
+
 func releaseURLs(base, version, asset string) (sums, binary string) {
 	if version == "latest" {
 		return base + "/latest/download/SHA256SUMS", base + "/latest/download/" + asset
 	}
 	return base + "/download/" + version + "/SHA256SUMS", base + "/download/" + version + "/" + asset
+}
+
+// releaseAPIURL is where the newest releases are listed. It lists
+// prereleases too, which is the point: the "latest" download URL does
+// not.
+const releaseAPIURL = "https://api.github.com/repos/muzimu217/container-mesh/releases"
+
+// releaseAPIURLOverride lets a test point the fallback at a fixture
+// server. It is empty in normal use.
+var releaseAPIURLOverride string
+
+// releaseAPIEndpoint returns the URL the fallback consults.
+func releaseAPIEndpoint() string {
+	if releaseAPIURLOverride != "" {
+		return releaseAPIURLOverride
+	}
+	return releaseAPIURL
+}
+
+// release is one entry of the release API's list.
+type release struct {
+	TagName    string `json:"tag_name"`
+	Draft      bool   `json:"draft"`
+	Prerelease bool   `json:"prerelease"`
+}
+
+// parseReleases reads the release API's JSON list.
+func parseReleases(body []byte) ([]release, error) {
+	var releases []release
+	if err := json.Unmarshal(body, &releases); err != nil {
+		return nil, fmt.Errorf("the release API did not return a release list: %w", err)
+	}
+	return releases, nil
+}
+
+// pickInstallableRelease returns the tag to install.
+//
+// The order is the order GitHub's own UI uses: the newest release that
+// is neither a draft nor a prerelease, and if there is none, the
+// newest prerelease. Both are "a release" — and while this project
+// publishes only prereleases, the newest prerelease is what a user
+// following the README must get.
+func pickInstallableRelease(releases []release) string {
+	best := ""
+	for _, r := range releases {
+		if r.TagName == "" || r.Draft {
+			continue
+		}
+		if !r.Prerelease {
+			return r.TagName
+		}
+		if best == "" {
+			best = r.TagName
+		}
+	}
+	return best
+}
+
+// resolveLatestRelease asks the release API for the newest installable
+// release and returns its tag.
+func resolveLatestRelease(client *http.Client) (string, error) {
+	body, err := fetch(client, releaseAPIEndpoint())
+	if err != nil {
+		return "", err
+	}
+	releases, err := parseReleases(body)
+	if err != nil {
+		return "", err
+	}
+	tag := pickInstallableRelease(releases)
+	if tag == "" {
+		return "", fmt.Errorf("the release API named no installable release")
+	}
+	return tag, nil
 }
 
 func fetch(client *http.Client, rawurl string) ([]byte, error) {
