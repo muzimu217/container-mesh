@@ -73,7 +73,7 @@ func run() error {
 	// never removes the directory itself. The stricter "direct child"
 	// rule belongs to the REMOVAL path, where it is the difference
 	// between a typo and a wiped machine.
-	if err := refuseRootOnly(dir, "install root"); err != nil {
+	if err := refuseInstallRoot(dir); err != nil {
 		return err
 	}
 	return installFrom(base, version, dir)
@@ -427,8 +427,17 @@ func replaceSymlink(path, target string) error {
 }
 
 func uninstall(root, state string, purge bool) error {
-	if root == "" || filepath.Clean(root) == string(filepath.Separator) {
-		return errors.New("refusing to uninstall from an empty path or filesystem root")
+	// ★ THE INSTALL ROOT GETS THE SAME "DIRECT CHILD OF THE ROOT" RULE
+	// THE STATE PATH HAS.
+	//
+	// The state path was guarded strictly while the install root only
+	// had the root check, and that asymmetry let a RELATIVE install root
+	// through: a relative path resolves against the working directory,
+	// so CMESH_INSTALL=".." points at the parent of wherever the
+	// operator happened to be — and the purge then removed THAT
+	// directory.
+	if err := refuseInstallRoot(root); err != nil {
+		return err
 	}
 	// ★ THE UNITS MUST BE STOPPED AND DISABLED, OR THE UNINSTALL IS
 	// INCOMPLETE — AND THE NEXT BOOT IGNITES A RESTART LOOP.
@@ -606,6 +615,80 @@ func refuseRootOnly(path, what string) error {
 		return fmt.Errorf("refusing to use the filesystem root as the %s (%q resolves to /)", what, path)
 	}
 	return nil
+}
+
+// refuseInstallRoot refuses an install root that the tool would write
+// into or remove.
+//
+// ★ THE "DIRECT CHILD OF THE ROOT" RULE APPLIES HERE TOO.
+//
+// The state path has always been guarded strictly (a path directly in
+// the root is refused), while the install root only had the root
+// check. That asymmetry let a RELATIVE install root through: a
+// relative path resolves against the working directory, so
+// CMESH_INSTALL=".." points at the parent of wherever the operator
+// happened to be — and the installer wrote versions/, current, cmesh
+// and .cmesh-install-root into that directory.
+//
+// The install branch only ADDS files, so the damage is litter rather
+// than deletion — but a tool that will happily write into a directory
+// it was not pointed at will do it again on a typo. The shell
+// installer (packaging/install.sh) carries the same rule.
+func refuseInstallRoot(path string) error {
+	if path == "" {
+		return fmt.Errorf("refusing to use an empty install root")
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return fmt.Errorf("refusing to use the install root %q: %v", path, err)
+	}
+	abs = filepath.Clean(abs)
+	if abs == string(filepath.Separator) {
+		return fmt.Errorf("refusing to use the filesystem root as the install root (%q resolves to /)", path)
+	}
+	// A path that sits DIRECTLY in the filesystem root.
+	if filepath.Dir(abs) == string(filepath.Separator) {
+		return fmt.Errorf("refusing to use %q as the install root: it would sit directly in the filesystem root", path)
+	}
+	// ★ A RELATIVE PATH THAT CLIMBS ABOVE THE WORKING DIRECTORY.
+	//
+	// filepath.Abs resolves the path against the working directory, so
+	// ".." becomes the parent of it — a perfectly ordinary directory
+	// that the operator never meant to point at. The install branch
+	// writes into it; the purge removes it.
+	//
+	// The rule is about climbing OUT, not about being relative: a
+	// relative path that stays inside the working directory is fine.
+	if !filepath.IsAbs(path) && climbsAbove(path) {
+		return fmt.Errorf("refusing to use %q as the install root: "+
+			"it climbs above the working directory (%s)", path, abs)
+	}
+	return nil
+}
+
+// climbsAbove reports whether a relative path contains a ".." that
+// takes it above the directory it starts in.
+//
+// It is pure string arithmetic over the path's components: the first
+// ".." that is not cancelled by a preceding ordinary component is the
+// one that escapes. A path that never goes above its starting point
+// returns false.
+func climbsAbove(rel string) bool {
+	depth := 0
+	for _, comp := range strings.Split(rel, string(filepath.Separator)) {
+		switch comp {
+		case "", ".":
+			// no effect
+		case "..":
+			if depth == 0 {
+				return true
+			}
+			depth--
+		default:
+			depth++
+		}
+	}
+	return false
 }
 
 func defaultStateDir() string {

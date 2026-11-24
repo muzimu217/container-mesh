@@ -186,10 +186,32 @@ if [ "${1:-}" = "--uninstall" ]; then
     # else, and the string comparison above let them through: the
     # installer then wrote versions/, current, cmesh and
     # .cmesh-install-root AT THE FILESYSTEM ROOT.
-    resolved_install=$(resolve_path "$INSTALL_DIR")
-    case "$resolved_install" in
-        /) die "refusing to uninstall from a path that resolves to the filesystem root ($INSTALL_DIR)" ;;
-    esac
+resolved_install=$(resolve_path "$INSTALL_DIR")
+case "$resolved_install" in
+    /) die "refusing to uninstall from a path that resolves to the filesystem root ($INSTALL_DIR)" ;;
+esac
+# ★ AND THE INSTALL ROOT GETS THE SAME "DIRECT CHILD OF THE ROOT" RULE
+# THE STATE PATH ALREADY HAS.
+#
+# The state path was guarded strictly (a path directly in the root is
+# refused) while the install root only had the root check. That
+# asymmetry let a RELATIVE install root through: "CMESH_INSTALL=.."
+# resolves to the parent of the working directory, the installer wrote
+# versions/, current, cmesh and .cmesh-install-root INTO THAT
+# PARENT — and the purge then ran `rm -rf` on it.
+#
+# GNU rm refuses to remove ".." and "." (and says so), so on a normal
+# Linux the damage is "the installer littered a directory it should
+# not have". But the refusal belongs to rm, not to the installer — and
+# the platforms where rm does NOT refuse it (busybox/Alpine, which this
+# file's own comments name) would lose the parent tree.
+#
+# So the installer refuses it itself.
+case "${resolved_install#/}" in
+    */*) ;;   # deeper than the root: fine
+    *) die "the install root would sit directly in the filesystem root ($INSTALL_DIR); set CMESH_INSTALL" ;;
+esac
+
 
     # THE SYSTEMD UNITS MUST BE STOPPED, OR THE UNINSTALL IS INCOMPLETE.
     #
@@ -309,6 +331,21 @@ esac
 resolved_install=$(resolve_path "$INSTALL_DIR")
 case "$resolved_install" in
     /) die "refusing to install into a path that resolves to the filesystem root ($INSTALL_DIR)" ;;
+esac
+# ★ THE SAME "DIRECT CHILD OF THE ROOT" RULE THE STATE PATH HAS.
+#
+# The state path was guarded strictly while the install root only had
+# the root check, and that asymmetry let a RELATIVE install root
+# through: "CMESH_INSTALL=.." resolves to the parent of the working
+# directory, and the installer wrote versions/, current, cmesh and
+# .cmesh-install-root INTO THAT PARENT.
+#
+# The install branch only ADDS files, so the damage is litter rather
+# than deletion — but a tool that will happily write into a directory
+# it was not pointed at is a tool that will do it again on a typo.
+case "${resolved_install#/}" in
+    */*) ;;   # deeper than the root: fine
+    *) die "the install root would sit directly in the filesystem root ($INSTALL_DIR); set CMESH_INSTALL" ;;
 esac
 # The state directory: an install NEVER touches it, so a state path
 # that would be dangerous to purge must not fail a good install — but
