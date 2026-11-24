@@ -16,7 +16,28 @@ set -eu
 BASE_URL=${CMESH_BASE_URL:-https://github.com/muzimu217/container-mesh/releases}
 VERSION=${CMESH_VERSION:-latest}
 INSTALL_DIR=${CMESH_INSTALL:-.}
-STATE_DIR=${CMESH_STATE:-${HOME:-}/.cmesh}
+# ★ THE DEFAULT STATE DIR MUST BE THE ONE THAT IS REALLY DEPLOYED.
+#
+# It used to be ${HOME}/.cmesh — which is where a per-user install put
+# its state, and it is NOT where the systemd units put theirs:
+#
+#   cmesh-serve-discovery.service  →  /var/lib/cmesh
+#   cmesh-hub.service              →  /var/lib/cmesh-hub
+#
+# So a purge with the default removed a directory that did not exist,
+# printed "purged install root and runtime state", and LEFT BOTH the
+# device's private-key envelope and the hub's whole channel history on
+# disk. The operator was told the machine was clean; it was not.
+#
+# The systemd deployment is the one that matters, so its state
+# directory is the default. A per-user install passes CMESH_STATE.
+#
+# ★ BUT THE ROOT-SHAPE SAFETY NET STAYS. It used to live in the default
+#   itself: with HOME unset, "${HOME:-}/.cmesh" expanded to "/.cmesh",
+#   and the purge then ran `rm -rf -- /.cmesh`. The warning below
+#   catches that shape, so removing the shape from the default must not
+#   remove the warning — the warning is what protects the NEXT shape.
+STATE_DIR=${CMESH_STATE:-/var/lib/cmesh}
 
 say() { printf '%s\n' "$*"; }
 die() { printf 'cmesh installer: %s\n' "$*" >&2; exit 1; }
@@ -188,7 +209,26 @@ if [ "${1:-}" = "--uninstall" ]; then
     #
     # `systemctl` is absent on a machine without systemd, so its absence
     # is not an error: there is nothing to stop there.
-    UNITS="cmesh-discovery.service cmesh-member.service"
+    # ★ THE UNIT LIST MUST NAME THE UNITS THAT ARE REALLY DEPLOYED.
+    #
+    # The list used to be "cmesh-discovery.service cmesh-member.service"
+    # — and on a real deployment NEITHER of those is the unit that runs
+    # the anchor. The deployed names are:
+    #
+    #   cmesh-serve-discovery.service   the anchor (serve-discovery)
+    #   cmesh-hub.service               the coordination hub
+    #
+    # So the uninstall stopped units that were never there, left the two
+    # that WERE there running and enabled, and told the operator
+    # "stopped and disabled: cmesh-discovery.service cmesh-member.service"
+    # — a list of units the machine never had. At the next boot those
+    # real units started with a removed binary: 203/EXEC and then the
+    # restart loop.
+    #
+    # The names are checked against what is ON DISK and what systemd
+    # knows, so a deployment that uses only some of them is handled: a
+    # unit that is not there is simply skipped.
+    UNITS="cmesh-serve-discovery.service cmesh-discovery.service cmesh-member.service cmesh-hub.service"
     stopped=""
     if command -v systemctl >/dev/null 2>&1; then
         for u in $UNITS; do
@@ -273,20 +313,31 @@ esac
 # The state directory: an install NEVER touches it, so a state path
 # that would be dangerous to purge must not fail a good install — but
 # the operator must hear about it NOW, not at purge time.
+#
+# ★ THE CHECK IS ON THE VALUE, NOT ON HOW IT WAS PRODUCED.
+#
+# The warning used to be reached only because the DEFAULT expanded to
+# "/.cmesh" when HOME was unset. Change the default and that safety net
+# disappears with it — which is exactly what happened when the default
+# became /var/lib/cmesh: the regression test caught that an install
+# with HOME unset no longer warned.
+#
+# So the shape is checked directly: a state path that is the root, or
+# a direct child of the root, is warned about whatever produced it.
 case "$STATE_DIR" in
     /|'')
-        say "warning: the runtime state directory would be the filesystem root (HOME is unset?); set CMESH_STATE or HOME"
+        say "warning: the runtime state directory would be the filesystem root; set CMESH_STATE"
         ;;
 esac
 resolved_state=$(resolve_path "$STATE_DIR")
 case "$resolved_state" in
     /)
-        say "warning: the runtime state directory resolves to the filesystem root ($STATE_DIR); set CMESH_STATE or HOME"
+        say "warning: the runtime state directory resolves to the filesystem root ($STATE_DIR); set CMESH_STATE"
         ;;
 esac
 case "${resolved_state#/}" in
     */*) ;;   # deeper than the root: fine
-    *) say "warning: the runtime state directory would sit directly in the filesystem root ($STATE_DIR); set CMESH_STATE or HOME" ;;
+    *) say "warning: the runtime state directory would sit directly in the filesystem root ($STATE_DIR); set CMESH_STATE" ;;
 esac
 
 os=$(uname -s | tr '[:upper:]' '[:lower:]')

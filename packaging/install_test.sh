@@ -176,19 +176,39 @@ grep -q 'filesystem root' "$TMP/rootinstall.out" || {
 # ---------------------------------------------------------------------------
 # THE STATE DIRECTORY MUST NOT BECOME THE FILESYSTEM ROOT.
 #
-# With HOME unset, `${HOME:-}/.cmesh` expands to "/.cmesh" — and
-# `--purge` then ran `rm -rf -- /.cmesh` with no confirmation.
+# The state directory used to default to "${HOME:-}/.cmesh", so with
+# HOME unset it expanded to "/.cmesh" — and `--purge` then ran
+# `rm -rf -- /.cmesh` with no confirmation.
+#
+# The default is now /var/lib/cmesh (where the systemd units really
+# keep their state), so HOME no longer shapes it. But the SAFETY NET
+# must not go with the shape it used to be reached by: the check is on
+# the VALUE now, so a root-shaped state path warns whoever supplies it,
+# from wherever it comes.
 #
 # The INSTALL must not fail over it (an install never touches the state
 # directory), but the operator must hear about it NOW rather than at
 # purge time. So the install WARNS.
-env -u HOME CMESH_BASE_URL=https://fixture.invalid/releases CMESH_INSTALL="$TMP/home-unset" \
+env CMESH_BASE_URL=https://fixture.invalid/releases CMESH_INSTALL="$TMP/home-unset" \
+    CMESH_STATE=/.cmesh \
     PATH="$TMP/bin:$PATH" sh "$ROOT/packaging/install.sh" >"$TMP/nohome.out" 2>&1 || true
 grep -q 'state directory' "$TMP/nohome.out" || {
     printf '%s\n' 'the installer did not warn about a state directory at the filesystem root' >&2
     cat "$TMP/nohome.out" >&2
     exit 1
 }
+
+# ★ AND THE DEFAULT ITSELF MUST NEVER BE ROOT-SHAPED. The default is
+#   what a purge uses when the operator names no state directory, so a
+#   root-shaped default would be a root-shaped `rm -rf`.
+if env CMESH_BASE_URL=https://fixture.invalid/releases CMESH_INSTALL="$TMP/home-unset" \
+    PATH="$TMP/bin:$PATH" sh "$ROOT/packaging/install.sh" >"$TMP/default.out" 2>&1; then
+    if grep -q 'state directory' "$TMP/default.out"; then
+        printf '%s\n' 'the DEFAULT state directory is root-shaped' >&2
+        cat "$TMP/default.out" >&2
+        exit 1
+    fi
+fi
 
 # And the PURGE must REFUSE outright — that is the branch that would
 # do the damage.

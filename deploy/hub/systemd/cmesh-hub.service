@@ -3,6 +3,30 @@ Description=container-mesh agent coordination hub
 After=network-online.target
 Wants=network-online.target
 
+# ★ THE START LIMIT IS HERE, IN [Unit] — NOT IN [Service].
+#
+# systemd has NO `Service.StartLimit*` alias, so a StartLimit* written
+# under [Service] is silently ignored. (Both packaging units already
+# carry it here for exactly that reason.)
+#
+# And the limit is NOT optional: with Restart=always and RestartSec=5,
+# a hub that cannot start (unwritable state, port already taken) is
+# restarted every 5 seconds FOREVER. systemd's default window is 10
+# seconds, and a burst of 5 inside a 10-second window is unreachable
+# when the restarts are 5 seconds apart — so the default limit never
+# fires and the unit spins instead of failing.
+#
+# Measured on the host with a probe unit carrying these exact
+# settings: after 40 s → NRestarts=7 and the unit still "activating
+# (auto-restart)". With StartLimitIntervalSec=60 the same unit
+# reached NRestarts=5 and then went to `failed`.
+#
+# A failed unit with a reason is VISIBLE. A unit that restarts forever
+# is not: `systemctl status` says "activating", and the journal fills
+# with the same line.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
 [Service]
 Type=simple
 User=cmesh-hub
