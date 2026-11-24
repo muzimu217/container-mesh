@@ -15,6 +15,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -60,15 +61,74 @@ func loadState() {
 }
 
 // saveStateLocked persists the whole store. Called with mu held.
-func saveStateLocked() {
+//
+// ★ IT RETURNS ITS FAILURE. (Round 102.) The hub is the coordination
+// channel's only record, and it used to swallow a failed save: it
+// logged it and carried on, and the caller answered {"ok":true}.
+//
+// That is not a theoretical gap. On the authorized host an operator's
+// cleanup script rewrote state.json as root while the service runs as
+// a dedicated low-privilege user. From then on EVERY write failed with
+// "permission denied" — and the hub kept answering {"ok":true} for two
+// hours. The messages existed only in this process's memory; a restart
+// lost all of them.
+//
+// "ok":true is not proof of delivery (the hub creates a phantom inbox
+// for any "to=" value), and it is not proof of persistence either.
+//
+// ★ THE WRITE IS ATOMIC, THROUGH A TEMP FILE AND A RENAME.
+//
+// Writing the file in place keeps whatever ownership and mode the
+// PREVIOUS file had — which is how a cleanup script running as root
+// left a file the service could read but not write, and how that state
+// survived every later write. Writing a fresh temp file and renaming
+// it into place gives the new file the ownership and mode of the
+// PROCESS THAT WROTE IT — the service user — every time.
+func saveStateLocked() error {
+	// An unset path is a programming error, not a transient failure:
+	// without it the rename below would fail with a confusing "no such
+	// file or directory" for the empty target.
+	if statePath == "" {
+		return fmt.Errorf("no state path is configured")
+	}
 	b, err := json.Marshal(store)
 	if err != nil {
 		log.Printf("state marshal failed: %v", err)
-		return
+		return fmt.Errorf("marshal state: %w", err)
 	}
-	if err := os.WriteFile(statePath, b, 0o600); err != nil {
+	dir := filepath.Dir(statePath)
+	tmp, err := os.CreateTemp(dir, ".state-*.json")
+	if err != nil {
 		log.Printf("state save failed: %v", err)
+		return fmt.Errorf("create temp state: %w", err)
 	}
+	tmpName := tmp.Name()
+	// The rename must not leave the temp file behind on any failure.
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		log.Printf("state save failed: %v", err)
+		return fmt.Errorf("chmod temp state: %w", err)
+	}
+	if _, err := tmp.Write(b); err != nil {
+		tmp.Close()
+		log.Printf("state save failed: %v", err)
+		return fmt.Errorf("write temp state: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		log.Printf("state save failed: %v", err)
+		return fmt.Errorf("sync temp state: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		log.Printf("state save failed: %v", err)
+		return fmt.Errorf("close temp state: %w", err)
+	}
+	if err := os.Rename(tmpName, statePath); err != nil {
+		log.Printf("state save failed: %v", err)
+		return fmt.Errorf("rename state: %w", err)
+	}
+	return nil
 }
 
 func keyOK(name string) bool {
@@ -117,8 +177,16 @@ func postMsg(w http.ResponseWriter, r *http.Request) {
 	if len(store.Topics[name]) > maxMsgs {
 		store.Topics[name] = store.Topics[name][len(store.Topics[name])-maxMsgs:]
 	}
-	saveStateLocked()
+	saveErr := saveStateLocked()
 	mu.Unlock()
+	// ★ A MESSAGE THAT WAS NOT STORED MUST NOT BE REPORTED AS STORED.
+	// The old code answered {"ok":true} whether or not the save
+	// worked. See saveStateLocked for what that cost on the host.
+	if saveErr != nil {
+		http.Error(w, "the message was accepted but could not be saved: "+saveErr.Error(),
+			http.StatusInternalServerError)
+		return
+	}
 	json.NewEncoder(w).Encode(map[string]bool{"ok": true})
 }
 
@@ -189,8 +257,13 @@ func postInstruct(w http.ResponseWriter, r *http.Request) {
 	if len(store.Inboxes[name]) > maxMsgs {
 		store.Inboxes[name] = store.Inboxes[name][len(store.Inboxes[name])-maxMsgs:]
 	}
-	saveStateLocked()
+	saveErr := saveStateLocked()
 	mu.Unlock()
+	if saveErr != nil {
+		http.Error(w, "the instruction was accepted but could not be saved: "+saveErr.Error(),
+			http.StatusInternalServerError)
+		return
+	}
 	json.NewEncoder(w).Encode(map[string]bool{"ok": true})
 }
 
@@ -208,4 +281,60 @@ func handleHub(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "unknown endpoint", http.StatusNotFound)
 	}
+}
+
+// checkStateWritable reports whether the hub can persist its state.
+//
+// It is called once at startup, before the listener opens.
+//
+// ★ IT MUST NOT TOUCH THE REAL STATE FILE.
+//
+// The first version of this check renamed its probe file ONTO
+// statePath — and that is how a CHECK destroyed the thing it was
+// checking: every start of the hub replaced the whole channel history
+// with the two bytes "{}". The bug was found because the state file
+// came back as 159 bytes.
+//
+// What the check has to establish is narrow: "can this process write
+// in the state DIRECTORY, and can it rename a file there". That is all
+// the atomic save needs — it never writes INTO statePath, it always
+// renames a fresh file over it. The ownership and mode of statePath
+// itself are irrelevant to that, and are in fact repaired by the first
+// successful save.
+//
+// So the probe writes and renames a file with its OWN name and removes
+// it again. It never names statePath.
+func checkStateWritable() error {
+	if statePath == "" {
+		return fmt.Errorf("no state path is configured")
+	}
+	dir := filepath.Dir(statePath)
+
+	// If statePath is a DIRECTORY, the save cannot work: the atomic
+	// save renames a file onto it, and a rename onto a directory fails.
+	// This is checked without writing anything.
+	if info, err := os.Stat(statePath); err == nil && info.IsDir() {
+		return fmt.Errorf("%s is a directory, so the state cannot be written", statePath)
+	}
+
+	tmp, err := os.CreateTemp(dir, ".state-probe-*")
+	if err != nil {
+		return fmt.Errorf("cannot create a file in %s: %w", dir, err)
+	}
+	name := tmp.Name()
+	defer os.Remove(name)
+	if _, err := tmp.Write([]byte("{}")); err != nil {
+		tmp.Close()
+		return fmt.Errorf("cannot write in %s: %w", dir, err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("cannot close the probe file: %w", err)
+	}
+	// Rename to a name of its own — never onto statePath.
+	probe := name + ".renamed"
+	defer os.Remove(probe)
+	if err := os.Rename(name, probe); err != nil {
+		return fmt.Errorf("cannot rename a file in %s: %w", dir, err)
+	}
+	return nil
 }

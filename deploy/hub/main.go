@@ -41,6 +41,26 @@ func main() {
 	}
 	loadState()
 
+	// ★ REFUSE TO START IF THE STATE CANNOT BE WRITTEN. (Round 102.)
+	//
+	// On the authorized host an operator's cleanup script rewrote
+	// state.json as root while the service runs as a dedicated
+	// low-privilege user. The file stayed readable, so the hub started
+	// happily — and every write failed with "permission denied" for
+	// two hours, while the hub answered {"ok":true} to every sender.
+	// The messages lived only in this process's memory.
+	//
+	// A hub that accepts messages and loses them is WORSE than a hub
+	// that is down: the down one is visible. So the check happens
+	// before the listener opens, and it says exactly what to fix.
+	if err := checkStateWritable(); err != nil {
+		log.Fatalf("the coordination hub cannot write its state (%v). "+
+			"It would accept every message and lose it. "+
+			"Fix the ownership of %s (it must belong to the user this service runs as) "+
+			"and start it again.",
+			err, statePath)
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")

@@ -3,13 +3,19 @@ package main
 import (
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 )
 
-// resetStore gives each test a clean in-memory store. The hub's real
-// one is loaded from disk by loadState(); the tests here must not touch
-// the state file, so they set the maps directly.
+// resetStore gives each test a clean in-memory store AND somewhere to
+// save it. The hub's real store is loaded from disk by loadState(); the
+// tests here must not touch the real state file, so they point
+// statePath at a temp file and set the maps directly.
+//
+// The save path matters: a post that cannot be persisted is answered
+// with 500, so a test that posts without a writable statePath would
+// see 500 and conclude the wrong thing about the body limit.
 func resetStore() {
 	mu.Lock()
 	defer mu.Unlock()
@@ -58,6 +64,7 @@ func TestTheHubSaysWhichLimitWasHit(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			resetStore()
+			useTempState(t)
 			r := httptest.NewRequest("POST", "/hub/report?from=t&topic=t", strings.NewReader(tc.body))
 			w := httptest.NewRecorder()
 			postMsg(w, r)
@@ -75,6 +82,7 @@ func TestTheHubSaysWhichLimitWasHit(t *testing.T) {
 // endpoint, and it had the identical conflated message.
 func TestTheInstructPathSaysWhichLimitWasHit(t *testing.T) {
 	resetStore()
+	useTempState(t)
 	r := httptest.NewRequest("POST", "/hub/instruct?to=somebody", strings.NewReader(strings.Repeat("a", int(maxBody)+1)))
 	w := httptest.NewRecorder()
 	postInstruct(w, r)
@@ -90,6 +98,7 @@ func TestTheInstructPathSaysWhichLimitWasHit(t *testing.T) {
 // the error has to be able to compute the number it must stay under.
 func TestTheLimitIsStatedInTheError(t *testing.T) {
 	resetStore()
+	useTempState(t)
 	r := httptest.NewRequest("POST", "/hub/report?from=t&topic=t", strings.NewReader(strings.Repeat("a", int(maxBody)+1)))
 	w := httptest.NewRecorder()
 	postMsg(w, r)
@@ -97,4 +106,13 @@ func TestTheLimitIsStatedInTheError(t *testing.T) {
 	if !strings.Contains(body, "262144") && !strings.Contains(body, "256") {
 		t.Fatalf("body = %q, want it to state the limit", body)
 	}
+}
+
+// useTempState points the hub's state file at a temp file for the
+// duration of the test, and restores the old one afterwards.
+func useTempState(t *testing.T) {
+	t.Helper()
+	old := statePath
+	statePath = filepath.Join(t.TempDir(), "state.json")
+	t.Cleanup(func() { statePath = old })
 }
