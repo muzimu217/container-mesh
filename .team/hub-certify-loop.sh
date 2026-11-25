@@ -401,7 +401,77 @@ advance_handled() {
 
 tip() { git rev-parse --short origin/develop 2>/dev/null || echo unknown; }
 
+# assignment_due decides whether the certification brief for $TIP may go
+# out, given the messages that were actually delivered to the channel.
+#
+# ★ THE COOLDOWN MUST BE A COOLDOWN, NOT A LIFETIME BAN. (Round 107.)
+# The old code set `assign_due=0` as soon as it SAW a brief for this tip,
+# and only restored it inside the `age < cooldown` branch — which does
+# nothing when the cooldown has EXPIRED. So the assignment for a tip was
+# sent exactly ONCE, ever: the second run found the brief, set the flag
+# to 0, found the age was 9 hours (over the 1 hour cooldown), and then
+# fell through to the empty `:` branch — skipping the send WITHOUT
+# SAYING WHY.
+#
+# Measured on the real hub: tip 65514aa's brief went out at 08:47Z; by
+# 17:40Z the cooldown (1 h) had long expired and the brief was STILL
+# never re-sent, and the loop printed no line about it at all. A silent
+# skip reads exactly like "the assignment was sent and nobody answered".
+#
+# ★ THE WHOLE DECISION LIVES HERE, NOT AT THE CALL SITE. (Round 107.)
+# The first version of the fix put the logic in this function but left
+# the OLD logic at the call site as well — and the mutation check
+# proved the point: putting the old inverted logic back at the call
+# site left the test GREEN, because the test drove the function and
+# the function had not changed. A test that passes while the defect is
+# back is worse than no test: it certifies the fix.
+#
+# So the call site now only calls this function and obeys its verdict.
+# There is no second copy of the rule to get wrong.
+#
+#   $1 = the tip
+#   $2 = now (epoch seconds)
+#   $3 = the cooldown (seconds)
+#   $4 = the delivered channel messages, as "<time>\t<first line>" lines
+# Prints "due <0|1> <reason>".
+assignment_due() {
+  local tip_wanted="$1" now="$2" cooldown="$3" delivered="$4"
+  local last="" mtime mfirst
+  while IFS=$'\t' read -r mtime mfirst; do
+    [ -z "$mtime" ] && continue
+    case "$mfirst" in
+      *"测试认证派单 · develop@$tip_wanted"*) last="$mtime" ;;
+    esac
+  done <<EOF
+$delivered
+EOF
+  if [ -z "$last" ]; then
+    echo "due 1 (no brief for this tip has ever been delivered)"
+    return 0
+  fi
+  local age=$(( now - $(ts_of "$last") ))
+  if [ "$age" -lt 0 ]; then
+    # A clock that went backwards is not a licence to skip.
+    echo "due 1 (the last brief is stamped in the future; sending rather than waiting on a broken clock)"
+    return 0
+  fi
+  if [ "$age" -lt "$cooldown" ]; then
+    echo "due 0 (the same brief went out $(( age / 60 )) min ago, under the $(( cooldown / 60 )) min cooldown)"
+    return 0
+  fi
+  echo "due 1 (the same brief went out $(( age / 60 )) min ago, over the $(( cooldown / 60 )) min cooldown)"
+}
+
 # ---------------------------------------------------------------------------
+# ★ SOURCING THIS FILE ONLY LOADS THE FUNCTIONS. (Round 107.)
+# The decisions in here are worth testing, and a shell script that can
+# only be run as a whole program cannot be tested without a live hub and
+# a live set of agent inboxes. Sourcing it with CMESH_HUB_LIB=1 defines
+# every function and returns before the loop body runs.
+if [ "${CMESH_HUB_LIB:-0}" = "1" ]; then
+  return 0 2>/dev/null || exit 0
+fi
+
 echo "=== Hub test-certification loop @ $(date -u +%FT%TZ) ==="
 TIP=$(tip)
 WM=$(watermark)
@@ -520,7 +590,21 @@ fi
 # silently dropped the coordinator's notes; the loop must not erase what
 # it did not write.)
 if [ ! -f "$LEDGER" ] || ! diff -q <(sort /tmp/hub-last-reports.$$) \
-    <(grep -E "^(doubao|kuku|netns|ohno|oh-no|muse)" "$LEDGER" 2>/dev/null | awk '{print $1, $2}' | sort) >/dev/null 2>&1; then
+    <(grep -E "^(doubao|kuku|netns|ohno|oh-no|muse)" "$LEDGER" 2>/dev/null | awk '{print $1, $2}' | sort) >/dev/null 2>&1 \
+    || ! grep -q "^# tip: $TIP  " "$LEDGER" 2>/dev/null; then
+  # ★ THE TIP LINE MUST BE KEPT CURRENT TOO. (Round 107.) The ledger is
+  # rewritten only when an agent row changes — so the "# tip: …" line
+  # kept whatever tip was current at that moment. Measured: the ledger
+  # said `tip: eaccf32` while origin/develop was `65514aa` (an ancestor,
+  # seven commits behind).
+  #
+  # That line is not decoration: it is what says WHICH SHA the rows
+  # below it refer to. A stale tip line makes the whole ledger read as
+  # "these agents certified eaccf32", when they certified something else
+  # — the same false-green shape as the wiped ledger, one level down.
+  #
+  # So the tip line is part of the condition, not a side effect.
+  #
   # A DRY RUN DOES NOT WRITE THE LEDGER EITHER. The ledger is the
   # record of who certified what; a rehearsal must not change it.
   if [ "$DRY" = 1 ]; then
@@ -673,22 +757,17 @@ if [ "$PENDING" -gt 0 ]; then
   #
   # The decision is made from what was actually delivered (read back
   # from the hub), not from a local guess.
-  assign_due=1
-  assign_at=""
-  while IFS=$'\t' read -r mtime mfirst; do
-    case "$mfirst" in
-      *"测试认证派单 · develop@$TIP"*) assign_due=0; assign_at="$mtime" ;;
-    esac
-  done <<EOF
-$(hub_inbox_times channel 2>/dev/null)
-EOF
-  if [ "$assign_due" = 0 ] && [ -n "$assign_at" ]; then
-    age=$(( NOW - $(ts_of "$assign_at") ))
-    if [ "$age" -lt "$ASSIGN_COOLDOWN" ]; then
-      echo "  assignment: SKIPPED (the same brief for tip $TIP went out $(( age / 60 )) min ago, under the $(( ASSIGN_COOLDOWN / 60 )) min cooldown)"
-      assign_due=0
-    fi
-  fi
+  # ★ THE DECISION IS MADE BY THE FUNCTION, SO IT CAN BE TESTED.
+  # The old inline version had the inverted-cooldown bug described in
+  # `assignment_due` above: once a brief for this tip existed, the
+  # assignment was skipped forever, silently.
+  assign_verdict=$(assignment_due "$TIP" "$NOW" "$ASSIGN_COOLDOWN" \
+    "$(hub_inbox_times channel 2>/dev/null)")
+  echo "  assignment: $assign_verdict"
+  case "$assign_verdict" in
+    "due 1 "*) assign_due=1 ;;
+    *) assign_due=0 ;;
+  esac
   if [ "$assign_due" = 0 ]; then
     :
   else
@@ -744,9 +823,47 @@ EOF
     fi
   fi
   N=/tmp/hub-nudge.$$
+  # ★ THE NUDGE MUST CARRY THE FACT, NOT JUST THE THRESHOLD. (Round 108.)
+  # It used to say only "你已静默超过 6 小时" — and an agent that had
+  # answered a few hours ago could not tell a real silence from a stale
+  # ledger row. (muse-licheng-test1 pointed this out: its report was
+  # 10.9 h old, so the nudge was FACTUALLY RIGHT, but the wording gave
+  # it no way to check that for itself.)
+  #
+  # So the nudge names the LAST REPORT TIME and the ACTUAL AGE. The
+  # reader can then verify the coordinator's arithmetic instead of
+  # taking it on faith.
+  last_report=""
+  while read -r ra rt; do
+    [ "$ra" = "$a" ] && last_report="$rt"
+  done < /tmp/hub-last-reports.$$
+  silent_hours="?"
+  if [ -n "$last_report" ] && [ "$last_report" != "never" ]; then
+    silent_hours=$(( (NOW - $(ts_of "$last_report")) / 3600 ))
+  fi
   {
     echo "# 具体催办 · $a · $(date -u +%FT%TZ)"
     echo "你已静默超过 6 小时（最后一报见台账）。当前 develop tip 是 \`$TIP\`，请按上一条认证派单回复你的复测结果；如被环境卡住，请直接说明卡点（缺环境/缺权限/缺凭据），不要静默。"
+    echo
+    echo "**★ 事实（你可以自己核对）**：你的最后一报是 \`$last_report\`，到现在约 **${silent_hours} 小时**。"
+    echo "**如果这与你的实际不符，请直接回一句「我刚回过」并附上时间** —— 那说明台账或水位有问题，"
+    echo "**比「我没做」更值得报**。"
+    echo
+    echo "**★ 请按下面这三行回，不用长**（**回「跑不了」也是合格的答复**）："
+    echo "    SHA=<你测的> 结论=PASS|FAIL|跑不了 证据=<命令原文+退出码+输出首末 20 行>"
+    echo
+    echo "**★ 如果你测的 SHA 上没有这一格要跑的测试**，回一句「**该 SHA 上无此测试**」即可 ——"
+    echo "**不要把「空跑」记成 PASS，也不要去跑一条不存在的命令**。"
+    echo
+    echo "**★ 只有在你连收件箱都读不到时**，才需要做这三步（**你已经收到了这封信就不用做**）："
+    echo "    1) curl -6 -sS -m 20 -o /dev/null -w '%{http_code}' -H \"X-Hub-Token: \$CMESH_HUB_TOKEN\" 'https://new.blackevil.cn/hub/reports?topic=issue8'"
+    echo "    2) 若上面不是 200，看你的出口能不能到 IPv6（\`ping6\` / \`curl -6 https://[::1]/\`）"
+    echo "    3) 回我一句「收不到报告 + 上面两步的输出」"
+    echo
+    echo "**★ 为什么问这个**：**协调者本机这一轮的公网出口也不通**（IPv6 路由在、连接失败），"
+    echo "**而 Hub 本身是好的**（主机侧实测 HTTP 200）。"
+    echo "**⇒ 「收不到报告」很可能不是 Hub 坏了，而是出口的问题 —— 而这在台账上长得和「没做事」一模一样。**"
+    echo "**所以我要的是「卡在哪」，不是「做完了吗」。**"
   } > "$N"
   echo "--- nudge → $a ---"
   hub_post "$a" "$N"
