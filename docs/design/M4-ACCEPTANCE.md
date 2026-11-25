@@ -1,7 +1,7 @@
 # M4 验收清单：外部验收与真实环境复测
 
 > **位置**：三层文档的第三层（具体怎么验）。上层：[`../REQUIREMENTS.md`](../REQUIREMENTS.md)（要什么）、
-> [`../DESIGN.md`](../DESIGN.md)（用什么结构）、[`../PROJECT-PLAN.md`](../PROJECT-PLAN.md)（做到哪一步）。
+> [`../DESIGN.md`](../DESIGN.md)（用什么结构）、[`../PLAN.md`](../PLAN.md)（做到哪一步）。
 > 本文的读者是**下一个外部测试员**——你不需要读过本仓库的历史，只需要照着 §4 抄命令。
 >
 > **状态**：本文是**验收方法**，不是验收结果。文中所有 `[实测]` 数字都注明出处（轮次/决策号）；
@@ -33,7 +33,7 @@ M4 的外部四线（oh-no / doubao / kuku / netns）反复卡住的**不是产�
 |---|---|---|
 | **锚点 / anchor** | 跑 `cmesh serve-discovery` 的那台机器 | 名册 `members.json`、账号公钥、凭证签发、面板令牌、trunk 开关 |
 | **成员设备** | 跑 `cmesh join` 的机器 | 自己的 `device.json` / `discovery.json` / `inbox/`；**没有名册** |
-| **值守** | 协调者（`docs/TEAM.md` 的主代理角色） | 签发凭证、放行 push、给外部代理派单 |
+| **值守** | 协调者（主代理；六道门见 `../CONVENTIONS.md` §6） | 签发凭证、放行 push、给外部代理派单 |
 | **外部代理** | oh-no / doubao / kuku / netns / muse 四线测试员 | 在自己的环境里跑命令、回报证据 |
 | **网主** | 用户 | 授权测试主机、授权 reboot、批准发布动作 |
 
@@ -974,11 +974,11 @@ rc=2 是用法错误（命令写错了），rc=1 是运行时失败（环境或�
 | 想知道 | 读 |
 |---|---|
 | 要什么能力（需求编号、判据） | [`../REQUIREMENTS.md`](../REQUIREMENTS.md) |
-| M4 交付到哪一步 | [`../PROJECT-PLAN.md`](../PROJECT-PLAN.md)、[`../DEV-KPI.md`](../DEV-KPI.md) |
+| M4 交付到哪一步 | [`../PLAN.md`](../PLAN.md)、[`../DEV-KPI.md`](../DEV-KPI.md) |
 | 每轮发生了什么（缺陷出处） | [`../ROUND-LOG.md`](../ROUND-LOG.md) |
 | 为什么是这个设计（决策与被推翻的方案） | [`../decisions.md`](../decisions.md)（尤其 D73–D78） |
 | 怎么部署（锚点/成员/Docker/systemd） | [`../../deploy/MESH-NET.md`](../../deploy/MESH-NET.md) |
 | systemd 单元的前置 | [`../../packaging/systemd/README.md`](../../packaging/systemd/README.md) |
-| 凭证的信任模型（为什么要两段入网） | [`../M4-CREDENTIAL.md`](../M4-CREDENTIAL.md) |
+| 凭证的信任模型（为什么要两段入网） | [`CREDENTIAL.md`](CREDENTIAL.md) |
 | 验收判据的纪律来源 | [`../CONVENTIONS.md`](../CONVENTIONS.md) §2（测试纪律） |
 | 多宿主设计（未来形态，不在 M4 验收范围） | [`MULTI-HOMING.md`](MULTI-HOMING.md) |

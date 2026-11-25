@@ -5,7 +5,7 @@
 >
 > **2026-11-12 更新**：用户已认可 `design-prototypes/aistudio-v1/` 的界面、交互和整体
 > 展示，要求保留这些成果并重构工程架构。以下单文件 HTML 约束只用于锚点轻量面板；
-> 完整桌面与移动客户端按 [跨平台应用设计](../../docs/architecture/APP-PACKAGING.md)
+> 完整桌面与移动客户端按 [跨平台应用设计](../../docs/design/APP-PACKAGING.md)
 > 实施。后续提示词不再要求重新设计产品视觉。
 
 ## 1. 产品是什么

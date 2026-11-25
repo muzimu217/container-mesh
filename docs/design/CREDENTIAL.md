@@ -1,6 +1,8 @@
 # 统一凭证的完整接线设计（M4 (a) 最后一环）
 
 日期：2026-11-13。状态：**设计已定，凭证包与委派签发已实现并有测试；本文件描述尚未接线的部分。**
+**现状（2026-11-24）**：本文描述的接线已全部落地；上面「尚未接线的部分」是 2026-11-13 当时的状态，保留不改。
+§2.1 的凭证来源优先级由测试 `TestTheCredentialSourceRulesAreTheDocumentedOnes` 与代码钉在一起。
 需求：R-6.7。已落地：`internal/credential`、`identity.Delegation`、`DeviceCert.SignerPub`。
 
 ## 0. 为什么要分两步

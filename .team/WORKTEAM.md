@@ -1,6 +1,6 @@
 # 工作团（Real-Agent Workteam）
 
-> 本文把 [`TEAM.md`](../docs/TEAM.md) 的六个**虚拟**专家角色映射到**真实可调用**的外部代理。
+> 本文把 [`CONVENTIONS.md`](../docs/CONVENTIONS.md) §6 的六道**虚拟**门映射到**真实可调用**的外部代理。
 > 主代理（ZCode）任**产品经理 + 首席协调**：定需求、理业务逻辑、做交接、验收、合并。
 > 外部代理任**评审与实现**——他们的价值不是「多个人」，是**不同模型的盲区不同**。
 >
@@ -39,7 +39,7 @@
      claude  codebuddy qoder  codearts  opencode  codex
 ```
 
-| 虚拟角色（TEAM.md） | 真实代理 | 为什么是它 |
+| 六道门（CONVENTIONS §6） | 真实代理 | 为什么是它 |
 |---|---|---|
 | ⑤安全专家 | **claude** | 安全推理最细；前一轮外部评审证明它能抓到真实漏洞（撤销即时性缺口） |
 | ③开发专家（评审半边） | **codebuddy** | 独立视角读代码结构与抽象；我写码时它当第二双眼睛 |
@@ -111,10 +111,10 @@ timeout 300 claude -p "$(cat /tmp/delegate.md)" 2>&1 | tee /tmp/review-security.
 
 ---
 
-## 4. 与 TEAM.md / ROUND-LOG 的关系
+## 4. 与六道门 / ROUND-LOG 的关系
 
 ```
-TEAM.md        六个虚拟角色的门（不变，仍是合并判据）
+CONVENTIONS §6 六道门（不变，仍是合并判据）
      ↑ 真实代理补强
 WORKTEAM.md    角色 → 代理的映射 + 提示词 + 委派协议（本文）
      ↓ 每轮产出

@@ -91,11 +91,11 @@ timeout 300 codex exec --skip-git-repo-check "$(cat .team/prompts/security-revie
 
 ---
 
-## 6. 与 TEAM.md 的关系
+## 6. 与六道门的关系
 
-TEAM.md 的六道**虚拟门**不变——它们是合并判据。本文只决定「每道门**请谁**来站」：
+[`CONVENTIONS.md`](../docs/CONVENTIONS.md) §6 的六道**虚拟门**不变——它们是合并判据。本文只决定「每道门**请谁**来站」：
 
-| TEAM.md 虚拟角色 | 本文真实代理 | 冗余 |
+| 六道门（CONVENTIONS §6） | 本文真实代理 | 冗余 |
 |---|---|---|
 | ①首席协调 | ZCode（我） | — |
 | ②需求专家 | opencode / claude 兼 | 无独立冗余 |

@@ -6,8 +6,8 @@
 - docs/DESIGN.md
 - docs/CONVENTIONS.md
 - docs/README.md
-- docs/architecture/MESH-DESIGN.md
-- docs/architecture/REVIEW-RESPONSE-MESH.md
+- docs/design/MESH-DESIGN.md
+- docs/PLAN.md
 
 逐项核对并输出：
 

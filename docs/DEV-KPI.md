@@ -113,7 +113,7 @@
 
 **★ 而新测试上线时又被新代推了一个数据竞态**（**红归红不是产品的红，是测试自己的红**）：扫描在 goroutine 里跑命令、超时从主 goroutine 里 kill 它（**`Cmd.Run` 写进程状态，`Process.Kill` 同时读它**）。已改用 `CommandContext` 并让命令自己超时（**无并行 kill、无共享状态**）。
 
-**★ 传输 CLI 的完成度（外部验收审计逐条核过）**：**阶段 1（`send`/`recv`/`forward`/`relay`）已完**；**阶段 2 的主链路能跑，而「完成」这个说法曾经对三处不成立** —— **这三处本轮全部关掉了**：**① help 文档的四种命令**（早已修）· **② mesh `send-to` 没有断点续传且会静默覆盖**（**覆盖已修；断点续传本轮也已实现**：接收端保留 `<名>.part`、ack 带 `ok <n>`、发送端 seek 后只传缺失的部分、整文件 hash 仍覆盖全文件、`.part` 成为保留后缀；**突变验证过**：恢复旧行为（中断就删部分文件）⇒ 两条行为测试立刻红）· **③ `msg`/`send-to`/`dial`/`run` 零 CLI 层测试**（**本轮补了运行期断言**：msg 查**消息真的到达目标**、send-to 查**接收端 inbox 里逐字节相同的字节**、run 查 stdout 上的五行、bench 查 `direction=both` 且 `sent==received==请求的大小`；**突变验证过**：把接收端改成丢掉消息而发送端照旧声称送达 ⇒ 源文本断言照样通过，**运行期断言立刻红**）。**KPI 逐条**：**P-5b 与 P-7 干净**；**P-3 / P-4 已实现、已实测、且明确未达标**（130.80 vs 200；48.66 vs 50 —— **而 P-4 ≥50 与 P-7 ≤50 在默认配额 50 下直接冲突**）；**P-6 测过但 GC 相位的判决没定，且「20 台设备」场景从未测过**（仓库里零条 RSS 断言）；**P-1 / P-2 / P-5 的门槛本身从未被断言**，只有更宽松的冒烟上限。**★ 本轮按项目自己的 T-2.4/T-2.5 纪律补了守卫**：**断言「有没有撞上停顿」（用时，秒级）而不是断言墙钟阈值** —— **1 MiB 在回环上约 12.8 ms，预算 2 s（三个数量级的余量）**，**突变验证过**（预算收到 1 ms ⇒ 两条守卫立刻红）。**★ 但这仍然是「实测门」而不是「CI 门」**：**5 ms 那个数本身没有被断言**（**硬编码 5 ms 正是 T-2.4 禁止的那种 flaky 断言**），它由 CLI 打印、由看板按测量条件记录。
+**★ 传输 CLI 的完成度（外部验收审计逐条核过）**：**阶段 1（`send`/`recv`/`forward`/`relay`）已完**；**阶段 2 的主链路能跑，而「完成」这个说法曾经对三处不成立** —— **这三处已全部关掉**；**★ Round 108 又抓到三处「完成不成立」，本轮也全部关掉**：**⑥ 一次性命令的撤销文案是死代码**（**用过期 context 发 announce ⇒ 永远拿不到 401**）· **⑦ 产品从不申请接收缓冲、也不核对内核实际给了多少**（**于是「缓冲不够」只能表现为一个 30 秒超时**）· **⑧ M4 验收的 B4/E1/E3/C3/C4/C5/C8 七格只有文案断言或无守卫**（**本轮补了运行期守卫**）。**★ Round 107 又抓到三处「完成不成立」，也在那一轮全部关掉**：**④ 协调脚本的认证派单被永久跳过**（**协调侧缺陷，但它的后果就是「没人复测」）**）· **⑤ `--p2p` 直连路径必然失败**（两个读者抢同一个 socket）· **⑥ 干道生产路径缺停机守卫**（停机后收养中转流）。**★ 这三处的共同形状是「守卫/能力/旗标都存在，但生产路径没在用」** —— **这已是本项目第四次命中同一个形状**。**前三处本轮全部关掉了**：**① help 文档的四种命令**（早已修）· **② mesh `send-to` 没有断点续传且会静默覆盖**（**覆盖已修；断点续传本轮也已实现**：接收端保留 `<名>.part`、ack 带 `ok <n>`、发送端 seek 后只传缺失的部分、整文件 hash 仍覆盖全文件、`.part` 成为保留后缀；**突变验证过**：恢复旧行为（中断就删部分文件）⇒ 两条行为测试立刻红）· **③ `msg`/`send-to`/`dial`/`run` 零 CLI 层测试**（**本轮补了运行期断言**：msg 查**消息真的到达目标**、send-to 查**接收端 inbox 里逐字节相同的字节**、run 查 stdout 上的五行、bench 查 `direction=both` 且 `sent==received==请求的大小`；**突变验证过**：把接收端改成丢掉消息而发送端照旧声称送达 ⇒ 源文本断言照样通过，**运行期断言立刻红**）。**KPI 逐条**：**P-5b 与 P-7 干净**；**P-3 / P-4 已实现、已实测、且明确未达标**（130.80 vs 200；48.66 vs 50 —— **而 P-4 ≥50 与 P-7 ≤50 在默认配额 50 下直接冲突**）；**P-6 测过但 GC 相位的判决没定，且「20 台设备」场景从未测过**（仓库里零条 RSS 断言）；**P-1 / P-2 / P-5 的门槛本身从未被断言**，只有更宽松的冒烟上限。**★ 本轮按项目自己的 T-2.4/T-2.5 纪律补了守卫**：**断言「有没有撞上停顿」（用时，秒级）而不是断言墙钟阈值** —— **1 MiB 在回环上约 12.8 ms，预算 2 s（三个数量级的余量）**，**突变验证过**（预算收到 1 ms ⇒ 两条守卫立刻红）。**★ 但这仍然是「实测门」而不是「CI 门」**：**5 ms 那个数本身没有被断言**（**硬编码 5 ms 正是 T-2.4 禁止的那种 flaky 断言**），它由 CLI 打印、由看板按测量条件记录。
 
 **★ 边界（照抄，不升级）**：本轮四个修复都是**本地行为已验**，**但这一格仍不是「外部已验」** —— **新 SHA 推送后需要外部代理在目标拓扑上复测**。
 
@@ -150,7 +150,7 @@ doubao 指出 Round 96 的第三处修法（把 `Shutdown()` 接进锚点停机�
 
 **⓪⓪ 另一条：muse 报告里「Round 94 仍未见」查实是**我的流程缺口**。** Round 94 我**只在频道发了广播，没有给这一线单独发派单** → **广播到了频道 ≠ 每条线的收件箱里都有**。**与「派单 ≠ 回报」是同一条纪律的两半：派单不等于对方收到了。**
 
-**⓪⓪⓪ 文档修复（本轮顺手查出的两处）**：`docs/DEV-KPI.md` 的**第 ⑦ 节被复制了三遍**（同一段性能研究文字三份）→ **已去重**（**用户每天看的文档，重复三遍就会让人以为是三条不同的结论**）；`docs/PROJECT-PLAN.md` 此前是唯一落后于 ROUND-LOG/看板的文档 → **已补 R95/R96/R97 条目**，并**更正「撤销后关闭已建立 direct QUIC 连接尚未实现」**（C1 已修，**证据等级：代码已核 + 本地行为已验，外部行为复现仍缺**）。
+**⓪⓪⓪ 文档修复（本轮顺手查出的两处）**：`docs/DEV-KPI.md` 的**第 ⑦ 节被复制了三遍**（同一段性能研究文字三份）→ **已去重**（**用户每天看的文档，重复三遍就会让人以为是三条不同的结论**）；`docs/PLAN.md` 此前是唯一落后于 ROUND-LOG/看板的文档 → **已补 R95/R96/R97 条目**，并**更正「撤销后关闭已建立 direct QUIC 连接尚未实现」**（C1 已修，**证据等级：代码已核 + 本地行为已验，外部行为复现仍缺**）。
 
 **⓪⓪⓪⓪ oh-no 交了联合复核清单的**行为层**结果 —— 值守复核后**收紧了两格的判读（这是本轮第二值钱的一条）**
 
@@ -317,14 +317,14 @@ doubao 指出 Round 96 的第三处修法（把 `Shutdown()` 接进锚点停机�
 | **真实 Release / M4 安装验收** | **安装器闭环已验证，但发布资产严重不全** | prerelease `v1.0.0-rc1`：**实际资产 10 个**（`gh release view`），矩阵需 20。逐 URL 实测：`cmesh-v1.0.0-rc1-{linux-amd64,linux-arm64,darwin-arm64}` **206 可用**；`darwin-amd64` **404**；`windows-amd64`（两种命名）**404**；`cmesh-latest-{linux-arm64,darwin-amd64,darwin-arm64,windows-amd64}` 全 **404**；`windows/arm64` 连 SHA256SUMS 都没有。**SHA256SUMS 列了 15 行，实际资产 10 个——7 行悬空**，`sha256sum -c --ignore-missing` 恰好跳过它们，让「校验通过」变成假象。**安装器实测**：`CMESH_VERSION=v1.0.0-rc1` → rc=0，版本化落盘 `versions/v1.0.0-rc1/` + `current` symlink + `.cmesh-install-root` 齐全，`--uninstall` rc=0；默认 `VERSION=latest` → **rc=1 404**。<br>**更正上一轮「资产来源不可追溯」——不成立**：`go version -m` 显示已发布二进制**内嵌 VCS 信息**（`vcs.revision=6f07562d37e31358b7ff18dbeecb1f02936f8dc1`、`vcs.time=2026-11-15T19:53:33Z`、`vcs.modified=true`），审计代理用「干净 clone + `-trimpath` + 复现 `+dirty`」配方**字节级复现 5/5 digest 精确命中**。真正的问题是**仓库里没把这个写下来**，而不是来源混乱。<br>**另更正「已发布 rc1 不含 K-1」**：它**含** serve-discovery 的 K-1，**不含** `relay` 的 K-1（`18404f1` 晚 12.6 小时）——此前用 `strings` 查 `relay: shutdown` 命中 0 是因为查的是 relay 路径而非 serve-discovery。<br>**未验收**：reboot 恢复（需网主授权或可重启 VM）；缺失资产重建上传（需网主放行发布动作） |
 | systemd 前置与安全 | **五处缺口已修，并在真机（175.24.139.148）逐条验收 PASS** | **更正上一轮的「仓库内无 systemd unit」——`packaging/systemd/` 存在**（`cmesh-discovery.service` + `cmesh-discovery.env.example` + README）。五处缺口（① 缺 `--account-pub` → **入网端点根本不挂载** ② 无 `StateDirectory=` ③ 无 `TimeoutStopSec=` ④ `EnvironmentFile=-` 的 `-` 让文件缺失不报错 → 变量全空 → `--state ""` 静默回落 `~/.cmesh` ⑤ 空口令在无 tty 时 EOF）**已修**（`79c6891`）。**真机验收（OpenCloudOS 9.4，当前 HEAD 二进制）全 PASS**：① 进程 cmdline 带着 `--account-pub`，`/mesh/enroll` 返回 **403（已挂载）**；**跨机 `join --cred` rc=0**（enrolled + approved）——**A/B 对照证明旧 unit 上凭证入网路径是真的死的**（enroll 404 "enrollment is not enabled on this node"、`join` 失败 `unreadable answer (HTTP 404)`）② env 缺失 → `START_RC=1`、`Result=resources`、journal `Failed to load environment files` ③ 全新机器上 `/var/lib/cmesh mode=750 owner=cmesh:cmesh` **自动创建** ④ `kill -TERM` → **`ExecMainStatus=0`（不是 143）**、端口释放、无残留 ⑤ env 示例与 `cmesh account show` 一致。另验证：双版本安装 + `current` 轮转、`--uninstall` 保留状态、`--purge` 删状态、状态跨服务重启存活、enable/disable、非 root journald 日志。**清理已确认**（175 上 unit/目录/用户全删，nginx 与 cmesh-hub 仍是原 PID 的 active）。**仍未验收**：reboot 恢复（需网主授权重启或提供可重启 VM）；**跨云 UDP 被两边安全组全封**（175 上 tcpdump 抓到 0 个来自 162 的包）→ mesh ping 只能走 UDP-over-TCP 隧道，RTT 214ms 含隧道开销，不是产品 RTT |
 | 性能观测补全 | **本轮已补 direct bench 可重复口径，relay 侧仍缺** | 新增 `internal/mesh/bench_perf_test.go` 的 `BenchmarkRunBenchDirect`（1/8/32MiB 双向，报 MiB/s 与 allocs/op）；relay status 仍无 per-session RTT/吞吐，下一步只补测试观测，不先改协议 |
-| 中继路由 / 增量视图 | **未开始，推迟 v1.1** | M4-PLAN C 组；不混入当前 v1.0 收口 |
+| 中继路由 / 增量视图 | 干道数据面已交付；P-4 未达标（33.6–48.7 MiB/s）；增量视图未开工 | PLAN §2 M5-12 / M5-13 |
 
 ## 本地新增开发 KPI
 
 | 任务 | 状态 | 验收 |
 |---|---|---|
 | 云服务器真实验收 | **已完成 mclaw loopback，公网/NAT 未达成** | VM-6-7-ubuntu：healthz/panel/token/API、join --cred、过期 credential 拒绝、status、ping 3/3、msg、send-to SHA、run @info、bench 4KB 均通过；仅 loopback/direct，未测公网 relay/WSS/跨云 NAT/反向客户端 |
-| 文档整改 brief | **已完成索引，整改执行中** | `docs/DEVELOPMENT-GAPS.md` 已按 P0/P1/P2 写明影响、需求/代码证据、完成判据和环境边界；`docs/README.md` 已加入入口并纠正过时阶段状态 |
+| 文档整改 brief | **已完成索引，整改执行中** | 原 `DEVELOPMENT-GAPS.md`（缺口已并入 `docs/PLAN.md` 任务表）曾按 P0/P1/P2 写明影响、需求/代码证据、完成判据和环境边界；`docs/README.md` 已加入入口并纠正过时阶段状态 |
 | **URL host 安全校验（出口策略缺口）** | **本地已修复（两条路径），红→绿已证** | 上一轮只实现了策略的**一半**：`allowedDiscoveryHost` 拒绝 loopback/私有/保留**字面 IP**，其注释把剩下的交给拨号方——「callers that dial them must use an egress policy that revalidates resolved addresses before connecting」——但**从未实现**：WebSocket 拨号用的是裸 `net.Dialer`，**解析后的地址无人复核**。因此一个解析到回环/私网的主机名可直连（kuku 在沙箱实测 `disc.local → 127.0.0.1` 穿透成功）。发现地址是运维提供的值 → 这是 **SSRF 形态**。修复：`wsconn.DialOptions` 增加可选 `EgressPolicy`，经 `net.Dialer.Control` 在 **DNS 解析后、socket 连接前**回调；discovery 客户端**始终**传入。stage-1 relay 保持原行为（其端点本就常是私网地址，**有意不启用**）。e2e 套件需要连 127.0.0.1 → 用 **build tag `cmeshtest`** 把逃生口编译进去；**`go build`、CI 构建、发布构建都不带该 tag**，故出货二进制没有逃生口，并有测试断言之（`go tool nm` 亦确认 `internal/cmeshtest` 未链接进生产二进制）。红→绿：去掉策略后接线测试红（"the client dialled without an egress policy"），恢复后绿。<br>**★ 补第二半（doubao 独立实测发现）**：策略最初只覆盖了 **members WS 流**，**register 的 HTTP POST 走的是裸 `http.Client`、无策略** → 同一个 origin 的两条路径一条被拒一条可达，**SSRF 面只关了一半**。doubao 用 127.0.0.1 listener 实测：members 流被正确拒绝（`egress policy: ... resolved to 127.0.0.1, which is not a public address`），而 register 请求**真实到达**（listener 回 `501 Unsupported method`）。已修：`client.go` 的 `httpTransport()` 给 register 加上同一策略（同样在 dialer 内按解析后地址判定，连接根本不会建立）。红→绿：新增测试用**裸 listener**（`httptest.Server` 会在测试看到连接前就拒掉不认识的方法 → **假绿**）且把 origin 排除出本地代理（否则代理替 origin 应答、测试根本看不到连接），修复前红（"the register request reached a loopback address"），修复后绿 |
 | `cmesh mesh ping` | **已在 `1f64cdc` 外部复测** | 100ms 最小间隔、1–1000 包、超时计 loss、p50/p95；当前 direct QUIC，relay-only 不伪造；默认超时已覆盖最大采样窗口 |
 | `cmesh bench` | **已在 `1f64cdc` 外部复测** | 默认 100MB/方向、双向独立 bench stream、可限速；回环 1MB 双向字节完整；QUIC retransmission 当前明确 `n/a` |
@@ -451,6 +451,40 @@ Linux headless 安装代理在**两台真实机器**（175 OpenCloudOS 9.4 + 35 
 | router/OpenWrt | ⚠️ 设计方向 | ❌ MIPS/ARMv7/procd | ❌ | ❌ | ❌ |
 
 ## 当前门禁证据
+
+**★ Round 107（2026-11-24 18:16Z）· 全绿 · 命令原文在位**
+
+| 检查 | 结果 | 时间 |
+|---|---|---|
+| `gofmt -l .` | **PASS**（空） | 18:00Z |
+| `go vet ./...` | **PASS** | 18:00Z |
+| `go test ./... -race -count=1` | **PASS · 20 包 · 零 FAIL** | 18:12Z |
+| `deploy/hub` 模块 `go vet` + `go test -race` | **PASS** | 18:14Z |
+| `bash tests/run-tests.sh --verbose --large` | **PASS · 49 通过 · 0 失败** | 18:15Z |
+| `GOOS/GOARCH` 交叉编译 `linux/amd64` · `linux/arm64` · `darwin/arm64` | **PASS** | 18:15Z |
+| `bash .team/hub-certify-loop-test.sh` | **PASS · 10 条** | 18:27Z（Round 107） |
+| **Round 108**：`go test ./... -race` | **PASS · 20 包**（`internal/mesh` 164 s / `internal/cli` 324 s） | 11:20Z |
+| **Round 108**：`go test ./internal/p2p2/ -race` | **PASS**（6 次连跑） | 11:35Z |
+| **Round 108**：三架构交叉编译 | **PASS**（含新拆出的 Linux / 其它 Unix 两份缓冲实现） | 11:10Z |
+| 协调脚本 `bash -n` | **PASS** | 18:27Z |
+
+**★ 本轮新增的三处修复，每一处都带「突变验证」（把修好的行为改回去 ⇒ 测试必须红）：**
+
+| 缺陷 | 突变验证的结果 |
+|---|---|
+| 协调脚本的认证派单被永久跳过 | **变异体被杀** —— 但**第一版存活**（测试钉的是函数，而缺陷在调用点）⇒ 改成钉**决策本身**才真正杀掉 |
+| `--p2p` 直连路径两个读者抢同一 socket | **变异体被杀**（把 `builtInTransportWanted` 改回恒真 ⇒ 立刻红） |
+| 干道生产路径缺停机守卫 | **变异体被杀**（守卫改成 `if false` ⇒ **10 秒超时后红**，红的那条消息直接说「flow 被收养了、serve goroutine 永远卡在 `flow.done` 上」） |
+| 协调脚本：台账的 tip 行会过期 | **已修**（tip 行也进重写条件）· **实测**：台账写着 `eaccf32` 而 `origin/develop` 是 `65514aa`（落后 7 笔）⇒ **整本台账读起来像「这些代理认证的是 eaccf32」** |
+| 一次性命令的撤销文案（死代码） | **变异体被杀** —— 把 `Announce(waitCtx)` 改回去 ⇒ **立刻红**，红的那条消息直接写着「这个分支是死代码：announce 用的 context 刚刚超时，请求根本发不出去」 |
+| 产品从不申请接收缓冲 | **变异体被杀** —— 把「申请 7 MiB」改回小数值 ⇒ **立刻红**，红的那条消息直接说出「socket 从没申请过这个路径需要的缓冲」 |
+| 接收缓冲的告警文案 | **★ 这个守卫原来住在测试文件里**（`udpBufferShortfallMessage` 是测试的辅助函数，**产品从不调用它** ⇒ **那条测试钉的是自己的替身**）⇒ 已搬进生产文件，**并加了一条断言「这条检查必须能失败」** |
+| 协调脚本：催办里的命令被 `echo` 拆成两行 | **变异体被杀** —— 但**这条守卫自己第一次也不会失败**（`grep` 的 `\n` 在 BRE 里是「换行」；源码里是「两个反斜杠」）⇒ **补了第三条断言「这条检查必须能失败」** |
+| ★ 安全扫描器报「命令注入」 | **误报** —— `exec.Command(binPath, sub, "--help")` 是 argv 列表形式，Go 直接调 `execve`，**全文件没有一处 `sh -c`**；`binPath` 是 `argv[0]`，含 `;` 也只是字面参数。**我复核了全部 6 处 exec 调用**（`systemctl` 那几处也是 argv 列表） |
+| 安装器：版本号能走出 `versions/` | **变异体被杀** —— `safeVersion` 的字符集含 `.` ⇒ `".."` 通过 ⇒ `bin` 塌成 `root/cmesh`、`link` 指向安装根 ⇒ **`--rollback ..` 会毁掉装好的布局** |
+| 安装器：回滚执行未验证的二进制 | **变异体被杀** —— 摘要验完就扔，磁盘上没记录；回滚直接执行该二进制。**已修**：安装时写 `cmesh.sha256`，回滚**执行前**核对，**没有摘要的版本一律拒绝**。★ 红的输出正好证明了这一点：「fork/exec … exec format error」就是那个二进制被跑起来了 |
+
+**★ 这三条是本轮最有价值的产出**：**不是「修了三个 bug」，而是「证明这三个 bug 现在被钉住了」**。
 
 **本轮（Round 49）本地批次，全部通过**（2026-11-16 10:30Z，本地 worktree）：
 

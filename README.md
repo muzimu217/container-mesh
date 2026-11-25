@@ -160,7 +160,7 @@ cmesh join --listen 0.0.0.0:18090 --device-passphrase <口令> <invite-string>
 
 - 中继路由（R-3.2/R-3.3）与增量视图：**尚未实现**，S3 全受限场景暂靠人工转发兜底
 - 组网内的**断点续传**仍待实现（`docs/REQUIREMENTS.md` R-4.2 记录为「待 PR-M5」）；断点续传目前只在 relay 配对通道可用
-- 桌面 / 手机 App：方案已定（[APP-PACKAGING.md](docs/architecture/APP-PACKAGING.md)），**尚无安装包**
+- 桌面 / 手机 App：方案已定（[APP-PACKAGING.md](docs/design/APP-PACKAGING.md)），**尚无安装包**
 - 图形界面为**驾驶舱**（按已验收原型实现，3D 名册视图）+ 轻量版 `/panel-lite`
 
 **关于「零入站端口」**：这句话描述的是**客户端**：成员设备只出站连到发现节点，
@@ -172,16 +172,18 @@ cmesh join --listen 0.0.0.0:18090 --device-passphrase <口令> <invite-string>
 
 | 你想… | 读 |
 |---|---|
-| 知道这是不是你要的产品 | [REQUIREMENTS.md](docs/REQUIREMENTS.md) |
-| 了解四层架构 | [DESIGN.md](docs/DESIGN.md) |
+| **知道现在做到哪了、下一步做什么** | [docs/PLAN.md](docs/PLAN.md)（唯一计划文档） |
+| 知道这是不是你要的产品 | [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) |
+| 了解四层架构 | [docs/DESIGN.md](docs/DESIGN.md) |
+| 看当前代码怎么串起来 | [docs/design/ARCHITECTURE-MAP.md](docs/design/ARCHITECTURE-MAP.md) |
+| 验收怎么验、结果是什么 | [docs/design/M4-ACCEPTANCE.md](docs/design/M4-ACCEPTANCE.md) |
+| 跨平台 App 方案 | [docs/design/APP-PACKAGING.md](docs/design/APP-PACKAGING.md) |
 | 部署一台锚点 | [deploy/MESH-NET.md](deploy/MESH-NET.md) |
-| 跨平台 App 方案 | [docs/architecture/APP-PACKAGING.md](docs/architecture/APP-PACKAGING.md) |
-| M4 交付计划 | [docs/M4-PLAN.md](docs/M4-PLAN.md) |
-| 当前开发与平台 KPI | [DEV-KPI.md](docs/DEV-KPI.md) |
-| 每日项目进度看板 | [project-dashboard.html](docs/project-dashboard.html) |
-| 路线规划图谱 | [PROJECT-ROADMAP.gpm](docs/PROJECT-ROADMAP.gpm) |
+| 当前开发与平台 KPI | [docs/DEV-KPI.md](docs/DEV-KPI.md) |
+| 每日项目进度看板 | [docs/project-dashboard.html](docs/project-dashboard.html) |
 | 技术决策历史（含被否决的方案） | [docs/decisions.md](docs/decisions.md) |
 | 每轮实测报告 | [docs/ROUND-LOG.md](docs/ROUND-LOG.md) |
+| **全部文档索引（唯一入口）** | [docs/README.md](docs/README.md) |
 
 ## 6. 安全边界（诚实版）
 

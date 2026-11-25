@@ -4,7 +4,8 @@
 - 日期：2026-10-21
 - 代码基线：`container-mesh@be15796`
 - 上游文档：
-  - [`ARCHITECTURE-SDWAN.md`](ARCHITECTURE-SDWAN.md)（总体架构，阶段 1 见 §4.3、§6）
+  - 原总体架构稿 `ARCHITECTURE-SDWAN.md`——**已归档**（它的产品目标已被 R3 取代）。全文：
+    `git show a16f3e3:docs/architecture/ARCHITECTURE-SDWAN.md`。下文的「原总体架构稿 §X」均指它
   - [`../research/mux-and-portforward.md`](../research/mux-and-portforward.md)（yamux 选型、端口转发原型、开放代理防御）
 - 证据标注沿用上游口径：**`[实测]`** = 研究或项目历史实际跑出的数字；**`[查证]`** = 读源码确认；**`[推断]`** = 工程判断，未实测
 - 标注约定：**【必须】** = 不做就会出错或不安全；**【可选】** = 可以在后续迭代补
@@ -19,7 +20,7 @@
 
 1. **分层顺序是 `transport → secure → 记录泵 → yamux → 业务流`，研究二的「mux 在 secure 之下」不能照字面实现。** `secure.Session` 是每方向一个严格递增计数器、且要求帧严格按发送顺序到达的 AEAD 通道（`secure.go:399-417`）。yamux 的 `recvLoop`（`session.go:548`）在应用读取之前就经 `handleStreamMessage`（`session.go:578-630`）按 streamID 把帧分发到各流的缓冲区，跨 stream 的到达顺序在那一刻就丢了。若多个 goroutine 各自解密，它们会看到**乱序的全局计数器**，解密必然失败。记录泵把「多流并发」重新收敛成「单序列」，`secure.go` 一行不改。
 
-2. **`wire.Version` 不升到 2。** 帧格式（10 字节头、1 MiB 上限）完全不变，新增帧类型是纯增量；而 `exchangeHello` 在版本不一致时直接返回 `ErrProtocol`、没有降级路径（`session.go:244-246`），升版本会让**现有 `send`/`recv` 在新旧二进制之间直接不可用**——这是纯粹的功能倒退。改用 hello 里的 `caps` 能力位协商，旧对端自动退化为「不支持转发」，文件传输完全不受影响。这是对 ARCHITECTURE-SDWAN §A1 的修正（理由见 §3.4）。
+2. **`wire.Version` 不升到 2。** 帧格式（10 字节头、1 MiB 上限）完全不变，新增帧类型是纯增量；而 `exchangeHello` 在版本不一致时直接返回 `ErrProtocol`、没有降级路径（`session.go:244-246`），升版本会让**现有 `send`/`recv` 在新旧二进制之间直接不可用**——这是纯粹的功能倒退。改用 hello 里的 `caps` 能力位协商，旧对端自动退化为「不支持转发」，文件传输完全不受影响。这是对 原总体架构稿 §A1 的修正（理由见 §3.4）。
 
 3. **记录大小取 32 KiB，一条记录一次 transport 写（不合并）**（本项经评审后两次修正：
    原方案 512 KiB，评审后改 32 KiB + 16 条批量，实现时实测又否掉了批量）。
@@ -323,7 +324,7 @@ func (p *Pump) writeLoop() {
    （`Node.Run` 已经会重建 session），而不是假装能无损迁移。真正的无损迁移需要
    在记录泵之下加一层带序列号与重传缓冲的虚拟会话层，那是阶段 3 之后的事，不在
    阶段 1 的范围内。
-2. **`fail` 必须同时关闭两个队列和 link。** 只关一端会让 yamux 的另一个 loop 永久阻塞，整个会话停摆（ARCHITECTURE-SDWAN §6 已列为风险）。
+2. **`fail` 必须同时关闭两个队列和 link。** 只关一端会让 yamux 的另一个 loop 永久阻塞，整个会话停摆（原总体架构稿 §6 已列为风险）。
 3. **队列是有界阻塞的，不是丢弃的。** 满时阻塞写侧，这是正确的背压（传输慢 → yamux `sendLoop` 慢 → 各流的 `Write` 慢 → 应用的 `write()` 慢），不是 bug。`BufBytes=1 MiB` 下，11–12 MiB/s 的跨公网链路约 85 ms 排空，远小于 yamux 的 `ConnectionWriteTimeout=10 s` 安全阀。
 4. **`SealFrame` 成功但 `Send` 失败时计数器已经消耗。** 会话必须判死，不能重试——这与现有 `SendFrame` 的行为一致（`session.go:423-431`），不是新增缺陷。
 
@@ -810,9 +811,9 @@ _ = wire.WriteStatus(st, wire.StatusOK, "")
 pipe(st, target)
 ```
 
-### 3.4 `wire.Version`：不升到 2（对 ARCHITECTURE-SDWAN §A1 的修正）
+### 3.4 `wire.Version`：不升到 2（对 原总体架构稿 §A1 的修正）
 
-ARCHITECTURE-SDWAN §A1 的结论是「新增帧类型与 mux 属于不兼容变更，`wire.Version` 提升到 2」。**本设计不同意，理由是代码事实：**
+原总体架构稿 §A1 的结论是「新增帧类型与 mux 属于不兼容变更，`wire.Version` 提升到 2」。**本设计不同意，理由是代码事实：**
 
 | 事实 | 证据 |
 |---|---|
@@ -849,7 +850,7 @@ type Hello struct {
 
 **什么时候才该升版本**：改动帧头布局、改变既有帧类型的语义、或需要单方面拒绝旧对端时。届时 `caps` 机制让升级成为一行改动（把 `Version` 改成 2 即可），所以本设计对两种选择都兼容——只是当前没有理由选 2。
 
-**这条修正必须同步写进 `ARCHITECTURE-SDWAN.md` §A1**，否则实现者会照旧文档升版本。
+（原总体架构稿 §A1 的「升到 2」由此作废；该稿已归档，以本设计为准。）
 
 ### 3.5 握手时序
 
@@ -1003,7 +1004,7 @@ cmesh forward --code CODE -L 127.0.0.1:8080:db:5432 --also-recv-files --out ./in
 func parseSpec(s string, reverse bool) (Spec, error)
 ```
 
-表驱动测试必须覆盖（ARCHITECTURE-SDWAN §6 明确要求）：`8080:h:1`、`1.2.3.4:8080:h:1`、`[::1]:8080:h:1`、`8080:[::1]:1`，外加：
+表驱动测试必须覆盖（原总体架构稿 §6 明确要求）：`8080:h:1`、`1.2.3.4:8080:h:1`、`[::1]:8080:h:1`、`8080:[::1]:1`，外加：
 `8080:db:5432`（省略 bind）、`[::1]:8080:[::2]:5432`（两端 IPv6）、`8080:db:5432:extra`（4 段但 bind 非法）、`8080:db`（2 段，拒绝）、`8080:db:0`（port 0 拒绝）、`0.0.0.0:8080:db:5432`（`-L` 允许但警告；`-R` 需要 `--listen-all`）、`[::1]:8080:db:5432` 与 `::1:8080:db:5432`（后者必须拒绝并提示加方括号）。
 
 `-L 0:db:5432`（ephemeral 端口）**允许**并打印实际端口——测试与临时调试很有用。
@@ -1093,7 +1094,7 @@ func (a AllowList) Permits(ctx context.Context, addr string) (net.IP, error)
 | 输入 | 结果 | 理由 |
 |---|---|---|
 | 零值 `AllowList` | 拒绝一切 | 忘记配置不能等于开放 |
-| `--allow-host 0.0.0.0/0` | **启动失败** | ARCHITECTURE-SDWAN §8 明确「不做 `--allow-any`」。要放宽就写具体 CIDR |
+| `--allow-host 0.0.0.0/0` | **启动失败** | 原总体架构稿 §8 明确「不做 `--allow-any`」。要放宽就写具体 CIDR |
 | `--allow-host ::/0` | **启动失败** | 同上 |
 | `--allow-host` 解析失败 | 启动失败 | 静默忽略一个白名单项比报错危险得多 |
 | `--allow-port` 空但 `--allow-host` 非空 | 允许任意端口 | 与 ssh 的 `AllowTcpForwarding local` 一致；文档写明「建议同时限制端口」 |
@@ -1135,14 +1136,14 @@ type PortSet struct{ ranges []portRange }  // zero value = deny all
 MaxStreams = min(--max-streams, StreamBudget / (2 × Window))
 ```
 
-128 MiB 预算下：256 KiB 窗口 → 256 流；1 MiB 窗口 → 64 流。ARCHITECTURE-SDWAN A9 的「两套预算各自硬顶」由此落地为一条可执行公式。
+128 MiB 预算下：256 KiB 窗口 → 256 流；1 MiB 窗口 → 64 流。原总体架构稿 A9 的「两套预算各自硬顶」由此落地为一条可执行公式。
 
 #### 额外要求（不是「层」，但必须做）
 
 1. **`--expect-sas` 强烈建议**：`--accept` 且未设 `--expect-sas` 时启动警告。理由：转发是持续双向通道，MITM 长期利用的后果比一次性传文件严重（D38 的方向）。
 2. **`-R` 的拨号目标只来自本地配置**，preamble 的 `Addr` 只用于查表，绝不直接拨。这是结构性保证：即使对端发来 `Addr="169.254.169.254:80"`，本端也只会查自己的 `-R` 表，查不到就拒绝。
 3. **审计日志**：每次允许/拒绝都记 `peer`, `target`, `status`, `stream_id`, `duration`。日志只在本地，relay 只能看到密文。
-4. **不做 `--allow-any`**。ARCHITECTURE-SDWAN §8 已明确列为「不做的事」。
+4. **不做 `--allow-any`**。原总体架构稿 §8 已明确列为「不做的事」。
 
 ### 5.3 攻击场景推演（code 已泄露）
 
@@ -1269,12 +1270,12 @@ MaxStreams = min(--max-streams, StreamBudget / (2 × Window))
 
 | 编号 | 指标 | 门槛 | 依据 |
 |---|---|---|---|
-| P1 | 文件传输回归（512 MiB，512 KiB 分块） | **≥ 485 MiB/s**（下降 ≤ 10%） | ARCHITECTURE-SDWAN A10 的回归门槛 |
-| P2 | 单流 `-L` 转发吞吐（回环，512 MiB） | **≥ 200 MiB/s** | ARCHITECTURE-SDWAN 验收 1.7。`[推断]` 实际应在 300–500 MiB/s（库层 yamux+AEAD 1957–2748 MiB/s，全栈参照 539 MiB/s） |
+| P1 | 文件传输回归（512 MiB，512 KiB 分块） | **≥ 485 MiB/s**（下降 ≤ 10%） | 原总体架构稿 A10 的回归门槛 |
+| P2 | 单流 `-L` 转发吞吐（回环，512 MiB） | **≥ 200 MiB/s** | 原总体架构稿 验收 1.7。`[推断]` 实际应在 300–500 MiB/s（库层 yamux+AEAD 1957–2748 MiB/s，全栈参照 539 MiB/s） |
 | P3 | 10 流聚合（回环） | **≥ 500 MiB/s** | 验收 1.7。研究二实测 10 流 1962 MiB/s（库层），全栈打折后仍应远超 500 |
 | P4 | 连接建立延迟（`-L`，2000 次） | p50 ≤ 2 ms，p95 ≤ 5 ms | 每次连接 = TCP accept + stream open + preamble + status（2 个 RTT 级） |
 | P5 | 已建立流的往返延迟（2000 次 ping-pong） | p50 ≤ 1 ms，p95 ≤ 3 ms | 研究二 yamux 空闲 p50 18 µs、9 条满载 191 µs `[实测]`；留出全栈余量 |
-| P6 | 100 条活跃流转发时 RSS | **< 80 MiB** | ARCHITECTURE-SDWAN 验收 1.9 |
+| P6 | 100 条活跃流转发时 RSS | **< 80 MiB** | 原总体架构稿 验收 1.9 |
 | P7 | 100 条空闲流转发时 RSS | < 40 MiB | 每空闲流 1.7–2.5 KiB `[实测]` |
 | P8 | relay 消息数 | 记录实测值，参照 **≤ 13 条/MiB**（研究二实测值） | 32 KiB 记录对应约 32 条/MiB。这个数字偏高是**已知且接受的代价**：换来的是 15.6 ms 而非 250 ms 的延迟下限。若 relay 的 `MaxMessageBytes` 或限流承压，再考虑传输层批量（§2.1） |
 | P9 | 文件传输 + 转发并发 | 转发吞吐下降 < 20%，文件传输下降 < 15% | 单 `sendLoop` 串行化是已知代价 |
@@ -1649,9 +1650,9 @@ P6 < 80 MiB、§6.5 的混沌测试 C1–C4 全绿、既有 39 项 + 新增 e2e 
 
 | # | 上游位置 | 原文 | 修正 | 依据 |
 |---|---|---|---|---|
-| 1 | `ARCHITECTURE-SDWAN.md` §A1、§6 阶段 1 | 「`wire.Version` 提升到 2，两端必须同时升级」 | **保持 1**，用 hello 的 `caps` 协商 | 帧格式未变，新帧类型是增量，`readPump` 的 default 分支忽略未知类型（`session.go:341-343`）；升版本会让 `send`/`recv` 在新旧二进制间不可用 |
-| 2 | `ARCHITECTURE-SDWAN.md` §6 阶段 1 交付物 2（第 674 行） | 「新增 `FrameStreamData`（payload = 任意字节块，≤64 KiB）」 | **32 KiB，一条记录一次 transport 写** | 512 KiB 在 2 MiB/s 链路上有 250 ms 队头阻塞；AEAD 在 32 KiB 仍有 1408 MB/s。合并在实现时被否掉：它会把加密单元重新放大到 512 KiB `[实测]` |
-| 3 | `ARCHITECTURE-SDWAN.md` §A9 预算表（第 604 行）与 §6 风险段（第 706 行） | 「记录泵缓冲 每方向 4 × 64 KiB」 | **每方向 1 MiB（32 条 × 32 KiB）** | 队列要有足够深度吸收一次 AEAD + 一次 Send 的抖动，又不能大到让死对端钉住内存。1 MiB 是 32 条记录；2 MiB 总量相对 128 MiB 的 yamux 预算可忽略 |
+| 1 | 原总体架构稿 §A1、§6 阶段 1 | 「`wire.Version` 提升到 2，两端必须同时升级」 | **保持 1**，用 hello 的 `caps` 协商 | 帧格式未变，新帧类型是增量，`readPump` 的 default 分支忽略未知类型（`session.go:341-343`）；升版本会让 `send`/`recv` 在新旧二进制间不可用 |
+| 2 | 原总体架构稿 §6 阶段 1 交付物 2（第 674 行） | 「新增 `FrameStreamData`（payload = 任意字节块，≤64 KiB）」 | **32 KiB，一条记录一次 transport 写** | 512 KiB 在 2 MiB/s 链路上有 250 ms 队头阻塞；AEAD 在 32 KiB 仍有 1408 MB/s。合并在实现时被否掉：它会把加密单元重新放大到 512 KiB `[实测]` |
+| 3 | 原总体架构稿 §A9 预算表（第 604 行）与 §6 风险段（第 706 行） | 「记录泵缓冲 每方向 4 × 64 KiB」 | **每方向 1 MiB（32 条 × 32 KiB）** | 队列要有足够深度吸收一次 AEAD + 一次 Send 的抖动，又不能大到让死对端钉住内存。1 MiB 是 32 条记录；2 MiB 总量相对 128 MiB 的 yamux 预算可忽略 |
 | 4 | `research/mux-and-portforward.md` §3.2 | `Preamble` 定义在 `internal/forward/proto.go` | 移到 `internal/wire/forward.go` | 状态码与帧 payload 都在 `wire`；放 `forward` 会形成 `forward→wire` 与 `wire→forward` 的环 |
 | 5 | `research/mux-and-portforward.md` §3.4 | 5 层防御中只有第 1 层管「是否启用」，且 `-R` 与 `-L` 共用同一个 `--accept`（正文还写作 `--allow-forward`，与参数表不一致） | 拆出 `--accept-reverse` + `--allow-listen-port`（零值拒绝） | `-R` 让攻击者在受害容器内开监听端口，风险量级不同于 `-L` |
 | 6 | `research/mux-and-portforward.md` §8 关键片段 3（第 974-1004 行）与第 961 行 | `Permits(addr)` 用主机名比对，然后 `net.DialTimeout("tcp", p.Addr)` 再解析一次 | `Permits` 返回**要拨的 IP**，拨号只用它 | check-then-dial TOCTOU / DNS rebinding |

@@ -3,9 +3,9 @@
 > 本文是**测绘报告**，不是设计稿。它回答一个问题：**当前代码里，从 `cmesh` 的一个子命令到数据面，
 > 到底经过哪些包、哪些函数、哪条线协议。**
 >
-> 位置：三层文档的第三层（`architecture/` 层）的一个补充。上层是
+> 位置：三层文档的第三层（`design/` 层）的一个补充。上层是
 > [`../REQUIREMENTS.md`](../REQUIREMENTS.md)（要什么）与 [`../DESIGN.md`](../DESIGN.md)（用什么结构），
-> 同层的是 [`../architecture/MESH-DESIGN.md`](../architecture/MESH-DESIGN.md)（组网详细设计）。
+> 同层的是 [`MESH-DESIGN.md`](MESH-DESIGN.md)（组网详细设计）。
 >
 > **撰写时的代码基线**：`develop` 分支，HEAD = `96fdef8fdd3c56d5201c3a906872a1d672ac4249`
 > （2026-11-19）。工作树有未提交改动，因此本文的 file:line 对该基线成立，
@@ -605,7 +605,7 @@ internal/relay
 ### 7.3 文档
 
 `docs/` 三层：`REQUIREMENTS.md`（需求正典）→ `DESIGN.md`（结构）→
-`architecture/`（怎么做）→ `research/`（实测依据）；`decisions.md` 记 `D<n>` 决策史；
+`design/`（怎么做）→ `research/`（实测依据）；`decisions.md` 记 `D<n>` 决策史；
 `CONVENTIONS.md` 是约束（本文遵循其中的 T-3.10 无环依赖、T-5.3 数字标注、
 T-5.5 文档定位声明）。
 

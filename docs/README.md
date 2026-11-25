@@ -1,141 +1,47 @@
 # 文档索引
 
-> **当前状态（2026-11-15）**
-> M4 的凭证、发现、直连 CLI、面板和诊断能力已有代码与部分外部证据；M4 尚未收口。真实 Release/checksum/安装升级回滚、Linux systemd、mesh relay-only、组网 E2E、组网断点续传、LEAVE、撤销后切断和平台真机验收仍未完成。工作树存在未提交改动，外部复测必须使用固化候选 SHA。
->
-> `DEVELOPMENT-GAPS.md` 是当前整改 brief；它按 P0/P1/P2 记录影响、代码/需求证据、完成判据和真实环境边界。它不能替代需求正典，也不能把方案或本地测试写成发布完成。
+> **每份文档都在这张表里；表里没有的，不该存在。** 新增文档必须在此登记一行（T-0.9）。
+> 现状：M4 **未完成**（验收 42 格 → ✔27 / ◐9 / ✘5）；本地 develop 领先远端 40 笔未推送。详见 [`PLAN.md`](PLAN.md) §1。
 
-三层结构，**顺序不可颠倒**：需求 → 设计 → 技术。
-
-> **当前状态**
-> 阶段 1（端口转发 + 多路复用）已合并 `main`，**冻结**——不再新增功能，但保留复用。
-> 阶段 2（**组网**）开发中：身份、发现、成员认证和 direct CLI 已有实现；mesh relay、E2E、resume、LEAVE、revoke-close 和平台生产化仍在整改队列。
-> 产品定义在 2026-10-23 从「两台机器之间的传输工具」改为「N 台机器组网」，见 `REQUIREMENTS.md` 开头。
-
-```
-① 要解决什么        REQUIREMENTS.md
-        ↓
-② 用什么结构解决     DESIGN.md  +  diagrams/
-        ↓
-③ 具体怎么做         architecture/  +  research/  +  decisions.md
-        +
-④ 怎么干            CONVENTIONS.md
-```
-
----
-
-## ① 需求层
+## 先读这三份
 
 | 文档 | 回答什么 |
 |---|---|
-| [`REQUIREMENTS.md`](REQUIREMENTS.md) | 谁的什么问题、功能清单（`R-*`）、非功能门槛（`P-*` / `C-*` / `O-*`）、硬边界（`N-*`）、验收标准 |
+| [`REQUIREMENTS.md`](REQUIREMENTS.md) | **要什么**：功能（`R-*`）、性能门槛（`P-*`）、兼容与运维（`C-*` / `O-*`）、硬边界（`N-*`）。只读基线 R3 |
+| [`DESIGN.md`](DESIGN.md) | **怎么搭**：身份 → 发现 → 连接 → 路由，四层架构。只读基线 |
+| [`PLAN.md`](PLAN.md) | **做到哪、接下来做什么**：现状 · M4/M5/M6 任务表 · 封口条件 · 每日节奏 · 待裁定 |
 
-**当前产品定义（R2）**：把散落各处的机器连成一张**自己的网**——同一身份下多设备共存、
-任意两台可直达、每台都是节点。不是「两台机器之间的传输工具」。
+## 其余文档
 
-**这是唯一的「要不要做」的判据。** 没有需求编号的功能不做。
-
----
-
-## ② 设计层
-
-| 文档 | 回答什么 |
-|---|---|
-| [`DESIGN.md`](DESIGN.md) | **四层架构**：身份 → 发现 → 连接 → 路由；模块划分、关键决策、数据流、部署拓扑、演进路线 |
-| [`diagrams/`](diagrams/) | `mesh.png` 网状拓扑、`stack.png` 协议栈；另有三张阶段 1 的图备查 |
-
-**这是唯一的「用什么结构」的判据。** 实现与设计冲突时先改设计。
-
----
-
-## ③ 技术层
-
-### 架构细节
-
-| 文档 | 内容 |
-|---|---|
-| [`architecture/ARCHITECTURE-SDWAN.md`](architecture/ARCHITECTURE-SDWAN.md) | 总体架构：分层、三种接入模式、四阶段路线、风险清单 |
-| [`architecture/STAGE1-PORTFORWARD.md`](architecture/STAGE1-PORTFORWARD.md) | 阶段 1 详细设计：包结构、Go 接口、协议扩展、CLI、四层防御、测试计划（含 4 项混沌测试）、按 PR 拆分的实施路线 |
-| [`architecture/REVIEW-RESPONSE-STAGE1.md`](architecture/REVIEW-RESPONSE-STAGE1.md) | 对 5 项架构质疑 + 4 项混沌测试要求的逐条答复（含没照办的两处及理由） |
-| [`architecture/MESH-DESIGN.md`](architecture/MESH-DESIGN.md) | **阶段 2（组网）详细设计**：身份/发现/路由/e2e 的 Go 接口、线协议、CLI、威胁模型、5 个 PR 的拆分。可直接指导编码 |
-| [`architecture/REVIEW-RESPONSE-MESH.md`](architecture/REVIEW-RESPONSE-MESH.md) | 对组网设计首轮外部评审的逐条答复：10 项接受、2 项部分、2 项不实（附原文核对） |
-
-### 研究报告
-
-每份都标注结论来源（`[实测]` / `[查证]` / `[推断]`），附可复现的实验。
-
-| 文档 | 回答的问题 | 关键结论 |
+| 类别 | 文档 | 回答什么 |
 |---|---|---|
-| [`research/userspace-netstack.md`](research/userspace-netstack.md) | 无 TUN 权限的容器能否获得虚拟 IP？ | **不能透明 L3**（内核无接口承载路由，`CAP_NET_ADMIN` 不可绕过）。gVisor 可提供用户态 TCP/IP，代价 +25% 体积、1.1 MiB/活跃流。**MTU 必须 ≤1200**，否则 TCP 卡死。 |
-| [`research/mux-and-portforward.md`](research/mux-and-portforward.md) | 如何在一条加密连接上做多路复用与端口转发？ | 选 **yamux**（+33 KB，每流独立流控，20000 并发稳定）。**smux v1 会静默丢数据**，已否决。QUIC 原生多流吞吐低一个数量级，已否决。 |
-| [`research/reliable-transport.md`](research/reliable-transport.md) | 自研可靠 UDP 传输该照抄哪套？ | 蓝本为 **KCP ARQ + ENet 消息头 + RFC 9002 丢包判定**。根因：旧实现的重组表用分片下标作 key，没有消息身份。 |
+| 规则 | [`CONVENTIONS.md`](CONVENTIONS.md) | 纪律（`T-*` 条约）、提交前的六道门、事故记录 |
+| 历史 | [`decisions.md`](decisions.md) | 为什么是这样做：产品定义的变更、技术选型、每条 `D<n>`、被否决的方案 |
+| 历史 | [`ROUND-LOG.md`](ROUND-LOG.md) | 每轮发生了什么（只追加） |
+| 今日 | [`project-dashboard.html`](project-dashboard.html) · [`DEV-KPI.md`](DEV-KPI.md) | 看板，以及同一份 KPI 的文字版 |
+| 设计 | [`design/ARCHITECTURE-MAP.md`](design/ARCHITECTURE-MAP.md) | 代码地图：一个子命令到数据面经过什么 |
+| 设计 | [`design/MESH-DESIGN.md`](design/MESH-DESIGN.md) | 组网（阶段 2）详细设计 |
+| 设计 | [`design/STAGE1-PORTFORWARD.md`](design/STAGE1-PORTFORWARD.md) | 端口转发（阶段 1，已冻结）详细设计 |
+| 设计 | [`design/RELAY-FRAME.md`](design/RELAY-FRAME.md) | 中转记录的二进制帧 |
+| 设计 | [`design/CREDENTIAL.md`](design/CREDENTIAL.md) | 统一凭证与委派签发 |
+| 设计 | [`design/M4-ACCEPTANCE.md`](design/M4-ACCEPTANCE.md) | M4 的 42 格验收清单 |
+| 设计 | [`design/MULTI-HOMING.md`](design/MULTI-HOMING.md) | 一机多网（未开工，M5-16） |
+| 设计 | [`design/APP-PACKAGING.md`](design/APP-PACKAGING.md) | 跨平台 App 包装（未开工，M6） |
+| 证据 | [`research/userspace-netstack.md`](research/userspace-netstack.md) · [`mux-and-portforward.md`](research/mux-and-portforward.md) · [`reliable-transport.md`](research/reliable-transport.md) | 带 `[实测]` 标注的研究：用户态网络栈（结论：不做）· 多路复用与端口转发 · 可靠传输 |
+| 图 | [`diagrams/`](diagrams/) | `mesh.mmd` / `mesh.png` 拓扑，`stack.mmd` / `stack.png` 协议栈，`render.sh` 渲染脚本；改图改 `.mmd` 再跑脚本 |
 
-### 决策历史
+## 已删除的旧文档（内容已并入上表）
 
-| 文档 | 内容 |
+下表里提交过的文件最后存在于提交 `a16f3e3`，原文可用 git 查，例如
+`git show a16f3e3:docs/architecture/ARCHITECTURE-SDWAN.md`。
+
+| 旧文档 | 去了哪里 |
 |---|---|
-| [`decisions.md`](decisions.md) | 按时间顺序的 D1 至今，**包含被否决的方案及原因**。提 PR 前先读与改动相关的条目。 |
-
-### 可观测性
-
-| 端点 | 内容 |
-|---|---|
-| `GET /dashboard` | 单页看板（内嵌二进制，无外部依赖，深/浅色自适应） |
-| `GET /status` | 同一份数据的 JSON |
-| `GET /healthz` | 存活探针 |
-
-看板不暴露房间号、对端地址或口令——房间号是 code 的派生值，公开它等于给出可离线攻击的校验值。
-
----
-
-## ④ 开发纪律与专家团
-
-| 文档 | 内容 |
-|---|---|
-| [`CONVENTIONS.md`](CONVENTIONS.md) | **开发范式与条约**：三层文档纪律、提交纪律、测试纪律、代码纪律、安全纪律、每轮检查清单、事故记录 |
-| [`TEAM.md`](TEAM.md) | **专家团**：六个虚拟角色（协调/需求/开发/测试/安全/性能），各自的入口问题、否决权、自有产物；迭代仪式与当前排期 |
-| [`ROUND-LOG.md`](ROUND-LOG.md) | **每轮报告**：协调者按 TEAM.md §3 格式产出，没有报告不算一轮结束 |
-
-**每个 PR 必须过全部六个角色的门才可推送。** 角色与真实事故的对应见 TEAM.md §5。
-
----
-
-## ⑤ 开发整改
-
-| 文档 | 内容 |
-|---|---|
-| [`DEVELOPMENT-GAPS.md`](DEVELOPMENT-GAPS.md) | 当前不足与整改 brief：核心能力缺口、文档状态冲突、真实环境验收、发布和平台交付门槛 |
-
----
-
-## ⑥ 打包与分发
-
-[`../packaging/`](../packaging/) —— 生成可直接上传到服务器的 Demo 包：
-
-```bash
-./packaging/build-demo.sh          # 产出 dist/cmesh-demo.tar.gz
-```
-
-含 linux/amd64、linux/arm64、darwin/amd64、darwin/arm64、windows/amd64 五个平台的静态二进制，
-`start.sh`（自动选架构、自动挑空闲端口）、`stop.sh` 与即开即用指南。
-
----
-
-## 快速导航
-
-| 你想… | 读 |
-|---|---|
-| **知道这项目是什么** | [`REQUIREMENTS.md`](REQUIREMENTS.md) §1.1（一句话）+ §1.2（与旧定义的差异） |
-| 知道这项目解决什么问题 | [`REQUIREMENTS.md`](REQUIREMENTS.md) §1–2 |
-| **理解组网的四层** | [`DESIGN.md`](DESIGN.md) §1–2 + `diagrams/mesh.png` + `diagrams/stack.png` |
-| 知道身份/发现/路由怎么设计 | [`DESIGN.md`](DESIGN.md) §2 |
-| 知道阶段 2 怎么拆 | [`DESIGN.md`](DESIGN.md) §7 |
-| 知道某功能做不做、做到什么程度 | [`REQUIREMENTS.md`](REQUIREMENTS.md) §3–5 |
-| 理解整体架构 | [`DESIGN.md`](DESIGN.md) §1 + [`diagrams/`](diagrams/) |
-| 知道某条限制为什么存在 | [`decisions.md`](decisions.md) 的 D 编号 |
-| 改传输层 | [`research/reliable-transport.md`](research/reliable-transport.md) + `decisions.md` 的 D43–D46 |
-| 加端口转发 / 多路复用 | [`DESIGN.md`](DESIGN.md) §3–4 + [`architecture/STAGE1-PORTFORWARD.md`](architecture/STAGE1-PORTFORWARD.md) |
-| 引入 gVisor 或 TUN | [`research/userspace-netstack.md`](research/userspace-netstack.md) 的约束章节 |
-| 提 PR 前自检 | [`CONVENTIONS.md`](CONVENTIONS.md) §6 检查清单 |
-| 部署一台中继 | [`../packaging/README.md`](../packaging/README.md) |
-| 理解多节点部署 | [`../deploy/MESH.md`](../deploy/MESH.md) |
+| `PROJECT-PLAN.md` · `M4-PLAN.md` · `PROJECT-ROADMAP.gpm` | 并入 `PLAN.md` |
+| `req-changelog.md`（未曾入库） · `REVIEW-RESPONSE-*.md` | 并入 `decisions.md` 开头 |
+| `TEAM.md` | 六道门并入 `CONVENTIONS.md` §6；报告格式并入 `ROUND-LOG.md` 开头 |
+| `PM-REVIEW.md` | 产品决策与红线并入 `PLAN.md` §10 |
+| `DEVELOPMENT-GAPS.md` | 仍未闭环的三块并入 `PLAN.md`：正式发布门槛（§9）、权限模型（§8）、表述红线（§10） |
+| `ARCHITECTURE-SDWAN.md` | 已被 R3 产品定义取代；`design/STAGE1-PORTFORWARD.md` 仍按节号引用它 |
+| `architecture/` 目录 | 与 `design/` 合并 |
+| `diagrams/stage1-*` | 阶段 1 的三张图，阶段已冻结 |

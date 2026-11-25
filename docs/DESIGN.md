@@ -1,7 +1,7 @@
 # 设计清单（Design）
 
 > 三层文档第二层。**需求**见 [`REQUIREMENTS.md`](REQUIREMENTS.md)（要解决什么），
-> **技术细节**见 [`architecture/`](architecture/) 与 [`research/`](research/)（怎么实现）。
+> **技术细节**见 [`design/`](design/) 与 [`research/`](research/)（怎么实现）。
 >
 > 本文只回答：**用什么结构满足那些需求**。每个决策标注它服务的需求编号。
 
@@ -153,6 +153,9 @@ account key (Ed25519, 离线保存或加密存本地)
 隧道内部的流拆分对 B 不可见（它在密文里）。直连路径上两层退化为「QUIC 流 + 隧道内
 yamux」，多一层头部但换来回用阶段 1 的全部代码。
 
+> **现状（2026-11-24 核对）**：本表描述的**两层 yamux 未进入实现**——组网连接使用 quic-go **原生流**承载会话（直连与中转同）。
+> 本表保留为 2026-10 的原设计；对照代码见 [`design/ARCHITECTURE-MAP.md`](design/ARCHITECTURE-MAP.md)，完整核销归 `PLAN.md` M5-6。
+
 加密同样是两层：
 
 ```
@@ -257,7 +260,7 @@ cmd/cm
 | `internal/e2e` | 端到端加密层（X25519 + AES-GCM），位于会话层之上 | R-3.5 | ~250 |
 
 **总计约 2550 行新代码（含 CLI 约 350 行）+ 约 2260 行测试。**
-分 5 个 PR（见 [`architecture/MESH-DESIGN.md`](architecture/MESH-DESIGN.md) §8）。
+分 5 个 PR（见 [`design/MESH-DESIGN.md`](design/MESH-DESIGN.md) §8）。
 
 ### 3.3 已有包的改动
 
@@ -454,7 +457,7 @@ B 看不到:
 CLI / 锚点仍满足 C-1 的无 CGO 单二进制约束，图形客户端按平台分别打包和验收。
 
 详细的接口边界、移动后台限制与验收顺序见
-[`architecture/APP-PACKAGING.md`](architecture/APP-PACKAGING.md)。本文是设计决策，
+[`design/APP-PACKAGING.md`](design/APP-PACKAGING.md)。本文是设计决策，
 不代表已交付桌面或手机安装包。
 
 ---
@@ -467,9 +470,8 @@ REQUIREMENTS.md  ── 要解决谁的什么问题、什么算成功
        ▼
    DESIGN.md     ── 用什么结构满足（本文）
        │
-       ├──> diagrams/          网状拓扑、协议栈（+ 阶段 1 三张备查）
-       ├──> architecture/MESH-DESIGN.md   阶段 2 详细设计（可直接指导编码）
-       ├──> architecture/      总体架构与阶段细节
+       ├──> diagrams/          网状拓扑、协议栈
+       ├──> design/            各模块详细设计（组网 / 端口转发 / 中继帧 / 凭证）
        ├──> research/          前置研究的实测数据
        └──> decisions.md       每条决策的历史与理由
 ```
