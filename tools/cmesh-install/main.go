@@ -46,6 +46,27 @@ func main() {
 		}
 		return
 	}
+	// ★ THE ROLLBACK PATH IS A COMMAND, NOT A MANUAL SYMLINK EDIT.
+	//
+	// The installer keeps every version under versions/<version>/ and
+	// points `current` at one of them, so rolling back IS a symlink
+	// rotation. But rotating it by hand has no floor check, and a
+	// version the units cannot drive turns into a restart loop that
+	// the operator finds out about from the journal minutes later.
+	//
+	// This command performs the rotation AND refuses a version below
+	// the floor — before anything is touched.
+	if len(os.Args) > 1 && os.Args[1] == "--rollback" {
+		if len(os.Args) != 3 {
+			fmt.Fprintln(os.Stderr, "usage: cmesh-install --rollback <version>")
+			os.Exit(2)
+		}
+		if err := rollback(envOr("CMESH_INSTALL", "."), os.Args[2]); err != nil {
+			fmt.Fprintf(os.Stderr, "cmesh-install: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if err := run(); err != nil {
 		fmt.Fprintf(os.Stderr, "cmesh-install: %v\n", err)
 		os.Exit(1)
@@ -167,7 +188,7 @@ func installFrom(base, version, dir string) error {
 	}
 	fmt.Println("  checksum ok")
 
-	if err := installPayload(dir, version, payload); err != nil {
+	if err := installPayloadWithDigest(dir, version, payload, expected); err != nil {
 		return err
 	}
 	fmt.Printf("  installed: %s\n", filepath.Join(dir, "current", "cmesh"))
@@ -312,29 +333,151 @@ func checksumFor(sums []byte, asset string) string {
 	return ""
 }
 
+// safeVersion reports whether a version string may be used as a
+// directory name under `versions/`.
+//
+// ★ IT MUST NOT BE ABLE TO WALK OUT OF `versions/`. (Round 107.)
+// The allowed charset includes ".", so ".." and "." passed the check —
+// and the version is then JOINED into a path:
+//
+//	bin  = root/versions/<version>/cmesh
+//	link = root/versions/<version>
+//
+// With version=".." both COLLAPSE out of the versions directory:
+//
+//	bin  = root/cmesh      ← the "current" symlink, not a version
+//	link = root            ← the install root itself
+//
+// So `cmesh-install --rollback ..` would rotate `current` to point at
+// the install ROOT, and the documented layout
+// (<install>/current -> versions/<version>) would be destroyed.
+//
+// So a version made only of dots is refused. A real version always
+// carries at least one non-dot character ("v1.0.0-rc1", "1.0.0+build").
+//
+// ★ AND: this is NOT a shell-injection guard. Nothing in this tool
+// reaches a shell — every process spawn is `exec.Command(prog, args...)`,
+// which calls execve directly with an argv list, so a value containing
+// ";" or "$(...)" is a LITERAL argument. The scanner's finding on line
+// 676 was a false positive; this is a PATH defect, and it is fixed on
+// its own terms.
 func safeVersion(version string) bool {
 	if version == "" || len(version) > 64 {
 		return false
 	}
+	hasNonDot := false
 	for _, r := range version {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '.' || r == '-' || r == '_' || r == '+' {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' || r == '+' {
+			hasNonDot = true
+			continue
+		}
+		if r == '.' {
 			continue
 		}
 		return false
 	}
-	return true
+	// A version of only dots ("." / ".." / "...") resolves to the
+	// parent (or the versions directory itself), so it is refused.
+	return hasNonDot
 }
+
+// digestFileName is the file that records a version's expected digest
+// next to its binary.
+//
+// ★ WHY IT EXISTS. (Round 107.) The install path verifies the payload
+// against the release's SHA256SUMS and then discards the digest, so
+// nothing on disk attests to what the installed binary is. The
+// rollback path therefore has nothing to compare against — and it
+// EXECUTES the binary (to ask it for --help) before rotating
+// `current` onto it.
+const digestFileName = "cmesh.sha256"
 
 // installPayload is the post-verification commit step. It only changes paths
 // below root and leaves runtime state untouched.
+//
+// It does NOT record the digest, so a version installed this way cannot
+// be attested later — and the rollback path REFUSES a version it cannot
+// verify. Use installPayloadWithDigest for the real install.
 func installPayload(root, version string, payload []byte) error {
+	return installPayloadWithDigest(root, version, payload, "")
+}
+
+// installPayloadWithDigest is installPayload plus the recording of the
+// payload's digest beside the binary.
+//
+// ★ WHY THE DIGEST IS RECORDED. (Round 107.) The install path verifies
+// the payload against the release's SHA256SUMS and then throws the
+// digest away — nothing on disk records it. So a later `--rollback` had
+// nothing to compare against, and it EXECUTED whatever sat in
+// versions/<version>/cmesh (the compatibility probe runs the binary
+// with "--help").
+//
+// That is the same trust hole the install path closes, left open on the
+// rollback path: the binary was verified when it was installed (maybe
+// long ago, maybe by the SHELL installer, which does not write this
+// file), and nothing re-verifies it.
+//
+// So the digest is stored beside the binary, and the rollback reads it
+// back BEFORE executing anything.
+//
+// An empty expected digest means "the caller could not verify it", and
+// then nothing is recorded — and the rollback refuses that version
+// rather than executing it on trust.
+func installPayloadWithDigest(root, version string, payload []byte, expected string) error {
 	if !safeVersion(version) {
 		return fmt.Errorf("unsafe version string: %q", version)
 	}
-	if err := os.MkdirAll(filepath.Join(root, "versions"), 0o755); err != nil {
+	versions := filepath.Join(root, "versions")
+	if err := os.MkdirAll(versions, 0o755); err != nil {
 		return fmt.Errorf("cannot create install directory: %w", err)
 	}
-	stage, err := os.MkdirTemp(filepath.Join(root, "versions"), ".cmesh-install-")
+
+	// ★ THE INSTALL ROOT AND THE versions/ DIRECTORY MUST BE
+	// TRAVERSABLE BY THE SERVICE USER. (Round 104.)
+	//
+	// The systemd units run the node as an unprivileged "cmesh" user and
+	// execute
+	//
+	//	ExecStart=/opt/container-mesh/current/cmesh ...
+	//
+	// so the service account has to be able to REACH the binary. On
+	// Linux that means the execute (traverse) bit on every directory on
+	// the path: the install root, versions/, and versions/<version>/.
+	//
+	// os.MkdirAll creates the tree with the PROCESS'S umask, and the
+	// umask applies to the INTERMEDIATE directories too — so
+	// os.MkdirAll(root+"/versions", 0755) creates root itself at 0700
+	// under a umask of 077.
+	//
+	// ★ THE HISTORICAL BUG, AND WHY IT WAS STILL ALIVE.
+	//
+	// This exact class of defect has already been fixed twice in this
+	// installer: once for the staging directory (MkdirTemp creates
+	// 0700) and once for the version directory. Both fixes were applied
+	// to the LEAF, and the tree AROUND them was left alone — so the
+	// install root, the directory that holds versions/, was still 0700,
+	// and the service user still could not get in.
+	//
+	// The symptom is the worst kind, because it looks like a different
+	// problem: the unit starts, is scheduled, and then fails with
+	//
+	//	Failed to execute ...: Permission denied
+	//
+	// which systemd reports as status=203/EXEC — the SAME status a
+	// MISSING binary produces. The operator's first conclusion is "the
+	// install did not happen", and the real cause is a directory the
+	// service user cannot walk into.
+	//
+	// The explicit Chmod is what makes the mode independent of the
+	// umask: MkdirAll's 0755 is a REQUEST, and the kernel's umask gets
+	// the last word.
+	for _, dir := range []string{root, versions} {
+		if err := os.Chmod(dir, 0o755); err != nil {
+			return fmt.Errorf("cannot make %s traversable: %w", dir, err)
+		}
+	}
+
+	stage, err := os.MkdirTemp(versions, ".cmesh-install-")
 	if err != nil {
 		return fmt.Errorf("cannot create staging directory: %w", err)
 	}
@@ -366,7 +509,29 @@ func installPayload(root, version string, payload []byte) error {
 		return fmt.Errorf("cannot make staged binary executable: %w", err)
 	}
 
-	versions := filepath.Join(root, "versions")
+	// ★ THE DIGEST IS WRITTEN NEXT TO THE BINARY. (Round 107.)
+	//
+	// The install path verifies the payload against the release's
+	// SHA256SUMS — and then THROWS THE DIGEST AWAY. Nothing on disk
+	// records it, so a later `--rollback` has nothing to compare
+	// against and ends up EXECUTING whatever sits in
+	// versions/<version>/cmesh.
+	//
+	// That is the same trust hole the install path closes, left open
+	// on the rollback path: the binary was verified when it was
+	// installed (possibly by the SHELL installer, possibly long ago),
+	// and nothing re-verifies it. A file placed there by anything else
+	// is executed with the installer's privileges.
+	//
+	// So the digest is stored beside the binary, and the rollback
+	// reads it back BEFORE executing anything.
+	if expected != "" {
+		sumFile := filepath.Join(stage, digestFileName)
+		if err := os.WriteFile(sumFile, []byte(expected+"  cmesh\n"), 0o644); err != nil {
+			return fmt.Errorf("cannot record the binary digest: %w", err)
+		}
+	}
+
 	dest := filepath.Join(versions, version)
 	backup := ""
 	if _, err := os.Lstat(dest); err == nil {
@@ -497,6 +662,18 @@ func uninstall(root, state string, purge bool) error {
 				return fmt.Errorf("cannot purge state directory: %w", err)
 			}
 		}
+		// ★ AND THE OPERATOR IS TOLD WHAT WAS STOPPED AND WHAT WAS
+		// REMOVED. (Round 104.)
+		//
+		// The purge removed the unit FILES as well as stopping them, so
+		// the operator's question — "what is left on this machine?" —
+		// has a LONGER answer here than it does for a plain uninstall.
+		//
+		// The report used to be printed only on the plain-uninstall path:
+		// the purge branch returned before reaching it. So the operator
+		// who purged the machine, and whose unit files were DELETED, was
+		// told nothing at all.
+		reportUninstall(stopped, state, true)
 		return nil
 	}
 	for _, name := range []string{"cmesh", "current", "versions", ".cmesh-install-root"} {
@@ -506,9 +683,283 @@ func uninstall(root, state string, purge bool) error {
 	}
 	// ★ AND THE OPERATOR IS TOLD WHAT WAS STOPPED. Otherwise they
 	// believe the machine is clean when it is not.
-	if stopped != "" {
+	reportUninstall(stopped, state, false)
+	return nil
+}
+
+// reportUninstall tells the operator what the uninstall did.
+//
+// ★ EVERY UNINSTALL REPORTS. Even one that found nothing to stop.
+//
+// A silent uninstall is indistinguishable from one that did nothing,
+// and the operator's next question is always "is it clean?". The
+// report answers it in full:
+//
+//   - which units were stopped and disabled (and that they are no
+//     longer enabled, so the next boot does not start a unit whose
+//     ExecStart points at a binary that no longer exists);
+//   - what happened to the runtime state, WHICH IS NOT THE SAME THING
+//     on the two paths.
+//
+// The state difference is the part that matters most. The plain
+// uninstall KEEPS the state — and that state holds the device's private
+// key envelope and the credential material — so an operator who is
+// told "uninstalled" and not told about the state believes the machine
+// was cleaned when the device's key envelope is still on disk.
+//
+// The purge REMOVES the state, so the next install starts from a blank
+// identity. That is a fact the operator has to have BEFORE they find
+// out.
+func reportUninstall(stopped, state string, purge bool) {
+	if stopped == "" {
+		fmt.Println("stopped and disabled: no cmesh systemd units were running")
+	} else {
 		fmt.Printf("stopped and disabled: %s\n", stopped)
 	}
+	if state == "" {
+		return
+	}
+	if purge {
+		fmt.Printf("purged install root and runtime state: %s\n", state)
+		return
+	}
+	fmt.Printf("uninstalled binaries; runtime state was retained at %s\n", state)
+}
+
+// unitDriverFlags are the CLI flags the shipped systemd units pass.
+//
+// The units drive the binary like this:
+//
+//	ExecStart=/opt/container-mesh/current/cmesh serve-discovery --state … --account-pub … --panel-token-file …
+//	ExecStart=/opt/container-mesh/current/cmesh join --state … --cred-file … --relay-trunk-id …
+//
+// A version that does not accept those flags cannot be driven by the
+// units, and the failure is not a clean one: the binary exits with
+// "flag provided but not defined" (status=2), and Restart=on-failure
+// restarts it until the start limit stops it. The operator sees a
+// restart loop, not "this version is too old".
+//
+// The list is EVERY long flag a shipped unit passes, because every one
+// of them is a flag whose absence breaks that unit. It is checked
+// against the unit files by the packaging regression, so it cannot
+// drift away from what the units actually pass.
+var unitDriverFlags = map[string][]string{
+	"serve-discovery": {
+		"account-pub", "addr", "announce", "panel",
+		"panel-token-file", "relay-trunk", "state",
+	},
+	"join": {
+		"cred-file", "listen", "relay-trunk", "relay-trunk-id", "state",
+	},
+}
+
+// checkUnitCompatibility reports whether the binary at path can be
+// driven by the shipped systemd units.
+//
+// ★ WHY IT EXECUTES THE BINARY.
+//
+// The question is "does this CLI accept this flag", and the only
+// honest way to answer it is to ask the CLI: the flag name can appear
+// in unrelated bytes, and a version can carry a flag in its help
+// without accepting it.
+//
+// Running "--help" is also exactly what the unit does, and on the
+// INSTALL path the binary is checksum-verified against the release's
+// SHA256SUMS BEFORE this runs — so the thing being executed is the
+// published artifact.
+//
+// ★ BUT THE ROLLBACK PATH IS DIFFERENT, AND THIS COMMENT USED TO
+// SAY OTHERWISE. (Round 107.) The rollback path verifies the digest
+// recorded BESIDE the installed binary (see verifyInstalledDigest)
+// before calling this — and REFUSES a version that has no recorded
+// digest, rather than executing it on trust. So the claim "the thing
+// being executed is the published artifact" holds on both paths, but
+// only because the rollback path now checks it.
+//
+// ★ AND: this is NOT a shell. `exec.Command(prog, args...)` calls
+// execve directly with an argv list — there is no `sh -c` anywhere in
+// this tool — so an argument containing ";" or "$(...)" is a LITERAL
+// argument, never interpreted. The scanner's finding on this line
+// ("command injection") was a false positive; the real defects nearby
+// were a path traversal and a missing digest attestation, and both are
+// fixed.
+//
+// The probe asks for help and never starts the service: "--help" is
+// handled by the flag parser, which prints the usage and exits.
+func checkUnitCompatibility(binPath string) error {
+	for sub, flags := range unitDriverFlags {
+		out, err := exec.Command(binPath, sub, "--help").CombinedOutput()
+		if err != nil {
+			// ★ A NON-ZERO EXIT IS NOT A FAILURE TO RUN.
+			//
+			// "--help" is handled by the flag package, which prints the
+			// usage and EXITS 2. So the normal, successful case of this
+			// probe is a non-zero exit — and treating that as "the
+			// binary is broken" would refuse every version, including
+			// the good ones.
+			//
+			// What matters is whether the binary RAN. An ExitError
+			// means it ran and chose that exit code; any other error
+			// means it could not be started at all — a broken install,
+			// and "cannot tell" is not "compatible".
+			var exitErr *exec.ExitError
+			if !errors.As(err, &exitErr) {
+				return fmt.Errorf("cannot check %s: %w", binPath, err)
+			}
+		}
+		usage := string(out)
+		if !strings.Contains(usage, "Usage of "+sub+":") {
+			return fmt.Errorf("%s has no %q subcommand, so the systemd unit "+
+				"cannot drive it at all (the unit's ExecStart names it)",
+				binPath, sub)
+		}
+		accepted := flagsInUsage(usage)
+		for _, flag := range flags {
+			if !accepted[flag] {
+				return fmt.Errorf("%s does not accept --%s, so the systemd unit "+
+					"would fail with \"flag provided but not defined\" and restart "+
+					"until the start limit stops it; this version is below the "+
+					"rollback floor", binPath, flag)
+			}
+		}
+	}
+	return nil
+}
+
+// flagsInUsage returns the set of flags a `--help` output declares.
+//
+// ★ THE MATCHING IS EXACT, AND THAT MATTERS.
+//
+// The usage lines look like this:
+//
+//	-panel
+//	-panel-token-file string
+//	-relay-trunk
+//
+// A substring search for "-panel" would match "-panel-token-file" too —
+// so a version that LOST the boolean -panel would be accepted, and the
+// unit would then fail with "flag provided but not defined".
+//
+// So each line is parsed: the flag name is the text between the dash
+// and the first whitespace, and the comparison is on that name alone.
+func flagsInUsage(usage string) map[string]bool {
+	out := map[string]bool{}
+	for _, line := range strings.Split(usage, "\n") {
+		trimmed := strings.TrimLeft(line, " \t")
+		if !strings.HasPrefix(trimmed, "-") {
+			continue
+		}
+		name := strings.TrimPrefix(trimmed, "-")
+		if idx := strings.IndexAny(name, " \t"); idx >= 0 {
+			name = name[:idx]
+		}
+		if name == "" {
+			continue
+		}
+		out[name] = true
+	}
+	return out
+}
+
+// rollback re-points `current` at an already-installed version.
+//
+// ★ THE ROLLBACK PATH IS: the installer keeps every version under
+// versions/<version>/ and points `current` at one of them. Rolling
+// back is therefore a symlink rotation — and this is the command that
+// performs it, WITH the floor check.
+//
+// The floor check is what makes the rotation safe. Rotating `current`
+// to a version the units cannot drive does not fail loudly at the
+// moment of rotation: the symlink rotates happily and the unit dies
+// on the next start with "flag provided but not defined" (status=2),
+// then restarts until the start limit stops it. The operator finds
+// out from a journal, minutes later, with no indication that the
+// rollback was the cause.
+//
+// ★ THE REFUSAL HAPPENS BEFORE ANYTHING IS TOUCHED.
+//
+// A rollback that half-succeeds leaves the service pointing at
+// nothing, which is worse than not rolling back at all. So the
+// version is checked FIRST, and `current` is only rotated once the
+// check has passed.
+// verifyInstalledDigest checks that the binary in a version directory
+// is the one that was verified when it was installed.
+//
+// ★ WHY THIS EXISTS. (Round 107.) The install path verifies the
+// downloaded payload against the release's SHA256SUMS and then throws
+// the digest away — nothing on disk recorded it. So the rollback path
+// had nothing to compare against, and it EXECUTED whatever sat in
+// versions/<version>/cmesh (the compatibility probe runs the binary
+// with "--help").
+//
+// The binary was verified WHEN IT WAS INSTALLED — but that may have
+// been long ago, and it may have been installed by the SHELL
+// installer, which does not write this file. So the honest rule is:
+// **if there is no recorded digest, the version cannot be attested,
+// and a rollback to it is refused** rather than executed on trust.
+//
+// ★ The refusal is deliberately LOUD. A rollback that is refused with a
+// clear reason is recoverable; a rollback that silently executes a
+// swapped binary is not.
+func verifyInstalledDigest(versionDir, binPath string) error {
+	sumFile := filepath.Join(versionDir, digestFileName)
+	raw, err := os.ReadFile(sumFile)
+	if err != nil {
+		return fmt.Errorf("this version has no recorded digest (%s), so it cannot be "+
+			"verified before it is executed — refusing to run it on trust", sumFile)
+	}
+	fields := strings.Fields(string(raw))
+	if len(fields) == 0 {
+		return fmt.Errorf("%s is empty, so the version cannot be verified", sumFile)
+	}
+	expected := strings.ToLower(fields[0])
+	if len(expected) != sha256.Size*2 {
+		return fmt.Errorf("%s does not hold a sha256 digest", sumFile)
+	}
+
+	payload, err := os.ReadFile(binPath)
+	if err != nil {
+		return fmt.Errorf("cannot read the installed binary: %w", err)
+	}
+	sum := sha256.Sum256(payload)
+	actual := hex.EncodeToString(sum[:])
+	if actual != expected {
+		return fmt.Errorf("the installed binary does not match the digest recorded "+
+			"when it was installed (expected %s, got %s) — refusing to execute it", expected, actual)
+	}
+	return nil
+}
+
+func rollback(root, version string) error {
+	if !safeVersion(version) {
+		return fmt.Errorf("unsafe version string: %q", version)
+	}
+	marker := filepath.Join(root, ".cmesh-install-root")
+	if _, err := os.Stat(marker); err != nil {
+		return fmt.Errorf("%s is not a cmesh install root", root)
+	}
+	bin := filepath.Join(root, "versions", version, "cmesh")
+	if _, err := os.Stat(bin); err != nil {
+		return fmt.Errorf("version %s is not installed under %s", version, root)
+	}
+	// ★ THE DIGEST IS CHECKED BEFORE THE BINARY IS EXECUTED.
+	// (Round 107.) checkUnitCompatibility RUNS the binary (to ask it for
+	// --help), so the digest has to be verified BEFORE that call — an
+	// unverified binary must never be executed, not even to ask it a
+	// question.
+	if err := verifyInstalledDigest(filepath.Join(root, "versions", version), bin); err != nil {
+		return fmt.Errorf("refusing to roll back to %s: %w", version, err)
+	}
+	if err := checkUnitCompatibility(bin); err != nil {
+		return fmt.Errorf("refusing to roll back to %s: %w", version, err)
+	}
+	if err := replaceSymlink(filepath.Join(root, "cmesh"), filepath.Join("current", "cmesh")); err != nil {
+		return fmt.Errorf("cannot switch cmesh link: %w", err)
+	}
+	if err := replaceSymlink(filepath.Join(root, "current"), filepath.Join("versions", version)); err != nil {
+		return fmt.Errorf("cannot switch current version: %w", err)
+	}
+	fmt.Printf("rolled back to %s\n", version)
 	return nil
 }
 

@@ -27,6 +27,35 @@ Type=simple
 User=cmesh
 Group=cmesh
 
+# ★ WHERE THE LOGS GO: THE JOURNAL, STATED EXPLICITLY.
+#
+# systemd's default for a system service IS the journal, so this unit
+# would log there anyway. The default is a MANAGER-wide setting
+# (DefaultStandardOutput / DefaultStandardError in systemd/system.conf),
+# though — and a machine that hardens those to "null" throws the
+# service's diagnostics away with no error anywhere.
+#
+# Stating it here makes the unit immune to that, and it answers the
+# operator's first question ("where do the logs go") without a guess.
+#
+# ★ THE JOURNAL ROTATES ON ITS OWN.
+#
+# journald's SystemMaxUse (default: 10% of the filesystem, capped at
+# 4 GiB) bounds the journal's size, so there is no logrotate job to
+# write and no rotated file to find. The operator reads the log with:
+#
+#	journalctl -u cmesh-member.service -f
+#
+# ★ SyslogIdentifier IS THE STABLE TAG.
+#
+# Without it the entries are filed under whatever the process called
+# itself, so `journalctl -t cmesh` finds nothing and the operator has
+# to know the unit's name to look at all. With it the tag is the same
+# on every host and every version of this unit.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cmesh-member
+
 # The environment file is NOT optional. The leading "-" would let systemd
 # start the unit with every variable empty, and an empty ${CMESH_STATE}
 # then reaches the CLI as an empty --state, which silently falls back to
@@ -167,6 +196,32 @@ ExecStart=/opt/container-mesh/current/cmesh join --state ${CMESH_STATE} --cred-f
 # the operator sees it once, with the reason, instead of a machine that
 # screams every five seconds.
 ExecCondition=/bin/sh -c 'if [ -z "$${CMESH_RELAY_TRUNK}" ] || [ -z "$${CMESH_RELAY_TRUNK_ID}" ]; then echo "cmesh-member: CMESH_RELAY_TRUNK and CMESH_RELAY_TRUNK_ID must both be set: without a relay trunk this member is pure-outbound and can never RECEIVE a relayed session (see the member env example)" >&2; exit 1; fi'
+
+# ★ THE STATE DIRECTORY IS A PRECONDITION TOO.
+#
+# The member's state holds a DEVICE PRIVATE KEY and the credential
+# material, so it must be its OWN directory — this unit declares
+# StateDirectory=cmesh-member and makes /var/lib/cmesh-member writable
+# and nothing else.
+#
+# With an empty CMESH_STATE the CLI does NOT fail: it falls back to
+# ~/.cmesh, which for this unit is the ANCHOR's directory (the member
+# user's home is /var/lib/cmesh). And that directory is read-only under
+# this unit's hardening. Measured on a real host:
+#
+#	mkdir /var/lib/cmesh/member: read-only file system
+#
+# …and then a restart loop. So the failure is real, it is measurable,
+# and it names a directory the operator never configured — which is the
+# worst way for it to fail.
+#
+# The same class of failure the state directory is meant to prevent:
+# the member's device identity landing in the anchor's trust domain.
+#
+# A separate ExecCondition, because it is a separate fact: multiple
+# ExecCondition lines are ANDed (measured on real systemd 249 — with the
+# second one failing, the ExecStart never ran).
+ExecCondition=/bin/sh -c 'if [ -z "$${CMESH_STATE}" ]; then echo "cmesh-member: CMESH_STATE is not set; it must name the member'"'"'s OWN state directory (/var/lib/cmesh-member), because an empty value silently falls back to ~/.cmesh — the ANCHOR'"'"'s directory, which this unit makes read-only, and the member'"'"'s device private key would land in the wrong trust domain" >&2; exit 1; fi'
 
 
 Restart=on-failure

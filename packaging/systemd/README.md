@@ -153,11 +153,42 @@ uses `--panel-token-file`, the member uses `--cred-file`. Rolling
 rotates happily and then BOTH units die in a restart loop with
 `flag provided but not defined` (status=2/INVALIDARGUMENT).
 
-So the rollback floor is the commit that introduced the file-based
-secrets (`f428483`, "the credential stops being a command-line
-secret"). Below that, roll FORWARD instead. The installer does not
-check this yet — it is a known gap, and the honest statement is that the
-floor is a rule an operator has to know, not a rule the tool enforces.
+**★ THE FLOOR IS NOW ENFORCED BY THE TOOL, NOT LEFT TO THE OPERATOR.**
+
+Both installers can roll back, and both REFUSE a version the units
+cannot drive:
+
+```sh
+# the shell installer
+CMESH_INSTALL=/opt/container-mesh sh packaging/install.sh --rollback v1.0.0-rc1
+
+# the Go installer
+CMESH_INSTALL=/opt/container-mesh cmesh-install --rollback v1.0.0-rc1
+```
+
+The check asks the candidate binary whether it accepts every flag a
+shipped unit passes — `--help` is run for each subcommand the units
+name, and the usage output is compared against the flags. A version
+that cannot be driven is refused **before anything is touched**, so a
+refused rollback leaves `current` exactly where it was.
+
+The floor is therefore a property of the BINARY, not of a commit. That
+matters because the commit-based statement was wrong in two ways:
+
+- **`f428483` does not build.** `go build` at that commit fails with
+  `internal/cli/discovery.go:407:25: undefined: discovery.DecodeInviteWith`
+  (three call sites). A floor that points at an unbuildable commit is
+  not a floor an operator can roll back TO.
+- **The published release is already below it.** `v1.0.0-rc1` has no
+  `serve-discovery` subcommand at all (`cmesh: unknown subcommand
+  "serve-discovery"`) and none of the file-based flags. So the only
+  released version cannot drive either shipped unit — and a capability
+  check says so, where a commit comparison would have said "fine, it is
+  newer than the floor".
+
+The list of flags the check demands is checked against the unit files
+by the packaging regression (`packaging/rollback_test.go`), so it cannot
+drift away from what the units actually pass.
 
 The other direction is safe: rolling FORWARD keeps the state directory
 byte-for-byte (measured — the device identity, the account key and the

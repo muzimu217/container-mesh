@@ -30,12 +30,95 @@ Type=simple
 User=cmesh
 Group=cmesh
 
+# ★ WHERE THE LOGS GO: THE JOURNAL, STATED EXPLICITLY.
+#
+# systemd's default for a system service IS the journal, so this unit
+# would log there anyway. The default is a MANAGER-wide setting
+# (DefaultStandardOutput / DefaultStandardError in systemd/system.conf),
+# though — and a machine that hardens those to "null" throws the
+# service's diagnostics away with no error anywhere.
+#
+# Stating it here makes the unit immune to that, and it answers the
+# operator's first question ("where do the logs go") without a guess.
+#
+# ★ THE JOURNAL ROTATES ON ITS OWN.
+#
+# journald's SystemMaxUse (default: 10% of the filesystem, capped at
+# 4 GiB) bounds the journal's size, so there is no logrotate job to
+# write and no rotated file to find. The operator reads the log with:
+#
+#	journalctl -u cmesh-discovery.service -f
+#
+# ★ SyslogIdentifier IS THE STABLE TAG.
+#
+# Without it the entries are filed under whatever the process called
+# itself, so `journalctl -t cmesh` finds nothing and the operator has
+# to know the unit's name to look at all. With it the tag is the same
+# on every host and every version of this unit.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cmesh-discovery
+
 # The environment file is NOT optional. The leading "-" would let systemd
 # start the unit with every variable empty, and the empty ${CMESH_STATE}
 # then reaches the CLI as an empty --state, which silently falls back to
 # ~/.cmesh -- a path the hardening below makes read-only, and the wrong
 # place for the node's state anyway. A missing file must fail loudly.
 EnvironmentFile=/etc/cmesh/discovery.env
+
+# ★ THE ANCHOR'S LOAD-BEARING CONFIGURATION IS A PRECONDITION, AND A
+# PRECONDITION IS AN ExecCondition.
+#
+# Two variables decide whether this node can do its job at all, and
+# without either of them it comes up LOOKING HEALTHY while being
+# useless. That is the worst shape of failure: the unit is active, the
+# listener is bound, and the operator finds out from a member's error
+# message hours later.
+#
+# CMESH_STATE: with an empty value the CLI does NOT fail — it falls back
+# to ~/.cmesh (measured: "cmesh: /root/.cmesh/device.json not found").
+# But this unit declares StateDirectory=cmesh and hardens the filesystem
+# with ProtectSystem=strict and ReadWritePaths=/var/lib/cmesh, so
+# ~/.cmesh is exactly the directory it cannot write to. The node then
+# dies with a permission error that names a path the operator never
+# configured.
+#
+# CMESH_ACCOUNT_PUB: without it the enrollment endpoint is NOT INSTALLED
+# AT ALL (the CLI prints "credential enrollment disabled: --account-pub
+# is required to verify a credential"). The node serves, the panel
+# works, the roster is visible — and not one member can ever join with a
+# team credential. The unit's own comment already says this variable "is
+# not optional in practice".
+#
+# ★ WHY ExecCondition AND NOT ExecStartPre.
+#
+# ExecStartPre's failure is a start FAILURE, and Restart=on-failure
+# covers it — so a precondition written that way retries every five
+# seconds forever (measured on a real systemd 255: four restarts in
+# sixteen seconds), filling the journal instead of stopping where an
+# operator can see it.
+#
+# ExecCondition is the right directive: systemd does not RESTART a unit
+# whose condition failed. Measured on real systemd 249:
+#
+#	ExecCondition=/bin/sh -c 'exit 1'   →  Result=success
+#	                                          ActiveState=inactive
+#	                                          NRestarts=0
+#
+# So the refusal is STABLE: the operator sees it once, with the reason,
+# and the journal does not fill up.
+#
+# "$$" is systemd's escape for a literal dollar sign: without it
+# systemd would expand ${CMESH_STATE} ITSELF (to the empty string,
+# before the shell ever sees it), and the shell would test the wrong
+# thing. With "$$" the shell does the expansion, from the environment
+# the EnvironmentFile above put there.
+#
+# Multiple ExecCondition lines are ANDed: the unit starts only when
+# EVERY one of them passes (measured: with the second one failing, the
+# ExecStart never ran and the marker file was never created).
+ExecCondition=/bin/sh -c 'if [ -z "$${CMESH_STATE}" ]; then echo "cmesh-discovery: CMESH_STATE is not set; it must name the state directory this unit manages (/var/lib/cmesh), because an empty value silently falls back to ~/.cmesh, which this unit cannot write to (see the member env example for the same trap)" >&2; exit 1; fi'
+ExecCondition=/bin/sh -c 'if [ -z "$${CMESH_ACCOUNT_PUB}" ]; then echo "cmesh-discovery: CMESH_ACCOUNT_PUB is not set; without it the credential enrollment endpoint is NOT installed, so no member can join with a team credential while this node looks perfectly healthy. Put the key printed by: cmesh account show --state /var/lib/cmesh" >&2; exit 1; fi'
 
 # StateDirectory creates /var/lib/cmesh with the right owner and mode, so
 # ReadWritePaths below has something to point at on a fresh machine.

@@ -120,12 +120,141 @@ usage() {
     cat >&2 <<'EOF'
 usage: install.sh
        install.sh --uninstall [--purge]
+       install.sh --rollback <version>
 
 CMESH_INSTALL selects the managed install root. CMESH_STATE selects the
 runtime state directory used by --purge; it is never touched by a normal
 install or uninstall.
+
+--rollback points the managed `current` at an already-installed version.
+It refuses a version the shipped systemd units cannot drive, before
+anything is touched.
 EOF
     exit 2
+}
+
+# ★ THE FLAGS THE SHIPPED SYSTEMD UNITS PASS.
+#
+# The units drive the binary like this:
+#
+#	ExecStart=/opt/container-mesh/current/cmesh serve-discovery --state … --account-pub … --panel-token-file …
+#	ExecStart=/opt/container-mesh/current/cmesh join --state … --cred-file … --relay-trunk-id …
+#
+# A version that does not accept those flags cannot be driven by the
+# units, and the failure is not a clean one: the binary exits with "flag
+# provided but not defined" (status=2) and Restart=on-failure restarts it
+# until the start limit stops it. The operator sees a restart loop, not
+# "this version is too old".
+#
+# These are EVERY long flag a shipped unit passes, because every one of
+# them is a flag whose absence breaks that unit. The list is checked
+# against the shipped unit files by the packaging regression, so it
+# cannot drift away from what the units actually pass.
+#
+# The list is "subcommand:flag" pairs.
+CMESH_UNIT_FLAGS="serve-discovery:account-pub serve-discovery:addr serve-discovery:announce serve-discovery:panel serve-discovery:panel-token-file serve-discovery:relay-trunk serve-discovery:state join:cred-file join:listen join:relay-trunk join:relay-trunk-id join:state"
+
+# check_unit_compat BIN — can the systemd units drive BIN?
+#
+# ★ WHY IT EXECUTES THE BINARY.
+#
+# The question is "does this CLI accept this flag", and the only honest
+# way to answer it is to ask the CLI: the flag name can appear in
+# unrelated bytes, and a version can carry a flag in its help without
+# accepting it.
+#
+# Running "--help" is also exactly what the unit does, and the binary is
+# checksum-verified against the release's SHA256SUMS BEFORE this runs —
+# so the thing being executed is the published artifact.
+#
+# The probe asks for help and never starts the service: "--help" is
+# handled by the flag parser, which prints the usage and exits.
+#
+# ★ THE MATCHING IS EXACT, AND THAT MATTERS.
+#
+# The usage lines look like this:
+#
+#	  -panel
+#	  -panel-token-file string
+#	  -relay-trunk
+#
+# A substring search for "-panel" would match "-panel-token-file" too —
+# so a version that LOST the boolean -panel would be accepted, and the
+# unit would then fail with "flag provided but not defined".
+#
+# So each line is matched as a WHOLE FLAG NAME: the name is the text
+# between the dash and the first whitespace, and it is compared exactly.
+#
+# It prints the reason on stderr and returns non-zero when the binary
+# cannot serve the units.
+check_unit_compat() {
+    _cuc_bin=$1
+    _cuc_cached_sub=""
+    _cuc_help=""
+    for _cuc_req in $CMESH_UNIT_FLAGS; do
+        _cuc_sub=${_cuc_req%%:*}
+        _cuc_flag=${_cuc_req#*:}
+        # The help text is cached per subcommand: the flag list belongs
+        # to the subcommand, not to the flag.
+        if [ "$_cuc_cached_sub" != "$_cuc_sub" ]; then
+            _cuc_help=$("$_cuc_bin" "$_cuc_sub" --help 2>&1 || true)
+            _cuc_cached_sub=$_cuc_sub
+        fi
+        case "$_cuc_help" in
+            *"Usage of $_cuc_sub:"*) ;;
+            *)
+                printf 'cmesh installer: %s has no %s subcommand, so the systemd unit cannot drive it at all (the unit ExecStart names it)\n' "$_cuc_bin" "$_cuc_sub" >&2
+                return 1
+                ;;
+        esac
+        # The exact-match: the flag name on its own, followed by
+        # whitespace or the end of the line.
+        if ! printf '%s\n' "$_cuc_help" | grep -q -- "^  -$_cuc_flag\( \|$\)"; then
+            printf 'cmesh installer: %s does not accept --%s, so the systemd unit would fail with "flag provided but not defined" and restart until the start limit stops it; this version is below the rollback floor\n' "$_cuc_bin" "$_cuc_flag" >&2
+            return 1
+        fi
+    done
+    return 0
+}
+
+# replace_link LINK TARGET — point LINK at TARGET, atomically.
+#
+# The link is created under a temporary name and RENAMED into place, so
+# the service never sees a missing or half-written `current`.
+#
+# ★ WHY "mv -f" ALONE IS NOT ENOUGH.
+#
+# BSD mv has no -T and FOLLOWS a directory symlink: `mv tmp current`
+# where `current` is a symlink to a directory moves tmp INTO that
+# directory instead of replacing the link. So the GNU form is tried
+# first, and the fallback removes the managed link and renames the new
+# one into place.
+#
+# The removal is -rf, not -f: `current` can be a DIRECTORY (a
+# half-finished earlier install, or somebody's own directory), and
+# `rm -f` on a directory fails — the install then died with "cannot
+# remove: Is a directory" and left the staged link behind as an
+# orphan, with `current/cmesh` still pointing at nothing.
+#
+# The -rf is safe because `link` is the MANAGED name inside the
+# install root, and the root is checked to be a cmesh install root
+# (with its marker file) before this runs. The guard below refuses
+# the one path that would be catastrophic: removing the root itself.
+replace_link() {
+    link=$1
+    target=$2
+    tmp=$(mktemp "$INSTALL_DIR/.cmesh-link.XXXXXX")
+    rm -f "$tmp"
+    ln -s "$target" "$tmp"
+    if mv -f -T "$tmp" "$link" 2>/dev/null; then
+        return 0
+    fi
+    case "$link" in
+        "$INSTALL_DIR"/*) ;;
+        *) die "refusing to replace a link outside the install root: $link" ;;
+    esac
+    rm -rf "$link"
+    mv -f "$tmp" "$link"
 }
 
 PURGE=0
@@ -281,17 +410,72 @@ esac
         if [ -n "$STATE_DIR" ] && [ "$STATE_DIR" != "$INSTALL_DIR" ]; then
             rm -rf -- "$STATE_DIR"
         fi
-        say "purged install root and runtime state"
+        # ★ THE PURGE NAMES THE STATE IT REMOVED.
+        #
+        # The plain uninstall below names the state it KEPT. The purge has
+        # to name the state it REMOVED, or the operator cannot answer
+        # "is this machine clean?" either way — and the fact they need
+        # BEFORE they find out is that the next install starts from a
+        # BLANK identity.
+        if [ -n "$STATE_DIR" ]; then
+            say "purged install root and runtime state: $STATE_DIR"
+        else
+            say "purged install root and runtime state"
+        fi
+        # ★ AND THE UNINSTALL REPORTS EVEN WHEN THERE WAS NOTHING TO
+        # STOP. A silent uninstall is indistinguishable from one that did
+        # nothing, and the operator's next question is always "is it
+        # clean?". The Go installer (tools/cmesh-install) reports
+        # unconditionally, so this one has to as well.
         if [ -n "$stopped" ]; then
             say "stopped and disabled:$stopped"
+        else
+            say "stopped and disabled: no cmesh systemd units were running"
         fi
     else
         rm -rf -- "$INSTALL_DIR/cmesh" "$INSTALL_DIR/current" "$INSTALL_DIR/versions" "$marker"
         say "uninstalled binaries; runtime state was retained at $STATE_DIR"
         if [ -n "$stopped" ]; then
             say "stopped and disabled:$stopped (the unit files were kept; --purge removes them)"
+        else
+            say "stopped and disabled: no cmesh systemd units were running (the unit files were kept; --purge removes them)"
         fi
     fi
+    exit 0
+fi
+
+# ★ THE ROLLBACK PATH IS A COMMAND, NOT A MANUAL SYMLINK EDIT.
+#
+# The installer keeps every version under versions/<version>/ and points
+# `current` at one of them, so rolling back IS a symlink rotation. But
+# rotating it by hand has no floor check, and a version the units cannot
+# drive turns into a restart loop that the operator finds out about from
+# the journal minutes later.
+#
+# This command performs the rotation AND refuses a version below the
+# floor — before anything is touched.
+if [ "${1:-}" = "--rollback" ]; then
+    shift
+    [ "$#" -eq 1 ] || usage
+    ROLLBACK_VERSION=$1
+    marker="$INSTALL_DIR/.cmesh-install-root"
+    [ -f "$marker" ] || die "$INSTALL_DIR is not a cmesh install root"
+    case "$ROLLBACK_VERSION" in
+        ''|*[!A-Za-z0-9._+-]*)
+            die "unsafe version string: $ROLLBACK_VERSION"
+            ;;
+    esac
+    rollback_bin="$INSTALL_DIR/versions/$ROLLBACK_VERSION/cmesh"
+    [ -f "$rollback_bin" ] || die "version $ROLLBACK_VERSION is not installed under $INSTALL_DIR"
+    # ★ THE FLOOR CHECK COMES FIRST. A rollback that half-succeeds
+    # leaves the service pointing at nothing, which is worse than not
+    # rolling back at all.
+    check_unit_compat "$rollback_bin" || die "refusing to roll back to $ROLLBACK_VERSION: it is below the rollback floor"
+    # The rotation itself. The symlink is replaced ATOMICALLY (a
+    # temporary link is renamed into place), so the service never sees a
+    # missing `current`.
+    replace_link "$INSTALL_DIR/current" "versions/$ROLLBACK_VERSION"
+    say "rolled back to $ROLLBACK_VERSION"
     exit 0
 fi
 [ "$#" -eq 0 ] || usage
@@ -482,54 +666,54 @@ esac
 actual=$($checker "$tmpdir/$asset_base" | awk '{print $1}')
 [ "$(printf '%s' "$expected" | tr '[:upper:]' '[:lower:]')" = "$(printf '%s' "$actual" | tr '[:upper:]' '[:lower:]')" ] || die "checksum mismatch for $asset_base"
 
-# ★ THE versions/ DIRECTORY MUST BE TRAVERSABLE BY THE SERVICE USER.
+# ★ THE INSTALL ROOT AND THE versions/ DIRECTORY MUST BE TRAVERSABLE BY
+# THE SERVICE USER.
 #
-# `mkdir -p` creates it with the process's umask, and the systemd units
-# run the node as an unprivileged "cmesh" user. Under a umask of 077 the
-# directory comes out 0700, so only the installing user can enter it and
-# the unit that is supposed to execute $INSTALL_DIR/current/cmesh gets
-# "Permission denied".
+# The systemd units run the node as an unprivileged "cmesh" user and
+# execute
 #
-# This is the SAME class as the version-directory bug that was already
-# fixed one level down (the version dir was 0700 because mktemp -d
-# creates 0700): the fix was applied to the leaf and not to the tree
-# around it.
+#	ExecStart=/opt/container-mesh/current/cmesh ...
+#
+# so the service account has to be able to REACH the binary. On Linux
+# that means the execute (traverse) bit on every directory on the path:
+# the install root, versions/, and versions/<version>/.
+#
+# `mkdir -p` creates the tree with the PROCESS'S umask, and the umask
+# applies to the INTERMEDIATE directories too — so `mkdir -p
+# "$INSTALL_DIR/versions"` creates "$INSTALL_DIR" itself at 0700 under a
+# umask of 077.
+#
+# ★ THE HISTORICAL BUG, AND WHY IT WAS STILL ALIVE.
+#
+# This exact class of defect has already been fixed twice in this
+# installer: once for the staging directory (mktemp -d creates 0700)
+# and once for the version directory. Both fixes were applied to the
+# LEAF, and the tree AROUND them was left alone — so the install root,
+# the directory that holds versions/, was still 0700, and the service
+# user still could not get in.
+#
+# The symptom is the worst kind, because it looks like a different
+# problem: the unit starts, is scheduled, and then fails with
+#
+#	Failed to execute ...: Permission denied
+#
+# which systemd reports as status=203/EXEC — the SAME status a MISSING
+# binary produces. The operator's first conclusion is "the install did
+# not happen", and the real cause is a directory the service user
+# cannot walk into.
+#
+# 0755 is the mode the layout needs: the binary inside is already 0755
+# and the version directory already is, so the root is the last level
+# that was inconsistent.
+chmod 0755 "$INSTALL_DIR" 2>/dev/null || true
 chmod 0755 "$INSTALL_DIR/versions" 2>/dev/null || true
 mkdir -p "$INSTALL_DIR/versions" || die "cannot create install directory $INSTALL_DIR"
+chmod 0755 "$INSTALL_DIR" 2>/dev/null || true
 chmod 0755 "$INSTALL_DIR/versions" 2>/dev/null || true
 stage=$(mktemp -d "$INSTALL_DIR/versions/.cmesh-install.XXXXXX")
 old=""
 cleanup_stage() { rm -rf "$stage"; [ -z "$old" ] || rm -rf "$old"; }
 trap 'cleanup_stage' EXIT INT TERM
-replace_link() {
-    link=$1
-    target=$2
-    tmp=$(mktemp "$INSTALL_DIR/.cmesh-link.XXXXXX")
-    rm -f "$tmp"
-    ln -s "$target" "$tmp"
-    if mv -f -T "$tmp" "$link" 2>/dev/null; then
-        return 0
-    fi
-    # BSD mv has no -T and follows a directory symlink. Remove only the
-    # managed link after the new link is ready, then rename it into place.
-    #
-    # The removal is -rf, not -f: `current` can be a DIRECTORY (a
-    # half-finished earlier install, or somebody's own directory), and
-    # `rm -f` on a directory fails — the install then died with "cannot
-    # remove: Is a directory" and left the staged link behind as an
-    # orphan, with `current/cmesh` still pointing at nothing.
-    #
-    # The -rf is safe because `link` is the MANAGED name inside the
-    # install root, and the root is checked to be a cmesh install root
-    # (with its marker file) before this runs. The guard below refuses
-    # the one path that would be catastrophic: removing the root itself.
-    case "$link" in
-        "$INSTALL_DIR"/*) ;;
-        *) die "refusing to replace a link outside the install root: $link" ;;
-    esac
-    rm -rf "$link"
-    mv -f "$tmp" "$link"
-}
 cp "$tmpdir/$asset_base" "$stage/cmesh"
 chmod 0755 "$stage/cmesh"
 # The staging directory came from mktemp -d, which creates it 0700 so
