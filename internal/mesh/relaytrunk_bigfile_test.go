@@ -202,7 +202,27 @@ func (f *bigFileFixture) sendFileOverRelay(t *testing.T, size int) (time.Duratio
 		Picker:   f.relayOnlyPicker(),
 	}
 	start := time.Now()
-	_, err := SendFile(context.Background(), cfg, path)
+	// ★ THE TRANSFER MUST HAVE A BOUND. (Round 108.) This call used
+	// context.Background(), so a hung transfer waited for the PRODUCT's
+	// own 30-second verdict deadline, and then the 60-second rolling
+	// write deadline — 45 seconds of a test sitting there, and a
+	// failure that looked like "the file did not get through" with no
+	// hint that it was a HANG rather than a loss.
+	//
+	// The observation that matters: the no-injection CONTROL (which by
+	// construction cannot lose anything) failed once in four whole-
+	// package runs, at the 1 MiB size, after 45 seconds. The control
+	// failing means the HARNESS is broken, and every other result in the
+	// file would be meaningless — so the control has to fail fast and
+	// say what it saw.
+	//
+	// The bound is generous (90 s for 1 MiB over loopback is two orders
+	// of magnitude of headroom) and it is applied to the CONTEXT, so the
+	// product's own deadlines are untouched: this only stops the TEST
+	// from waiting forever.
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	_, err := SendFile(ctx, cfg, path)
 	took := time.Since(start)
 	if err != nil {
 		return took, err

@@ -346,8 +346,8 @@ func TestN3_NonMemberTargetMustNotReachAnyRelayPath(t *testing.T) {
 //
 // 与上一条成对: 上一条说"非成员不该问路径", 这一条说"**纯出站成员必须问**"。
 //
-// 纯出站成员(零端点)恰恰是**唯一需要中转的一类** (docs/PM-REVIEW.md:28:
-// "纯出站 NAT 反拨失败 | netns | 已复现, 归 v1.1 缺口")。如果路径层因为
+// 纯出站成员(零端点)恰恰是**唯一需要中转的一类** (docs/REQUIREMENTS.md R-3.2:
+// "纯出站成员（NAT/容器）主动连锚点、经锚点中转")。如果路径层因为
 // "没有端点"就拒绝问路径, 中转这条唯一出路就被堵死了。
 //
 // 判据: 零端点的成员 → ErrNoRoute (不是 ErrAuth) —— 因为凭证没问题,

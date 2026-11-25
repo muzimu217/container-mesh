@@ -1463,7 +1463,7 @@ func (t *RelayTrunk) openFlow(ctx context.Context, open RelayOpen, req Session, 
 // reserveStream takes one of the trunk's stream slots.
 //
 // "Only refuse NEW requests, never kill the running ones" is the hard
-// requirement (docs/architecture/MESH-DESIGN.md:37): a 2 GB transfer in
+// requirement (docs/design/MESH-DESIGN.md:37): a 2 GB transfer in
 // progress must not be thrown away because the trunk is busy.
 //
 // The reservation is counted SEPARATELY from the live flows, because a
@@ -3293,6 +3293,35 @@ func (t *RelayTrunk) ServeRequesterWithFirstFormat(ctx context.Context, sess Ses
 	// The flow is registered so the quota counts it and the revocation
 	// watch can tear it down.
 	t.mu.Lock()
+	// ★ THE FLOW MUST NOT BE ADOPTED AFTER THE TEARDOWN. (Round 107.)
+	//
+	// This is the SAME guard that `openFlow` has, and it was missing
+	// here — on the PRODUCTION path. `openFlow` is the test-only entry
+	// point, so every existing regression test
+	// (`relaytrunk_teardown_test.go`'s
+	// TestAFlowIsNotAdoptedAfterTheTeardown) drove the GUARDED path,
+	// and the production path was never covered.
+	//
+	// The window is real: the slot is reserved, then the target's
+	// session is opened (which can take seconds, up to the dial
+	// budget), and only NOW is the flow registered. Shutdown() walks
+	// the live flows and then zeroes the reserved counter — so a flow
+	// that reaches this line after that walk is neither torn down (the
+	// walk already passed) nor accounted for (its slot was handed
+	// back). It lives forever, invisible to the stream-limit quota,
+	// holding two sessions and a splice goroutine open.
+	//
+	// Measured: after Shutdown(), the serve goroutine stayed blocked on
+	// flow.done forever, and FlowCount() read 0 while the flow table
+	// held 1 — so the quota counter and the real number of live flows
+	// were out of step.
+	if t.stopping {
+		t.mu.Unlock()
+		_ = sess.Close()
+		_ = tgt.Close()
+		t.releaseStream()
+		return fmt.Errorf("%w: mesh: relay trunk: this node is shutting down", ErrRelayUnavailable)
+	}
 	t.nextFlow++
 	id := t.nextFlow
 	flow := &relayFlow{
@@ -4049,6 +4078,25 @@ type RelayListener struct {
 	lns  []*quic.Listener
 	cfg  RelayListenerConfig
 	stop chan struct{}
+	// bufferWarnings records what the kernel actually granted the
+	// relay's sockets.
+	//
+	// ★ IT IS A REPORT, NOT A REFUSAL. (Round 108.) A receive buffer
+	// below the floor makes the path degraded, not broken, and refusing
+	// to start would trade a slow transfer for no service at all.
+	// The warning is surfaced to the operator through the CLI, because
+	// the symptom it explains — a transfer that fails as a TIMEOUT with
+	// no reason — is otherwise untraceable.
+	bufferWarnings []string
+}
+
+// BufferWarnings returns what the relay's sockets were actually
+// granted, and what to do about it when that is short.
+func (l *RelayListener) BufferWarnings() []string {
+	if l == nil {
+		return nil
+	}
+	return l.bufferWarnings
 }
 
 // NewRelayListener binds the relay listener's endpoints.
@@ -4098,6 +4146,31 @@ func NewRelayListener(ctx context.Context, cfg RelayListenerConfig) (*RelayListe
 		if err != nil {
 			l.Close()
 			return nil, fmt.Errorf("mesh: relay listener: cannot bind %s (address in use?): %w", a, err)
+		}
+		// ★ ASK FOR THE RECEIVE BUFFER, AND NAME THE SHORTFALL.
+		// (Round 108.) The relay's forward loop pulls records on demand,
+		// so the socket buffer must hold a whole BURST of them — and a
+		// path that delivers traffic in bursts makes the kernel drop the
+		// datagrams the socket cannot hold. The drop then shows up as a
+		// 30-second timeout with no reason, which is what the real
+		// machine did at every size from 64 KiB up.
+		//
+		// The kernel caps the request at net.core.rmem_max and truncates
+		// it SILENTLY, so the GRANT is read back and a shortfall is
+		// REPORTED — otherwise the operator is sent to debug a timeout
+		// when the cause is one sysctl.
+		//
+		// ★ IT IS A WARNING, NOT A REFUSAL TO START. (Round 108.) A
+		// buffer below the floor makes the path degraded, not broken, and
+		// refusing to start would trade a slow transfer for no service
+		// at all. macOS grants about 3.5 MiB against a 4 MiB floor, so a
+		// refusal here would make the product unstartable there.
+		if granted, shortfall := requestUDPReceiveBuffer(conn); shortfall != "" {
+			l.bufferWarnings = append(l.bufferWarnings,
+				fmt.Sprintf("relay listener on %s: %s", a, shortfall))
+		} else if granted > 0 {
+			l.bufferWarnings = append(l.bufferWarnings,
+				fmt.Sprintf("relay listener on %s: the UDP receive buffer is %d bytes", a, granted))
 		}
 		ln, err := quic.Listen(conn, tlsCfg, quicConfig())
 		if err != nil {

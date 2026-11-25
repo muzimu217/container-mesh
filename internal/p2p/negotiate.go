@@ -53,6 +53,23 @@ type Options struct {
 	PunchTimeout time.Duration
 	// Enabled false skips the attempt entirely (relay-only mode).
 	Enabled bool
+	// SkipBuiltInTransport leaves the built-in transport's reader OFF
+	// the punched socket.
+	//
+	// ★ WHY THIS OPTION EXISTS (Round 107.) The built-in transport
+	// (package p2p's Conn) starts a readLoop goroutine that reads the
+	// punched socket. The CLI's QUIC path then starts quic-go on THE
+	// SAME SOCKET, and quic-go's Transport.listen also reads it. Two
+	// readers on one socket split the datagrams at random: the QUIC
+	// handshake packets get swallowed by p2p.Conn's readLoop, which
+	// drops anything whose connection ID is not its own ("stray traffic
+	// on the port"). The direct path then NEVER succeeds — silently,
+	// and with the session falling back to the relay, so the symptom is
+	// indistinguishable from "this network has no direct path".
+	//
+	// A caller that wants QUIC on the punched socket must therefore say
+	// so, so that only ONE reader exists on that socket.
+	SkipBuiltInTransport bool
 	// Logger receives progress events.
 	Logger *slog.Logger
 }
@@ -76,6 +93,25 @@ func DefaultOptions() Options {
 		Enabled:      false,
 		Logger:       slog.Default(),
 	}
+}
+
+// builtInTransportWanted reports whether the built-in transport (this
+// package's Conn) should be built on the punched socket.
+//
+// ★ THE SOCKET MUST HAVE EXACTLY ONE READER. (Round 107.) The built-in
+// transport's Conn starts a readLoop goroutine that reads the socket.
+// The CLI's QUIC path starts quic-go on the SAME socket, and quic-go's
+// Transport.listen reads it too. Two readers on one socket split the
+// datagrams at random, so the QUIC handshake packets get swallowed by
+// the built-in reader and dropped as "stray traffic" (a datagram whose
+// connection ID is not ours). The direct path then NEVER succeeds — and
+// because the session falls back to the relay, the symptom is
+// indistinguishable from "this network has no direct path".
+//
+// So the decision is made in ONE place, and it is testable without a
+// STUN server, a punch, or a peer.
+func builtInTransportWanted(opts Options) bool {
+	return !opts.SkipBuiltInTransport
 }
 
 // Negotiate tries to establish a direct UDP path.
@@ -207,7 +243,19 @@ func Negotiate(ctx context.Context, sig Signaller, opts Options) (*Result, error
 
 	// Build the built-in transport as well: --p2p-legacy uses it, and the QUIC
 	// path ignores it (the caller closes it).
-	conn := NewConn(udp, punch.Remote, connID, DefaultConfig())
+	//
+	// ★ BUT ONLY IF THE CALLER WANTS IT. (Round 107.) Building it
+	// starts a readLoop goroutine on THIS socket, and the QUIC path
+	// starts quic-go on the same socket — two readers on one socket
+	// split the datagrams, and the QUIC handshake packets are dropped
+	// as "stray traffic". The direct path then never works.
+	//
+	// So the caller that runs a DIFFERENT transport on the socket says
+	// so, and no reader is started here at all.
+	var conn *Conn
+	if builtInTransportWanted(opts) {
+		conn = NewConn(udp, punch.Remote, connID, DefaultConfig())
+	}
 
 	opts.Logger.Info("p2p path established",
 		"remote", punch.Remote.String(),

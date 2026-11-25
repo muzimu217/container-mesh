@@ -292,7 +292,7 @@ func TestTheSavedConfigurationIsPrivateEvenWhenTheFileAlreadyExists(t *testing.T
 // docs said file > env > flag, the code said file > flag > env), and a
 // reader who trusted the docs would pick the wrong source.
 func TestTheCredentialSourceRulesAreTheDocumentedOnes(t *testing.T) {
-	doc := readRepoFile(t, "docs/M4-CREDENTIAL.md")
+	doc := readRepoFile(t, "docs/design/CREDENTIAL.md")
 	// The rules live in §2.1; the rest of the document mentions the
 	// sources in passing.
 	start := strings.Index(doc, "### 2.1")

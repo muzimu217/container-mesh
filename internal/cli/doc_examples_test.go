@@ -141,7 +141,7 @@ var docExampleDirs = []string{
 	"deploy/MESH-NET.md",
 	"packaging/systemd/README.md",
 	"docs/design/M4-ACCEPTANCE.md",
-	"docs/M4-CREDENTIAL.md",
+	"docs/design/CREDENTIAL.md",
 }
 
 // docExampleSkipDirs are directories under docs/ that hold HISTORY

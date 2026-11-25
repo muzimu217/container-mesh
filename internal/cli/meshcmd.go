@@ -168,7 +168,27 @@ func openMeshSessionWithSnapshotTimeout(ctx context.Context, state, passFlag str
 				// about membership, not a network fault, and the message must
 				// say so instead of sending the user off to debug routing
 				// (issue #8, report 1 finding on the revocation UX).
-				if perr := cl.Announce(waitCtx); perr != nil && discovery.IsNotAMember(perr) {
+				//
+				// ★ THE ANNOUNCE MUST USE A LIVE CONTEXT. (Round 108.)
+				// This used to be `cl.Announce(waitCtx)` — and waitCtx is
+				// the context whose deadline JUST fired. So the request
+				// never left the process: the HTTP client failed with
+				// "context deadline exceeded", never with the 401 that
+				// `IsNotAMember` looks for. The condition was therefore
+				// ALWAYS false, and the revocation message was DEAD CODE.
+				//
+				// A device revoked hours ago was told "no member view
+				// within 15s (discovery node unreachable, or not approved
+				// yet?)" — which sends the operator to debug routing for a
+				// problem that is a credential decision.
+				//
+				// The fix is a FRESH, SHORT-LIVED context: the announce is
+				// one HTTP round trip, so it gets its own budget rather
+				// than an already-spent one.
+				announceCtx, announceCancel := context.WithTimeout(ctx, 5*time.Second)
+				perr := cl.Announce(announceCtx)
+				announceCancel()
+				if perr != nil && discovery.IsNotAMember(perr) {
 					return nil, fmt.Errorf("this device has been removed from this network (revoked by the account owner, or the approval never happened)")
 				}
 				return nil, fmt.Errorf("no member view within %s (discovery node unreachable, or not approved yet?)", snapshotTimeout)

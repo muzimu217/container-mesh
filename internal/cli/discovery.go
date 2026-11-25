@@ -1656,6 +1656,14 @@ func runServeDiscovery(args []string) error {
 				defer rl.Close()
 				fmt.Fprintf(os.Stderr, "  relay trunk: ON — UDP %d carries relays between members\n", relayPort)
 				fmt.Fprintf(os.Stderr, "    (the payload is end-to-end encrypted: the trunk sees routing metadata, not content)\n")
+				// ★ THE BUFFER THE KERNEL ACTUALLY GRANTED. (Round 108.)
+				// A receive buffer below the floor makes the relay path
+				// drop datagrams under burst, and the drop shows up as a
+				// transfer that fails as a TIMEOUT with no reason. The
+				// operator is told here, where they are looking.
+				for _, w := range rl.BufferWarnings() {
+					fmt.Fprintf(os.Stderr, "  note: %s\n", w)
+				}
 				relayHost := relayAnnounceHost(*announce, *addr)
 				if relayHost != "" {
 					relaySelfEPS = []string{net.JoinHostPort(relayHost, strconv.Itoa(relayPort))}
@@ -1791,6 +1799,15 @@ func runServeDiscovery(args []string) error {
 			defer ml.Close()
 			udpBound = ml.BoundAddrs()
 			fmt.Fprintf(os.Stderr, "  mesh direct-link listener: UDP %s\n", strings.Join(ml.BoundAddrs(), ", "))
+			// ★ THE BUFFER THE KERNEL ACTUALLY GRANTED. (Round 108.)
+			// The relay protocol RIDES on this socket when there is no
+			// separate relay port, so this socket's receive buffer IS
+			// the relay path's buffer. A buffer below the floor makes the
+			// path drop datagrams under burst, and the drop shows up as a
+			// transfer that fails as a TIMEOUT with no reason.
+			for _, w := range ml.BufferWarnings() {
+				fmt.Fprintf(os.Stderr, "  note: %s\n", w)
+			}
 		}
 	}
 

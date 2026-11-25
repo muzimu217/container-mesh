@@ -493,6 +493,18 @@ func (n *Node) negotiator() peer.Negotiator {
 		}
 		// The signalling exchange reads frames directly, which is only safe
 		// before the read pump exists.
+		//
+		// ★ THE OPTIONS ARE USED AS THEY ARE. (Round 107.) The decision
+		// about who reads the punched socket is made in `p2pOptions`,
+		// where the options are built — so it cannot be forgotten here.
+		// It used to be decided at this call site, and the call site is
+		// exactly where it was forgotten: the built-in transport's
+		// reader and quic-go's reader both ended up on one socket, the
+		// datagrams were split at random, the QUIC handshake packets
+		// were dropped as "stray traffic", and the direct path never
+		// worked — silently, with the session falling back to the relay,
+		// so the symptom looked exactly like "this network has no
+		// direct path".
 		res, err := p2p.Negotiate(context.Background(), s, n.cfg.P2P)
 		if err != nil {
 			// A failed negotiation can leave a reader parked inside

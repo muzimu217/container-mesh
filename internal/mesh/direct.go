@@ -570,6 +570,22 @@ type Listener struct {
 	// relay is the handler for the connections that negotiated the relay
 	// ALPN. It is nil when this listener does not run a trunk.
 	relay *RelayHandler
+	// bufferWarnings records what the kernel actually granted the
+	// listener's sockets.
+	//
+	// ★ IT IS A REPORT, NOT A REFUSAL. (Round 108.) A receive buffer
+	// below the floor makes the path degraded, not broken, and refusing
+	// to start would trade a slow transfer for no service at all.
+	bufferWarnings []string
+}
+
+// BufferWarnings returns what the listener's sockets were actually
+// granted, and what to do about it when that is short.
+func (l *Listener) BufferWarnings() []string {
+	if l == nil {
+		return nil
+	}
+	return l.bufferWarnings
 }
 
 // NewListener binds the configured UDP endpoints and starts accepting.
@@ -635,6 +651,23 @@ func NewListener(ctx context.Context, cfg ListenerConfig) (*Listener, error) {
 		if err != nil {
 			l.Close()
 			return nil, fmt.Errorf("mesh: cannot bind %s (address in use?): %w", a, err)
+		}
+		// ★ ASK FOR THE RECEIVE BUFFER, AND NAME THE SHORTFALL.
+		// (Round 108.) The kernel caps the request at net.core.rmem_max
+		// and truncates it SILENTLY, so the GRANT is read back and a
+		// shortfall is REPORTED — otherwise a path that delivers traffic
+		// in bursts makes the kernel drop datagrams the socket cannot
+		// hold, and the operator sees a 30-second timeout that names
+		// neither the buffer nor the loss.
+		//
+		// ★ IT IS A WARNING, NOT A REFUSAL TO START. A buffer below the
+		// floor makes the path degraded, not broken.
+		if granted, shortfall := requestUDPReceiveBuffer(conn); shortfall != "" {
+			l.bufferWarnings = append(l.bufferWarnings,
+				fmt.Sprintf("listener on %s: %s", a, shortfall))
+		} else if granted > 0 {
+			l.bufferWarnings = append(l.bufferWarnings,
+				fmt.Sprintf("listener on %s: the UDP receive buffer is %d bytes", a, granted))
 		}
 		ln, err := quic.Listen(conn, tlsCfg, quicConfig())
 		if err != nil {

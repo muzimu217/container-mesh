@@ -60,9 +60,23 @@ func humanBytes(n int64) string {
 }
 
 // p2pOptions builds direct-path settings from the common flags.
+// p2pOptions turns the shared flags into the p2p negotiation options.
+//
+// ★ THE SOCKET MUST HAVE EXACTLY ONE READER. (Round 107.) The QUIC
+// path runs quic-go on the punched socket, so the built-in transport's
+// reader must NOT be on it too: two readers split the datagrams, the
+// QUIC handshake packets are dropped as "stray traffic", and the direct
+// path never works.
+//
+// So the decision is made HERE, where the options are built — not at
+// the call site that uses them. A decision made at the call site is a
+// decision that can be forgotten.
 func p2pOptions(cf commonFlags) p2p.Options {
 	o := p2p.DefaultOptions()
 	o.Enabled = cf.p2p
+	// The legacy transport IS the built-in transport, so it is the one
+	// case where the built-in reader is wanted.
+	o.SkipBuiltInTransport = !cf.p2pLegacy
 	if strings.TrimSpace(cf.stun) != "" {
 		var servers []string
 		for _, s := range strings.Split(cf.stun, ",") {
@@ -111,7 +125,15 @@ func commonNodeConfig(cf commonFlags) (NodeConfig, error) {
 		Role:       secure.RoleA,
 		PairWindow: cf.pairWindow,
 		P2P:        p2pOptions(cf),
-		ExpectSAS:  cf.expectSAS,
+		// ★ THE FLAG WAS PARSED BUT NEVER ASSIGNED. (Round 107.)
+		// `--p2p-legacy` was a documented option that did NOTHING:
+		// NodeConfig.P2PLegacy was always false, so the branch that
+		// selects the built-in transport was dead code, and the built-in
+		// transport could never be chosen. A flag that is accepted and
+		// silently ignored is worse than a flag that does not exist —
+		// it looks like a working switch.
+		P2PLegacy: cf.p2pLegacy,
+		ExpectSAS: cf.expectSAS,
 	}, nil
 }
 
@@ -144,7 +166,9 @@ func newNode(cf commonFlags, role secure.Role, outDir string, oneShot bool) (*No
 		PairWindow: cf.pairWindow,
 		OutDir:     outDir,
 		P2P:        p2pOptions(cf),
-		ExpectSAS:  cf.expectSAS,
+		// ★ SEE THE NOTE ABOVE: the flag was parsed and dropped.
+		P2PLegacy: cf.p2pLegacy,
+		ExpectSAS: cf.expectSAS,
 	}
 	if oneShot {
 		// One-shot commands must terminate on their own, but must also survive
