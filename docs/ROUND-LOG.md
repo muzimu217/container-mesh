@@ -5027,6 +5027,36 @@ quic-go 要 7 MiB，内核按 `net.core.rmem_max` **静默截断**
 **⇒ 「调用方看到的错误」和「真正出错的原因」是两个事实，只有一个点名了原因。**
 **一条只断言「有错」的测试，在内容检查被拿掉、只是传输断了的时候也会过。**
 
+### ★ 十一、★ 推送之后 CI 又红了两次 —— **两次都是负载敏感的 flake，不是回归**
+
+**第一次（`10e6cd5`，docs-only 提交）**：`internal/relay` 的
+`TestRelayDuplicateRoleEvictsStaleWaiter` 红，报 `B recv: websocket: close 1000 (normal)`。
+**第二次（`bb1e225`）**：同一类，不同的测试（`internal/mesh` 的
+`TestATruncatedRelayRecordIsNotACleanEnd`）。
+
+**★ 关键证据：这两次红的文件，**本分支一行都没碰**
+（`git diff 65514aa..HEAD -- internal/relay/ internal/mesh/relaytrunk_integrity_test.go`
+为空）。
+
+**★ 而且那条测试自己的注释早就写着这件事**：
+「it only failed on a LOADED machine: an external tester saw it fail under -race on a
+2-core container (1 red in 3 full-package runs) while it was 8/8 green in isolation」。
+
+**★ 我做的排查（每一步都有数字）**：
+
+| 现场 | 结果 |
+|---|---|
+| base commit `65514aa`，Linux 容器，整包 **6 次** | **6/6 绿** |
+| base commit，`internal/relay` 单独 **8 次** | **8/8 绿** |
+| 当前树，Linux 容器，整包 **4 次** | 3 绿 1 红（**每次红的测试都不同**） |
+| 当前树，**两个包并行**（= CI 的两个 job）**6 次** | **6/6 绿** |
+| 同一棵树 `10e6cd5` → `e88ba78`（**内容完全相同**） | **红 → 绿** |
+
+**★ 最后一行是决定性的**：**同一棵树，一次红一次绿** ⇒ **它是 flake，不是回归。**
+
+**★ 而「每次红的测试都不同」正是负载敏感的签名** ——
+**一个真缺陷会稳定地红在同一个测试上**。
+
 ### 二十二、状态
 
 - **远端 develop 仍是 `65514aa`（CI 绿）**；本地 **40 笔**待放行 —— **定时会话不自行推送**。
