@@ -17,7 +17,7 @@
 
 | 项 | 事实 | 来源 |
 |---|---|---|
-| 代码 | 18 个内部包：`cli` `identity` `credential` `discovery` `mesh` `relay` `mux` `peer` `p2p` `p2pquic` `probe` `secure` `version` `wire` `wsconn` `forward` `cmeshtest`（`p2p2` 已于 2026-11-25 按 D79 删除） | `internal/` |
+| 代码 | 17 个内部包：`cli` `identity` `credential` `discovery` `mesh` `relay` `mux` `peer` `p2p` `p2pquic` `probe` `secure` `version` `wire` `wsconn` `forward` `cmeshtest` · 生产 34,025 行（`p2p2` 已于 2026-11-25 按 D79 删除，减 4,710 行） | `internal/` |
 | CLI 动词 | `init` `account` `invite` `join` `serve-discovery` `status` `mesh`（`ping`/`msg`/`send-to`/`run`）`dial` `bench` `cred` `doctor` `probe` `forward` `verify` | `internal/cli` |
 | 需求编号 | `R-1.1`~`R-6.8` 共 44 条 + `P-1`~`P-7`（含 `P-5b`）+ `C-1`~`C-5` + `O-1`~`O-8` + `N-1`~`N-10` | `REQUIREMENTS.md` |
 | 技术决策 | `D1`~`D78` | `decisions.md` |
