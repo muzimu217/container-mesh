@@ -22,6 +22,26 @@ import (
 type BenchConfig struct {
 	Size               int64
 	RateBytesPerSecond int64
+
+	// CorruptPayload, when set, is called with the payload the sender
+	// is about to put on the wire, so a test can damage it.
+	//
+	// ★ IT IS A CONFIG FIELD, NOT A SWAPPED GLOBAL. (Round 108.)
+	// The corruption probe used to replace a package-level variable
+	// while another test's sender goroutine was reading it, and the
+	// race detector caught it on Linux:
+	//
+	//	WARNING: DATA RACE
+	//	testing.go:1490: race detected during execution of test
+	//
+	// ⇒ the probe went red on a healthy tree, for a reason that had
+	// nothing to do with what it was testing. A field on the config
+	// travels WITH the one bench it belongs to, so nothing else can
+	// see it.
+	//
+	// It is nil in production: the product never damages its own
+	// payload.
+	CorruptPayload func(payload []byte, offset int64)
 }
 
 // BenchStats reports application bytes moved by a completed benchmark.
@@ -612,6 +632,11 @@ func sendBenchData(ctx context.Context, st Session, cfg BenchConfig) error {
 		// tell — and a deterministic pattern lets both sides agree by
 		// construction, with no digest exchanged.
 		benchFillPattern(payload[:n], sent)
+		// ★ THE CORRUPTION HOOK, when set, damages the bytes on the
+		// wire. It is nil in production.
+		if cfg.CorruptPayload != nil {
+			cfg.CorruptPayload(payload[:n], sent)
+		}
 		if cfg.RateBytesPerSecond > 0 {
 			want := started.Add(time.Duration(float64(sent) / float64(cfg.RateBytesPerSecond) * float64(time.Second)))
 			if err := waitBenchUntil(ctx, want); err != nil {

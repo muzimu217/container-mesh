@@ -37,11 +37,23 @@ func benchPatternByte(offset int64) byte {
 // benchFillPattern fills buf with the pattern starting at the given
 // absolute offset.
 //
-// ★ IT IS A VARIABLE, NOT A FUNCTION, so a test can substitute it and
-// corrupt the payload on the wire. That substitution is how the
-// content check proves it is load-bearing: a bench that counted
-// corrupted bytes as a success would pass the corruption probe.
-var benchFillPattern = func(buf []byte, offset int64) {
+// ★ IT IS A FUNCTION, NOT A SWAPPED VARIABLE. (Round 108.)
+//
+// It used to be a `var` so that a test could substitute it and corrupt
+// the payload on the wire. But the corruption probe swapped it while
+// ANOTHER test's sender goroutine was reading it, and the race
+// detector caught it on Linux:
+//
+//	WARNING: DATA RACE
+//	testing.go:1490: race detected during execution of test
+//
+// ⇒ the probe went red on a healthy tree, for a reason that had
+// nothing to do with what it was testing.
+//
+// The corruption now travels with the one bench it belongs to
+// (BenchConfig.CorruptPayload), so NOTHING has to be swapped globally
+// and there is nothing for a concurrent sender to race with.
+func benchFillPattern(buf []byte, offset int64) {
 	for i := range buf {
 		buf[i] = benchPatternByte(offset + int64(i))
 	}
