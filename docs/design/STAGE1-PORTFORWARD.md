@@ -124,7 +124,6 @@ cmd/cm
 | `internal/secure` | **一行不改** | 记录泵的全部意义就在于让它继续只看到「一条有序的帧序列」。`SealFrame`/`OpenFrame` 的现有测试（重放/篡改/计数器）继续有效 |
 | `internal/wsconn` / `p2pquic` / `p2p` | 不改 | 它们只提供 `MessageConn`，与 mux 正交 |
 | `internal/p2p`（打洞） | 不改 | `Negotiator` 的时机天然在 mux 之前（`session.go:271-289`），满足 A8 |
-| `internal/p2p2` | 不接入 | A12 冻结策略 |
 | `internal/relay` | 不改 | relay 只转发密文；消息数会从约 2 条/MiB 升到约 4–13 条/MiB（研究二 §4.9 `[实测]`），仍在 `MaxMessageBytes=16 MiB` 与限流之内 |
 
 ---

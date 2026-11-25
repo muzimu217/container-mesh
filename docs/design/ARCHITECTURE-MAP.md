@@ -360,7 +360,6 @@ internal/wsconn     → （无项目内依赖）
 internal/version    → （无项目内依赖）
 internal/cmeshtest  → （无项目内依赖）
 internal/mux        → （无项目内依赖）
-internal/p2p2       → （无项目内依赖）
 internal/probe      → （无项目内依赖）
 internal/p2pquic    → （无项目内依赖）
 internal/secure     → wire

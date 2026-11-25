@@ -15,7 +15,8 @@ package mesh
 // So a measurement made under the detector says so, and a reader knows
 // not to compare it with a normal-build number.
 //
-// The same convention lives in internal/p2p2; see race_on_test.go there.
+// The convention is written down in docs/CONVENTIONS.md §2.2 (performance
+// assertions must not be wall-clock thresholds).
 func raceNote() string {
 	if raceEnabled {
 		return " (MEASURED UNDER -race: the syscall-bound hot path is inflated by the " +

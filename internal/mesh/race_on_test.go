@@ -12,5 +12,6 @@ package mesh
 // hot path by an order of magnitude, so the number is not comparable
 // with a normal build.
 //
-// The same convention lives in internal/p2p2; see race_on_test.go there.
+// The convention is written down in docs/CONVENTIONS.md §2.2 (performance
+// assertions must not be wall-clock thresholds).
 const raceEnabled = true

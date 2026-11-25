@@ -808,6 +808,9 @@ per-Write  sent 64.0 MiB in 23ms  transport messages=801  avg msg=81.8 KiB  msgs
 
 ### 5.3 与 `p2p2` / `p2pquic` 的关系
 
+> **现状（2026-11-25）**：本节结论已落地——`internal/p2p2` **已删除**（`decisions.md` D79），
+> 逐轮实验记录归档在 [`p2p2-kpi-log.md`](p2p2-kpi-log.md)。以下为当时的查证记录，保留原样。
+
 **`p2p2` 是死代码（已查证）。** `grep -rln "internal/p2p2"` 除自身目录外**零命中**，`internal/cli`、`internal/p2p`、`cmd/` 都不导入它。它有 4,700+ 行（含测试），自带 Reno 拥塞控制、SACK、批量收发。
 
 **建议：不要为了端口转发去动 `p2p2`。** 它解决的是"UDP 上的可靠传输"，与"应用层多路复用"是正交问题。而且它的包注释明确写着 `Multiplexing ... are out of scope`（`p2p2/conn.go:26-30`）——设计上就没打算做复用。

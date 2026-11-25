@@ -213,8 +213,8 @@ func TestTheRelayQuotaIsTheSustainedCeiling(t *testing.T) {
 	// thing that found the ceiling), and it always LOGS. It does not
 	// fail the suite on a slow machine.
 	//
-	// The repo already has this convention in internal/p2p2
-	// (raceEnabled), with the same reasoning: "the instrumentation
+	// The convention is docs/CONVENTIONS.md §2.2 (no wall-clock
+	// thresholds in performance assertions), with the same reasoning: "the instrumentation
 	// inflates the cost of the syscall-bound hot path by an order of
 	// magnitude, so the number is not comparable".
 	t.Logf("SUMMARY: quota %d MiB/s -> %.2f MiB/s ; quota %d MiB/s -> %.2f MiB/s (%.2fx)%s",

@@ -171,8 +171,7 @@ func TestTheRelayThroughputAtSeveralRecordSizes(t *testing.T) {
 	// machine. But it is still a wall-clock comparison, so under the
 	// race detector the instrumented hot path dominates every size
 	// equally and the spread collapses — so the assertion is skipped
-	// there, for the reason the repo already documents in
-	// internal/p2p2.
+	// there, for the reason docs/CONVENTIONS.md §2.2 documents.
 	if len(rows) > 1 && !raceEnabled {
 		best, worst := rows[0].mibsPerSec, rows[0].mibsPerSec
 		for _, r := range rows {
