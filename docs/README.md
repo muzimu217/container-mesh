@@ -24,7 +24,7 @@
 | 设计 | [`design/STAGE1-PORTFORWARD.md`](design/STAGE1-PORTFORWARD.md) | 端口转发（阶段 1，已冻结）详细设计 |
 | 设计 | [`design/RELAY-FRAME.md`](design/RELAY-FRAME.md) | 中转记录的二进制帧 |
 | 设计 | [`design/CREDENTIAL.md`](design/CREDENTIAL.md) | 统一凭证与委派签发 |
-| 设计 | [`design/M4-ACCEPTANCE.md`](design/M4-ACCEPTANCE.md) | M4 的 42 格验收清单 |
+| 设计 | [`design/M4-ACCEPTANCE.md`](design/M4-ACCEPTANCE.md) | M4 的 52 格验收清单 |
 | 设计 | [`design/MULTI-HOMING.md`](design/MULTI-HOMING.md) | 一机多网（未开工，M5-16） |
 | 设计 | [`design/APP-PACKAGING.md`](design/APP-PACKAGING.md) | 跨平台 App 包装（未开工，M6） |
 | 证据 | [`research/userspace-netstack.md`](research/userspace-netstack.md) · [`mux-and-portforward.md`](research/mux-and-portforward.md) · [`reliable-transport.md`](research/reliable-transport.md) · [`p2p2-kpi-log.md`](research/p2p2-kpi-log.md) | 带 `[实测]` 标注的研究：用户态网络栈（结论：不做）· 多路复用与端口转发 · 可靠传输 · **已删除的 `internal/p2p2` 的逐轮实验记录（D79）** |
