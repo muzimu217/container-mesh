@@ -1,7 +1,7 @@
 # 文档索引
 
 > **每份文档都在这张表里；表里没有的，不该存在。** 新增文档必须在此登记一行（T-0.9）。
-> 现状：M4 **未完成**（验收清单还没有逐格结果台账）；远端 tip 的 CI 是红的。详见 [`PLAN.md`](PLAN.md) §1。
+> 现状：M4 **未完成**（验收清单还没有逐格结果台账 —— 台账与工具正在 M4-3 里落地）；远端 `origin/develop` 的 CI 是绿的。详见 [`PLAN.md`](PLAN.md) §1。
 
 ## 先读这三份
 
@@ -24,9 +24,10 @@
 | 设计 | [`design/STAGE1-PORTFORWARD.md`](design/STAGE1-PORTFORWARD.md) | 端口转发（阶段 1，已冻结）详细设计 |
 | 设计 | [`design/RELAY-FRAME.md`](design/RELAY-FRAME.md) | 中转记录的二进制帧 |
 | 设计 | [`design/CREDENTIAL.md`](design/CREDENTIAL.md) | 统一凭证与委派签发 |
-| 设计 | [`design/M4-ACCEPTANCE.md`](design/M4-ACCEPTANCE.md) | M4 的 52 格验收清单 |
+| 设计 | [`design/M4-ACCEPTANCE.md`](design/M4-ACCEPTANCE.md) | M4 的 52 格验收清单（§2 是方法，§10 是结果台账） |
 | 设计 | [`design/MULTI-HOMING.md`](design/MULTI-HOMING.md) | 一机多网（未开工，M5-16） |
 | 设计 | [`design/APP-PACKAGING.md`](design/APP-PACKAGING.md) | 跨平台 App 包装（未开工，M6） |
+| 部署 | [`../deploy/anchor/README.md`](../deploy/anchor/README.md) | 锚点重装后的一键重建：命令、顺序、身份为什么是最难重建的那一件 |
 | 证据 | [`research/userspace-netstack.md`](research/userspace-netstack.md) · [`mux-and-portforward.md`](research/mux-and-portforward.md) · [`reliable-transport.md`](research/reliable-transport.md) · [`p2p2-kpi-log.md`](research/p2p2-kpi-log.md) | 带 `[实测]` 标注的研究：用户态网络栈（结论：不做）· 多路复用与端口转发 · 可靠传输 · **已删除的 `internal/p2p2` 的逐轮实验记录（D79）** |
 | 图 | [`diagrams/`](diagrams/) | `mesh.mmd` / `mesh.png` 拓扑，`stack.mmd` / `stack.png` 协议栈，`render.sh` 渲染脚本；改图改 `.mmd` 再跑脚本 |
 
