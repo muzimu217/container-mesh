@@ -289,6 +289,46 @@ func (f *fixture) installRoot() string {
 	return filepath.Join(f.root, "install")
 }
 
+// stateFileName is the name of the file that stands for the device's
+// private key envelope inside the runtime state.
+//
+// The uninstaller knows no file name: it removes the whole state
+// DIRECTORY on a purge and leaves it alone on a plain uninstall. The
+// name only matters to the TEST, which needs a file that is REALLY
+// there before the uninstall so that "the state survived" and "the
+// state was removed" are statements about something that existed.
+//
+// It is the same name the shell regression (packaging/install_test.sh)
+// and the Go installer regression (tools/cmesh-install) use, so the
+// three guards talk about the same artifact.
+const stateFileName = "identity.enc"
+
+// makeState creates the runtime state directory and puts a file in it
+// that represents the device's private key envelope.
+//
+// It returns the state directory and the path of the file inside it.
+//
+// ★ WHY THE FILE IS CREATED HERE AND NOT BY THE INSTALLER.
+//
+// The state is NOT the installer's business on a normal install: the
+// installer never creates it, and on a plain uninstall it must leave it
+// exactly as it found it. So the only way to have a state that exists
+// before the uninstall is for the fixture to create one — and it has to
+// create a FILE in it, because an empty directory cannot show that the
+// contents survived.
+func (f *fixture) makeState(t *testing.T) (string, string) {
+	t.Helper()
+	state := filepath.Join(f.root, "state")
+	if err := os.MkdirAll(state, 0o700); err != nil {
+		t.Fatalf("mkdir state: %v", err)
+	}
+	secret := filepath.Join(state, stateFileName)
+	if err := os.WriteFile(secret, []byte("secret envelope"), 0o600); err != nil {
+		t.Fatalf("write the state file %s: %v", secret, err)
+	}
+	return state, secret
+}
+
 // mode returns the permission bits of a path.
 func mode(t *testing.T, path string) os.FileMode {
 	t.Helper()

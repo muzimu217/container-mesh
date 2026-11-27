@@ -212,11 +212,21 @@ func TestTheUninstallStopsAndDisablesTheDeployedUnits(t *testing.T) {
 // deployed units keep theirs).
 func TestTheUninstallReportsTheStateItRetained(t *testing.T) {
 	f := newFixture(t, "#!/bin/sh\nexit 0\n")
-	_ = f.installRoot()
-	state := filepath.Join(f.root, "state")
-	if err := os.MkdirAll(state, 0o700); err != nil {
-		t.Fatalf("mkdir state: %v", err)
-	}
+	// ★ THE STATE FILE MUST REALLY EXIST BEFORE THE UNINSTALL RUNS.
+	//
+	// This is what the old assertion needed and did not have. The
+	// fixture used to create an EMPTY state directory, so the file the
+	// assertion looked for ("identity.enc") was never there — and the
+	// assertion, which was inverted as well ("os.Stat returned no
+	// error" was the FAILURE case), could not fire whatever the
+	// uninstaller did. A guard that cannot fail is not a guard.
+	//
+	// The uninstaller does not know any file name: it removes the
+	// whole state DIRECTORY on a purge and leaves it alone on a plain
+	// uninstall. So the file the fixture writes stands for the device's
+	// private key envelope, and the assertions below are about what is
+	// left of it.
+	state, secret := f.makeState(t)
 
 	out, code := f.run(t, 0o022)
 	if code != 0 {
@@ -230,10 +240,23 @@ func TestTheUninstallReportsTheStateItRetained(t *testing.T) {
 		t.Fatalf("the uninstall failed (exit %d):\n%s", code, out)
 	}
 
-	// The state must survive...
-	if _, err := os.Stat(filepath.Join(state, "identity.enc")); err == nil {
-		t.Errorf("the plain uninstall removed the state file; the state must be " +
-			"retained so a reinstall recovers the identity")
+	// ★ THE STATE MUST SURVIVE — AND THIS ASSERTION CAN FAIL.
+	//
+	// The file must STILL BE THERE after the plain uninstall. If the
+	// uninstaller had removed the state, os.Stat fails here and the
+	// test goes red with the name of the file that disappeared.
+	if _, err := os.Stat(secret); err != nil {
+		t.Errorf("the plain uninstall removed the state file %s (stat error: %v); "+
+			"the state must be retained so a reinstall recovers the identity",
+			secret, err)
+	}
+	// The state DIRECTORY is what the uninstaller actually manages, so
+	// it is asserted too: a state that survived as a name but not as a
+	// directory is not a retained state.
+	if _, err := os.Stat(state); err != nil {
+		t.Errorf("the plain uninstall removed the state directory %s (stat error: %v); "+
+			"the state must be retained so a reinstall recovers the identity",
+			state, err)
 	}
 	// ...and the operator must be told it is still there.
 	if !strings.Contains(out, state) {
@@ -256,10 +279,13 @@ func TestTheUninstallReportsTheStateItRetained(t *testing.T) {
 // clean?" either way.
 func TestThePurgeNamesTheStateItRemoved(t *testing.T) {
 	f := newFixture(t, "#!/bin/sh\nexit 0\n")
-	state := filepath.Join(f.root, "state")
-	if err := os.MkdirAll(state, 0o700); err != nil {
-		t.Fatalf("mkdir state: %v", err)
-	}
+	// ★ THE PURGE MUST ACTUALLY REMOVE THE STATE, FILE BY FILE.
+	//
+	// The assertion below used to look at the state DIRECTORY only.
+	// This file is the device's private key envelope: the one thing the
+	// operator must be certain is GONE after a purge, because the next
+	// install starts from a blank identity.
+	state, secret := f.makeState(t)
 
 	out, code := f.run(t, 0o022)
 	if code != 0 {
@@ -274,6 +300,13 @@ func TestThePurgeNamesTheStateItRemoved(t *testing.T) {
 		t.Errorf("the purge did not mention the state directory it removed (%s); "+
 			"the next install starts from a BLANK identity, and the operator has "+
 			"to know that before they find out.\n--- output ---\n%s", state, out)
+	}
+	// The state file must be GONE — the assertion fails when it is
+	// still there, so it can go red.
+	if _, err := os.Stat(secret); err == nil {
+		t.Errorf("the purge left the state file %s behind; the purge must remove the "+
+			"device identity, because the next install starts from a BLANK identity",
+			secret)
 	}
 	if _, err := os.Stat(state); err == nil {
 		t.Errorf("the purge left the state directory behind at %s", state)
