@@ -1,0 +1,42 @@
+[Unit]
+Description=container-mesh discovery anchor
+After=network-online.target
+Wants=network-online.target
+# The start limit is a [Unit] directive: systemd has NO Service.StartLimit*
+# alias, so the same directives under [Service] are silently ignored.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=cmesh
+Group=cmesh
+EnvironmentFile=/etc/cmesh/discovery.env
+StateDirectory=cmesh
+StateDirectoryMode=0750
+
+# The panel token is in NEITHER the command line NOR the environment:
+# LoadCredential gives the service a private copy of a root-owned file.
+# The data endpoint hands out the whole roster.
+LoadCredential=panel-token:/etc/cmesh/panel-token
+
+ExecStart=/usr/local/bin/cmesh serve-discovery --state ${CMESH_STATE} --addr ${CMESH_ADDR} --announce ${CMESH_ANNOUNCE} --account-pub ${CMESH_ACCOUNT_PUB} --relay-trunk --panel --panel-token-file ${CREDENTIALS_DIRECTORY}/panel-token
+
+Restart=on-failure
+RestartSec=5s
+KillSignal=SIGTERM
+TimeoutStopSec=15s
+
+# The relay switch: without ExecReload= the documented "systemctl reload"
+# sends nothing and the operator concludes the switch is broken.
+ExecReload=/bin/kill -HUP $MAINPID
+
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/cmesh
+
+[Install]
+WantedBy=multi-user.target
