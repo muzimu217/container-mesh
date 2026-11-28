@@ -452,6 +452,49 @@ Linux headless 安装代理在**两台真实机器**（175 OpenCloudOS 9.4 + 35 
 
 ## 当前门禁证据
 
+**★ Round 110（2026-11-27 07:50Z–08:20Z）· 全绿 · 命令原文在位**
+
+| 检查 | 结果 | 时间 |
+|---|---|---|
+| `gofmt -l .` | **PASS**（空） | 07:50Z |
+| `go vet ./...` | **PASS** | 07:50Z |
+| `go test ./... -race -count=1` | 首跑 **FAIL 1**：`tools/acceptance` 的 `TestTheBoardShowsTheLedger` —— **守卫按设计抓到「看板片段与台账漂移」**（台账合流 ✔35 后看板片段没重新生成）⇒ 重新生成并逐字节填回 ⇒ 复跑 **PASS（57.6 s）** | 07:55Z |
+| `go build ./cmd/cm` | **PASS** | 07:58Z |
+| `bash tests/run-tests.sh --verbose --large` | 首跑 **FAIL 1**：`internal/mesh` 的 `TestTheRelayPathWithNoInjectionIsTheControl/16384`（45 s 超时「the target never joined the trunk」）—— **Round 108 已记过同型 flake**（无注入对照组），文件本轮零改动（`b80a3f5` 已推）· 单独跑 **5/5 绿（0.3–0.4 s）** ⇒ 复跑全套 **PASS · 49-0（含 1 GiB 传输）** | 08:02Z |
+| `sh packaging/install_test.sh` | **PASS**（rc=0） | 08:05Z |
+| `deploy/hub` 模块 `go vet` + `go test -race` | **PASS** | 08:05Z |
+| 交叉编译 `linux/amd64` · `linux/arm64` · `darwin/arm64` | **PASS** | 08:06Z |
+| 发布二进制版本戳不是 `dev` | **PASS**（三平台） | 08:06Z |
+| `go run ./tools/acceptance check` | **PASS · 52 格 · 0 问题** | 08:07Z |
+| `go run ./tools/acceptance counts` | **total ✔=35 ◐=15 ✘=0 未验=2 / guarded 35** | 08:07Z |
+| `bash .team/hub-certify-loop-test.sh` | **PASS · all good** | 08:07Z |
+
+**★ Round 110 的两条门禁记录**：
+① `TestTheBoardShowsTheLedger` **第一次真的抓到一次真漂移** —— 它比对看板片段与 `dashboard` 输出是否逐字节一致，台账合流后我没重新生成片段，它就红了。**这正是这条守卫存在的理由。**
+② 那条预存的 flake（`TestTheRelayPathWithNoInjectionIsTheControl`）在 Round 108 记过同型（「对照组自己会红 ⇒ 查夹具不查产品」）；本轮单独 5/5 绿、整包负载下 45 s 超时 ⇒ **记「成因未知、负载敏感、与 Round 108 同型」，文件零改动**。
+
+**★ Round 109（2026-11-27 04:00Z–07:30Z）· 全绿 · 命令原文在位**
+
+| 检查 | 结果 | 时间 |
+|---|---|---|
+| `gofmt -l .` | **PASS**（空） | 04:00Z |
+| `go vet ./...` | **PASS** | 04:00Z |
+| `go test ./... -race -count=1` | **PASS · 20 包 · 零 FAIL**（`internal/cli` 253 s · `internal/mesh` 147 s · `tools/acceptance` 49 s） | 04:20Z |
+| `go build ./cmd/cm` | **PASS** | 04:25Z |
+| `bash tests/run-tests.sh --verbose --large` | **PASS · 49 通过 · 0 失败**（含 1 GiB 传输） | 04:30Z |
+| `sh packaging/install_test.sh` | **PASS**（rc=0） | 04:30Z |
+| `deploy/hub` 模块 `go vet` + `go test -race` | **PASS** | 04:31Z |
+| 交叉编译 `linux/amd64` · `linux/arm64` · `darwin/arm64` | **PASS** | 04:32Z |
+| 发布二进制版本戳不是 `dev` | **PASS**（linux 读字符串 + darwin 读 `version`） | 04:32Z |
+| `go run ./tools/acceptance check` | **PASS · 52 格 · 0 问题** | 04:33Z |
+| `bash .team/hub-certify-loop-test.sh` | **PASS · all good** | 04:33Z |
+
+**★ 本地门禁脚本的两处缺陷（已修）**：
+① **在 macOS 上执行 Linux 二进制**去验版本 ⇒ `Exec format error`（与产品无关）⇒ 改成读二进制里的版本戳 + 用 darwin 产物读 `version`；
+② **★ `go test … | grep | tail` 会把退出码吞掉** —— 管道报告的是**最后一个命令**的退出码（`tail` 恒 0），于是**`internal/mesh` 红了一次而脚本仍打印「ALL GREEN」并退出 0** ⇒ 已改用 `PIPESTATUS[0]`。**★ 这就是本项目最恨的那种假绿：一个会把红变成绿的脚本。**
+
+**★ 一条负载敏感的 flake**：`internal/mesh` 的 `TestRelayListenerServesARequesterEndToEnd` 在一次整仓 `-race` 里超时（15.07 s），**而本轮一行 `internal/mesh` 都没改**。四组跑法：单独跑 6/6 绿 · 整包 `-race` 2/2 绿（138 s / 129 s）· Linux 容器整包 `-race` 绿（130.5 s）· **整仓 `-race`（CI 的形态）绿**。**记作「成因未知、负载敏感、1 次未复现」，不写「已修」，也不写「与我无关」。**
+
 **★ Round 107（2026-11-24 18:16Z）· 全绿 · 命令原文在位**
 
 | 检查 | 结果 | 时间 |

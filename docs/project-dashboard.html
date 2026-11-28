@@ -13,7 +13,7 @@
 <main class="wrap">
 <header class="top">
   <div><div class="eyebrow">container-mesh / daily delivery board</div><h1 class="title">项目进度与路线看板</h1><p class="sub">每天看这里：当前开发完成到哪一步、门禁是否全绿、哪个平台真的能安装运行、下一步由谁推进。状态按代码和测试证据记录。</p></div>
-  <div class="stamp">看板更新<br><strong id="updated">2026-11-26 20:40Z</strong><br>远端 develop<br><strong>36905ae</strong>（<b>已推送 · CI 绿</b>）<br>本地 <strong>c38cdd3</strong>（<b>领先 2 笔 · 只改文档 · 未推</b>）<br>远端 main <strong>34fb7de</strong>（develop 领先 282 笔）<br><b style="color:var(--green)">★ 本轮：M4 验收台账（M4-3）开工</b><br><b style="color:var(--yellow)">★ 阶段：M4 收口 · <b>M5 一个都不动</b></b><br><b>历史叙述见本文件末尾「往轮记录」</b></div>
+  <div class="stamp">看板更新<br><strong id="updated">2026-11-27 07:50Z</strong><br>远端 develop<br><strong>aa2517b</strong>（<b>CI 绿</b>）→ 本轮再推 2 笔（M4-4 守卫 21 格 + 台账合流），<b>CI 待跑</b><br>远端 main <code>34fb7de</code>（develop 领先 284 笔）<br><b style="color:var(--green)">★ 台账：✔ 21 → 35 / ◐ 29 → 15（M4-4 四线并行，每格一条变异证明）</b><br><b style="color:var(--yellow)">★ 阶段：M4 收口 · <b>M5 一个都不动</b></b></div>
 </header>
 <section class="grid kpis">
   <div class="card kpi"><div class="label">M4 收口</div><div class="value warn">0 / 10 任务完成</div><div class="label">部分完成 1 · 进行中 4 · 待办 2 · <b>等网主裁定 3</b><br><b>干道已在真机跑通</b>，但那是 11-17 的外部复测，锚点现在落后远端 39 笔</div></div>
@@ -34,23 +34,23 @@
 <section class="section" id="ledger">
   <div class="section-head"><h2>M4 验收台账</h2><p>52 格 · 数据来自 docs/design/M4-ACCEPTANCE.md §10 · `go run ./tools/acceptance counts`</p></div>
   <section class="grid kpis">
-    <div class="card kpi"><div class="label">✔ 判据达成</div><div class="value warn">21</div><div class="label">判据达成，且有被测 SHA、复测人、日期和证据</div></div>
-    <div class="card kpi"><div class="label">◐ 部分达成</div><div class="value warn">29</div><div class="label">只达成了一部分</div></div>
+    <div class="card kpi"><div class="label">✔ 判据达成</div><div class="value warn">35</div><div class="label">判据达成，且有被测 SHA、复测人、日期和证据</div></div>
+    <div class="card kpi"><div class="label">◐ 部分达成</div><div class="value warn">15</div><div class="label">只达成了一部分</div></div>
     <div class="card kpi"><div class="label">✘ 判据未达成</div><div class="value muted">0</div><div class="label">真跑了，判据没达成</div></div>
     <div class="card kpi"><div class="label">未验</div><div class="value warn">2</div><div class="label">没跑，或跑不了</div></div>
-    <div class="card kpi"><div class="label">台账进度</div><div class="value warn">✔ 21 / 52</div><div class="progress"><i style="width:40.3%"></i></div><div class="label">21 格带 CI 守卫</div></div>
-    <div class="card kpi"><div class="label">CI 守卫</div><div class="value info">21</div><div class="label">✔ 里复测人写 CI、证据指向测试函数的格数</div></div>
+    <div class="card kpi"><div class="label">台账进度</div><div class="value warn">✔ 35 / 52</div><div class="progress"><i style="width:67.3%"></i></div><div class="label">35 格带 CI 守卫</div></div>
+    <div class="card kpi"><div class="label">CI 守卫</div><div class="value info">35</div><div class="label">✔ 里复测人写 CI、证据指向测试函数的格数</div></div>
   </section>
   <article class="card matrix-wrap">
     <table class="matrix">
       <thead><tr><th>组</th><th>格</th><th>✔</th><th>◐</th><th>✘</th><th>未验</th><th>进度</th></tr></thead>
       <tbody>
-        <tr><td>A · 组网与身份</td><td>11</td><td class="warn">5</td><td class="warn">6</td><td class="muted">0</td><td class="muted">0</td><td><div class="progress"><i style="width:45.4%"></i></div></td></tr>
-        <tr><td>B · 状态与连通性</td><td>10</td><td class="warn">4</td><td class="warn">6</td><td class="muted">0</td><td class="muted">0</td><td><div class="progress"><i style="width:40.0%"></i></div></td></tr>
-        <tr><td>C · 撤销、拆流、配额</td><td>8</td><td class="warn">5</td><td class="warn">3</td><td class="muted">0</td><td class="muted">0</td><td><div class="progress"><i style="width:62.5%"></i></div></td></tr>
+        <tr><td>A · 组网与身份</td><td>11</td><td class="warn">11</td><td class="muted">0</td><td class="muted">0</td><td class="muted">0</td><td><div class="progress"><i style="width:100.0%"></i></div></td></tr>
+        <tr><td>B · 状态与连通性</td><td>10</td><td class="warn">9</td><td class="warn">1</td><td class="muted">0</td><td class="muted">0</td><td><div class="progress"><i style="width:90.0%"></i></div></td></tr>
+        <tr><td>C · 撤销、拆流、配额</td><td>8</td><td class="warn">6</td><td class="warn">2</td><td class="muted">0</td><td class="muted">0</td><td><div class="progress"><i style="width:75.0%"></i></div></td></tr>
         <tr><td>D · 面板</td><td>6</td><td class="warn">3</td><td class="warn">2</td><td class="muted">0</td><td class="warn">1</td><td><div class="progress"><i style="width:50.0%"></i></div></td></tr>
-        <tr><td>E · 中转（干道）四项</td><td>7</td><td class="warn">1</td><td class="warn">6</td><td class="muted">0</td><td class="muted">0</td><td><div class="progress"><i style="width:14.2%"></i></div></td></tr>
-        <tr><td>F · 安装、发布、systemd</td><td>10</td><td class="warn">3</td><td class="warn">6</td><td class="muted">0</td><td class="warn">1</td><td><div class="progress"><i style="width:30.0%"></i></div></td></tr>
+        <tr><td>E · 中转（干道）四项</td><td>7</td><td class="warn">2</td><td class="warn">5</td><td class="muted">0</td><td class="muted">0</td><td><div class="progress"><i style="width:28.5%"></i></div></td></tr>
+        <tr><td>F · 安装、发布、systemd</td><td>10</td><td class="warn">4</td><td class="warn">5</td><td class="muted">0</td><td class="warn">1</td><td><div class="progress"><i style="width:40.0%"></i></div></td></tr>
       </tbody>
     </table>
   </article>
@@ -147,7 +147,7 @@
 <section class="grid two section">
   <article class="card"><div class="section-head"><h2>今日状态</h2><p>当前阶段：<b>M4（v1.0 收口）</b> · <b>M5 一个都不动</b> · 远端 develop = <code>36905ae</code>（<b>CI 绿</b>）· 本地 <code>c38cdd3</code>（领先 2 笔，只改文档，未推）· 远端 main = <code>34fb7de</code></p></div><div class="checklist">
     <div class="check"><b class="bad">✗</b><div><strong>M4 的 10 个任务，<b>一个都还没完成</b></strong><br><span>部分完成 1（M4-1 差锚点 SHA 一致）· 进行中 4（M4-2 剩 <code>P-6</code> GC 相位 · M4-4/M4-5 补守卫 · M4-7 真机回归）· 待办 2（M4-3 验收结果台账 · M4-6 看板诚实化）· <b>3 个在等网主裁定</b>（M4-8 Release 资产上传 · M4-9 reboot 授权 · M4-10 生产数据恢复）。<br><b>★ 阶段是串行的</b>：M4 的封口条件是「M4-1~M4-10 全绿 + 验收台账 ✔ 数 = <b>52</b>（脚本数，不是 42）+ 远端 tip = 本地 tip + 真机锚点跑的就是那个 SHA」⇒ <b>这 3 个不解开，M4 就封不上，M5 就不能开工</b>（铁律五）。<br><b>★ 另有 2 格在任务表之外也是红的</b>：<b>E4</b>（抓包验密，只有进程内替身）与 <b>E5</b>（真实公网 hairpin 上 1 MiB 仍 0/5）。</span></div></div>
-    <div class="check"><b class="ok">✓</b><div><strong>本轮（2026-11-26）：验收清单升为结果台账（M4-3）</strong><br><span>① 工具 <code>tools/acceptance</code>：<code>check</code> / <code>counts</code> / <code>dashboard</code> / <code>apply</code>，规则只有一份实现、CI 守卫跑同一套 —— <b>「这条检查必须能失败」已证</b>（造坏副本 ⇒ 一次列全违规、exit 1、点名行号与格号）；<b>✔ 行的绿只在 52 格全过时出现</b>。<br>② <b>52 格盘点第一版</b>：✔ <b>21</b> / ◐ <b>29</b> / ✘ 0 / 未验 <b>2</b>（D6 渲染层需人看 + F8 需网主授权 reboot）⇒ <b>M4-4 = 31 格</b>（无守卫 8 + 只钉一半 23）、<b>M4-5 = 29 格</b>。<br>③ <b>M4-10 我方那一半</b>：真机锚点的 unit 原文进了仓库 + 「重装后一键重建锚点」的幂等脚本（不生成密钥、身份只在缺失时创建、env 是引导而非同步）。<br>④ <b>修掉一条永远绿的守卫</b>：<code>install_closure_test.go</code> 里那条「状态必须还在」的断言方向反了（夹具从未创建过那个文件）⇒ 它钉不住任何东西。<br>⑤ <b>文档的十处偏差按脚本数改正</b>（验收格 42→52、尾注 15→80 笔、DCO 60/60→71/325、远端 tip 与 CI 状态、Release「未上传」→「已上传但过期」、B5–B10「零断言」→ 只有 B8）。</span></div></div>
+    <div class="check"><b class="ok">✓</b><div><strong>本轮（2026-11-26 → 11-27）：验收清单升为结果台账（M4-3），已推送</strong><br><span><b>★ 已推 6 笔到 develop：<code>36905ae</code> → <code>aa2517b</code>，CI 在 tip 上绿</b>（① 台账工具 <code>tools/acceptance</code>：<code>check</code>/<code>counts</code>/<code>dashboard</code>/<code>apply</code>，规则只有一份实现、CI 守卫跑同一套 —— <b>「这条检查必须能失败」已证</b>；<b>✔ 行的绿只在 52 格全过时出现</b>。② 文档与看板：十处偏差按脚本数改正、<b>第一屏的 87 KB 历史叙述压成 407 字符</b>、门禁卡从「PASS」改成「未重跑」。③ 修掉一条永远绿的守卫。④ <b>M4-10 我方那一半</b>：真机锚点的 unit 原文进仓库 + 「重装后一键重建锚点」的幂等脚本。⑤ <b>P-6 第一次真测</b>：锚点带 20 台设备在线，post-GC <b>30.29 MiB</b>、<b>GC 前峰值 99.62 MiB（差 0.38 MiB 擦线）</b>）。<br><b>★ 下一轮（M4-4 补守卫）已派四条线，文件范围互不重叠</b>：线 1 <code>internal/cli</code>（A3 A6 A7 A8 A10 A11 B1 B2 B3）· 线 2 <code>internal/mesh</code>（B8 B10 C1 C2 E2 E5 E6 E7）· 线 3 <code>internal/relay</code>（D3 D4）· 线 4 <code>tools/cmesh-install</code>（F1）。<b>线 4 与线 3 已交并复核通过</b>（F1/F7 记 ✔；D3/D4 记 ◐ —— D3 字面「命中 0 个」未达成，需网主在「改前端重建」与「正式豁免」之间拍板）。<br><b>★ 本轮挖出一条真产品缺口（E6）</b>：撤销拆中转活流时，请求方只读到裸传输错（<code>stream 0 canceled by remote</code>），理由「a member of this relay was revoked」<b>只留在锚点自己的日志里</b> —— 已被钉成测试，产品补上理由后该格即可从 ◐ 升 ✔。</span></div></div>
     <div class="check"><b class="ok">✓</b><div><strong>上次推送（2026-11-25）</strong><br><span><b>55 笔</b>推到 develop（<code>65514aa</code> → <code>36905ae</code>），<b>CI 在 tip 上绿</b>；<code>main</code> 未动（远端 <code>34fb7de</code>）。<br><b>★ 推送本身抓到了三件本地门禁抓不到的事</b>：<b>① 第一次推送后 CI 红了，而本地全绿、base commit 也绿</b> ⇒ <b>「base 绿」是推送的前提，而「我这里绿」不等于「那里绿」</b>；<b>② 两条红都只在 Linux 上出现</b>（本机是 macOS）⇒ <b>用 Docker 跑了 5 次整包：改前 2/5 红、改后 5/5 绿</b>；<b>③ 一次 docs-only 的提交让 CI 红了</b> ⇒ 是负载敏感的 flake，<b>同一棵树重跑即绿</b>（内容完全相同）。</span></div></div>
     <div class="check"><b class="warn">!</b><div><strong>本轮修掉的三个真缺陷</strong><br><span>① <b>一次性命令的「你已被撤销」文案是死代码</b>（用刚超时的 context 发 announce ⇒ 永远拿不到 401 ⇒ 被撤销的设备被告知「发现节点不可达」）· ② <b><code>--p2p</code> 直连路径两个读者抢同一个 socket</b>（内置传输的 readLoop 与 quic-go 同抢 ⇒ 握手包被当杂散流量丢掉 ⇒ <b>直连永远不成功且静默</b>）· ③ <b>干道生产路径缺停机守卫</b>（<code>stopping</code> 守卫只在测试专用入口上 ⇒ 停机后收养中转流 ⇒ goroutine 与两个会话永久泄漏）。<b>每条都带突变验证</b>（把修好的行为改回去 ⇒ 测试必须红）。</span></div></div>
     <div class="check"><b class="warn">!</b><div><strong>中转大文件的根因（已定位）</strong><br><span><b>不是中转数据面</b>（注入实测路径形状后每腿丢 175–321 个数据报仍 sha256 逐字节一致）；<b>是 hairpin 的「队列溢出尾丢弃」× 节点的 socket 缓冲天花板</b> ⇒ <b>产品从不申请接收缓冲、从不核对内核实际给了多少</b>，<b>于是「缓冲不够」只能表现为一个 30 秒超时</b>。已修（申请 + 回读 + 把缺口写进启动输出与失败信息）。<b>★ 但 1 MiB 在抬高天花板后仍然 0/5</b> ⇒ <b>还有第二个因素未定位</b> ⇒ <b>「中转大文件已修好」这句话还不能说</b>。</span></div></div>
