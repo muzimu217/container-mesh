@@ -245,7 +245,15 @@ func splitRemark(p string) (string, string) {
 // name, or a bare file path.
 func (r *resolver) resolveBare(p string) (evidenceKind, error) {
 	if identRe.MatchString(p) {
-		if _, ok := r.tests[p]; ok {
+		if file, ok := r.tests[p]; ok {
+			// ★ THE FILE THAT HOLDS THE TEST MUST BE ONE THE REPOSITORY
+			// CARRIES. A bare name resolves against the working tree, so a
+			// test that was never committed would satisfy it — and the
+			// ledger would then claim a cell is guarded by a test that
+			// does not exist in the checkout the row points at.
+			if err := r.checkTracked(r.rel(file)); err != nil {
+				return evidenceNone, fmt.Errorf("the test %q lives in %q, which %w", p, r.rel(file), err)
+			}
 			return evidenceTest, nil
 		}
 		if err := r.checkPath(p); err != nil {
@@ -449,6 +457,15 @@ func (r *resolver) checkPath(p string) error {
 		return fmt.Errorf("%q is a directory, not a file", p)
 	}
 	return nil
+}
+
+// rel turns a path inside the repository into one relative to its root.
+// The indexer stores absolute paths; git wants relative ones.
+func (r *resolver) rel(path string) string {
+	if rel, err := filepath.Rel(r.root, path); err == nil {
+		return filepath.ToSlash(rel)
+	}
+	return filepath.ToSlash(path)
 }
 
 // ★ A POINTER MUST POINT AT A FILE THE REPOSITORY CARRIES.

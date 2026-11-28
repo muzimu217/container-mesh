@@ -1024,6 +1024,39 @@ func TestAnUntrackedFileIsNotEvidence(t *testing.T) {
 	if _, err := ev.resolve(tracked); err != nil {
 		t.Errorf("the pointer at the tracked file %q was refused: %v", tracked, err)
 	}
+
+	// ★ A BARE TEST NAME IN AN UNTRACKED FILE IS REFUSED TOO.
+	//
+	// A bare name resolves against the working tree, so a test that was
+	// never committed used to satisfy it — and the ledger could then
+	// claim a cell is guarded by a test that does not exist in the
+	// checkout the row points at. The file has to be one the repository
+	// carries, whichever way the pointer names it.
+	untrackedTest := filepath.Join(root, "tools", "acceptance", "untracked_probe_test.go")
+	if err := os.WriteFile(untrackedTest,
+		[]byte("package main\n\nfunc TestAnUntrackedProbeTest(t *testing.T) {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(untrackedTest)
+
+	// The resolver has to be rebuilt: the index is taken when it is made.
+	ev2, err := newResolver(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := ev2.tests["TestAnUntrackedProbeTest"]; !ok {
+		t.Fatalf("the probe test was not indexed at all; the case below would prove nothing")
+	}
+	if kind, err := ev2.resolve("TestAnUntrackedProbeTest"); err == nil {
+		t.Errorf("the pointer at the test %q in an untracked file was accepted as a %v; "+
+			"a guard that names a test the repository does not carry is not a guard",
+			"TestAnUntrackedProbeTest", kind)
+	}
+
+	// A test in a TRACKED file is still accepted by its bare name.
+	if _, err := ev2.resolve("TestTheSubtestNameIsAcceptedWithSpacesAndWithUnderscores"); err != nil {
+		t.Errorf("the pointer at a test in a tracked file was refused: %v", err)
+	}
 }
 
 // TestTheSubtestNameIsAcceptedWithSpacesAndWithUnderscores: Go rewrites
