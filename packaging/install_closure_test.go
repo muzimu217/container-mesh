@@ -4,11 +4,90 @@
 package packaging
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+// ★ THE SHELL INSTALLER MUST REFUSE A PAYLOAD THAT DOES NOT MATCH THE
+// RELEASE CHECKSUM.
+//
+// The acceptance cell F1 says the installer "downloads + verifies the
+// sha256 + writes it to disk, exit code 0". Every guard that existed
+// covered the POSITIVE half: the download lands, the version directory
+// appears, the `current` symlink points at it.
+//
+// A positive half cannot tell a verifying installer from one that does
+// not verify at all — remove the sha256 comparison and every one of
+// them stays green, and the machine runs whatever the network served.
+//
+// So the guard is the negative one: the release serves an asset whose
+// bytes do not hash to the digest in its SHA256SUMS, and the installer
+// must refuse it, exit non-zero, and leave NOTHING behind. A half
+// install is worse than no install.
+func TestTheShellInstallerRefusesATamperedAsset(t *testing.T) {
+	f := newFixture(t, "#!/bin/sh\necho good\n")
+	// The fixture ships a REAL checksum. This replaces it with the
+	// digest of a DIFFERENT payload — the shape of a compromised
+	// download, and the only input the negative guard needs.
+	corruptSums(t, f, "latest", fixtureAsset())
+
+	out, code := f.run(t, 0o022)
+	if code == 0 {
+		t.Errorf("the installer exited 0 on an asset whose sha256 does not match the "+
+			"release checksum; the bytes at %s were never verified.\n--- output ---\n%s",
+			filepath.Join(f.installRoot(), "current", "cmesh"), out)
+	} else if !strings.Contains(out, "checksum mismatch") {
+		t.Errorf("the installer refused the tampered asset but did not say why "+
+			"(exit %d); the operator must be told the checksum did not match.\n"+
+			"--- output ---\n%s", code, out)
+	}
+
+	// And NOTHING may be left behind: no version directory, no
+	// `current` symlink, no managed-install marker.
+	root := f.installRoot()
+	for _, path := range []string{
+		filepath.Join(root, "versions", "latest"),
+		filepath.Join(root, "current"),
+		filepath.Join(root, "cmesh"),
+		filepath.Join(root, ".cmesh-install-root"),
+	} {
+		if _, err := os.Lstat(path); err == nil {
+			t.Errorf("the refused install left %s behind; a payload whose sha256 does "+
+				"not match the release checksum must not be installed at all", path)
+		} else if !os.IsNotExist(err) {
+			t.Errorf("cannot stat %s: %v", path, err)
+		}
+	}
+	// The install root itself must not even have been created.
+	if _, err := os.Stat(root); !os.IsNotExist(err) {
+		t.Errorf("the refused install created the install root %s (stat error: %v); "+
+			"a rejected download must leave no half install behind", root, err)
+	}
+}
+
+// corruptSums replaces the release's SHA256SUMS with a digest that does
+// NOT match the asset the release ships.
+//
+// The digest is a real sha256 — of a different payload — so the
+// installer cannot refuse it for a malformed-checksum reason. The only
+// reason left to refuse is the mismatch, which is the one under test.
+func corruptSums(t *testing.T, f *fixture, version, asset string) {
+	t.Helper()
+	dir := filepath.Join(f.releases, "latest", "download")
+	if version != "latest" {
+		dir = filepath.Join(f.releases, "download", version)
+	}
+	other := sha256.Sum256([]byte("a payload that was not published"))
+	line := fmt.Sprintf("%s  %s\n", hex.EncodeToString(other[:]), asset)
+	if err := os.WriteFile(filepath.Join(dir, "SHA256SUMS"), []byte(line), 0o644); err != nil {
+		t.Fatalf("write the tampered SHA256SUMS: %v", err)
+	}
+}
 
 // ★ THE INSTALL TREE MUST BE TRAVERSABLE BY THE SERVICE USER.
 //
